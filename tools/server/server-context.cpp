@@ -2392,6 +2392,7 @@ private:
                                 memcpy(hdr + 4, &payload_l, 8);
                                 hydra_send_all(hydra_fd, hdr,           HYDRA_RES_HEADER_SIZE);
                                 hydra_send_all(hydra_fd, meta_str.data(), meta_str.size());
+                                res->header_sent = true; // META + header before payload
                             }
                             // Stream payload: GPU tensors → 256 KB chunks → socket
                             const size_t streamed = llama_state_seq_get_data_to_fd(
@@ -2399,6 +2400,9 @@ private:
                             if (streamed == 0) {
                                 res->rpc_status = HYDRA_STATUS_ERROR;
                                 res->error      = "llama_state_seq_get_data_to_fd failed";
+                                // header already sent as OK — close fd so client detects truncation
+                                // RPC handler will log + skip re-sending response
+                                ::close(hydra_fd);
                             } else {
                                 res->streamed_bytes = streamed;
                             }
@@ -4231,6 +4235,119 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // ── Hydra state streaming (M0.0) ───────────────────────────────────────
+    this->get_state = [this](const server_http_req & req) {
+        auto res = create_response();
+        int id_slot;
+        try {
+            id_slot = std::stoi(req.get_param("id_slot"));
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_HYDRA_STATE_GET);
+        task.id = res->rd.get_new_id();
+        task.hydra_action.id_slot = id_slot;
+        task.hydra_action.hydra_fd = -1;
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * hr = dynamic_cast<server_task_result_hydra_state*>(result.get());
+        GGML_ASSERT(hr != nullptr);
+        if (hr->rpc_status != HYDRA_STATUS_OK) {
+            res->status = hr->rpc_status == HYDRA_STATUS_NOT_FOUND ? 404 : 503;
+            res->data = hr->error.empty() ? "" : hr->error;
+            return res;
+        }
+        res->content_type = "application/octet-stream";
+        res->headers["X-Hydra-State-Size"] = std::to_string(hr->state_data.size());
+        res->headers["X-Hydra-N-Past"] = std::to_string(hr->n_past);
+        res->data.assign((const char*)hr->state_data.data(), hr->state_data.size());
+        return res;
+    };
+    this->put_state = [this](const server_http_req & req) {
+        auto res = create_response();
+        int id_slot;
+        try {
+            id_slot = std::stoi(req.get_param("id_slot"));
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_HYDRA_STATE_PUT);
+        task.id = res->rd.get_new_id();
+        task.hydra_action.id_slot = id_slot;
+        task.hydra_action.state_data.assign(req.body.begin(), req.body.end());
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * hr = dynamic_cast<server_task_result_hydra_state*>(result.get());
+        GGML_ASSERT(hr != nullptr);
+        if (hr->rpc_status != HYDRA_STATUS_OK) {
+            json err = {{"error", "restore failed"}};
+            if (!hr->error.empty()) err["detail"] = hr->error;
+            return res;
+        }
+        res->ok(json{
+            {"restored", hr->restored},
+            {"n_past",   hr->n_past},
+            {"bytes",    hr->bytes},
+        });
+        return res;
+    };
+    this->get_state_meta = [this](const server_http_req & req) {
+        auto res = create_response();
+        int id_slot;
+        try {
+            id_slot = std::stoi(req.get_param("id_slot"));
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_HYDRA_STATE_META);
+        task.id = res->rd.get_new_id();
+        task.hydra_action.id_slot = id_slot;
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * hr = dynamic_cast<server_task_result_hydra_state*>(result.get());
+        GGML_ASSERT(hr != nullptr);
+        if (hr->rpc_status != HYDRA_STATUS_OK) {
+            res->status = hr->rpc_status == HYDRA_STATUS_NOT_FOUND ? 404 : 503;
+            res->data = hr->error.empty() ? "" : hr->error;
+            return res;
+        }
+        res->ok(json{
+            {"slot_id",        hr->id_slot},
+            {"n_past",         hr->n_past},
+            {"state_size",     (uint64_t)hr->state_size},
+            {"is_processing",  hr->is_processing},
+            {"is_transferring", hr->is_transferring},
+        });
+        return res;
+    };
+
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
 
@@ -5067,6 +5184,13 @@ static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ct
     }
 
     if (res->rpc_status != HYDRA_STATUS_OK) {
+        if (res->header_sent) {
+            // M2 failure: header already sent but stream failed; fd closed by background thread
+            // Log and return without sending a second response header
+            SRV_WRN("hydra rpc: STATE_GET slot=%d M2 stream failed: %s\n",
+                    slot_id, res->error.c_str());
+            return;
+        }
         hydra_write_res(fd, res->rpc_status, 0, 0);
         if (!res->error.empty()) {
             hydra_send_all(fd, res->error.data(), res->error.size());
@@ -5170,9 +5294,9 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
     const int task_id = task.id;
     ctx.queue_tasks->post(std::move(task));
 
-    // Wait for result from inference thread (1s timeout — metadata is cheap)
+    // Wait for result from inference thread (5s timeout — allows for queue congestion)
     std::unordered_set<int> task_ids = {task_id};
-    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 1000);
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5000);
     if (!res_ptr) {
         SRV_WRN("hydra rpc: STATE_META timeout for slot %d\n", slot_id);
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
@@ -5190,10 +5314,11 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
     uint8_t rpc_status = res->rpc_status;
     if (rpc_status == HYDRA_STATUS_OK) {
         json meta_j;
-        meta_j["slot_id"]       = res->id_slot;
-        meta_j["n_past"]        = res->n_past;
-        meta_j["state_size"]    = res->state_size;
-        meta_j["is_processing"] = res->is_processing;
+        meta_j["slot_id"]         = res->id_slot;
+        meta_j["n_past"]          = res->n_past;
+        meta_j["state_size"]      = res->state_size;
+        meta_j["is_processing"]   = res->is_processing;
+        meta_j["is_transferring"] = res->is_transferring;
         const std::string meta_str = meta_j.dump();
         hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
         hydra_send_all(fd, meta_str.data(), meta_str.size());
@@ -5206,6 +5331,11 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
 // Persistent: one TCP connection handles many sequential requests.
 
 static void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx) {
+    // Set receive timeout to prevent hung connections on stalled clients
+    struct timeval tv;
+    tv.tv_sec  = 120; // 2 min inactivity timeout
+    tv.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     while (true) {
         uint8_t hdr[HYDRA_REQ_HEADER_SIZE];
         if (!hydra_recv_all(fd, hdr, HYDRA_REQ_HEADER_SIZE)) break;
