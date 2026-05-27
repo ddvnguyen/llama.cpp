@@ -1980,14 +1980,27 @@ json server_task_result_apply_lora::to_json() {
 //
 
 json server_task_result_hydra_state::to_json() {
-    json j = {{"slot_id", id_slot}, {"op", op}, {"rpc_status", rpc_status}};
-    if (!error.empty())     j["error"]        = error;
-    if (op == 0x30)         j["n_past"]       = n_past;
-    if (op == 0x31) {       j["restored"]     = restored; j["bytes"] = bytes; }
+    json j;
+    j["slot_id"]    = id_slot;
+    j["op"]         = op;
+    j["rpc_status"] = rpc_status;
+    if (!error.empty()) j["error"] = error;
+    if (op == 0x30) {
+        j["n_past"] = n_past;
+        // M1 path: state_data was buffered (size tells how many bytes follow)
+        // M2 path: streamed_bytes was sent directly on socket (state_data is empty)
+        if (streamed_bytes > 0) j["streamed_bytes"] = streamed_bytes;
+        else                    j["state_size"]      = (uint64_t)state_data.size();
+    }
+    if (op == 0x31) {
+        j["restored"] = restored;
+        j["bytes"]    = bytes;
+    }
     if (op == 0x32) {
-        j["n_past"]         = n_past;
-        j["state_size"]     = state_size;
-        j["is_processing"]  = is_processing;
+        j["n_past"]          = n_past;
+        j["state_size"]      = state_size;
+        j["is_processing"]   = is_processing;
+        j["is_transferring"] = is_transferring; // true while M1/M2 async GET is active
     }
     return j;
 }

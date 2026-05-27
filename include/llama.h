@@ -841,6 +841,16 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   seq_id);
 
+    // Hydra M2: stream the KV state of a single sequence directly to an open POSIX file descriptor
+    // (typically a TCP socket).  No intermediate 800 MB buffer is allocated — GPU tensors are
+    // copied in 256 KB chunks and written to fd immediately.
+    // Returns bytes written (== llama_state_seq_get_size for the same seq_id), or 0 on error.
+    // Not supported on Windows (returns 0 with a log warning).
+    LLAMA_API size_t llama_state_seq_get_data_to_fd(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                             int   fd);
+
     // Copy the sequence data (originally copied with `llama_state_seq_get_data`) into the specified sequence
     // Returns:
     //  - Positive: Ok

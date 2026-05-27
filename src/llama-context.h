@@ -149,6 +149,8 @@ struct llama_context {
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+    // Hydra M2: stream state directly to an open socket fd (zero-copy, no 800 MB buffer)
+    size_t state_seq_get_data_to_fd(llama_seq_id seq_id, int fd);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     bool state_load_file(

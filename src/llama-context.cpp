@@ -2775,6 +2775,62 @@ size_t llama_context::state_get_size() {
     }
 }
 
+// ── Hydra M2: zero-copy socket streaming ──────────────────────────────────────
+// Subclasses llama_io_write_i so state_seq_write_data() streams directly to a TCP
+// socket via a small per-tensor staging buffer (default 256 KB).
+// Peak RAM: HYDRA_STREAM_CHUNK bytes — not 800 MB.
+// Tensor writes happen immediately (no deferred destructor) preserving stream order.
+#if !defined(_WIN32)
+#include <sys/socket.h>
+
+class llama_io_write_socket : public llama_io_write_i {
+    static constexpr size_t CHUNK = 256 * 1024; // 256 KB staging buffer per tensor chunk
+
+    int    fd             = -1;
+    size_t bytes_written  = 0;
+    std::vector<uint8_t> staging;
+
+    // Send all bytes; throws on error so callers propagate to state_seq_get_data_fd.
+    void send_all(const void * buf, size_t n) {
+        const char * p = static_cast<const char *>(buf);
+        while (n > 0) {
+            ssize_t w = ::send(fd, p, n, MSG_NOSIGNAL);
+            if (w <= 0) {
+                throw std::runtime_error("hydra: socket send failed during state stream");
+            }
+            p += w;
+            n -= (size_t)w;
+        }
+    }
+
+public:
+    explicit llama_io_write_socket(int fd) : fd(fd), staging(CHUNK) {}
+
+    // Small metadata (ints, strings, headers): send immediately.
+    void write(const void * src, size_t size) override {
+        send_all(src, size);
+        bytes_written += size;
+    }
+
+    // Large tensor data: copy from GPU in CHUNK-sized pieces, send each piece immediately.
+    // This is the zero-copy path — no 800 MB intermediate allocation.
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        size_t rem = size;
+        size_t off = offset;
+        while (rem > 0) {
+            const size_t chunk = std::min(rem, staging.size());
+            ggml_backend_tensor_get(tensor, staging.data(), off, chunk);
+            send_all(staging.data(), chunk);
+            bytes_written += chunk;
+            off += chunk;
+            rem -= chunk;
+        }
+    }
+
+    size_t n_bytes() override { return bytes_written; }
+};
+#endif // !_WIN32
+
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
     llama_io_write_host io(dst, size);
     try {
@@ -2827,6 +2883,27 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
     }
+}
+
+// Hydra M2: stream KV state for one sequence directly to a socket fd.
+// No intermediate 800 MB buffer — GPU tensors are copied to a 256 KB staging area and sent.
+// Returns bytes streamed (same as llama_state_seq_get_size would return), 0 on error.
+size_t llama_context::state_seq_get_data_to_fd(llama_seq_id seq_id, int fd) {
+#if !defined(_WIN32)
+    llama_io_write_socket io(fd);
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id,   sizeof(seq_id));
+        return state_seq_write_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error streaming state to fd %d: %s\n", __func__, fd, err.what());
+        return 0;
+    }
+#else
+    (void)seq_id; (void)fd;
+    LLAMA_LOG_WARN("%s: not supported on Windows\n", __func__);
+    return 0;
+#endif
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
@@ -3866,6 +3943,12 @@ size_t llama_state_seq_get_size(llama_context * ctx, llama_seq_id seq_id) {
 
 size_t llama_state_seq_get_data(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id) {
     return llama_state_seq_get_data_ext(ctx, dst, size, seq_id, 0);
+}
+
+// Hydra M2: public C API entry point — synchronize GPU then stream to fd
+size_t llama_state_seq_get_data_to_fd(llama_context * ctx, llama_seq_id seq_id, int fd) {
+    ctx->synchronize(); // same as llama_state_seq_get_data_ext
+    return ctx->state_seq_get_data_to_fd(seq_id, fd);
 }
 
 size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id) {

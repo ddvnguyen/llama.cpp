@@ -175,7 +175,10 @@ struct server_task {
     // used by SERVER_TASK_TYPE_HYDRA_STATE_*
     struct hydra_action {
         int                  id_slot    = -1;
-        std::vector<uint8_t> state_data; // STATE_PUT only: KV bytes to restore
+        // STATE_PUT only: KV bytes to restore
+        std::vector<uint8_t> state_data;
+        // STATE_GET M2: open socket fd to stream directly into (< 0 = use buffer path)
+        int                  hydra_fd   = -1;
     };
     hydra_action hydra_action;
 
@@ -582,17 +585,22 @@ struct server_task_result_hydra_state : server_task_result {
     uint8_t op         = 0;                 // HYDRA_OP_STATE_GET/PUT/META
     uint8_t rpc_status = 0x02 /*ERROR*/;    // set by inference thread
 
-    // STATE_GET: filled with raw KV bytes (~800 MB)
+    // STATE_GET M1 path: filled with raw KV bytes (~800 MB) when hydra_fd < 0
     std::vector<uint8_t> state_data;
     int32_t  n_past    = 0;                 // GET + META
+
+    // STATE_GET M2 path: set when data was streamed directly to socket (hydra_fd >= 0)
+    // state_data is empty; streamed_bytes is the byte count sent.
+    uint64_t streamed_bytes = 0;
 
     // STATE_PUT: restore stats
     uint64_t bytes     = 0;
     bool     restored  = false;
 
     // STATE_META extra
-    bool     is_processing = false;
-    uint64_t state_size    = 0;
+    bool     is_processing   = false;
+    bool     is_transferring = false;       // true while M1/M2 background send is active
+    uint64_t state_size      = 0;
 
     std::string error; // human-readable, non-empty on failure
 

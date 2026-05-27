@@ -47,6 +47,12 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Forward-declared so the background thread lambda in process_single_task can use it
+// before the full RPC helper definitions appear later in this file.
+#if !defined(_WIN32)
+static bool hydra_send_all(int fd, const void * buf, size_t n);
+#endif
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -115,6 +121,12 @@ struct server_slot {
 
     // state
     slot_state state = SLOT_STATE_IDLE;
+
+    // Hydra M1: true when a background thread is serializing KV state for STATE_GET.
+    // Guards concurrent RPC ops (STATE_PUT, another STATE_GET) on this slot.
+    // Serialization runs off the inference thread so decode can continue on other slots.
+    // Use a raw pointer to an atomic so server_slot remains movable (needed by std::vector).
+    std::shared_ptr<std::atomic<bool>> hydra_transferring{std::make_shared<std::atomic<bool>>(false)};
 
     server_prompt prompt;
 
@@ -2317,6 +2329,9 @@ private:
 
             case SERVER_TASK_TYPE_HYDRA_STATE_GET:
                 {
+                    // M1: background serialization thread — inference loop continues during state transfer.
+                    // llama_state_seq_get_data reads KV cells for an IDLE sequence; llama_decode
+                    // writes cells for ACTIVE sequences only — no memory overlap for different seq IDs.
                     const int id_slot = task.hydra_action.id_slot;
                     auto res = std::make_unique<server_task_result_hydra_state>();
                     res->id      = task.id;
@@ -2330,20 +2345,79 @@ private:
                         queue_results.send(std::move(res));
                         break;
                     }
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot->hydra_transferring->load()) {
                         res->rpc_status = HYDRA_STATUS_BUSY;
                         queue_results.send(std::move(res));
                         break;
                     }
 
+                    // Snapshot on inference thread (cheap — dry-run serialization, no GPU copies).
                     const size_t state_size = llama_state_seq_get_size(ctx_tgt, slot->id);
-                    res->state_data.resize(state_size);
-                    llama_state_seq_get_data(ctx_tgt, res->state_data.data(), state_size, slot->id);
                     res->n_past     = slot->n_prompt_tokens_cache + slot->n_decoded;
                     res->rpc_status = HYDRA_STATUS_OK;
-                    SRV_INF("hydra: STATE_GET slot=%d n_past=%d state=%.1f MiB\n",
+                    SRV_INF("hydra: STATE_GET slot=%d n_past=%d state=%.1f MiB — async\n",
                             id_slot, res->n_past, state_size / (1024.0 * 1024.0));
-                    queue_results.send(std::move(res));
+
+                    slot->hydra_transferring->store(true);
+
+                    // M2: background thread streams directly to socket (zero-copy).
+                    // Falls back to buffer path if fd < 0 (no fd in task).
+                    const int      snap_seq_id = slot->id;
+                    llama_context * snap_ctx   = ctx_tgt;
+                    // shared_ptr keeps the atomic alive even if the slot is reallocated
+                    std::shared_ptr<std::atomic<bool>> flag_ptr = slot->hydra_transferring;
+                    const int      hydra_fd    = task.hydra_action.hydra_fd;
+
+                    std::thread([snap_ctx, snap_seq_id, state_size, hydra_fd,
+                                 res = std::move(res), flag_ptr,
+                                 &results = queue_results]() mutable {
+                        if (hydra_fd >= 0) {
+                            // M2 path: stream GPU→socket directly, no 800 MB allocation.
+                            // Send response header + meta JSON FIRST (client expects framing),
+                            // then llama_state_seq_get_data_to_fd sends the payload bytes.
+                            {
+                                json meta_j;
+                                meta_j["n_past"]     = res->n_past;
+                                meta_j["state_size"] = (uint64_t)state_size;
+                                const std::string meta_str = meta_j.dump();
+
+                                // Build 12-byte response header inline
+                                const uint32_t meta_len  = (uint32_t)meta_str.size();
+                                const uint64_t payload_l = (uint64_t)state_size;
+                                uint8_t hdr[HYDRA_RES_HEADER_SIZE] = {};
+                                hdr[0] = HYDRA_STATUS_OK;
+                                hdr[1] = (meta_len)       & 0xFF;
+                                hdr[2] = (meta_len >>  8) & 0xFF;
+                                hdr[3] = (meta_len >> 16) & 0xFF;
+                                memcpy(hdr + 4, &payload_l, 8);
+                                hydra_send_all(hydra_fd, hdr,           HYDRA_RES_HEADER_SIZE);
+                                hydra_send_all(hydra_fd, meta_str.data(), meta_str.size());
+                            }
+                            // Stream payload: GPU tensors → 256 KB chunks → socket
+                            const size_t streamed = llama_state_seq_get_data_to_fd(
+                                    snap_ctx, snap_seq_id, hydra_fd);
+                            if (streamed == 0) {
+                                res->rpc_status = HYDRA_STATUS_ERROR;
+                                res->error      = "llama_state_seq_get_data_to_fd failed";
+                            } else {
+                                res->streamed_bytes = streamed;
+                            }
+                        } else {
+                            // M1 path: buffer in memory, RPC thread sends afterwards.
+                            res->state_data.resize(state_size);
+                            const size_t copied = llama_state_seq_get_data(
+                                    snap_ctx, res->state_data.data(), state_size, snap_seq_id);
+                            if (copied == 0) {
+                                res->rpc_status = HYDRA_STATUS_ERROR;
+                                res->error      = "llama_state_seq_get_data failed";
+                                res->state_data.clear();
+                            }
+                        }
+                        flag_ptr->store(false);
+                        results.send(std::move(res));
+                    }).detach();
+
+                    // Inference thread returns immediately — no stall on decode for other slots.
                 } break;
 
             case SERVER_TASK_TYPE_HYDRA_STATE_PUT:
@@ -2361,7 +2435,7 @@ private:
                         queue_results.send(std::move(res));
                         break;
                     }
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot->hydra_transferring->load()) {
                         res->rpc_status = HYDRA_STATUS_BUSY;
                         queue_results.send(std::move(res));
                         break;
@@ -2396,9 +2470,10 @@ private:
                         queue_results.send(std::move(res));
                         break;
                     }
-                    // META is safe to serve even while processing (read-only metadata)
-                    res->n_past        = slot->n_prompt_tokens_cache + slot->n_decoded;
-                    res->is_processing = slot->is_processing();
+                    // META is safe to serve even while processing or transferring (read-only metadata)
+                    res->n_past          = slot->n_prompt_tokens_cache + slot->n_decoded;
+                    res->is_processing   = slot->is_processing();
+                    res->is_transferring = slot->hydra_transferring->load();
                     res->state_size    = (uint64_t)llama_state_seq_get_size(ctx_tgt, slot->id);
                     res->rpc_status    = HYDRA_STATUS_OK;
                     queue_results.send(std::move(res));
@@ -4950,17 +5025,34 @@ static void hydra_write_res(int fd, uint8_t status, uint32_t meta_len, uint64_t 
 
 // ── Op handlers (M1: dispatch via task queue) ─────────────────────────────────
 
-// STATE_GET (0x30): Post task to inference thread, wait for result, send response.
+// STATE_GET (0x30): Post task, wait for result.
+//
+// M1 path (hydra_fd < 0): inference thread serializes 800 MB into result buffer;
+//   RPC thread sends response header + meta JSON + buffer here.
+//
+// M2 path (hydra_fd = fd): background thread streams GPU→socket directly using
+//   llama_state_seq_get_data_to_fd; result carries only n_past + streamed_bytes.
+//   Response header + meta are sent BEFORE the task (we know size from STATE_META),
+//   so the payload is already on the wire before we even get the result back.
+//   Actually: we must send header AFTER knowing state_size. So:
+//   - If M2: we get state_size first from a quick STATE_META query (n_past already known),
+//     OR we embed state_size in the result from get_size() on the inference thread.
+//   The inference thread always calls llama_state_seq_get_size (cheap) and stores it
+//   in res->state_size for M2 so we can send the header before the stream completes.
+//
+// Timeout: 30s — streaming 800 MB over localhost may take a few seconds.
 static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
+    // Build task — pass fd for M2 zero-copy streaming
     server_task task(SERVER_TASK_TYPE_HYDRA_STATE_GET);
     task.id = ctx.queue_tasks->get_new_id();
-    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.id_slot  = slot_id;
+    task.hydra_action.hydra_fd = fd;    // M2: background thread streams here
     const int task_id = task.id;
     ctx.queue_tasks->post(std::move(task));
 
-    // Wait for result from inference thread (5s timeout)
+    // Wait for result (n_past + state_size always set; state_data only on M1)
     std::unordered_set<int> task_ids = {task_id};
-    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5000);
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 30000);
     if (!res_ptr) {
         SRV_WRN("hydra rpc: STATE_GET timeout for slot %d\n", slot_id);
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
@@ -4974,21 +5066,33 @@ static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ct
         return;
     }
 
-    // Send result back to client
-    uint8_t rpc_status = res->rpc_status;
-    if (rpc_status == HYDRA_STATUS_OK) {
-        json meta_j;
-        meta_j["n_past"]     = res->n_past;
-        meta_j["state_size"] = (uint64_t)res->state_data.size();
-        const std::string meta_str = meta_j.dump();
-        hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), (uint64_t)res->state_data.size());
-        hydra_send_all(fd, meta_str.data(), meta_str.size());
-        hydra_send_all(fd, res->state_data.data(), res->state_data.size());
-    } else {
-        hydra_write_res(fd, rpc_status, 0, 0);
+    if (res->rpc_status != HYDRA_STATUS_OK) {
+        hydra_write_res(fd, res->rpc_status, 0, 0);
         if (!res->error.empty()) {
             hydra_send_all(fd, res->error.data(), res->error.size());
         }
+        return;
+    }
+
+    if (res->streamed_bytes > 0) {
+        // M2 path: data already on the wire — response header + meta were sent by background thread.
+        // Nothing left for RPC thread to do. The protocol framing (header + meta + payload)
+        // was completed inside llama_io_write_socket / the background thread.
+        // Note: header was sent AFTER state_size was known (inference thread called get_size).
+        SRV_INF("hydra rpc: STATE_GET slot=%d M2 streamed %.1f MiB directly\n",
+                slot_id, res->streamed_bytes / (1024.0 * 1024.0));
+    } else {
+        // M1 path: inference thread buffered 800 MB; send it now.
+        const uint64_t payload = (uint64_t)res->state_data.size();
+        json meta_j;
+        meta_j["n_past"]     = res->n_past;
+        meta_j["state_size"] = payload;
+        const std::string meta_str = meta_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), payload);
+        hydra_send_all(fd, meta_str.data(), meta_str.size());
+        hydra_send_all(fd, res->state_data.data(), (size_t)payload);
+        SRV_INF("hydra rpc: STATE_GET slot=%d M1 sent %.1f MiB from buffer\n",
+                slot_id, payload / (1024.0 * 1024.0));
     }
 }
 
