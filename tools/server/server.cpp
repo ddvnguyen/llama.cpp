@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "server-rpc.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -303,6 +304,29 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/v1/streams/lookup",        ex_wrapper(streams_lookup_h));
     ctx_http.del ("/v1/stream",                ex_wrapper(stream_delete_h));
 
+    // Hydra state endpoints (HTTP debug/curl path; production path uses --rpc-port)
+    // GET /slots/:id_slot/state/meta — lightweight metadata, no KV serialization
+    // Binary GET/PUT state are served only via the RPC port (800 MB not suitable for HTTP body).
+    ctx_http.get("/slots/:id_slot/state/meta", ex_wrapper([&ctx_server](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const int id_slot = std::stoi(req.get_param("id_slot"));
+        auto * ll_ctx = ctx_server.get_llama_context();
+        if (!ll_ctx) {
+            res->status = 503;
+            res->data   = safe_json_to_str(json{{"error", "model not loaded or sleeping"}});
+            return res;
+        }
+        // state_size is available via public llama API; n_past requires slot internals
+        // (available via STATE_META RPC op on --rpc-port).
+        const size_t state_size = llama_state_seq_get_size(ll_ctx, (llama_seq_id)id_slot);
+        res->data = safe_json_to_str(json{
+            {"slot_id",    id_slot},
+            {"state_size", (uint64_t)state_size},
+            {"rpc_ops",    "STATE_GET=0x30 STATE_PUT=0x31 STATE_META=0x32 via --rpc-port"},
+        });
+        return res;
+    }));
+
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
 
@@ -487,6 +511,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.is_ready.store(true);
 
         SRV_INF("%s", "model loaded\n");
+
+        // Hydra RPC: start binary state-transfer listener if --rpc-port is set
+        if (params.rpc_port > 0) {
+            ctx_server.start_rpc_server(params.rpc_port);
+        }
 
         shutdown_handler = [&](int) {
             mcp_mgr.shutdown();

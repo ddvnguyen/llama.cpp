@@ -110,6 +110,13 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // Hydra RPC: start a binary TCP listener for KV state transfer.
+    // Ops: STATE_GET (0x30), STATE_PUT (0x31), STATE_META (0x32).
+    // port = 0 is a no-op (disabled). Must be called after load_model().
+    // Thread safety: slots must be idle (is_processing() == false) when ops run.
+    // TODO(M1): route through task queue for full thread safety under load.
+    void start_rpc_server(int port);
 };
 
 
