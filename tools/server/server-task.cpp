@@ -1976,6 +1976,23 @@ json server_task_result_apply_lora::to_json() {
 }
 
 //
+// server_task_result_hydra_state
+//
+
+json server_task_result_hydra_state::to_json() {
+    json j = {{"slot_id", id_slot}, {"op", op}, {"rpc_status", rpc_status}};
+    if (!error.empty())     j["error"]        = error;
+    if (op == 0x30)         j["n_past"]       = n_past;
+    if (op == 0x31) {       j["restored"]     = restored; j["bytes"] = bytes; }
+    if (op == 0x32) {
+        j["n_past"]         = n_past;
+        j["state_size"]     = state_size;
+        j["is_processing"]  = is_processing;
+    }
+    return j;
+}
+
+//
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {

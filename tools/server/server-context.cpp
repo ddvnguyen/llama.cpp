@@ -2310,6 +2310,99 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+
+            // ── Hydra RPC state-transfer tasks (M1) ──────────────────────────
+            // All three cases run on the inference thread so llama API access is safe.
+            // The calling RPC thread blocks on queue_results.recv_with_timeout().
+
+            case SERVER_TASK_TYPE_HYDRA_STATE_GET:
+                {
+                    const int id_slot = task.hydra_action.id_slot;
+                    auto res = std::make_unique<server_task_result_hydra_state>();
+                    res->id      = task.id;
+                    res->id_slot = id_slot;
+                    res->op      = HYDRA_OP_STATE_GET;
+
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        res->rpc_status = HYDRA_STATUS_NOT_FOUND;
+                        res->error      = "invalid slot ID";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        res->rpc_status = HYDRA_STATUS_BUSY;
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    const size_t state_size = llama_state_seq_get_size(ctx_tgt, slot->id);
+                    res->state_data.resize(state_size);
+                    llama_state_seq_get_data(ctx_tgt, res->state_data.data(), state_size, slot->id);
+                    res->n_past     = slot->n_prompt_tokens_cache + slot->n_decoded;
+                    res->rpc_status = HYDRA_STATUS_OK;
+                    SRV_INF("hydra: STATE_GET slot=%d n_past=%d state=%.1f MiB\n",
+                            id_slot, res->n_past, state_size / (1024.0 * 1024.0));
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_HYDRA_STATE_PUT:
+                {
+                    const int id_slot = task.hydra_action.id_slot;
+                    auto res = std::make_unique<server_task_result_hydra_state>();
+                    res->id      = task.id;
+                    res->id_slot = id_slot;
+                    res->op      = HYDRA_OP_STATE_PUT;
+
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        res->rpc_status = HYDRA_STATUS_NOT_FOUND;
+                        res->error      = "invalid slot ID";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        res->rpc_status = HYDRA_STATUS_BUSY;
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    const auto & buf = task.hydra_action.state_data;
+                    const size_t n_read = llama_state_seq_set_data(ctx_tgt, buf.data(), buf.size(), slot->id);
+                    if (n_read == 0) {
+                        res->rpc_status = HYDRA_STATUS_ERROR;
+                        res->error      = "llama_state_seq_set_data returned 0";
+                    } else {
+                        res->rpc_status = HYDRA_STATUS_OK;
+                        res->restored   = true;
+                        res->bytes      = (uint64_t)n_read;
+                        SRV_INF("hydra: STATE_PUT slot=%d restored=%zu B\n", id_slot, n_read);
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_HYDRA_STATE_META:
+                {
+                    const int id_slot = task.hydra_action.id_slot;
+                    auto res = std::make_unique<server_task_result_hydra_state>();
+                    res->id      = task.id;
+                    res->id_slot = id_slot;
+                    res->op      = HYDRA_OP_STATE_META;
+
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        res->rpc_status = HYDRA_STATUS_NOT_FOUND;
+                        res->error      = "invalid slot ID";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    // META is safe to serve even while processing (read-only metadata)
+                    res->n_past        = slot->n_prompt_tokens_cache + slot->n_decoded;
+                    res->is_processing = slot->is_processing();
+                    res->state_size    = (uint64_t)llama_state_seq_get_size(ctx_tgt, slot->id);
+                    res->rpc_status    = HYDRA_STATUS_OK;
+                    queue_results.send(std::move(res));
+                } break;
         }
     }
 
@@ -4807,12 +4900,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Hydra RPC server — KV state transfer (M0)
+// Hydra RPC server — KV state transfer (M1: task-queue based)
 // Wire format: specs/rpc-protocol.md  |  constants: server-rpc.h
 // Ops implemented: STATE_GET (0x30), STATE_PUT (0x31), STATE_META (0x32)
+// M1: All llama API calls routed through task queue (inference thread safe)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #if !defined(_WIN32)
+
+// ── Context for RPC thread — pass to handlers ─────────────────────────────────
+
+struct hydra_rpc_ctx {
+    server_queue * queue_tasks = nullptr;
+    server_response * queue_results = nullptr;
+};
 
 // ── Low-level I/O helpers ─────────────────────────────────────────────────────
 
@@ -4847,38 +4948,57 @@ static void hydra_write_res(int fd, uint8_t status, uint32_t meta_len, uint64_t 
     hydra_send_all(fd, buf, HYDRA_RES_HEADER_SIZE);
 }
 
-// ── Op handlers ───────────────────────────────────────────────────────────────
+// ── Op handlers (M1: dispatch via task queue) ─────────────────────────────────
 
-// STATE_GET (0x30): serialize full KV state and send as response payload.
-// n_past = n_prompt_tokens_cache + n_decoded (total KV positions).
-static void hydra_handle_state_get(int fd, server_slot & slot) {
-    if (slot.is_processing()) {
-        hydra_write_res(fd, HYDRA_STATUS_BUSY, 0, 0);
+// STATE_GET (0x30): Post task to inference thread, wait for result, send response.
+static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
+    server_task task(SERVER_TASK_TYPE_HYDRA_STATE_GET);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    const int task_id = task.id;
+    ctx.queue_tasks->post(std::move(task));
+
+    // Wait for result from inference thread (5s timeout)
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5000);
+    if (!res_ptr) {
+        SRV_WRN("hydra rpc: STATE_GET timeout for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
-    const size_t state_size = llama_state_seq_get_size(slot.ctx_tgt, slot.id);
-    std::vector<uint8_t> buf(state_size);
-    llama_state_seq_get_data(slot.ctx_tgt, buf.data(), buf.size(), slot.id);
 
-    const int32_t n_past = slot.n_prompt_tokens_cache + slot.n_decoded;
-    const json meta_j = {{"n_past", n_past}, {"state_size", (uint64_t)state_size}};
-    const std::string meta_str = meta_j.dump();
+    auto * res = dynamic_cast<server_task_result_hydra_state*>(res_ptr.get());
+    if (!res) {
+        SRV_WRN("hydra rpc: STATE_GET result type mismatch for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
 
-    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), (uint64_t)state_size);
-    hydra_send_all(fd, meta_str.data(), meta_str.size());
-    hydra_send_all(fd, buf.data(), state_size);
+    // Send result back to client
+    uint8_t rpc_status = res->rpc_status;
+    if (rpc_status == HYDRA_STATUS_OK) {
+        json meta_j;
+        meta_j["n_past"]     = res->n_past;
+        meta_j["state_size"] = (uint64_t)res->state_data.size();
+        const std::string meta_str = meta_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), (uint64_t)res->state_data.size());
+        hydra_send_all(fd, meta_str.data(), meta_str.size());
+        hydra_send_all(fd, res->state_data.data(), res->state_data.size());
+    } else {
+        hydra_write_res(fd, rpc_status, 0, 0);
+        if (!res->error.empty()) {
+            hydra_send_all(fd, res->error.data(), res->error.size());
+        }
+    }
 }
 
-// STATE_PUT (0x31): receive KV state from client and restore into slot.
-// Note: slot->n_prompt_tokens_cache / n_decoded are NOT updated by llama_state_seq_set_data.
-// The caller must track n_past from the preceding STATE_GET response.
-// TODO(M1): update slot cache bookkeeping after restore.
-static void hydra_handle_state_put(int fd, server_slot & slot, uint64_t payload_len) {
+// STATE_PUT (0x31): Receive payload, post task, wait for result, send ack.
+static void hydra_handle_state_put(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
     if (payload_len > HYDRA_MAX_STATE_BYTES) {
         SRV_WRN("hydra rpc: STATE_PUT payload %" PRIu64 " B exceeds cap %" PRIu64 " B\n",
                 payload_len, HYDRA_MAX_STATE_BYTES);
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
-        // drain to keep persistent connection alive
+        // Drain to keep persistent connection alive
         std::vector<uint8_t> drain(65536);
         for (uint64_t rem = payload_len; rem > 0; ) {
             size_t chunk = (size_t)std::min(rem, (uint64_t)drain.size());
@@ -4887,43 +5007,101 @@ static void hydra_handle_state_put(int fd, server_slot & slot, uint64_t payload_
         }
         return;
     }
+
+    // Read payload from socket
     std::vector<uint8_t> buf((size_t)payload_len);
     if (!hydra_recv_all(fd, buf.data(), (size_t)payload_len)) {
+        SRV_WRN("%s", "hydra rpc: STATE_PUT failed to read payload\n");
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
-    const size_t n_read = llama_state_seq_set_data(slot.ctx_tgt, buf.data(), buf.size(), slot.id);
-    if (n_read == 0) {
-        const json err_j = {{"error", "llama_state_seq_set_data returned 0"}};
-        const std::string err_str = err_j.dump();
-        hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
-        hydra_send_all(fd, err_str.data(), err_str.size());
+
+    // Post task to inference thread
+    server_task task(SERVER_TASK_TYPE_HYDRA_STATE_PUT);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.state_data = std::move(buf);
+    const int task_id = task.id;
+    ctx.queue_tasks->post(std::move(task));
+
+    // Wait for result from inference thread (10s timeout for large restore)
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 10000);
+    if (!res_ptr) {
+        SRV_WRN("hydra rpc: STATE_PUT timeout for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
-    const json meta_j = {{"restored", true}, {"bytes", (uint64_t)n_read}};
-    const std::string meta_str = meta_j.dump();
-    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
-    hydra_send_all(fd, meta_str.data(), meta_str.size());
+
+    auto * res = dynamic_cast<server_task_result_hydra_state*>(res_ptr.get());
+    if (!res) {
+        SRV_WRN("hydra rpc: STATE_PUT result type mismatch for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // Send result back to client
+    uint8_t rpc_status = res->rpc_status;
+    if (rpc_status == HYDRA_STATUS_OK) {
+        json meta_j;
+        meta_j["restored"] = true;
+        meta_j["bytes"]    = res->bytes;
+        const std::string meta_str = meta_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+        hydra_send_all(fd, meta_str.data(), meta_str.size());
+    } else {
+        json err_j;
+        err_j["error"] = res->error;
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, rpc_status, (uint32_t)err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
+    }
 }
 
-// STATE_META (0x32): slot metadata only — cheap, no KV serialization.
-static void hydra_handle_state_meta(int fd, server_slot & slot) {
-    const int32_t n_past = slot.n_prompt_tokens_cache + slot.n_decoded;
-    const json meta_j = {
-        {"slot_id",       slot.id},
-        {"n_past",        n_past},
-        {"state_size",    (uint64_t)llama_state_seq_get_size(slot.ctx_tgt, slot.id)},
-        {"is_processing", slot.is_processing()},
-    };
-    const std::string meta_str = meta_j.dump();
-    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
-    hydra_send_all(fd, meta_str.data(), meta_str.size());
+// STATE_META (0x32): Post task, wait for result, send JSON metadata.
+static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
+    server_task task(SERVER_TASK_TYPE_HYDRA_STATE_META);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    const int task_id = task.id;
+    ctx.queue_tasks->post(std::move(task));
+
+    // Wait for result from inference thread (1s timeout — metadata is cheap)
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 1000);
+    if (!res_ptr) {
+        SRV_WRN("hydra rpc: STATE_META timeout for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_state*>(res_ptr.get());
+    if (!res) {
+        SRV_WRN("hydra rpc: STATE_META result type mismatch for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // Send result back to client
+    uint8_t rpc_status = res->rpc_status;
+    if (rpc_status == HYDRA_STATUS_OK) {
+        json meta_j;
+        meta_j["slot_id"]       = res->id_slot;
+        meta_j["n_past"]        = res->n_past;
+        meta_j["state_size"]    = res->state_size;
+        meta_j["is_processing"] = res->is_processing;
+        const std::string meta_str = meta_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+        hydra_send_all(fd, meta_str.data(), meta_str.size());
+    } else {
+        hydra_write_res(fd, rpc_status, 0, 0);
+    }
 }
 
 // ── Per-connection loop ───────────────────────────────────────────────────────
 // Persistent: one TCP connection handles many sequential requests.
 
-static void hydra_handle_connection(int fd, std::vector<server_slot> * slots) {
+static void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx) {
     while (true) {
         uint8_t hdr[HYDRA_REQ_HEADER_SIZE];
         if (!hydra_recv_all(fd, hdr, HYDRA_REQ_HEADER_SIZE)) break;
@@ -4936,7 +5114,7 @@ static void hydra_handle_connection(int fd, std::vector<server_slot> * slots) {
         }
 
         const uint8_t op = hdr[2];
-        // hdr[3] = flags (reserved, unused in M0)
+        // hdr[3] = flags (reserved, unused in M1)
         uint16_t key_len = 0, trace_len = 0;
         uint64_t payload_len = 0;
         memcpy(&key_len,     hdr + 4,  2);
@@ -4956,29 +5134,20 @@ static void hydra_handle_connection(int fd, std::vector<server_slot> * slots) {
             continue;
         }
 
-        server_slot * slot = nullptr;
-        for (auto & s : *slots) {
-            if (s.id == slot_id) { slot = &s; break; }
-        }
-        if (!slot) {
-            SRV_WRN("hydra rpc: slot %d not found\n", slot_id);
-            hydra_write_res(fd, HYDRA_STATUS_NOT_FOUND, 0, 0);
-            continue;
-        }
-
+        // Dispatch to handler via task queue (no direct slot access)
         switch (op) {
             case HYDRA_OP_STATE_GET:
                 SRV_DBG("hydra rpc: STATE_GET  slot=%d trace=%s\n", slot_id, trace_id.c_str());
-                hydra_handle_state_get(fd, *slot);
+                hydra_handle_state_get(fd, slot_id, ctx);
                 break;
             case HYDRA_OP_STATE_PUT:
                 SRV_DBG("hydra rpc: STATE_PUT  slot=%d payload=%" PRIu64 " trace=%s\n",
                         slot_id, payload_len, trace_id.c_str());
-                hydra_handle_state_put(fd, *slot, payload_len);
+                hydra_handle_state_put(fd, slot_id, payload_len, ctx);
                 break;
             case HYDRA_OP_STATE_META:
                 SRV_DBG("hydra rpc: STATE_META slot=%d trace=%s\n", slot_id, trace_id.c_str());
-                hydra_handle_state_meta(fd, *slot);
+                hydra_handle_state_meta(fd, slot_id, ctx);
                 break;
             default:
                 SRV_WRN("hydra rpc: unknown op 0x%02x — ignoring\n", (unsigned)op);
@@ -4988,16 +5157,19 @@ static void hydra_handle_connection(int fd, std::vector<server_slot> * slots) {
     ::close(fd);
 }
 
-// ── server_context::start_rpc_server ─────────────────────────────────────────
+// ── server_context::start_rpc_server (M1) ────────────────────────────────────
+// Extract queue pointers and pass to connection handlers via context struct.
 
 void server_context::start_rpc_server(int port) {
     if (port <= 0) return;
 
     // server_context is a friend of server_context_impl, so we can access private fields.
-    // We extract a raw pointer to slots — safe for the lifetime of the process (M0: no reload).
-    auto * slots_ptr = &impl->slots;
+    // Extract queue pointers (PUBLIC members of server_context_impl).
+    hydra_rpc_ctx ctx;
+    ctx.queue_tasks = &impl->queue_tasks;
+    ctx.queue_results = &impl->queue_results;
 
-    std::thread([port, slots_ptr]() {
+    std::thread([port, ctx]() {
         const int srv_fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (srv_fd < 0) {
             SRV_ERR("hydra rpc: socket() failed: %s\n", strerror(errno));
@@ -5017,12 +5189,12 @@ void server_context::start_rpc_server(int port) {
             return;
         }
         ::listen(srv_fd, 16);
-        SRV_INF("hydra rpc: listening on 0.0.0.0:%d\n", port);
+        SRV_INF("hydra rpc: listening on 0.0.0.0:%d (M1: task-queue routing)\n", port);
 
         while (true) {
             const int conn_fd = ::accept(srv_fd, nullptr, nullptr);
             if (conn_fd < 0) continue;
-            std::thread(hydra_handle_connection, conn_fd, slots_ptr).detach();
+            std::thread(hydra_handle_connection, conn_fd, ctx).detach();
         }
     }).detach();
 }

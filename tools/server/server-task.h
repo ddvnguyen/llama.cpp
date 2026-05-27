@@ -26,6 +26,11 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    // Hydra RPC state-transfer tasks (M1): llama API called on inference thread.
+    // Dispatched from hydra_handle_connection via queue_tasks; result returned via queue_results.
+    SERVER_TASK_TYPE_HYDRA_STATE_GET,   // 0x30 — serialize slot KV state → result buffer
+    SERVER_TASK_TYPE_HYDRA_STATE_PUT,   // 0x31 — restore slot KV state ← task buffer
+    SERVER_TASK_TYPE_HYDRA_STATE_META,  // 0x32 — slot metadata only (lightweight)
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -166,6 +171,13 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_HYDRA_STATE_*
+    struct hydra_action {
+        int                  id_slot    = -1;
+        std::vector<uint8_t> state_data; // STATE_PUT only: KV bytes to restore
+    };
+    hydra_action hydra_action;
 
     server_task() = default;
 
@@ -561,6 +573,30 @@ struct server_task_result_get_lora : server_task_result {
 };
 
 struct server_task_result_apply_lora : server_task_result {
+    virtual json to_json() override;
+};
+
+// Result for SERVER_TASK_TYPE_HYDRA_STATE_GET / PUT / META.
+// `rpc_status` maps directly to Hydra wire-format status byte (see server-rpc.h).
+struct server_task_result_hydra_state : server_task_result {
+    uint8_t op         = 0;                 // HYDRA_OP_STATE_GET/PUT/META
+    uint8_t rpc_status = 0x02 /*ERROR*/;    // set by inference thread
+
+    // STATE_GET: filled with raw KV bytes (~800 MB)
+    std::vector<uint8_t> state_data;
+    int32_t  n_past    = 0;                 // GET + META
+
+    // STATE_PUT: restore stats
+    uint64_t bytes     = 0;
+    bool     restored  = false;
+
+    // STATE_META extra
+    bool     is_processing = false;
+    uint64_t state_size    = 0;
+
+    std::string error; // human-readable, non-empty on failure
+
+    // is_stop() inherits true (single result, not a stream)
     virtual json to_json() override;
 };
 
