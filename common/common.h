@@ -586,6 +586,7 @@ struct common_params {
 
     // server params
     int32_t port                = 8080;          // server listens on this network port
+    int32_t rpc_port            = 0;             // Hydra binary RPC port (0 = disabled)
     bool    reuse_port          = false;         // allow multiple sockets to bind to the same port
     int32_t timeout_read        = 600;           // http read timeout in seconds
     int32_t timeout_write       = timeout_read;  // http write timeout in seconds

@@ -5,6 +5,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-rpc.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -22,7 +23,16 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <thread>
 #include <utility>
+
+#if !defined(_WIN32)
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <unistd.h>
+#  include <cerrno>
+#  include <cstring>
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -4795,3 +4805,233 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
     res->ok(root);
     return res;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Hydra RPC server — KV state transfer (M0)
+// Wire format: specs/rpc-protocol.md  |  constants: server-rpc.h
+// Ops implemented: STATE_GET (0x30), STATE_PUT (0x31), STATE_META (0x32)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#if !defined(_WIN32)
+
+// ── Low-level I/O helpers ─────────────────────────────────────────────────────
+
+static bool hydra_recv_all(int fd, void * buf, size_t n) {
+    char * p = reinterpret_cast<char *>(buf);
+    while (n > 0) {
+        ssize_t r = ::recv(fd, p, n, 0);
+        if (r <= 0) return false;
+        p += r; n -= r;
+    }
+    return true;
+}
+
+static bool hydra_send_all(int fd, const void * buf, size_t n) {
+    const char * p = reinterpret_cast<const char *>(buf);
+    while (n > 0) {
+        ssize_t w = ::send(fd, p, n, MSG_NOSIGNAL);
+        if (w <= 0) return false;
+        p += w; n -= w;
+    }
+    return true;
+}
+
+// Response header: status(1) | meta_len(3 LE uint24) | payload_len(8 LE) — 12 bytes
+static void hydra_write_res(int fd, uint8_t status, uint32_t meta_len, uint64_t payload_len) {
+    uint8_t buf[HYDRA_RES_HEADER_SIZE] = {};
+    buf[0] = status;
+    buf[1] = (meta_len)       & 0xFF;
+    buf[2] = (meta_len >>  8) & 0xFF;
+    buf[3] = (meta_len >> 16) & 0xFF;
+    memcpy(buf + 4, &payload_len, 8); // little-endian (x86/arm64)
+    hydra_send_all(fd, buf, HYDRA_RES_HEADER_SIZE);
+}
+
+// ── Op handlers ───────────────────────────────────────────────────────────────
+
+// STATE_GET (0x30): serialize full KV state and send as response payload.
+// n_past = n_prompt_tokens_cache + n_decoded (total KV positions).
+static void hydra_handle_state_get(int fd, server_slot & slot) {
+    if (slot.is_processing()) {
+        hydra_write_res(fd, HYDRA_STATUS_BUSY, 0, 0);
+        return;
+    }
+    const size_t state_size = llama_state_seq_get_size(slot.ctx_tgt, slot.id);
+    std::vector<uint8_t> buf(state_size);
+    llama_state_seq_get_data(slot.ctx_tgt, buf.data(), buf.size(), slot.id);
+
+    const int32_t n_past = slot.n_prompt_tokens_cache + slot.n_decoded;
+    const json meta_j = {{"n_past", n_past}, {"state_size", (uint64_t)state_size}};
+    const std::string meta_str = meta_j.dump();
+
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), (uint64_t)state_size);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+    hydra_send_all(fd, buf.data(), state_size);
+}
+
+// STATE_PUT (0x31): receive KV state from client and restore into slot.
+// Note: slot->n_prompt_tokens_cache / n_decoded are NOT updated by llama_state_seq_set_data.
+// The caller must track n_past from the preceding STATE_GET response.
+// TODO(M1): update slot cache bookkeeping after restore.
+static void hydra_handle_state_put(int fd, server_slot & slot, uint64_t payload_len) {
+    if (payload_len > HYDRA_MAX_STATE_BYTES) {
+        SRV_WRN("hydra rpc: STATE_PUT payload %" PRIu64 " B exceeds cap %" PRIu64 " B\n",
+                payload_len, HYDRA_MAX_STATE_BYTES);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        // drain to keep persistent connection alive
+        std::vector<uint8_t> drain(65536);
+        for (uint64_t rem = payload_len; rem > 0; ) {
+            size_t chunk = (size_t)std::min(rem, (uint64_t)drain.size());
+            if (!hydra_recv_all(fd, drain.data(), chunk)) break;
+            rem -= chunk;
+        }
+        return;
+    }
+    std::vector<uint8_t> buf((size_t)payload_len);
+    if (!hydra_recv_all(fd, buf.data(), (size_t)payload_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+    const size_t n_read = llama_state_seq_set_data(slot.ctx_tgt, buf.data(), buf.size(), slot.id);
+    if (n_read == 0) {
+        const json err_j = {{"error", "llama_state_seq_set_data returned 0"}};
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
+        return;
+    }
+    const json meta_j = {{"restored", true}, {"bytes", (uint64_t)n_read}};
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
+// STATE_META (0x32): slot metadata only — cheap, no KV serialization.
+static void hydra_handle_state_meta(int fd, server_slot & slot) {
+    const int32_t n_past = slot.n_prompt_tokens_cache + slot.n_decoded;
+    const json meta_j = {
+        {"slot_id",       slot.id},
+        {"n_past",        n_past},
+        {"state_size",    (uint64_t)llama_state_seq_get_size(slot.ctx_tgt, slot.id)},
+        {"is_processing", slot.is_processing()},
+    };
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
+// ── Per-connection loop ───────────────────────────────────────────────────────
+// Persistent: one TCP connection handles many sequential requests.
+
+static void hydra_handle_connection(int fd, std::vector<server_slot> * slots) {
+    while (true) {
+        uint8_t hdr[HYDRA_REQ_HEADER_SIZE];
+        if (!hydra_recv_all(fd, hdr, HYDRA_REQ_HEADER_SIZE)) break;
+
+        uint16_t magic = 0;
+        memcpy(&magic, hdr + 0, 2);
+        if (magic != HYDRA_MAGIC) {
+            SRV_WRN("hydra rpc: bad magic 0x%04x — closing connection\n", (unsigned)magic);
+            break;
+        }
+
+        const uint8_t op = hdr[2];
+        // hdr[3] = flags (reserved, unused in M0)
+        uint16_t key_len = 0, trace_len = 0;
+        uint64_t payload_len = 0;
+        memcpy(&key_len,     hdr + 4,  2);
+        memcpy(&payload_len, hdr + 6,  8);
+        memcpy(&trace_len,   hdr + 14, 2);
+
+        std::string key(key_len, '\0');
+        std::string trace_id(trace_len, '\0');
+        if (!hydra_recv_all(fd, key.data(),      key_len))   break;
+        if (!hydra_recv_all(fd, trace_id.data(), trace_len)) break;
+
+        int slot_id = -1;
+        try { slot_id = std::stoi(key); }
+        catch (...) {
+            SRV_WRN("hydra rpc: invalid slot key '%s'\n", key.c_str());
+            hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+            continue;
+        }
+
+        server_slot * slot = nullptr;
+        for (auto & s : *slots) {
+            if (s.id == slot_id) { slot = &s; break; }
+        }
+        if (!slot) {
+            SRV_WRN("hydra rpc: slot %d not found\n", slot_id);
+            hydra_write_res(fd, HYDRA_STATUS_NOT_FOUND, 0, 0);
+            continue;
+        }
+
+        switch (op) {
+            case HYDRA_OP_STATE_GET:
+                SRV_DBG("hydra rpc: STATE_GET  slot=%d trace=%s\n", slot_id, trace_id.c_str());
+                hydra_handle_state_get(fd, *slot);
+                break;
+            case HYDRA_OP_STATE_PUT:
+                SRV_DBG("hydra rpc: STATE_PUT  slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_state_put(fd, *slot, payload_len);
+                break;
+            case HYDRA_OP_STATE_META:
+                SRV_DBG("hydra rpc: STATE_META slot=%d trace=%s\n", slot_id, trace_id.c_str());
+                hydra_handle_state_meta(fd, *slot);
+                break;
+            default:
+                SRV_WRN("hydra rpc: unknown op 0x%02x — ignoring\n", (unsigned)op);
+                hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        }
+    }
+    ::close(fd);
+}
+
+// ── server_context::start_rpc_server ─────────────────────────────────────────
+
+void server_context::start_rpc_server(int port) {
+    if (port <= 0) return;
+
+    // server_context is a friend of server_context_impl, so we can access private fields.
+    // We extract a raw pointer to slots — safe for the lifetime of the process (M0: no reload).
+    auto * slots_ptr = &impl->slots;
+
+    std::thread([port, slots_ptr]() {
+        const int srv_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (srv_fd < 0) {
+            SRV_ERR("hydra rpc: socket() failed: %s\n", strerror(errno));
+            return;
+        }
+        const int opt = 1;
+        ::setsockopt(srv_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port        = htons((uint16_t)port);
+
+        if (::bind(srv_fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
+            SRV_ERR("hydra rpc: bind() on port %d failed: %s\n", port, strerror(errno));
+            ::close(srv_fd);
+            return;
+        }
+        ::listen(srv_fd, 16);
+        SRV_INF("hydra rpc: listening on 0.0.0.0:%d\n", port);
+
+        while (true) {
+            const int conn_fd = ::accept(srv_fd, nullptr, nullptr);
+            if (conn_fd < 0) continue;
+            std::thread(hydra_handle_connection, conn_fd, slots_ptr).detach();
+        }
+    }).detach();
+}
+
+#else
+// Windows: RPC server not implemented — target hardware is Linux-only for M0.
+void server_context::start_rpc_server(int port) {
+    if (port > 0) {
+        SRV_WRN("hydra rpc: not supported on Windows (port %d ignored)\n", port);
+    }
+}
+#endif // !_WIN32

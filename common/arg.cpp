@@ -2849,6 +2849,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PORT"));
     add_opt(common_arg(
+        {"--rpc-port"}, "PORT",
+        string_format("Hydra binary RPC port for KV state transfer (0 = disabled, default: %d)", params.rpc_port),
+        [](common_params & params, int value) {
+            params.rpc_port = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RPC_PORT"));
+    add_opt(common_arg(
         {"--reuse-port"},
         string_format("allow multiple sockets to bind to the same port (default: %s)", params.reuse_port ? "enabled" : "disabled"),
         [](common_params & params) {
