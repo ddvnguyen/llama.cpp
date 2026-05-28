@@ -111,6 +111,10 @@ struct server_routes {
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
+    // Hydra state streaming (M0.0)
+    server_http_context::handler_t get_state;       // GET  /slots/:id_slot/state
+    server_http_context::handler_t put_state;       // PUT  /slots/:id_slot/state
+    server_http_context::handler_t get_state_meta;  // GET  /slots/:id_slot/state/meta
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;

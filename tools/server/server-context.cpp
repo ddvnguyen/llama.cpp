@@ -2368,8 +2368,13 @@ private:
                     std::shared_ptr<std::atomic<bool>> flag_ptr = slot->hydra_transferring;
                     const int      hydra_fd    = task.hydra_action.hydra_fd;
 
+                    // Capture prompt tokens for M1 path header (slot is valid on inference thread)
+                    const llama_tokens prompt_tokens_get = slot->prompt.tokens.get_tokens();
+                    const int32_t     n_past_val         = res->n_past;
+
                     std::thread([snap_ctx, snap_seq_id, state_size, hydra_fd,
                                  res = std::move(res), flag_ptr,
+                                 prompt_tokens_get, n_past_val,
                                  &results = queue_results]() mutable {
                         if (hydra_fd >= 0) {
                             // M2 path: stream GPU→socket directly, no 800 MB allocation.
@@ -2408,9 +2413,19 @@ private:
                             }
                         } else {
                             // M1 path: buffer in memory, RPC thread sends afterwards.
-                            res->state_data.resize(state_size);
+                            // Hydra: prepend prompt-token header so PUT can restore slot.prompt.tokens.
+                            const size_t n_tok = prompt_tokens_get.size();
+                            const uint32_t hdr_n_tok = (uint32_t)n_tok;
+                            const uint32_t hdr_n_past = (uint32_t)n_past_val;
+                            const size_t hdr_size = 8 + n_tok * sizeof(llama_token);
+                            res->state_data.resize(hdr_size + state_size);
+                            memcpy(res->state_data.data(),         &hdr_n_past, 4);
+                            memcpy(res->state_data.data() + 4,     &hdr_n_tok,  4);
+                            if (n_tok > 0) {
+                                memcpy(res->state_data.data() + 8, prompt_tokens_get.data(), n_tok * sizeof(llama_token));
+                            }
                             const size_t copied = llama_state_seq_get_data(
-                                    snap_ctx, res->state_data.data(), state_size, snap_seq_id);
+                                    snap_ctx, res->state_data.data() + hdr_size, state_size, snap_seq_id);
                             if (copied == 0) {
                                 res->rpc_status = HYDRA_STATUS_ERROR;
                                 res->error      = "llama_state_seq_get_data failed";
@@ -2446,7 +2461,27 @@ private:
                     }
 
                     const auto & buf = task.hydra_action.state_data;
-                    const size_t n_read = llama_state_seq_set_data(ctx_tgt, buf.data(), buf.size(), slot->id);
+                    // Hydra: extract prompt-token header (4 B n_past + 4 B n_tok + n_tok*4 B token IDs)
+                    size_t hdr_offset = 0;
+                    int32_t hdr_n_tok = 0;
+                    if (buf.size() >= 8) {
+                        // n_past is informational; n_tok tells us how many tokens to read
+                        memcpy(&hdr_n_tok, buf.data() + 4, 4);
+                        hdr_offset = 8 + (size_t)hdr_n_tok * sizeof(llama_token);
+                    }
+                    const bool has_hdr = hdr_offset > 0 && hdr_offset <= buf.size();
+                    if (has_hdr) {
+                        const size_t n_tokens = (size_t)hdr_n_tok;
+                        slot->prompt.tokens.clear();
+                        if (n_tokens > 0) {
+                            const llama_token * tok_ptr = (const llama_token *)(buf.data() + 8);
+                            llama_tokens restored_tokens(tok_ptr, tok_ptr + n_tokens);
+                            slot->prompt.tokens.insert(restored_tokens);
+                        }
+                    }
+                    const uint8_t * state_ptr = has_hdr ? buf.data() + hdr_offset : buf.data();
+                    const size_t    state_len = has_hdr ? buf.size() - hdr_offset : buf.size();
+                    const size_t n_read = llama_state_seq_set_data(ctx_tgt, state_ptr, state_len, slot->id);
                     if (n_read == 0) {
                         res->rpc_status = HYDRA_STATUS_ERROR;
                         res->error      = "llama_state_seq_set_data returned 0";
@@ -2454,7 +2489,19 @@ private:
                         res->rpc_status = HYDRA_STATUS_OK;
                         res->restored   = true;
                         res->bytes      = (uint64_t)n_read;
-                        SRV_INF("hydra: STATE_PUT slot=%d restored=%zu B\n", id_slot, n_read);
+                        // Update slot tracking from restored prompt tokens
+                        if (has_hdr && hdr_n_tok > 0) {
+                            const llama_memory_t mem = llama_get_memory(ctx_tgt);
+                            const llama_pos pos_min = llama_memory_seq_pos_min(mem, slot->id);
+                            if (pos_min >= 0) {
+                                const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot->id);
+                                slot->n_prompt_tokens_cache = (int32_t)(pos_max - pos_min + 1);
+                                slot->n_decoded = 0;
+                                res->n_past = slot->n_prompt_tokens_cache;
+                            }
+                        }
+                        SRV_INF("hydra: STATE_PUT slot=%d restored=%zu B n_past=%d n_prompt_tok=%d\n",
+                                id_slot, n_read, res->n_past, hdr_n_tok);
                     }
                     queue_results.send(std::move(res));
                 } break;

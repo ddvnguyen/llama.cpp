@@ -210,28 +210,11 @@ int llama_server(int argc, char ** argv) {
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
 
-    // Hydra state endpoints (HTTP debug/curl path; production path uses --rpc-port)
-    // GET /slots/:id_slot/state/meta — lightweight metadata, no KV serialization
-    // Binary GET/PUT state are served only via the RPC port (800 MB not suitable for HTTP body).
-    ctx_http.get("/slots/:id_slot/state/meta", ex_wrapper([&ctx_server](const server_http_req & req) {
-        auto res = std::make_unique<server_http_res>();
-        const int id_slot = std::stoi(req.get_param("id_slot"));
-        auto * ll_ctx = ctx_server.get_llama_context();
-        if (!ll_ctx) {
-            res->status = 503;
-            res->data   = safe_json_to_str(json{{"error", "model not loaded or sleeping"}});
-            return res;
-        }
-        // state_size is available via public llama API; n_past requires slot internals
-        // (available via STATE_META RPC op on --rpc-port).
-        const size_t state_size = llama_state_seq_get_size(ll_ctx, (llama_seq_id)id_slot);
-        res->data = safe_json_to_str(json{
-            {"slot_id",    id_slot},
-            {"state_size", (uint64_t)state_size},
-            {"rpc_ops",    "STATE_GET=0x30 STATE_PUT=0x31 STATE_META=0x32 via --rpc-port"},
-        });
-        return res;
-    }));
+    // Hydra state streaming (M0.0): HTTP path for debugging + curl verification.
+    // Production path uses --rpc-port with binary framing (no 800 MB HTTP body).
+    ctx_http.get ("/slots/:id_slot/state",      ex_wrapper(routes.get_state));
+    ctx_http.put ("/slots/:id_slot/state",      ex_wrapper(routes.put_state));
+    ctx_http.get ("/slots/:id_slot/state/meta", ex_wrapper(routes.get_state_meta));
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();

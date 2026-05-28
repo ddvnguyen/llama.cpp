@@ -593,6 +593,9 @@ struct server_task_result_hydra_state : server_task_result {
     // state_data is empty; streamed_bytes is the byte count sent.
     uint64_t streamed_bytes = 0;
 
+    // STATE_GET M2: true = response header already written to socket (avoids double-write on error)
+    bool     header_sent  = false;
+
     // STATE_PUT: restore stats
     uint64_t bytes     = 0;
     bool     restored  = false;
