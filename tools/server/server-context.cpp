@@ -4345,8 +4345,8 @@ void server_routes::init_routes() {
         auto * hr = dynamic_cast<server_task_result_hydra_state*>(result.get());
         GGML_ASSERT(hr != nullptr);
         if (hr->rpc_status != HYDRA_STATUS_OK) {
-            json err = {{"error", "restore failed"}};
-            if (!hr->error.empty()) err["detail"] = hr->error;
+            res->status = 503;
+            res->data  = hr->error.empty() ? "restore failed" : hr->error;
             return res;
         }
         res->ok(json{
