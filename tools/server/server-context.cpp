@@ -526,6 +526,7 @@ struct server_slot {
         };
 
         const auto & ptask = task ? task : task_prev;
+        res["n_past"] = ptask ? (int32_t)(n_prompt_tokens_cache + n_decoded) : 0;
 
         if (ptask) {
             res["id_task"] = ptask->id;
