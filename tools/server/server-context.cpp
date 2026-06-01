@@ -2370,13 +2370,15 @@ private:
                     const int      hydra_fd    = task.hydra_action.hydra_fd;
 
                     // Capture prompt tokens for M1 path header (slot is valid on inference thread)
-                    const llama_tokens prompt_tokens_get = slot->prompt.tokens.get_tokens();
+                    const llama_tokens prompt_tokens_get = slot->prompt.tokens.get_text_tokens();
                     const int32_t     n_past_val         = res->n_past;
 
                     std::thread([snap_ctx, snap_seq_id, state_size, hydra_fd,
                                  res = std::move(res), flag_ptr,
                                  prompt_tokens_get, n_past_val,
                                  &results = queue_results]() mutable {
+                        SRV_INF("hydra: STATE_GET background thread starting (fd=%d state=%.1f MiB)\n",
+                                hydra_fd, state_size / (1024.0 * 1024.0));
                         if (hydra_fd >= 0) {
                             // M2 path: stream GPU→socket directly, no 800 MB allocation.
                             // Send response header + meta JSON FIRST (client expects framing),
@@ -2434,6 +2436,13 @@ private:
                             }
                         }
                         flag_ptr->store(false);
+                        // M2 streams to fd (streamed_bytes); M1 buffers into state_data.
+                        const uint64_t out_bytes = (hydra_fd >= 0)
+                                ? res->streamed_bytes
+                                : (uint64_t) res->state_data.size();
+                        SRV_INF("hydra: STATE_GET background done slot=%d rpc_status=%d path=%s bytes=%" PRIu64 "\n",
+                                snap_seq_id, res->rpc_status,
+                                hydra_fd >= 0 ? "M2-stream" : "M1-buffer", out_bytes);
                         results.send(std::move(res));
                     }).detach();
 
