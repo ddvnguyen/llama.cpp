@@ -3075,6 +3075,13 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
+                                    // For recurrent/hybrid models (e.g. Qwen3.x MTP) a checkpoint's
+                                    // pos_min equals the full sequence length, so the usual
+                                    // `pos_min < pos_min_thold` test is perpetually false → every turn
+                                    // force-re-prefills. Match on pos_max <= pos_next instead so cached
+                                    // KV is reused. Ref: ik_llama.cpp#1762 (port).
+                                    const bool is_rec = llama_model_is_recurrent(model_tgt) ||
+                                                        llama_model_is_hybrid(model_tgt);
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3083,6 +3090,9 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
+                                            if (is_rec) {
+                                                return cur.pos_max <= pos_next;
+                                            }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
@@ -3351,8 +3361,14 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together
-                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    // no need to create checkpoints that are too close together.
+                    // For recurrent/hybrid models, use a much smaller minimum spacing so short
+                    // follow-up turns still get a checkpoint to resume from. Ref: ik_llama.cpp#1762.
+                    const int eff_checkpoint_min_step =
+                        (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))
+                            ? std::min(params_base.checkpoint_min_step, 4)
+                            : params_base.checkpoint_min_step;
+                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + eff_checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
