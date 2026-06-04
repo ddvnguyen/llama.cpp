@@ -150,6 +150,7 @@ bool server_http_context::init(const common_params & params) {
     // set timeouts and change hostname and port
     srv->set_read_timeout (params.timeout_read);
     srv->set_write_timeout(params.timeout_write);
+    srv->set_payload_max_length(0);
     srv->set_socket_options([reuse_port = params.reuse_port](const socket_t sock) {
         httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
         if (reuse_port) {
