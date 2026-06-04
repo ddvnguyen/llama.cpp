@@ -53,6 +53,21 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 static bool hydra_send_all(int fd, const void * buf, size_t n);
 #endif
 
+static uint32_t server_n_outputs_max(const common_params & params) {
+    const uint32_t n_batch  = params.n_batch;
+
+    if (params.embedding ||
+            (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+        return n_batch;
+    }
+
+    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+
+    const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
+
+    return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -266,9 +281,9 @@ struct server_slot {
         return task->need_embd() || (spec && common_speculative_need_embd(spec));
     }
 
-    bool need_embd_pre_norm() const {
+    bool need_embd_nextn() const {
         GGML_ASSERT(task);
-        return spec && common_speculative_need_embd_pre_norm(spec);
+        return spec && common_speculative_need_embd_nextn(spec);
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -776,6 +791,7 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         std::string & mmproj_path = params_base.mmproj.path;
         bool has_mmproj = !mmproj_path.empty();
@@ -840,6 +856,8 @@ private:
                     // MTP draft context lives on the target model, only context+compute are new
                     measure_model_bytes = false;
                 }
+
+                params_dft.n_outputs_max = params_base.n_parallel;
 
                 auto mparams_dft = common_model_params_to_llama(params_dft);
                 auto cparams_dft = common_context_params_to_llama(params_dft);
@@ -964,10 +982,11 @@ private:
                     params_base.model.path.c_str());
 
             auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-            cparams_mtp.type_k   = params_base.speculative.draft.cache_type_k;
-            cparams_mtp.type_v   = params_base.speculative.draft.cache_type_v;
-            cparams_mtp.n_rs_seq = 0;
+            cparams_mtp.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.type_k        = params_base.speculative.draft.cache_type_k;
+            cparams_mtp.type_v        = params_base.speculative.draft.cache_type_v;
+            cparams_mtp.n_rs_seq      = 0;
+            cparams_mtp.n_outputs_max = params_base.n_parallel;
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {
@@ -1260,6 +1279,20 @@ private:
 
         for (server_slot & slot : slots) {
             if (slot.id == id_slot) {
+                return &slot;
+            }
+        }
+
+        return nullptr;
+    }
+
+    server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
+        if (cmpl_id.empty()) {
+            return nullptr;
+        }
+
+        for (server_slot & slot : slots) {
+            if (slot.is_processing() && slot.task && slot.task->params.oaicompat_cmpl_id == cmpl_id) {
                 return &slot;
             }
         }
@@ -1757,7 +1790,7 @@ private:
         return true;
     }
 
-    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress) {
+    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
         res->id    = slot.task->id;
@@ -1769,6 +1802,9 @@ private:
             res->progress.cache     = slot.n_prompt_tokens_cache;
             res->progress.processed = slot.prompt.tokens.size();
             res->progress.time_ms   = (ggml_time_us() - slot.t_start_process_prompt) / 1000;
+        }
+        if (is_begin) {
+            res->is_begin = true;
         } else {
             res->content = tkn.text_to_send;
             res->tokens  = { tkn.tok };
@@ -2114,6 +2150,37 @@ private:
                             break;
                         }
                     }
+                } break;
+            case SERVER_TASK_TYPE_CONTROL:
+                {
+                    auto res = std::make_unique<server_task_result_control>();
+                    res->id = task.id;
+
+                    server_slot * slot = get_slot_by_cmpl_id(task.params.control_cmpl_id);
+                    if (slot == nullptr) {
+                        res->success = false;
+                        res->message = "no active completion for this id";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    if (task.params.control_action == "reasoning_end") {
+                        // the budget sampler only exists when reasoning control was armed
+                        if (!slot->task->params.sampling.reasoning_control) {
+                            res->success = false;
+                            res->message = "reasoning control not enabled for this completion";
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                        // act on the live slot mid generation, never defer
+                        common_sampler_reasoning_budget_force(slot->smpl.get());
+                        res->success = true;
+                    } else {
+                        res->success = false;
+                        res->message = "unknown control action";
+                    }
+
+                    queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
                 {
@@ -3008,6 +3075,13 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
+                                    // For recurrent/hybrid models (e.g. Qwen3.x MTP) a checkpoint's
+                                    // pos_min equals the full sequence length, so the usual
+                                    // `pos_min < pos_min_thold` test is perpetually false → every turn
+                                    // force-re-prefills. Match on pos_max <= pos_next instead so cached
+                                    // KV is reused. Ref: ik_llama.cpp#1762 (port).
+                                    const bool is_rec = llama_model_is_recurrent(model_tgt) ||
+                                                        llama_model_is_hybrid(model_tgt);
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3016,6 +3090,9 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
+                                            if (is_rec) {
+                                                return cur.pos_max <= pos_next;
+                                            }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
@@ -3067,10 +3144,15 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
-                        // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
-                        if (slot.task->params.stream && slot.task->params.return_progress) {
-                            send_partial_response(slot, {}, true);
+                        if (slot.task->params.stream) {
+                            if (slot.task->params.return_progress) {
+                                // send initial 0% progress update if needed
+                                send_partial_response(slot, {}, true);
+                            } else {
+                                // otherwise, for streaming without progress, signal HTTP to send the headers (i.e. 200 status)
+                                send_partial_response(slot, {}, false, true);
+                            }
                         }
                     }
 
@@ -3180,7 +3262,7 @@ private:
 
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_pre_norm into ctx_dft.
+                        // streaming hook can mirror t_h_nextn into ctx_dft.
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
@@ -3279,8 +3361,14 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together
-                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    // no need to create checkpoints that are too close together.
+                    // For recurrent/hybrid models, use a much smaller minimum spacing so short
+                    // follow-up turns still get a checkpoint to resume from. Ref: ik_llama.cpp#1762.
+                    const int eff_checkpoint_min_step =
+                        (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))
+                            ? std::min(params_base.checkpoint_min_step, 4)
+                            : params_base.checkpoint_min_step;
+                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + eff_checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
@@ -3860,6 +3948,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
+    auto & params = this->params;
 
     try {
         std::vector<server_task> tasks;
@@ -3984,7 +4073,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // next responses are streamed
         // to be sent immediately
         json first_result_json = first_result->to_json();
-        if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+        if (first_result_json == nullptr) {
+            res->data = ""; // simply send HTTP headers and status code
+        } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
             res->data = format_anthropic_sse(first_result_json);
         } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
             res->data = format_oai_resp_sse(first_result_json);
@@ -3993,7 +4084,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->next = [res_this = res.get(), res_type, &req](std::string & output) -> bool {
+        res->next = [res_this = res.get(), res_type, &req, &params](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -4038,7 +4129,25 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
 
                 // receive subsequent results
-                auto result = rd.next(req.should_stop);
+                bool timeout = false;
+                int64_t start_time = ggml_time_ms();
+                auto result = rd.next([&timeout, &req, &start_time, &params]() {
+                    if (req.should_stop()) {
+                        return true; // should_stop condition met
+                    } else if (params.sse_ping_interval > 0 && ggml_time_ms() - start_time > (int64_t)params.sse_ping_interval * 1000) {
+                        timeout = true;
+                        return true; // timeout
+                    }
+                    return false;
+                });
+
+                if (timeout) {
+                    // some clients may time out (e.g. undici) will time out if no data is received for a while, so we need to send a ping to keep the connection alive
+                    SRV_DBG("%s", "sending SSE ping\n");
+                    output = ":\n\n";
+                    return true;
+                }
+
                 if (result == nullptr) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(req.should_stop());
@@ -4587,6 +4696,43 @@ void server_routes::init_routes() {
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_CHAT);
+    };
+
+    this->post_control = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        const std::string cmpl_id = json_value(body, "id", std::string());
+        const std::string action  = json_value(body, "action", std::string());
+        if (cmpl_id.empty()) {
+            res->error(format_error_response("missing completion id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (action != "reasoning_end") {
+            res->error(format_error_response("unknown control action", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_CONTROL);
+            task.id              = rd.get_new_id();
+            task.params.control_cmpl_id = cmpl_id;
+            task.params.control_action  = action;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
     };
 
     this->post_responses_oai = [this](const server_http_req & req) {
