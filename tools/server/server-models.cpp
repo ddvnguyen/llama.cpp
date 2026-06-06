@@ -1196,9 +1196,13 @@ void server_models_routes::init_routes() {
 
     this->proxy_post = [this](const server_http_req & req) {
         std::string method = "POST";
-        json body = json::parse(req.body);
-        std::string name = json_value(body, "model", std::string());
-        // Fall back to query param for binary/non-JSON bodies (e.g. PUT state)
+        std::string name;
+        try {
+            json body = json::parse(req.body);
+            name = json_value(body, "model", std::string());
+        } catch (...) {
+            // non-JSON body (e.g. binary state PUT) — fall back to query param
+        }
         if (name.empty()) {
             name = req.get_param("model");
         }
@@ -1207,7 +1211,7 @@ void server_models_routes::init_routes() {
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
         }
-        return models.proxy_request(req, method, name, true); // update last usage for POST request only
+        return models.proxy_request(req, method, name, true);
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {
