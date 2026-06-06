@@ -203,6 +203,7 @@ struct server_models_routes {
     server_http_context::handler_t get_router_props;
     server_http_context::handler_t proxy_get;
     server_http_context::handler_t proxy_post;
+    server_http_context::handler_t proxy_put_state;
     server_http_context::handler_t get_router_models;
     server_http_context::handler_t post_router_models_load;
     server_http_context::handler_t post_router_models_unload;

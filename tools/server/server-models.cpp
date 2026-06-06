@@ -1195,7 +1195,7 @@ void server_models_routes::init_routes() {
     };
 
     this->proxy_post = [this](const server_http_req & req) {
-        std::string method = req.method;
+        std::string method = "POST";
         std::string name;
         try {
             json body = json::parse(req.body);
@@ -1212,6 +1212,17 @@ void server_models_routes::init_routes() {
             return error_res;
         }
         return models.proxy_request(req, method, name, true);
+    };
+
+    // Dedicated PUT handler for binary body requests (e.g. state restore via query param)
+    this->proxy_put_state = [this](const server_http_req & req) {
+        std::string name = req.get_param("model");
+        bool autoload = is_autoload(params, req);
+        auto error_res = std::make_unique<server_http_res>();
+        if (!router_validate_model(name, models, autoload, error_res)) {
+            return error_res;
+        }
+        return models.proxy_request(req, "PUT", name, false);
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {
