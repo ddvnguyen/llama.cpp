@@ -541,7 +541,13 @@ struct server_slot {
         };
 
         const auto & ptask = task ? task : task_prev;
-        res["n_past"] = ptask ? (int32_t)(n_prompt_tokens_cache + n_decoded) : 0;
+        {
+            int raw = ptask ? (int32_t)(n_prompt_tokens_cache + n_decoded) : 0;
+            if (n_prompt_tokens_cache == 0 && prompt.tokens.size() > 0) {
+                raw = (int32_t)prompt.tokens.size();
+            }
+            res["n_past"] = raw;
+        }
 
         if (ptask) {
             res["id_task"] = ptask->id;
@@ -2599,7 +2605,12 @@ private:
                         break;
                     }
                     // META is safe to serve even while processing or transferring (read-only metadata)
-                    res->n_past          = slot->n_prompt_tokens_cache + slot->n_decoded;
+                    int actual_n_past = slot->n_prompt_tokens_cache + slot->n_decoded;
+                    // For cold prefills n_prompt_tokens_cache is 0 — use prompt token count
+                    if (slot->n_prompt_tokens_cache == 0 && slot->prompt.tokens.size() > 0) {
+                        actual_n_past = (int)slot->prompt.tokens.size();
+                    }
+                    res->n_past = actual_n_past;
                     res->is_processing   = slot->is_processing();
                     res->is_transferring = slot->hydra_transferring->load();
                     res->state_size    = (uint64_t)llama_state_seq_get_size(ctx_tgt, slot->id);

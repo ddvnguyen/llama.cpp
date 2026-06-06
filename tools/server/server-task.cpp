@@ -809,7 +809,8 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "text_completion"},
         {"usage",              usage_json_oaicompat()},
-        {"id", oaicompat_cmpl_id}
+        {"id",                 oaicompat_cmpl_id},
+        {"id_slot",            id_slot}
     };
 
     // extra fields for debugging purposes
@@ -857,7 +858,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "chat.completion"},
         {"usage",              usage_json_oaicompat()},
-        {"id", oaicompat_cmpl_id}
+        {"id",                 oaicompat_cmpl_id},
+        {"id_slot",            id_slot}
     };
 
     // extra fields for debugging purposes

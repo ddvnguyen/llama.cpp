@@ -1198,6 +1198,10 @@ void server_models_routes::init_routes() {
         std::string method = "POST";
         json body = json::parse(req.body);
         std::string name = json_value(body, "model", std::string());
+        // Fall back to query param for binary/non-JSON bodies (e.g. PUT state)
+        if (name.empty()) {
+            name = req.get_param("model");
+        }
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {
