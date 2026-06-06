@@ -1195,7 +1195,7 @@ void server_models_routes::init_routes() {
     };
 
     this->proxy_post = [this](const server_http_req & req) {
-        std::string method = "POST";
+        std::string method = req.method;
         std::string name;
         try {
             json body = json::parse(req.body);
