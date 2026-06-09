@@ -2477,17 +2477,14 @@ private:
                                 hydra_send_all(hydra_fd, meta_str.data(), meta_str.size());
                                 res->header_sent = true; // META + header before payload
                             }
-                             // Stream payload: GPU tensors → 256 KB chunks → socket
-                             std::vector<uint8_t> m2_buf(state_size);
-                             const size_t copied = llama_state_get_data(
-                                     snap_ctx, m2_buf.data(), state_size);
-                             if (copied == 0) {
+                             // Stream payload: GPU tensors → 256 KB chunks → socket (zero-copy)
+                             const size_t streamed = llama_state_seq_get_data_to_fd(snap_ctx, snap_seq_id, hydra_fd);
+                             if (streamed == 0) {
                                  res->rpc_status = HYDRA_STATUS_ERROR;
-                                 res->error      = "llama_state_get_data failed";
+                                 res->error      = "llama_state_seq_get_data_to_fd failed";
                                  ::close(hydra_fd);
                              } else {
-                                 hydra_send_all(hydra_fd, m2_buf.data(), copied);
-                                 res->streamed_bytes = copied;
+                                 res->streamed_bytes = streamed;
                              }
                          } else {
                              // M1 path: buffer in memory, RPC thread sends afterwards.
@@ -2502,11 +2499,9 @@ private:
                               // the copy returns 0. Retry up to 3 times with fresh sizing.
                               const size_t buf_size = hdr_size + state_size;
                               res->state_data.resize(buf_size);
-                              res->state_data[0] = (uint8_t)(hdr_n_tok       & 0xFF);
-                              res->state_data[1] = (uint8_t)(hdr_n_tok >>  8) & 0xFF;
-                              res->state_data[2] = (uint8_t)(hdr_n_tok >> 16) & 0xFF;
-                              res->state_data[3] = (uint8_t)(hdr_n_tok >> 24) & 0xFF;
-                              memcpy(res->state_data.data() + 4, &hdr_n_past, 4);
+                              // Hydra header: [n_past @ 0..3][n_tok @ 4..7] — must match STATE_PUT reader
+                              memcpy(res->state_data.data(),     &hdr_n_past, 4);
+                              memcpy(res->state_data.data() + 4, &hdr_n_tok,  4);
                               memcpy(res->state_data.data() + 8, prompt_tokens_get.data(), n_tok * sizeof(llama_token));
 
                               size_t cur_state_size = state_size;
@@ -2618,7 +2613,7 @@ private:
                             // so this checkpoint WILL match and attention KV will be reused.
                             if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                                 slot->prompt.checkpoints.clear();
-                                create_checkpoint(*slot, hdr_n_tok, 0, (llama_pos)(hdr_n_tok - 1));
+                                create_checkpoint(*slot, 0, 0, (llama_pos)(hdr_n_tok - 1));
                             } else {
                                 create_checkpoint(*slot, 0, 0, (llama_pos)(hdr_n_tok - 1));
                             }
