@@ -19,6 +19,7 @@ struct common_params;
 struct server_http_res {
     std::string content_type = "application/json; charset=utf-8";
     int status = 200;
+    size_t content_length = 0; // 0 = unknown/streaming
     std::string data;
     std::map<std::string, std::string> headers;
 

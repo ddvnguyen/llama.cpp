@@ -186,7 +186,17 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     cell.pos = p0 - 1;
                     return true;
                 }
-                return false;
+                // Rollback out of range (n_rs_seq=0 or insufficient snapshots).
+                // Clear the cell completely instead of crashing — the caller
+                // (STATE_PUT path for recurrent/hybrid models) may need
+                // partial seq_rm after checkpoint restore, and n_rs_seq==0
+                // for models without MTP rollback support.
+                tail_id = -1;
+                cell.pos = -1;
+                cell.src = -1;
+                cell.seq_id.clear();
+                if (cell.is_empty() && used > 0) used--;
+                return true;
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {

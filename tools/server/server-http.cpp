@@ -440,29 +440,51 @@ static void process_handler_response(server_http_req_ptr && request, server_http
         res.status = response->status;
         set_headers(res, response->headers);
         const std::string content_type = response->content_type;
-        // convert to shared_ptr as both chunked_content_provider() and on_complete() need to use it
+        const size_t content_length = response->content_length;
         std::shared_ptr q_ptr = std::move(request);
         std::shared_ptr r_ptr = std::move(response);
-        const auto chunked_content_provider = [response = r_ptr](size_t, const httplib::DataSink & sink) -> bool {
-            std::string chunk;
-            const bool has_next = response->next(chunk);
-            if (!chunk.empty()) {
-                if (!sink.write(chunk.data(), chunk.size())) {
-                    return false;
+        if (content_length > 0) {
+            // ContentProvider takes (offset, length, sink), returns bool
+            const auto content_provider = [r_ptr](size_t, size_t, httplib::DataSink & sink) -> bool {
+                std::string chunk;
+                const bool has_next = r_ptr->next(chunk);
+                if (!chunk.empty()) {
+                    if (!sink.write(chunk.data(), chunk.size())) {
+                        sink.done();
+                        return false;
+                    }
                 }
-                SRV_DBG("http: streamed chunk: %s\n", chunk.c_str());
-            }
-            if (!has_next) {
-                sink.done();
-                SRV_DBG("%s", "http: stream ended\n");
-            }
-            return has_next;
-        };
-        const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
-            response.reset(); // trigger the destruction of the response object
-            request.reset();  // trigger the destruction of the request object
-        };
-        res.set_chunked_content_provider(content_type, chunked_content_provider, on_complete);
+                if (!has_next) {
+                    sink.done();
+                }
+                return has_next;
+            };
+            const auto on_complete = [q_ptr, r_ptr](bool) mutable {
+                r_ptr.reset();
+                q_ptr.reset();
+            };
+            res.set_content_provider(content_length, content_type, content_provider, on_complete);
+        } else {
+            // ContentProviderWithoutLength takes (offset, sink), returns bool
+            const auto chunked_content_provider = [r_ptr](size_t, httplib::DataSink & sink) -> bool {
+                std::string chunk;
+                const bool has_next = r_ptr->next(chunk);
+                if (!chunk.empty()) {
+                    if (!sink.write(chunk.data(), chunk.size())) {
+                        return false;
+                    }
+                }
+                if (!has_next) {
+                    sink.done();
+                }
+                return has_next;
+            };
+            const auto on_complete = [q_ptr, r_ptr](bool) mutable {
+                r_ptr.reset();
+                q_ptr.reset();
+            };
+            res.set_chunked_content_provider(content_type, chunked_content_provider, on_complete);
+        }
     } else {
         res.status = response->status;
         set_headers(res, response->headers);

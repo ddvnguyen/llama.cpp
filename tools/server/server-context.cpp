@@ -12,6 +12,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "../src/llama-memory-hybrid.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -142,6 +143,7 @@ struct server_slot {
     // Serialization runs off the inference thread so decode can continue on other slots.
     // Use a raw pointer to an atomic so server_slot remains movable (needed by std::vector).
     std::shared_ptr<std::atomic<bool>> hydra_transferring{std::make_shared<std::atomic<bool>>(false)};
+    bool just_restored  = false; // set on STATE_PUT; one-shot, gates restored-slot KV reuse
 
     server_prompt prompt;
 
@@ -2475,39 +2477,55 @@ private:
                                 hydra_send_all(hydra_fd, meta_str.data(), meta_str.size());
                                 res->header_sent = true; // META + header before payload
                             }
-                            // Stream payload: GPU tensors → 256 KB chunks → socket
-                            const size_t streamed = llama_state_seq_get_data_to_fd(
-                                    snap_ctx, snap_seq_id, hydra_fd);
-                            if (streamed == 0) {
-                                res->rpc_status = HYDRA_STATUS_ERROR;
-                                res->error      = "llama_state_seq_get_data_to_fd failed";
-                                // header already sent as OK — close fd so client detects truncation
-                                // RPC handler will log + skip re-sending response
-                                ::close(hydra_fd);
-                            } else {
-                                res->streamed_bytes = streamed;
-                            }
-                        } else {
-                            // M1 path: buffer in memory, RPC thread sends afterwards.
-                            // Hydra: prepend prompt-token header so PUT can restore slot.prompt.tokens.
-                            const size_t n_tok = prompt_tokens_get.size();
-                            const uint32_t hdr_n_tok = (uint32_t)n_tok;
-                            const uint32_t hdr_n_past = (uint32_t)n_past_val;
-                            const size_t hdr_size = 8 + n_tok * sizeof(llama_token);
-                            res->state_data.resize(hdr_size + state_size);
-                            memcpy(res->state_data.data(),         &hdr_n_past, 4);
-                            memcpy(res->state_data.data() + 4,     &hdr_n_tok,  4);
-                            if (n_tok > 0) {
-                                memcpy(res->state_data.data() + 8, prompt_tokens_get.data(), n_tok * sizeof(llama_token));
-                            }
-                            const size_t copied = llama_state_seq_get_data(
-                                    snap_ctx, res->state_data.data() + hdr_size, state_size, snap_seq_id);
-                            if (copied == 0) {
-                                res->rpc_status = HYDRA_STATUS_ERROR;
-                                res->error      = "llama_state_seq_get_data failed";
-                                res->state_data.clear();
-                            }
-                        }
+                             // Stream payload: GPU tensors → 256 KB chunks → socket
+                             std::vector<uint8_t> m2_buf(state_size);
+                             const size_t copied = llama_state_get_data(
+                                     snap_ctx, m2_buf.data(), state_size);
+                             if (copied == 0) {
+                                 res->rpc_status = HYDRA_STATUS_ERROR;
+                                 res->error      = "llama_state_get_data failed";
+                                 ::close(hydra_fd);
+                             } else {
+                                 hydra_send_all(hydra_fd, m2_buf.data(), copied);
+                                 res->streamed_bytes = copied;
+                             }
+                         } else {
+                             // M1 path: buffer in memory, RPC thread sends afterwards.
+                             // Hydra: prepend prompt-token header so PUT can restore slot.prompt.tokens.
+                             const size_t n_tok = prompt_tokens_get.size();
+                             const uint32_t hdr_n_tok = (uint32_t)n_tok;
+                             const uint32_t hdr_n_past = (uint32_t)n_past_val;
+                             const size_t hdr_size = 8 + n_tok * sizeof(llama_token);
+
+                              // TOCTOU retry: if another slot grew the state between
+                              // get_size (inference thread) and get_data (background thread),
+                              // the copy returns 0. Retry up to 3 times with fresh sizing.
+                              const size_t buf_size = hdr_size + state_size;
+                              res->state_data.resize(buf_size);
+                              res->state_data[0] = (uint8_t)(hdr_n_tok       & 0xFF);
+                              res->state_data[1] = (uint8_t)(hdr_n_tok >>  8) & 0xFF;
+                              res->state_data[2] = (uint8_t)(hdr_n_tok >> 16) & 0xFF;
+                              res->state_data[3] = (uint8_t)(hdr_n_tok >> 24) & 0xFF;
+                              memcpy(res->state_data.data() + 4, &hdr_n_past, 4);
+                              memcpy(res->state_data.data() + 8, prompt_tokens_get.data(), n_tok * sizeof(llama_token));
+
+                              size_t cur_state_size = state_size;
+                              size_t copied = 0;
+                              int retries = 3;
+                              while (retries-- > 0) {
+                                  copied = llama_state_seq_get_data(
+                                          snap_ctx, res->state_data.data() + hdr_size, cur_state_size, snap_seq_id);
+                                  if (copied > 0) break;
+                                  // State grew — re-measure and retry
+                                  cur_state_size = llama_state_seq_get_size(snap_ctx, snap_seq_id);
+                                  res->state_data.resize(hdr_size + cur_state_size);
+                              }
+                              if (copied == 0) {
+                                  res->rpc_status = HYDRA_STATUS_ERROR;
+                                  res->error      = "llama_state_get_data failed after 3 retries";
+                                  res->state_data.clear();
+                              }
+                         }
                         flag_ptr->store(false);
                         // M2 streams to fd (streamed_bytes); M1 buffers into state_data.
                         const uint64_t out_bytes = (hydra_fd >= 0)
@@ -2543,6 +2561,13 @@ private:
                         break;
                     }
 
+                    // Erase existing checkpoints to avoid collision with restored session state
+                    if (task.hydra_action.erase_existing && !slot->prompt.checkpoints.empty()) {
+                        SLT_INF(*slot, "erasing %zu existing checkpoints before STATE_PUT restore\n",
+                                slot->prompt.checkpoints.size());
+                        slot->prompt.checkpoints.clear();
+                    }
+
                     const auto & buf = task.hydra_action.state_data;
                     // Hydra: extract prompt-token header (4 B n_past + 4 B n_tok + n_tok*4 B token IDs)
                     size_t hdr_offset = 0;
@@ -2567,21 +2592,40 @@ private:
                     const size_t n_read = llama_state_seq_set_data(ctx_tgt, state_ptr, state_len, slot->id);
                     if (n_read == 0) {
                         res->rpc_status = HYDRA_STATUS_ERROR;
-                        res->error      = "llama_state_seq_set_data returned 0";
+                        res->error      = "llama_state_set_data returned 0";
                     } else {
                         res->rpc_status = HYDRA_STATUS_OK;
                         res->restored   = true;
                         res->bytes      = (uint64_t)n_read;
-                        // Update slot tracking from restored prompt tokens
+                        // Update slot tracking from restored prompt tokens.
+                        // Use hdr_n_tok (prompt token count from save) directly instead of
+                        // computing from hybrid memory intersection. For recurrent/hybrid models
+                        // (qwen35moe), the attention cache has 1 cell/token while the recurrent
+                        // SSM state has only 1 cell at the final position. Hybrid seq_pos_min/max
+                        // computes the intersection, giving pos_min == pos_max == final pos -> n_past=1.
+                        // Using hdr_n_tok gives the correct count of tokens whose KV was restored.
                         if (has_hdr && hdr_n_tok > 0) {
-                            const llama_memory_t mem = llama_get_memory(ctx_tgt);
-                            const llama_pos pos_min = llama_memory_seq_pos_min(mem, slot->id);
-                            if (pos_min >= 0) {
-                                const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot->id);
-                                slot->n_prompt_tokens_cache = (int32_t)(pos_max - pos_min + 1);
-                                slot->n_decoded = 0;
-                                res->n_past = slot->n_prompt_tokens_cache;
+                            slot->n_prompt_tokens_cache = hdr_n_tok;
+                            slot->n_decoded = 0;
+                            res->n_past = hdr_n_tok;
+
+                            // Reconstruct a context checkpoint at the restored position so
+                            // prompt-cache reuse can find it on the next matching request.
+                            // For hybrid/recurrent (FULL) models, use attention-only memory
+                            // positions (0..n_past-1) instead of the hybrid intersection which
+                            // collapses to a single cell (pos_min == pos_max == n_past-1).
+                            // The checkpoint match condition for hybrid: cur.pos_min == 0 is true,
+                            // so this checkpoint WILL match and attention KV will be reused.
+                            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                                slot->prompt.checkpoints.clear();
+                                create_checkpoint(*slot, hdr_n_tok, 0, (llama_pos)(hdr_n_tok - 1));
+                            } else {
+                                create_checkpoint(*slot, 0, 0, (llama_pos)(hdr_n_tok - 1));
                             }
+
+                            // One-shot flag: gates restored-slot KV reuse path for
+                            // the first request after STATE_PUT (regenerate or with-suffix).
+                            slot->just_restored = true;
                         }
                         SRV_INF("hydra: STATE_PUT slot=%d restored=%zu B n_past=%d n_prompt_tok=%d\n",
                                 id_slot, n_read, res->n_past, hdr_n_tok);
@@ -3110,6 +3154,18 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    // For slots restored via STATE_PUT (full context state),
+                                    // skip the checkpoint search entirely. The restored state
+                                    // already has the correct KV cache + logits. The checkpoint
+                                    // check is needed for in-server reuse across turns, not for
+                                    // cross-node migration where the full state is restored.
+                                    if (do_reset && slot.just_restored && n_past > 0) {
+                                        SLT_WRN(slot, "STATE_PUT restored slot — using cached n_past=%d, skipping checkpoint check\n", n_past);
+                                        do_reset = false;
+                                        pos_next = n_past;
+                                        slot.just_restored = false;
+                                    }
+
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3118,6 +3174,8 @@ private:
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        // One-shot: STATE_PUT flag consumed on first successful match
+                                        slot.just_restored = false;
                                     }
 
                                     if (do_reset) {
@@ -4461,6 +4519,7 @@ void server_routes::init_routes() {
         server_task task(SERVER_TASK_TYPE_HYDRA_STATE_PUT);
         task.id = res->rd.get_new_id();
         task.hydra_action.id_slot = id_slot;
+        task.hydra_action.erase_existing = req.get_param("erase_existing") == "true";
         task.hydra_action.state_data.assign(req.body.begin(), req.body.end());
         res->rd.post_task(std::move(task));
         auto result = res->rd.next(req.should_stop);
@@ -5462,6 +5521,7 @@ static void hydra_handle_state_put(int fd, int slot_id, uint64_t payload_len, co
     server_task task(SERVER_TASK_TYPE_HYDRA_STATE_PUT);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
+    task.hydra_action.erase_existing = true; // RPC restore always replaces slot state
     task.hydra_action.state_data = std::move(buf);
     const int task_id = task.id;
     ctx.queue_tasks->post(std::move(task));

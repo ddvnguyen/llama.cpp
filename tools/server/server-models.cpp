@@ -692,6 +692,17 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
+std::vector<std::string> server_models::get_running() {
+    std::lock_guard<std::mutex> lk(mutex);
+    std::vector<std::string> result;
+    for (const auto & [name, inst] : mapping) {
+        if (inst.meta.is_running()) {
+            result.push_back(name);
+        }
+    }
+    return result;
+}
+
 void server_models::unload_lru() {
     if (base_params.models_max <= 0) {
         return; // no limit
@@ -726,6 +737,11 @@ void server_models::unload_lru() {
 }
 
 void server_models::load(const std::string & name) {
+    static const json empty_overrides = json::object();
+    load(name, empty_overrides);
+}
+
+void server_models::load(const std::string & name, const json & overrides) {
     if (!has_model(name)) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
@@ -777,6 +793,7 @@ void server_models::load(const std::string & name) {
         inst.meta.update_args(ctx_preset, bin_path); // render args
 
         std::vector<std::string> child_args = inst.meta.args; // copy
+        apply_overrides(child_args, overrides); // apply overrides after preset args
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
 
@@ -907,6 +924,60 @@ void server_models::load(const std::string & name) {
 
     mapping[name] = std::move(inst);
     cv.notify_all();
+}
+
+void server_models::apply_overrides(std::vector<std::string> & args, const json & overrides) {
+    if (!overrides.is_object()) {
+        return;
+    }
+    for (auto it = overrides.begin(); it != overrides.end(); ++it) {
+        std::string key = it.key();
+        if (key.size() == 1) {
+            key = "-" + key;
+        } else {
+            key = "--" + key;
+        }
+
+        // Remove existing occurrences of this key + its value(s)
+        for (auto i = args.begin(); i != args.end(); ) {
+            if (*i == key) {
+                i = args.erase(i);
+                if (i != args.end() && i->size() > 0 && i->front() != '-') {
+                    i = args.erase(i);
+                }
+            } else {
+                ++i;
+            }
+        }
+
+        // Append new value(s)
+        auto append = [&](const std::string & val) {
+            args.push_back(key);
+            args.push_back(val);
+        };
+
+        if (it->is_array()) {
+            for (const auto & elem : *it) {
+                if (elem.is_string()) {
+                    append(elem.get<std::string>());
+                } else if (elem.is_number_integer()) {
+                    append(std::to_string(elem.get<int>()));
+                } else if (elem.is_number_float()) {
+                    append(std::to_string(elem.get<float>()));
+                }
+            }
+        } else if (it->is_string()) {
+            append(it->get<std::string>());
+        } else if (it->is_number_integer()) {
+            append(std::to_string(it->get<int>()));
+        } else if (it->is_number_float()) {
+            append(std::to_string(it->get<float>()));
+        } else if (it->is_boolean()) {
+            append(it->get<bool>() ? "1" : "0");
+        } else {
+            SRV_WRN("apply_overrides: unsupported type for key=%s\n", key.c_str());
+        }
+    }
 }
 
 void server_models::unload(const std::string & name) {
@@ -1128,11 +1199,23 @@ static bool router_validate_model(std::string & name, server_models & models, bo
     }
     auto meta = models.get_meta(name);
     if (!meta.has_value()) {
-        res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
-        return false;
+        // Unknown model name — fallback to the currently running model (if only one)
+        auto running = models.get_running();
+        if (running.empty()) {
+            res_err(res, format_error_response(string_format("model '%s' not found, and no model is currently loaded", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
+            return false;
+        }
+        // Use the first running model
+        name = running.front();
+        meta = models.get_meta(name);
+        if (!meta.has_value()) {
+            res_err(res, format_error_response(string_format("fallback model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
+            return false;
+        }
+    } else {
+        // resolve alias to canonical model name
+        name = meta->name;
     }
-    // resolve alias to canonical model name
-    name = meta->name;
     if (models_autoload) {
         models.ensure_model_ready(name);
     } else {
@@ -1186,6 +1269,21 @@ void server_models_routes::init_routes() {
     this->proxy_get = [this](const server_http_req & req) {
         std::string method = "GET";
         std::string name = req.get_param("model");
+        if (name.empty()) {
+            auto all = models.get_all_meta();
+            for (const auto & m : all) {
+                if (m.is_running()) {
+                    name = m.name;
+                    break;
+                }
+            }
+            if (name.empty()) {
+                // No model loaded yet — return empty slots so health checks pass
+                auto res = std::make_unique<server_http_res>();
+                res_ok(res, json::array());
+                return res;
+            }
+        }
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {
@@ -1235,10 +1333,11 @@ void server_models_routes::init_routes() {
             return res;
         }
         if (meta->is_running()) {
-            res_err(res, format_error_response("model is already running", ERROR_TYPE_INVALID_REQUEST));
+            res_ok(res, {{"success", true}});
             return res;
         }
-        models.load(meta->name);
+        json overrides = body.contains("overrides") ? body["overrides"] : json::object();
+        models.load(meta->name, overrides);
         res_ok(res, {{"success", true}});
         return res;
     };
@@ -1324,7 +1423,7 @@ void server_models_routes::init_routes() {
             return res;
         }
         if (!model->is_running()) {
-            res_err(res, format_error_response("model is not running", ERROR_TYPE_INVALID_REQUEST));
+            res_ok(res, {{"success", true}});
             return res;
         }
         models.unload(model->name);
@@ -1534,6 +1633,9 @@ server_http_proxy::server_http_proxy(
         for (const auto & [key, value] : response.headers) {
             const auto lowered = to_lower_copy(key);
             if (should_strip_proxy_header(lowered)) {
+                if (lowered == "content-length") {
+                    msg.content_length = (size_t)std::stoll(value);
+                }
                 continue;
             }
             if (lowered == "content-type") {
@@ -1635,6 +1737,7 @@ server_http_proxy::server_http_proxy(
             SRV_DBG("%s", "received response headers\n");
             this->status  = header.status;
             this->headers = std::move(header.headers);
+            this->content_length = header.content_length;
             if (!header.content_type.empty()) {
                 this->content_type = std::move(header.content_type);
             }

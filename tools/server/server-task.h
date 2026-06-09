@@ -184,6 +184,8 @@ struct server_task {
         std::vector<uint8_t> state_data;
         // STATE_GET M2: open socket fd to stream directly into (< 0 = use buffer path)
         int                  hydra_fd   = -1;
+        // STATE_PUT only: clear existing checkpoints before restore (avoids session collision)
+        bool                 erase_existing = false;
     };
     hydra_action hydra_action;
 

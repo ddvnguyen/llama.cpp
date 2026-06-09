@@ -141,9 +141,18 @@ public:
     // return a copy of all model metadata (thread-safe)
     std::vector<server_model_meta> get_all_meta();
 
+    // return names of all currently running models (thread-safe)
+    std::vector<std::string> get_running();
+
     // load and unload model instances
     // these functions are thread-safe
     void load(const std::string & name);
+    void load(const std::string & name, const json & overrides);
+
+    // convenience: load with optional overrides from request body
+    // overrides is merged after the preset args, e.g. {"ctx-size":65536}
+    static void apply_overrides(std::vector<std::string> & args, const json & overrides);
+
     void unload(const std::string & name);
     void unload_all();
 
@@ -240,5 +249,6 @@ private:
         int status = 0;
         std::string data;
         std::string content_type;
+        size_t content_length = 0;
     };
 };
