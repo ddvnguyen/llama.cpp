@@ -767,6 +767,9 @@ private:
     }
 
     void slot_save_and_clear(server_slot & slot) {
+        if (slot.hydra_transferring->load()) {
+            return;
+        }
         if (slot.prompt.n_tokens() == 0) {
             return;
         }
@@ -1319,7 +1322,7 @@ private:
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (slot.is_processing() || slot.hydra_transferring->load()) {
                     continue;
                 }
 
@@ -1360,7 +1363,7 @@ private:
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (slot.is_processing() || slot.hydra_transferring->load()) {
                     continue;
                 }
 
@@ -2005,7 +2008,7 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            if (!slot.is_processing() && !slot.hydra_transferring->load() && slot.id != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
             if (free_slots.size() >= n_slots_needed) {
@@ -2116,7 +2119,7 @@ private:
                         break;
                     }
 
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot->hydra_transferring->load()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
@@ -2143,7 +2146,7 @@ private:
 
                     if (params_base.cache_idle_slots) {
                         for (auto & s : slots) {
-                            if (!s.is_processing()) {
+                            if (!s.is_processing() && !s.hydra_transferring->load()) {
                                 slot_save_and_clear(s);
                             }
                         }
@@ -2204,7 +2207,7 @@ private:
                     for (server_slot & slot : slots) {
                         json slot_data = slot.to_json(slots_debug == 0);
 
-                        if (slot.is_processing()) {
+                        if (slot.is_processing() || slot.hydra_transferring->load()) {
                             n_processing_slots++;
                         } else {
                             n_idle_slots++;
@@ -2341,7 +2344,7 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot->hydra_transferring->load()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
@@ -2429,7 +2432,13 @@ private:
 
                     // Snapshot on inference thread (cheap — dry-run serialization, no GPU copies).
                     const size_t state_size = llama_state_seq_get_size(ctx_tgt, slot->id);
-                    res->n_past     = slot->n_prompt_tokens_cache + slot->n_decoded;
+                    int actual_n_past = slot->n_prompt_tokens_cache + slot->n_decoded;
+                    // Cold prefill: n_prompt_tokens_cache is still 0 so n_decoded (1) dominates.
+                    // Use prompt token count instead — matches STATE_META fallback.
+                    if (slot->n_prompt_tokens_cache == 0 && slot->prompt.tokens.size() > 0) {
+                        actual_n_past = (int)slot->prompt.tokens.size();
+                    }
+                    res->n_past     = actual_n_past;
                     res->rpc_status = HYDRA_STATUS_OK;
                     SRV_INF("hydra: STATE_GET slot=%d n_past=%d state=%.1f MiB — async\n",
                             id_slot, res->n_past, state_size / (1024.0 * 1024.0));
@@ -2448,9 +2457,40 @@ private:
                     const llama_tokens prompt_tokens_get = slot->prompt.tokens.get_text_tokens();
                     const int32_t     n_past_val         = res->n_past;
 
+                    // Snapshot the most recent native checkpoint so STATE_PUT can
+                    // register it instead of fabricating one at the final position.
+                    // Fabricating at pos_max=n-1 corrupts hybrid/recurrent model
+                    // decode because the recurrent state is one token ahead of the
+                    // decode resume point — it has already processed the final token.
+                    std::vector<uint8_t> snapshot_ckpt;
+                    uint8_t hdr_flags = 0x00;
+                    int32_t ckpt_pos_min = 0, ckpt_pos_max = 0;
+                    int64_t ckpt_n_tokens = 0;
+                    if (!slot->prompt.checkpoints.empty()) {
+                        hdr_flags |= 0x01;
+                        const auto & ckpt = slot->prompt.checkpoints.back();
+                        ckpt_pos_min = ckpt.pos_min;
+                        ckpt_pos_max = ckpt.pos_max;
+                        ckpt_n_tokens = ckpt.n_tokens;
+
+                        const uint64_t tgt_sz = ckpt.data_tgt.size();
+                        const uint64_t dft_sz = ckpt.data_dft.size();
+                        const size_t ckpt_hdr_sz = 4 + 4 + 8 + 8 + (size_t)tgt_sz + 8 + (size_t)dft_sz;
+                        snapshot_ckpt.resize(ckpt_hdr_sz);
+                        size_t off = 0;
+                        memcpy(snapshot_ckpt.data() + off, &ckpt_pos_min, 4); off += 4;
+                        memcpy(snapshot_ckpt.data() + off, &ckpt_pos_max, 4); off += 4;
+                        memcpy(snapshot_ckpt.data() + off, &ckpt_n_tokens, 8); off += 8;
+                        memcpy(snapshot_ckpt.data() + off, &tgt_sz, 8); off += 8;
+                        if (tgt_sz > 0) { memcpy(snapshot_ckpt.data() + off, ckpt.data_tgt.data(), (size_t)tgt_sz); off += (size_t)tgt_sz; }
+                        memcpy(snapshot_ckpt.data() + off, &dft_sz, 8); off += 8;
+                        if (dft_sz > 0) memcpy(snapshot_ckpt.data() + off, ckpt.data_dft.data(), (size_t)dft_sz);
+                    }
+
                     std::thread([snap_ctx, snap_seq_id, state_size, hydra_fd,
                                  res = std::move(res), flag_ptr,
                                  prompt_tokens_get, n_past_val,
+                                 hdr_flags, snapshot_ckpt = std::move(snapshot_ckpt),
                                  &results = queue_results]() mutable {
                         SRV_INF("hydra: STATE_GET background thread starting (fd=%d state=%.1f MiB)\n",
                                 hydra_fd, state_size / (1024.0 * 1024.0));
@@ -2488,21 +2528,34 @@ private:
                              }
                          } else {
                              // M1 path: buffer in memory, RPC thread sends afterwards.
-                             // Hydra: prepend prompt-token header so PUT can restore slot.prompt.tokens.
+                             // v2 blob format (0x02): [1B version][4B n_past][4B n_tok][n_tok*4B tokens]
+                             //   [1B flags (bit 0 = has_checkpoint)]
+                             //   [if flags & 0x01: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz | tgt_data | 8B dft_sz | dft_data]
+                             //   [raw KV state from llama_state_seq_get_data]
                              const size_t n_tok = prompt_tokens_get.size();
                              const uint32_t hdr_n_tok = (uint32_t)n_tok;
                              const uint32_t hdr_n_past = (uint32_t)n_past_val;
-                             const size_t hdr_size = 8 + n_tok * sizeof(llama_token);
+                             const uint8_t version_byte = 0x02;
+                             const size_t base_hdr_size = 1 + 4 + 4 + n_tok * sizeof(llama_token) + 1; // version + n_past + n_tok + tokens + flags
+                             const size_t hdr_size = base_hdr_size + snapshot_ckpt.size();
 
                               // TOCTOU retry: if another slot grew the state between
                               // get_size (inference thread) and get_data (background thread),
                               // the copy returns 0. Retry up to 3 times with fresh sizing.
-                              const size_t buf_size = hdr_size + state_size;
+                              size_t buf_size = hdr_size + state_size;
                               res->state_data.resize(buf_size);
-                              // Hydra header: [n_past @ 0..3][n_tok @ 4..7] — must match STATE_PUT reader
-                              memcpy(res->state_data.data(),     &hdr_n_past, 4);
-                              memcpy(res->state_data.data() + 4, &hdr_n_tok,  4);
-                              memcpy(res->state_data.data() + 8, prompt_tokens_get.data(), n_tok * sizeof(llama_token));
+                              {
+                                  size_t off = 0;
+                                  memcpy(res->state_data.data() + off, &version_byte, 1); off += 1;
+                                  memcpy(res->state_data.data() + off, &hdr_n_past, 4);    off += 4;
+                                  memcpy(res->state_data.data() + off, &hdr_n_tok, 4);     off += 4;
+                                  memcpy(res->state_data.data() + off, prompt_tokens_get.data(), n_tok * sizeof(llama_token)); off += n_tok * sizeof(llama_token);
+                                  memcpy(res->state_data.data() + off, &hdr_flags, 1);     off += 1;
+                                  if (!snapshot_ckpt.empty()) {
+                                      memcpy(res->state_data.data() + off, snapshot_ckpt.data(), snapshot_ckpt.size());
+                                      off += snapshot_ckpt.size();
+                                  }
+                              }
 
                               size_t cur_state_size = state_size;
                               size_t copied = 0;
@@ -2564,24 +2617,81 @@ private:
                     }
 
                     const auto & buf = task.hydra_action.state_data;
-                    // Hydra: extract prompt-token header (4 B n_past + 4 B n_tok + n_tok*4 B token IDs)
+
+                    // Detect v2 blob (0x02 at offset 0) vs legacy format (no version byte).
+                    // v2: [1B version=0x02][4B n_past][4B n_tok][n_tok*4B tokens][1B flags][?ckpt?][KV state]
+                    // legacy: [4B n_past][4B n_tok][n_tok*4B tokens][KV state]
+                    const bool is_v2 = buf.size() >= 1 && buf[0] == 0x02;
+
                     size_t hdr_offset = 0;
                     int32_t hdr_n_tok = 0;
-                    if (buf.size() >= 8) {
-                        // n_past is informational; n_tok tells us how many tokens to read
-                        memcpy(&hdr_n_tok, buf.data() + 4, 4);
-                        hdr_offset = 8 + (size_t)hdr_n_tok * sizeof(llama_token);
-                    }
-                    const bool has_hdr = hdr_offset > 0 && hdr_offset <= buf.size();
-                    if (has_hdr) {
-                        const size_t n_tokens = (size_t)hdr_n_tok;
-                        slot->prompt.tokens.clear();
-                        if (n_tokens > 0) {
-                            const llama_token * tok_ptr = (const llama_token *)(buf.data() + 8);
-                            llama_tokens restored_tokens(tok_ptr, tok_ptr + n_tokens);
+                    int32_t hdr_n_past = 0;
+                    bool has_chkpt = false;
+                    int32_t ckpt_pos_min_in = 0, ckpt_pos_max_in = 0;
+                    int64_t ckpt_n_tokens_in = 0;
+                    std::vector<uint8_t> ckpt_tgt_data, ckpt_dft_data;
+
+                    if (is_v2) {
+                        // v2: version at [0], n_past at [1..4], n_tok at [5..8]
+                        if (buf.size() >= 9) {
+                            memcpy(&hdr_n_past, buf.data() + 1, 4);
+                            memcpy(&hdr_n_tok,  buf.data() + 5, 4);
+                        }
+                        const size_t token_start = 9;
+                        const size_t token_end = token_start + (size_t)hdr_n_tok * sizeof(llama_token);
+                        hdr_offset = token_end;
+                        if (hdr_offset < buf.size()) {
+                            const uint8_t flags = buf[hdr_offset];
+                            hdr_offset += 1; // past flags byte
+                            if (flags & 0x01) {
+                                // Parse checkpoint: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz | tgt_data | 8B dft_sz | dft_data
+                                if (hdr_offset + 4 + 4 + 8 + 8 <= buf.size()) {
+                                    memcpy(&ckpt_pos_min_in, buf.data() + hdr_offset, 4); hdr_offset += 4;
+                                    memcpy(&ckpt_pos_max_in, buf.data() + hdr_offset, 4); hdr_offset += 4;
+                                    memcpy(&ckpt_n_tokens_in, buf.data() + hdr_offset, 8); hdr_offset += 8;
+                                    uint64_t tgt_sz_in;
+                                    memcpy(&tgt_sz_in, buf.data() + hdr_offset, 8); hdr_offset += 8;
+                                    if (tgt_sz_in > 0 && hdr_offset + tgt_sz_in <= buf.size()) {
+                                        ckpt_tgt_data.assign(buf.data() + hdr_offset, buf.data() + hdr_offset + (size_t)tgt_sz_in);
+                                        hdr_offset += (size_t)tgt_sz_in;
+                                    }
+                                    if (hdr_offset + 8 <= buf.size()) {
+                                        uint64_t dft_sz_in;
+                                        memcpy(&dft_sz_in, buf.data() + hdr_offset, 8); hdr_offset += 8;
+                                        if (dft_sz_in > 0 && hdr_offset + dft_sz_in <= buf.size()) {
+                                            ckpt_dft_data.assign(buf.data() + hdr_offset, buf.data() + hdr_offset + (size_t)dft_sz_in);
+                                            hdr_offset += (size_t)dft_sz_in;
+                                        }
+                                    }
+                                    has_chkpt = true;
+                                }
+                            }
+                        }
+                        // Restore tokens from token_start
+                        if (hdr_n_tok > 0 && token_start + (size_t)hdr_n_tok * sizeof(llama_token) <= buf.size()) {
+                            slot->prompt.tokens.clear();
+                            const llama_token * tok_ptr = (const llama_token *)(buf.data() + token_start);
+                            llama_tokens restored_tokens(tok_ptr, tok_ptr + (size_t)hdr_n_tok);
                             slot->prompt.tokens.insert(restored_tokens);
                         }
+                    } else {
+                        // Legacy v1 format
+                        if (buf.size() >= 8) {
+                            memcpy(&hdr_n_past, buf.data(), 4);
+                            memcpy(&hdr_n_tok, buf.data() + 4, 4);
+                            hdr_offset = 8 + (size_t)hdr_n_tok * sizeof(llama_token);
+                        }
+                        if (hdr_offset > 0 && hdr_offset <= buf.size()) {
+                            const size_t n_tokens = (size_t)hdr_n_tok;
+                            slot->prompt.tokens.clear();
+                            if (n_tokens > 0) {
+                                const llama_token * tok_ptr = (const llama_token *)(buf.data() + 8);
+                                llama_tokens restored_tokens(tok_ptr, tok_ptr + n_tokens);
+                                slot->prompt.tokens.insert(restored_tokens);
+                            }
+                        }
                     }
+                    const bool has_hdr = hdr_offset > 0 && hdr_offset <= buf.size();
                     const uint8_t * state_ptr = has_hdr ? buf.data() + hdr_offset : buf.data();
                     const size_t    state_len = has_hdr ? buf.size() - hdr_offset : buf.size();
                     const size_t n_read = llama_state_seq_set_data(ctx_tgt, state_ptr, state_len, slot->id);
@@ -2592,34 +2702,30 @@ private:
                         res->rpc_status = HYDRA_STATUS_OK;
                         res->restored   = true;
                         res->bytes      = (uint64_t)n_read;
-                        // Update slot tracking from restored prompt tokens.
-                        // Use hdr_n_tok (prompt token count from save) directly instead of
-                        // computing from hybrid memory intersection. For recurrent/hybrid models
-                        // (qwen35moe), the attention cache has 1 cell/token while the recurrent
-                        // SSM state has only 1 cell at the final position. Hybrid seq_pos_min/max
-                        // computes the intersection, giving pos_min == pos_max == final pos -> n_past=1.
-                        // Using hdr_n_tok gives the correct count of tokens whose KV was restored.
-                        if (has_hdr && hdr_n_tok > 0) {
+                        if (hdr_n_tok > 0) {
                             slot->n_prompt_tokens_cache = hdr_n_tok;
                             slot->n_decoded = 0;
                             res->n_past = hdr_n_tok;
 
-                            // Reconstruct a context checkpoint at the restored position so
-                            // prompt-cache reuse can find it on the next matching request.
-                            // For hybrid/recurrent (FULL) models, use attention-only memory
-                            // positions (0..n_past-1) instead of the hybrid intersection which
-                            // collapses to a single cell (pos_min == pos_max == n_past-1).
-                            // The checkpoint match condition for hybrid: cur.pos_min == 0 is true,
-                            // so this checkpoint WILL match and attention KV will be reused.
-                            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-                                slot->prompt.checkpoints.clear();
-                                create_checkpoint(*slot, 0, 0, (llama_pos)(hdr_n_tok - 1));
+                            // Register native checkpoint from the blob (v2) or fabricate one (legacy).
+                            // The native checkpoint has pos_max at n-4 (created before the last
+                            // few prompt tokens were decoded), so loading it rewinds the recurrent
+                            // state to a clean position. The old fabricated checkpoint at (0, n-1)
+                            // puts the recurrent state at the final position — one token ahead of
+                            // where decode must resume — corrupting hybrid/recurrent model output.
+                            slot->prompt.checkpoints.clear();
+                            if (has_chkpt) {
+                                auto & ckpt = slot->prompt.checkpoints.emplace_back();
+                                ckpt.n_tokens = ckpt_n_tokens_in;
+                                ckpt.pos_min  = ckpt_pos_min_in;
+                                ckpt.pos_max  = ckpt_pos_max_in;
+                                ckpt.data_tgt = std::move(ckpt_tgt_data);
+                                ckpt.data_dft = std::move(ckpt_dft_data);
+                                SLT_INF(*slot, "STATE_PUT registered native checkpoint (pos_min=%d pos_max=%d n_tokens=%" PRId64 " tgt_sz=%zu)\n",
+                                        ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, ckpt.data_tgt.size());
                             } else {
                                 create_checkpoint(*slot, 0, 0, (llama_pos)(hdr_n_tok - 1));
                             }
-
-                            // One-shot flag: gates restored-slot KV reuse path for
-                            // the first request after STATE_PUT (regenerate or with-suffix).
                             slot->just_restored = true;
                         }
                         SRV_INF("hydra: STATE_PUT slot=%d restored=%zu B n_past=%d n_prompt_tok=%d\n",
@@ -2665,7 +2771,7 @@ private:
             bool all_idle = true;
 
             for (auto & slot : slots) {
-                if (slot.is_processing()) {
+                if (slot.is_processing() || slot.hydra_transferring->load()) {
                     all_idle = false;
                     break;
                 }
@@ -3528,7 +3634,7 @@ private:
                         SRV_ERR("%s i = %d, n_batch = %d, ret = %d\n", err.c_str(), i, n_batch, ret);
 
                         for (auto & slot : slots) {
-                            if (slot.is_processing()) {
+                            if (slot.is_processing() || slot.hydra_transferring->load()) {
                                 send_error(slot, err);
                                 slot.release();
 
