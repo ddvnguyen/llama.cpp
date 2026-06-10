@@ -2733,6 +2733,13 @@ private:
                     if (n_read == 0) {
                         res->rpc_status = HYDRA_STATUS_ERROR;
                         res->error      = "llama_state_set_data returned 0";
+                        // Tokens were registered before set_data — clear them so the slot
+                        // is not left poisoned (n_past > 0 with no KV cells → pos_min == -1
+                        // abort on the next decode that touches this slot).
+                        slot->prompt.tokens.clear();
+                        slot->prompt.checkpoints.clear();
+                        slot->n_prompt_tokens_cache = 0;
+                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot->id, -1, -1);
                     } else {
                         res->rpc_status = HYDRA_STATUS_OK;
                         res->restored   = true;
@@ -3406,10 +3413,18 @@ private:
                     // - the model does not support partial sequence removal
                     // - the model uses SWA (and we are not using `swa_full`)
                     // - the model supports partial sequence removal but only up to a fixed bound
+                    // Hydra: when the binary RPC port is enabled this server participates in
+                    // cross-node KV migration. The restore target may not support rollback
+                    // (e.g. it reports SEQ_RM_TYPE_FULL for the same model), so create native
+                    // checkpoints regardless of the local seq_rm verdict — STATE_GET ships
+                    // the latest checkpoint in the v2 blob, and without one the receiver
+                    // fabricates a checkpoint at the final position, which corrupts
+                    // hybrid/recurrent decode (recurrent state ends up past the resume point).
                     do_checkpoint = do_checkpoint && (
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
-                            n_swa > 0);
+                            n_swa > 0 ||
+                            params_base.rpc_port > 0);
 
                     bool has_mtmd = false;
 
@@ -3615,12 +3630,15 @@ private:
         }
 
         if (batch.n_tokens == 0) {
-            SRV_WRN("%s", "no tokens to decode\n");
-
             if (++n_empty_consecutive > 3) {
                 // Hydra: a STATE_GET background stream holds the slot (hydra_transferring)
                 // without contributing batch tokens — that is expected, not a stall.
-                // Only suppress the abort while a transfer is actually in flight.
+                // Suppress the abort while a transfer is in flight, and for a short
+                // grace window after it ends (the flag clears a few loop iterations
+                // before the queue delivers the releasing task — without the grace
+                // window those tail iterations trip the abort).
+                static int64_t hydra_last_transfer_ms = 0;
+                static int64_t hydra_suppress_count   = 0;
                 bool any_transferring = false;
                 for (const auto & s : slots) {
                     if (s.hydra_transferring && s.hydra_transferring->load()) {
@@ -3628,10 +3646,22 @@ private:
                         break;
                     }
                 }
+                const int64_t now_ms = ggml_time_us() / 1000;
                 if (any_transferring) {
-                    SRV_WRN("empty batch threshold exceeded (n_empty=%d) — slot is hydra_transferring, suppressing abort\n", n_empty_consecutive);
+                    hydra_last_transfer_ms = now_ms;
+                }
+                if (any_transferring || now_ms - hydra_last_transfer_ms < 2000) {
+                    // rate-limit: this branch runs in a hot loop — log once per 256 suppressions
+                    if (hydra_suppress_count++ % 256 == 0) {
+                        SRV_WRN("empty batch threshold exceeded (n_empty=%d, suppressed=%" PRId64 ") — hydra transfer %s, suppressing abort\n",
+                                n_empty_consecutive, hydra_suppress_count,
+                                any_transferring ? "in flight" : "just ended");
+                    }
                     n_empty_consecutive = 0;
+                    // avoid hot-spinning while the transfer holds the slot
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 } else {
+                    SRV_WRN("%s", "no tokens to decode\n");
                     GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
                 }
             }
