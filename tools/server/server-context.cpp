@@ -2495,18 +2495,40 @@ private:
                         SRV_INF("hydra: STATE_GET background thread starting (fd=%d state=%.1f MiB)\n",
                                 hydra_fd, state_size / (1024.0 * 1024.0));
                         if (hydra_fd >= 0) {
-                            // M2 path: stream GPU→socket directly, no 800 MB allocation.
-                            // Send response header + meta JSON FIRST (client expects framing),
-                            // then llama_state_seq_get_data_to_fd sends the payload bytes.
+                            // M2 path: stream v2 blob (header + checkpoint + GPU state) to fd.
+                            // Response header + meta JSON sent first, then v2 header bytes,
+                            // then llama_state_seq_get_data_to_fd writes GPU state directly.
+                            const size_t n_tok = prompt_tokens_get.size();
+                            const uint32_t hdr_n_tok = (uint32_t)n_tok;
+                            const uint32_t hdr_n_past = (uint32_t)n_past_val;
+                            const uint8_t version_byte = 0x02;
+                            const size_t base_hdr_size = 1 + 4 + 4 + n_tok * sizeof(llama_token) + 1;
+                            const size_t hdr_size = base_hdr_size + snapshot_ckpt.size();
+                            const size_t total_payload = hdr_size + state_size;
+
+                            // Build v2 header buffer
+                            std::vector<uint8_t> v2_hdr(hdr_size);
+                            {
+                                size_t off = 0;
+                                memcpy(v2_hdr.data() + off, &version_byte, 1); off += 1;
+                                memcpy(v2_hdr.data() + off, &hdr_n_past, 4);    off += 4;
+                                memcpy(v2_hdr.data() + off, &hdr_n_tok, 4);     off += 4;
+                                memcpy(v2_hdr.data() + off, prompt_tokens_get.data(), n_tok * sizeof(llama_token)); off += n_tok * sizeof(llama_token);
+                                memcpy(v2_hdr.data() + off, &hdr_flags, 1);     off += 1;
+                                if (!snapshot_ckpt.empty()) {
+                                    memcpy(v2_hdr.data() + off, snapshot_ckpt.data(), snapshot_ckpt.size());
+                                    off += snapshot_ckpt.size();
+                                }
+                            }
+
                             {
                                 json meta_j;
                                 meta_j["n_past"]     = res->n_past;
                                 meta_j["state_size"] = (uint64_t)state_size;
                                 const std::string meta_str = meta_j.dump();
 
-                                // Build 12-byte response header inline
                                 const uint32_t meta_len  = (uint32_t)meta_str.size();
-                                const uint64_t payload_l = (uint64_t)state_size;
+                                const uint64_t payload_l = (uint64_t)total_payload;
                                 uint8_t hdr[HYDRA_RES_HEADER_SIZE] = {};
                                 hdr[0] = HYDRA_STATUS_OK;
                                 hdr[1] = (meta_len)       & 0xFF;
@@ -2515,16 +2537,20 @@ private:
                                 memcpy(hdr + 4, &payload_l, 8);
                                 hydra_send_all(hydra_fd, hdr,           HYDRA_RES_HEADER_SIZE);
                                 hydra_send_all(hydra_fd, meta_str.data(), meta_str.size());
-                                res->header_sent = true; // META + header before payload
+
+                                // Write v2 blob header before GPU state — STATE_PUT needs tokens + checkpoint
+                                hydra_send_all(hydra_fd, v2_hdr.data(), v2_hdr.size());
+
+                                res->header_sent = true; // META + header + v2-hdr before payload
                             }
-                             // Stream payload: GPU tensors → 256 KB chunks → socket (zero-copy)
+                             // Stream GPU state to fd (zero-copy from GPU memory)
                              const size_t streamed = llama_state_seq_get_data_to_fd(snap_ctx, snap_seq_id, hydra_fd);
                              if (streamed == 0) {
                                  res->rpc_status = HYDRA_STATUS_ERROR;
                                  res->error      = "llama_state_seq_get_data_to_fd failed";
                                  ::close(hydra_fd);
                              } else {
-                                 res->streamed_bytes = streamed;
+                                 res->streamed_bytes = total_payload;
                              }
                          } else {
                              // M1 path: buffer in memory, RPC thread sends afterwards.
