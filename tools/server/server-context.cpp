@@ -2545,10 +2545,19 @@ private:
                             }
                              // Stream GPU state to fd (zero-copy from GPU memory)
                              const size_t streamed = llama_state_seq_get_data_to_fd(snap_ctx, snap_seq_id, hydra_fd);
-                             if (streamed == 0) {
+                             if (streamed != state_size) {
+                                 // TOCTOU: state size changed between get_size (header already
+                                 // promised state_size bytes) and the stream, or the stream
+                                 // failed mid-way. The wire framing is now broken — the only
+                                 // safe recovery is to kill the connection. Use shutdown(),
+                                 // not close(): the RPC connection loop owns the fd and will
+                                 // close it when its next read fails; closing here would race
+                                 // (double-close / fd-reuse against unrelated threads).
                                  res->rpc_status = HYDRA_STATUS_ERROR;
-                                 res->error      = "llama_state_seq_get_data_to_fd failed";
-                                 ::close(hydra_fd);
+                                 res->error      = "llama_state_seq_get_data_to_fd streamed " +
+                                                   std::to_string(streamed) + " B, expected " +
+                                                   std::to_string(state_size) + " B";
+                                 ::shutdown(hydra_fd, SHUT_RDWR);
                              } else {
                                  res->streamed_bytes = total_payload;
                              }
@@ -3609,7 +3618,22 @@ private:
             SRV_WRN("%s", "no tokens to decode\n");
 
             if (++n_empty_consecutive > 3) {
-                GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+                // Hydra: a STATE_GET background stream holds the slot (hydra_transferring)
+                // without contributing batch tokens — that is expected, not a stall.
+                // Only suppress the abort while a transfer is actually in flight.
+                bool any_transferring = false;
+                for (const auto & s : slots) {
+                    if (s.hydra_transferring && s.hydra_transferring->load()) {
+                        any_transferring = true;
+                        break;
+                    }
+                }
+                if (any_transferring) {
+                    SRV_WRN("empty batch threshold exceeded (n_empty=%d) — slot is hydra_transferring, suppressing abort\n", n_empty_consecutive);
+                    n_empty_consecutive = 0;
+                } else {
+                    GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+                }
             }
         } else {
             n_empty_consecutive = 0;
@@ -5565,14 +5589,21 @@ static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ct
     task.hydra_action.id_slot  = slot_id;
     task.hydra_action.hydra_fd = fd;    // M2: background thread streams here
     const int task_id = task.id;
+    // Register BEFORE posting — server_response::send() silently drops results
+    // for ids not in waiting_task_ids.
+    ctx.queue_results->add_waiting_task_id(task_id);
     ctx.queue_tasks->post(std::move(task));
 
     // Wait for result (n_past + state_size always set; state_data only on M1)
     std::unordered_set<int> task_ids = {task_id};
-    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 30000);
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 30); // seconds
+    ctx.queue_results->remove_waiting_task_id(task_id);
     if (!res_ptr) {
         SRV_WRN("hydra rpc: STATE_GET timeout for slot %d\n", slot_id);
-        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        // M2 caveat: the background thread may own the fd (header possibly sent);
+        // writing an error header here could interleave with the stream. Shut the
+        // socket down instead so the client unblocks with a clean EOF.
+        ::shutdown(fd, SHUT_RDWR);
         return;
     }
 
@@ -5585,8 +5616,9 @@ static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ct
 
     if (res->rpc_status != HYDRA_STATUS_OK) {
         if (res->header_sent) {
-            // M2 failure: header already sent but stream failed; fd closed by background thread
-            // Log and return without sending a second response header
+            // M2 failure: header already sent but stream failed; background thread
+            // shut the socket down — connection loop will close the fd on next read.
+            // Log and return without sending a second response header.
             SRV_WRN("hydra rpc: STATE_GET slot=%d M2 stream failed: %s\n",
                     slot_id, res->error.c_str());
             return;
@@ -5651,11 +5683,14 @@ static void hydra_handle_state_put(int fd, int slot_id, uint64_t payload_len, co
     task.hydra_action.erase_existing = true; // RPC restore always replaces slot state
     task.hydra_action.state_data = std::move(buf);
     const int task_id = task.id;
+    // Register BEFORE posting — results for unregistered ids are dropped.
+    ctx.queue_results->add_waiting_task_id(task_id);
     ctx.queue_tasks->post(std::move(task));
 
-    // Wait for result from inference thread (10s timeout for large restore)
+    // Wait for result from inference thread (30s timeout for large restore)
     std::unordered_set<int> task_ids = {task_id};
-    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 10000);
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 30); // seconds
+    ctx.queue_results->remove_waiting_task_id(task_id);
     if (!res_ptr) {
         SRV_WRN("hydra rpc: STATE_PUT timeout for slot %d\n", slot_id);
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
@@ -5693,11 +5728,14 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
     const int task_id = task.id;
+    // Register BEFORE posting — results for unregistered ids are dropped.
+    ctx.queue_results->add_waiting_task_id(task_id);
     ctx.queue_tasks->post(std::move(task));
 
     // Wait for result from inference thread (5s timeout — allows for queue congestion)
     std::unordered_set<int> task_ids = {task_id};
-    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5000);
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5); // seconds
+    ctx.queue_results->remove_waiting_task_id(task_id);
     if (!res_ptr) {
         SRV_WRN("hydra rpc: STATE_META timeout for slot %d\n", slot_id);
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
