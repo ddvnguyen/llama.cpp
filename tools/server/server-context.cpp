@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "llama-hydra.h"
 #include "log.h"
 #include "../src/llama-memory-hybrid.h"
 #include "sampling.h"

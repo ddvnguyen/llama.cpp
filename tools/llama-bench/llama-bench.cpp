@@ -722,7 +722,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
-            } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
+            } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc" || arg == "--rpc-engine")) {
                 if (++i >= argc) {
                     invalid_param = true;
                     break;
