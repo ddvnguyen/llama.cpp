@@ -1,8 +1,10 @@
 #include "llama-engine.h"
+#include "server-common.h"
 #include "server-context.h"
 #include "server-task.h"
 #include "server-rpc.h"
 #include "server-http.h"
+#include "server-queue.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -17,6 +19,7 @@
 #include <cstring>
 #include <functional>
 #include <signal.h>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -195,18 +198,173 @@ int llama_engine(int argc, char ** argv) {
             return res;
         });
 
-        ctx_http.get("/slots", [&ctx_server](const server_http_req &) {
+        // A1: Real /slots data
+        ctx_http.get("/slots", [&ctx_server](const server_http_req & req) {
             auto res = std::make_unique<server_http_res>();
-            res->status = 200;
-            res->data = "[]";
+            auto rd = ctx_server.get_response_reader();
+            server_task task(SERVER_TASK_TYPE_METRICS);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task), true);
+            auto result = rd.next(req.should_stop);
+            if (!result || result->is_error()) {
+                res->status = 200;
+                res->data = "[]";
+                return res;
+            }
+            auto * res_task = dynamic_cast<server_task_result_metrics*>(result.get());
+            if (!res_task) {
+                res->status = 200;
+                res->data = "[]";
+                return res;
+            }
+            res->data = res_task->slots_data.dump();
             return res;
         });
 
+        // A2: /metrics Prometheus endpoint
+        ctx_http.get("/metrics", [&ctx_server](const server_http_req & req) {
+            auto res = std::make_unique<server_http_res>();
+            auto rd = ctx_server.get_response_reader();
+            server_task task(SERVER_TASK_TYPE_METRICS);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task), true);
+            auto result = rd.next(req.should_stop);
+            if (!result || result->is_error()) {
+                res->status = 200;
+                res->content_type = "text/plain; version=0.0.4";
+                res->data = "";
+                return res;
+            }
+            auto * res_task = dynamic_cast<server_task_result_metrics*>(result.get());
+            if (!res_task) {
+                res->status = 200;
+                res->content_type = "text/plain; version=0.0.4";
+                res->data = "";
+                return res;
+            }
+            res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->t_start);
+            res->content_type = "text/plain; version=0.0.4";
+            std::stringstream prom;
+            auto emit = [&](const std::string & name, const std::string & help,
+                            const std::string & type, double value) {
+                prom << "# HELP llamacpp:" << name << " " << help << "\n"
+                     << "# TYPE llamacpp:" << name << " " << type << "\n"
+                     << "llamacpp:"        << name << " " << value << "\n";
+            };
+            emit("prompt_tokens_total",       "Number of prompt tokens processed.",                               "counter", (uint64_t)res_task->n_prompt_tokens_processed_total);
+            emit("prompt_seconds_total",      "Prompt process time",                                              "counter", (uint64_t)res_task->t_prompt_processing_total / 1.e3);
+            emit("tokens_predicted_total",    "Number of generation tokens processed.",                            "counter", (uint64_t)res_task->n_tokens_predicted_total);
+            emit("tokens_predicted_seconds_total", "Predict process time",                                        "counter", (uint64_t)res_task->t_tokens_generation_total / 1.e3);
+            emit("n_decode_total",            "Total number of llama_decode() calls",                             "counter", res_task->n_decode_total);
+            emit("n_tokens_max",              "Largest observed n_tokens.",                                       "counter", res_task->n_tokens_max);
+            emit("prompt_tokens_seconds",     "Average prompt throughput in tokens/s.",                           "gauge",   res_task->n_prompt_tokens_processed ? 1.e3 / res_task->t_prompt_processing * res_task->n_prompt_tokens_processed : 0.);
+            emit("predicted_tokens_seconds",  "Average generation throughput in tokens/s.",                       "gauge",   res_task->n_tokens_predicted ? 1.e3 / res_task->t_tokens_generation * res_task->n_tokens_predicted : 0.);
+            emit("requests_processing",       "Number of requests processing.",                                   "gauge",   (uint64_t)res_task->n_processing_slots);
+            emit("requests_deferred",         "Number of requests deferred.",                                     "gauge",   (uint64_t)res_task->n_tasks_deferred);
+            emit("n_busy_slots_per_decode",   "Average number of busy slots per llama_decode() call",             "gauge",   (float)res_task->n_busy_slots_total / std::max((float)res_task->n_decode_total, 1.f));
+            res->status = 200;
+            res->data = prom.str();
+            return res;
+        });
+
+        // A3: Slot erase
+        ctx_http.post("/slots/:id_slot", [&ctx_server](const server_http_req & req) {
+            auto res = std::make_unique<server_http_res>();
+            std::string action = req.get_param("action");
+            if (action != "erase") {
+                res->status = 400;
+                res->data = "{\"error\":\"only erase action is supported\"}";
+                return res;
+            }
+            int id_slot;
+            try {
+                id_slot = std::stoi(req.get_param("id_slot"));
+            } catch (...) {
+                res->status = 400;
+                res->data = "{\"error\":\"invalid slot ID\"}";
+                return res;
+            }
+            auto rd = ctx_server.get_response_reader();
+            server_task task(SERVER_TASK_TYPE_SLOT_ERASE);
+            task.id = rd.get_new_id();
+            task.slot_action.id_slot = id_slot;
+            rd.post_task(std::move(task));
+            auto result = rd.next(req.should_stop);
+            if (!result || result->is_error()) {
+                res->status = 500;
+                res->data = "{\"error\":\"slot erase failed\"}";
+                return res;
+            }
+            res->data = result->to_json().dump();
+            return res;
+        });
+
+        // A4: /v1/models stub
+        ctx_http.get("/v1/models", [&ctx_server](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            auto meta = ctx_server.get_meta();
+            res->data = (json{
+                {"object", "list"},
+                {"data", {{
+                    {"id", meta.model_name},
+                    {"object", "model"},
+                    {"created", 0},
+                    {"owned_by", "llama-engine"}
+                }}}
+            }).dump();
+            return res;
+        });
+        ctx_http.get("/models", [&ctx_server](const server_http_req &) {
+            // Reuse same handler as /v1/models
+            auto res = std::make_unique<server_http_res>();
+            auto meta = ctx_server.get_meta();
+            res->data = (json{
+                {"object", "list"},
+                {"data", {{
+                    {"id", meta.model_name},
+                    {"object", "model"},
+                    {"created", 0},
+                    {"owned_by", "llama-engine"}
+                }}}
+            }).dump();
+            return res;
+        });
+
+        // State meta: real data from task queue
         ctx_http.get("/slots/:id/state/meta", [&ctx_server](const server_http_req & req) {
             auto res = std::make_unique<server_http_res>();
-            int slot_id = std::stoi(req.get_param("id"));
-            res->status = 200;
-            res->data = "{\"slot_id\":" + std::to_string(slot_id) + ",\"n_past\":0,\"state_size\":0}";
+            int slot_id;
+            try {
+                slot_id = std::stoi(req.get_param("id"));
+            } catch (...) {
+                res->status = 400;
+                res->data = "{\"error\":\"invalid slot ID\"}";
+                return res;
+            }
+            auto rd = ctx_server.get_response_reader();
+            server_task task(SERVER_TASK_TYPE_HYDRA_STATE_META);
+            task.id = rd.get_new_id();
+            task.hydra_action.id_slot = slot_id;
+            rd.post_task(std::move(task));
+            auto result = rd.next(req.should_stop);
+            if (!result || result->is_error()) {
+                res->status = 503;
+                res->data = "{\"error\":\"state meta unavailable\"}";
+                return res;
+            }
+            auto * hr = dynamic_cast<server_task_result_hydra_state*>(result.get());
+            if (!hr) {
+                res->status = 503;
+                res->data = "{\"error\":\"state meta type mismatch\"}";
+                return res;
+            }
+            json j = {
+                {"slot_id", slot_id},
+                {"n_past", hr->n_past},
+                {"state_size", hr->state_size},
+                {"is_processing", hr->is_processing}
+            };
+            res->data = j.dump();
             return res;
         });
 

@@ -663,9 +663,16 @@ struct server_task_result_hydra_engine : server_task_result {
     // PREFILL: n_past after prefill
     int32_t  n_past    = 0;
 
-    // DECODE: generated tokens
+    // PREFILL: KV state data (returned inline, no separate StateGet needed)
+    std::vector<uint8_t> state_data;
+    uint64_t             state_size = 0;
+
+    // DECODE: generated tokens (IDs)
     std::vector<llama_token> tokens;
     std::vector<float>       logprobs;
+
+    // DECODE: concatenated generated text (set by inference thread)
+    std::string generated_text;
 
     // INFO: capabilities JSON
     std::string info_json;
