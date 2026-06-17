@@ -2854,7 +2854,37 @@ private:
                         break;
                     }
 
-                    SRV_INF("hydra: PREFILL slot=%d tokens=%zu\n", id_slot, task.hydra_action.prompt_tokens.size());
+                    // Tokenize from JSON messages if request_json is provided;
+                    // otherwise fall back to pre-tokenized prompt_tokens for back-compat.
+                    std::vector<llama_token> prompt_tokens = std::move(task.hydra_action.prompt_tokens);
+                    if (!task.hydra_action.request_json.empty()) {
+                        try {
+                            json body = json::parse(task.hydra_action.request_json);
+                            std::vector<raw_buffer> dummy_files;
+                            json parsed = oaicompat_chat_params_parse(body, chat_params, dummy_files);
+                            if (!parsed.contains("prompt")) {
+                                res->rpc_status = HYDRA_STATUS_ERROR;
+                                res->error = "chat template produced no prompt";
+                                queue_results.send(std::move(res));
+                                break;
+                            }
+                            auto tokenized = tokenize_input_prompts(vocab, mctx, parsed["prompt"], true, true);
+                            if (tokenized.empty()) {
+                                res->rpc_status = HYDRA_STATUS_ERROR;
+                                res->error = "tokenization produced no tokens";
+                                queue_results.send(std::move(res));
+                                break;
+                            }
+                            prompt_tokens = tokenized[0].get_tokens();
+                        } catch (const std::exception & e) {
+                            res->rpc_status = HYDRA_STATUS_ERROR;
+                            res->error = std::string("JSON/tokenization error: ") + e.what();
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                    }
+
+                    SRV_INF("hydra: PREFILL slot=%d tokens=%zu\n", id_slot, prompt_tokens.size());
 
                     // Clear existing slot state
                     slot->prompt_clear(false);
@@ -2863,7 +2893,7 @@ private:
                     slot->n_decoded = 0;
 
                     // Insert prompt tokens
-                    if (task.hydra_action.prompt_tokens.empty()) {
+                    if (prompt_tokens.empty()) {
                         res->rpc_status = HYDRA_STATUS_OK;
                         res->n_past = 0;
                         res->state_size = 0;
@@ -2871,7 +2901,7 @@ private:
                         break;
                     }
 
-                    slot->prompt.tokens.insert(task.hydra_action.prompt_tokens);
+                    slot->prompt.tokens.insert(prompt_tokens);
                     const auto & tokens = slot->prompt.tokens.get_tokens();
                     const int n_tokens = (int)tokens.size();
 
@@ -2961,36 +2991,123 @@ private:
                         break;
                     }
 
-                    SRV_INF("hydra: DECODE slot=%d n_predict=%d tokens=%zu\n",
-                            id_slot, task.hydra_action.n_predict, task.hydra_action.prompt_tokens.size());
-
                     const int n_predict = task.hydra_action.n_predict;
                     const int stream_fd = task.hydra_action.stream_fd;
 
-                    // Append any additional prompt tokens
-                    if (!task.hydra_action.prompt_tokens.empty()) {
-                        slot->prompt.tokens.insert(task.hydra_action.prompt_tokens);
-                        const auto & all_tokens = slot->prompt.tokens.get_tokens();
-                        const int n_total = (int)all_tokens.size();
-                        const int n_cached = slot->n_prompt_tokens_cache + slot->n_decoded;
+                    // If request_json is present (atomic mode), parse messages,
+                    // tokenize, and prefill before decoding using the same
+                    // tokenization pipeline as HYDRA_PREFILL.
+                    if (!task.hydra_action.request_json.empty()) {
+                        SRV_INF("hydra: DECODE slot=%d n_predict=%d atomic mode (JSON prefill)\n",
+                                id_slot, n_predict);
 
-                        if (n_total > n_cached) {
-                            const int n_ubatch = llama_n_ubatch(ctx_tgt);
-                            for (int i = n_cached; i < n_total; i += n_ubatch) {
-                                const int n_tokens_batch = std::min(n_ubatch, n_total - i);
-                                common_batch_clear(batch);
-                                for (int j = 0; j < n_tokens_batch; j++) {
-                                    const bool need_logits = (i + j == n_total - 1);
-                                    common_batch_add(batch, all_tokens[i + j], i + j, {slot->id}, need_logits);
-                                }
-                                if (llama_decode(ctx_tgt, batch) != 0) {
-                                    SRV_ERR("hydra: DECODE slot=%d prefill failed at batch %d\n", id_slot, i);
-                                    break;
-                                }
+                        // Tokenize from JSON messages
+                        std::vector<llama_token> prompt_tokens;
+                        try {
+                            json body = json::parse(task.hydra_action.request_json);
+                            std::vector<raw_buffer> dummy_files;
+                            json parsed = oaicompat_chat_params_parse(body, chat_params, dummy_files);
+                            if (!parsed.contains("prompt")) {
+                                res->rpc_status = HYDRA_STATUS_ERROR;
+                                res->error = "chat template produced no prompt";
+                                queue_results.send(std::move(res));
+                                break;
                             }
-                            slot->n_prompt_tokens_processed = n_total;
-                            slot->n_prompt_tokens_cache = n_total;
-                            slot->n_decoded = 0;
+                            auto tokenized = tokenize_input_prompts(vocab, mctx, parsed["prompt"], true, true);
+                            if (tokenized.empty()) {
+                                res->rpc_status = HYDRA_STATUS_ERROR;
+                                res->error = "tokenization produced no tokens";
+                                queue_results.send(std::move(res));
+                                break;
+                            }
+                            prompt_tokens = tokenized[0].get_tokens();
+                        } catch (const std::exception & e) {
+                            res->rpc_status = HYDRA_STATUS_ERROR;
+                            res->error = std::string("JSON/tokenization error: ") + e.what();
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+
+                        // Clear existing slot state
+                        slot->prompt_clear(false);
+                        slot->n_prompt_tokens_cache = 0;
+                        slot->n_prompt_tokens_processed = 0;
+                        slot->n_decoded = 0;
+
+                        // Insert prompt tokens
+                        slot->prompt.tokens.insert(prompt_tokens);
+                        const auto & tokens = slot->prompt.tokens.get_tokens();
+                        const int n_tokens = (int)tokens.size();
+
+                        // Add BOS if needed
+                        int token_offset = 0;
+                        llama_token bos = llama_vocab_bos(vocab);
+                        if (add_bos_token && bos != LLAMA_TOKEN_NULL && (tokens.empty() || tokens[0] != bos)) {
+                            token_offset = 1;
+                        }
+
+                        // Prefill in batches
+                        const int n_ubatch = llama_n_ubatch(ctx_tgt);
+                        for (int i = 0; i < n_tokens + token_offset; i += n_ubatch) {
+                            const int n_tokens_batch = std::min(n_ubatch, n_tokens + token_offset - i);
+                            common_batch_clear(batch);
+                            for (int j = 0; j < n_tokens_batch; j++) {
+                                const int tok_idx = i + j;
+                                llama_token id;
+                                if (token_offset > 0 && tok_idx == 0) {
+                                    id = bos;
+                                } else {
+                                    id = tokens[tok_idx - token_offset];
+                                }
+                                const bool need_logits = (tok_idx == n_tokens + token_offset - 1);
+                                common_batch_add(batch, id, tok_idx, {slot->id}, need_logits);
+                            }
+                            if (llama_decode(ctx_tgt, batch) != 0) {
+                                SRV_ERR("hydra: DECODE slot=%d atomic prefill failed at batch %d\n", id_slot, i);
+                                slot->n_prompt_tokens_processed = i;
+                                break;
+                            }
+                        }
+                        slot->n_prompt_tokens_processed = n_tokens;
+                        slot->n_prompt_tokens_cache = n_tokens;
+                        slot->n_decoded = 0;
+
+                        // Register checkpoint
+                        if (n_tokens > 0) {
+                            create_checkpoint(*slot, 0, 0, (llama_pos)(n_tokens - 1));
+                        }
+
+                        SRV_INF("hydra: DECODE slot=%d atomic prefill done tokens=%d\n",
+                                id_slot, n_tokens);
+                    } else {
+                        SRV_INF("hydra: DECODE slot=%d n_predict=%d cross-GPU mode\n",
+                                id_slot, n_predict);
+
+                        // Append any additional prompt tokens (cross-GPU: none expected)
+                        if (!task.hydra_action.prompt_tokens.empty()) {
+                            slot->prompt.tokens.insert(task.hydra_action.prompt_tokens);
+                            const auto & all_tokens = slot->prompt.tokens.get_tokens();
+                            const int n_total = (int)all_tokens.size();
+                            const int n_cached = slot->n_prompt_tokens_cache + slot->n_decoded;
+
+                            if (n_total > n_cached) {
+                                const int n_ubatch = llama_n_ubatch(ctx_tgt);
+                                for (int i = n_cached; i < n_total; i += n_ubatch) {
+                                    const int n_tokens_batch = std::min(n_ubatch, n_total - i);
+                                    common_batch_clear(batch);
+                                    for (int j = 0; j < n_tokens_batch; j++) {
+                                        const bool need_logits = (i + j == n_total - 1);
+                                        common_batch_add(batch, all_tokens[i + j], i + j, {slot->id}, need_logits);
+                                    }
+                                    if (llama_decode(ctx_tgt, batch) != 0) {
+                                        SRV_ERR("hydra: DECODE slot=%d prefill failed at batch %d\n", id_slot, i);
+                                        break;
+                                    }
+                                }
+                                slot->n_prompt_tokens_processed = n_total;
+                                slot->n_prompt_tokens_cache = n_total;
+                                slot->n_decoded = 0;
+                            }
                         }
                     }
 
@@ -3049,6 +3166,7 @@ private:
 
                     // Update slot tracking
                     slot->n_decoded = n_decoded;
+                    res->n_past = slot->n_prompt_tokens_cache + slot->n_decoded;
 
                     res->rpc_status = HYDRA_STATUS_OK;
                     queue_results.send(std::move(res));
@@ -6141,15 +6259,16 @@ static void hydra_handle_info(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
     hydra_send_all(fd, info_str.data(), info_str.size());
 }
 
-// PREFILL (0x35): Read prompt tokens, run prefill, return n_past + KV state blob.
+// PREFILL (0x35): Read JSON payload with {"messages": [...]},
+// tokenize internally, run prefill, return n_past + KV state blob.
 static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
-    if (payload_len % sizeof(llama_token) != 0) {
+    if (payload_len == 0) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
 
-    std::vector<llama_token> tokens(payload_len / sizeof(llama_token));
-    if (!hydra_recv_all(fd, tokens.data(), payload_len)) {
+    std::string json_str((size_t)payload_len, '\0');
+    if (!hydra_recv_all(fd, json_str.data(), (size_t)payload_len)) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
@@ -6157,7 +6276,7 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
     server_task task(SERVER_TASK_TYPE_HYDRA_PREFILL);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
-    task.hydra_action.prompt_tokens = std::move(tokens);
+    task.hydra_action.request_json = std::move(json_str);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
     ctx.queue_tasks->post(std::move(task));
@@ -6191,28 +6310,35 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
             slot_id, res->n_past, res->state_size);
 }
 
-// DECODE (0x36): Read prompt tokens + n_predict, run decode,
-// return generated token strings as the response payload.
+// DECODE (0x36): Read JSON payload with {"n_predict": N, "messages": [...]}.
+// If "messages" is present, tokenize + prefill first (atomic / single-node path).
+// If "messages" is absent, decode from existing slot KV state (cross-GPU path).
+// Returns generated text as payload.
 static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
-    if (payload_len < sizeof(int32_t)) {
+    if (payload_len == 0) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
 
-    int32_t n_predict = 0;
-    if (!hydra_recv_all(fd, &n_predict, sizeof(n_predict))) {
+    std::string json_str((size_t)payload_len, '\0');
+    if (!hydra_recv_all(fd, json_str.data(), (size_t)payload_len)) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
 
-    const uint64_t tokens_len = payload_len - sizeof(int32_t);
-    if (tokens_len % sizeof(llama_token) != 0) {
+    int32_t n_predict = -1;
+
+    try {
+        json req = json::parse(json_str);
+        if (req.contains("n_predict")) {
+            n_predict = req["n_predict"].get<int32_t>();
+        }
+    } catch (...) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
 
-    std::vector<llama_token> tokens(tokens_len / sizeof(llama_token));
-    if (tokens_len > 0 && !hydra_recv_all(fd, tokens.data(), tokens_len)) {
+    if (n_predict < 0) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
@@ -6220,8 +6346,8 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     server_task task(SERVER_TASK_TYPE_HYDRA_DECODE);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
-    task.hydra_action.prompt_tokens = std::move(tokens);
     task.hydra_action.n_predict = n_predict;
+    task.hydra_action.request_json = std::move(json_str);
     task.hydra_action.stream_fd = -1; // Disabled for now — tokens collected in result and sent as payload
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
@@ -6242,6 +6368,7 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     }
 
     json meta_j = {
+        {"n_past", res->n_past},
         {"tokens_generated", (int)res->tokens.size()},
         {"stop_reason", "complete"}
     };

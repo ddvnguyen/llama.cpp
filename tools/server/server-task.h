@@ -200,6 +200,8 @@ struct server_task {
         int32_t              n_predict  = -1;
         // DECODE: socket fd for streaming token output
         int                  stream_fd  = -1;
+        // PREFILL: JSON request body (messages to tokenize internally)
+        std::string          request_json;
         // CONFIGURE: JSON config payload
         std::string          config_json;
         // SET_EXPERT_MODE: "solo" or "combined"
