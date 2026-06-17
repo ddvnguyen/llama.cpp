@@ -6363,11 +6363,13 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
-    // Bumped from 60s to 120s to match C# RpcClient.DefaultRequestTimeout. Prefill for
-    // 32k+ token prompts exceeds 60s (we measured 32s for 22k tokens; 48k ≈ 70s). The C++
-    // side was timing out and returning HYDRA_STATUS_ERROR before the C# client gave up,
-    // surfacing as a 503 from the coordinator even though the model was still working.
-    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 120);
+    // Bumped from 60s to 180s. Prefill for 32k+ token prompts exceeds 120s
+    // (we measured 32s for 22k tokens; 48k ≈ 70s, 100k ≈ 150s+). Long autoregressive
+    // decode on P100 (28 tok/s) for 4k+ token outputs also exceeds 120s. The C++
+    // side was timing out and returning HYDRA_STATUS_ERROR before the C# client
+    // gave up, surfacing as a 503 from the coordinator even though the model was
+    // still working.
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 180);
     ctx.queue_results->remove_waiting_task_id(task_id);
     if (!res_ptr) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
@@ -6442,9 +6444,10 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
-    // Bumped from 60s to 120s to match C# RpcClient.DefaultRequestTimeout. Long
-    // autoregressive decode on P100 (28 tok/s) can take >60s for 1024+ token outputs.
-    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 120);
+    // Bumped from 60s to 180s. Long autoregressive decode on P100 (28 tok/s) for
+    // 4k+ token outputs can take >120s. Atomic mode (prefill+decode on same card)
+    // for 100k+ token prompts also takes >120s.
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 180);
     ctx.queue_results->remove_waiting_task_id(task_id);
     if (!res_ptr) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
