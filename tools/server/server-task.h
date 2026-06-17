@@ -666,8 +666,11 @@ struct server_task_result_hydra_engine : server_task_result {
     int32_t  n_past    = 0;
 
     // PREFILL: KV state data (returned inline, no separate StateGet needed)
+    // state_data layout: [v2 blob (header + KV)] + [logits (n_vocab * float)]
+    // logits_size is non-zero when logits are appended (activation handoff for P/D split).
     std::vector<uint8_t> state_data;
-    uint64_t             state_size = 0;
+    uint64_t             state_size  = 0; // raw KV bytes only (from llama_state_seq_get_size)
+    uint64_t             logits_size = 0; // appended logits bytes (n_vocab * sizeof(float))
 
     // DECODE: generated tokens (IDs)
     std::vector<llama_token> tokens;

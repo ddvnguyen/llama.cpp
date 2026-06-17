@@ -2742,6 +2742,20 @@ private:
                         slot->n_prompt_tokens_cache = 0;
                         llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot->id, -1, -1);
                     } else {
+                        // Inject trailing logits if present — activation handoff from PREFILL.
+                        // PREFILL appends n_vocab floats after the KV state so the decode GPU
+                        // can call common_sampler_sample immediately without a re-prefill pass.
+                        const size_t remaining = state_len - n_read;
+                        const size_t expected_logits = (size_t)llama_vocab_n_tokens(vocab) * sizeof(float);
+                        if (remaining == expected_logits) {
+                            float * ctx_logits = llama_get_logits(ctx_tgt);
+                            if (ctx_logits) {
+                                memcpy(ctx_logits, state_ptr + n_read, expected_logits);
+                                SRV_INF("hydra: STATE_PUT slot=%d injected %zu B logits\n",
+                                        id_slot, expected_logits);
+                            }
+                        }
+
                         res->rpc_status = HYDRA_STATUS_OK;
                         res->restored   = true;
                         res->bytes      = (uint64_t)n_read;
@@ -2943,29 +2957,90 @@ private:
                         break;
                     }
 
-                    // Get KV state for inline return
-                    const size_t state_size = llama_state_seq_get_size(ctx_tgt, slot->id);
-                    std::vector<uint8_t> state_data(state_size);
-                    if (state_size > 0) {
-                        llama_state_seq_get_data(ctx_tgt, state_data.data(), state_size, slot->id);
-                    }
-
                     // Update slot tracking
                     slot->n_prompt_tokens_processed = n_tokens;
                     slot->n_prompt_tokens_cache = n_tokens;
 
-                    // Register checkpoint for recurrent/hybrid models
+                    // Register checkpoint BEFORE getting state so v2 header includes it
                     if (n_tokens > 0) {
                         create_checkpoint(*slot, 0, 0, (llama_pos)(n_tokens - 1));
                     }
 
-                    SRV_INF("hydra: PREFILL slot=%d done n_past=%d state_size=%zu\n",
-                            id_slot, n_tokens, state_size);
+                    // Build v2 blob: [1B version=0x02][4B n_past][4B n_tok][n_tok*4B tokens][1B flags][?ckpt?][raw KV state]
+                    const uint32_t hdr_n_past = (uint32_t)n_tokens;
+                    const uint32_t hdr_n_tok  = (uint32_t)(tokens.size());
+                    uint8_t hdr_flags = 0x00;
+                    std::vector<uint8_t> ckpt_buf;
+                    int32_t ckpt_pos_min = 0, ckpt_pos_max = 0;
+                    int64_t ckpt_n_tokens = 0;
+                    if (!slot->prompt.checkpoints.empty()) {
+                        hdr_flags |= 0x01;
+                        const auto & ckpt = slot->prompt.checkpoints.back();
+                        ckpt_pos_min = ckpt.pos_min;
+                        ckpt_pos_max = ckpt.pos_max;
+                        ckpt_n_tokens = ckpt.n_tokens;
+                        const uint64_t tgt_sz = ckpt.data_tgt.size();
+                        const uint64_t dft_sz = ckpt.data_dft.size();
+                        ckpt_buf.resize(4 + 4 + 8 + 8 + (size_t)tgt_sz + 8 + (size_t)dft_sz);
+                        size_t off = 0;
+                        memcpy(ckpt_buf.data() + off, &ckpt_pos_min, 4); off += 4;
+                        memcpy(ckpt_buf.data() + off, &ckpt_pos_max, 4); off += 4;
+                        memcpy(ckpt_buf.data() + off, &ckpt_n_tokens, 8); off += 8;
+                        memcpy(ckpt_buf.data() + off, &tgt_sz, 8); off += 8;
+                        if (tgt_sz > 0) { memcpy(ckpt_buf.data() + off, ckpt.data_tgt.data(), (size_t)tgt_sz); off += (size_t)tgt_sz; }
+                        memcpy(ckpt_buf.data() + off, &dft_sz, 8); off += 8;
+                        if (dft_sz > 0) memcpy(ckpt_buf.data() + off, ckpt.data_dft.data(), (size_t)dft_sz);
+                    }
+                    const size_t base_hdr_size = 1 + 4 + 4 + hdr_n_tok * sizeof(llama_token) + 1;
+                    const size_t v2_size = base_hdr_size + ckpt_buf.size();
 
-                    res->rpc_status = HYDRA_STATUS_OK;
-                    res->n_past = n_tokens;
-                    res->state_data = std::move(state_data);
-                    res->state_size = state_size;
+                    // Get raw KV state
+                    const size_t state_size = llama_state_seq_get_size(ctx_tgt, slot->id);
+                    std::vector<uint8_t> v2_blob(v2_size + state_size);
+                    {
+                        size_t off = 0;
+                        const uint8_t version_byte = 0x02;
+                        memcpy(v2_blob.data() + off, &version_byte, 1); off += 1;
+                        memcpy(v2_blob.data() + off, &hdr_n_past, 4);   off += 4;
+                        memcpy(v2_blob.data() + off, &hdr_n_tok, 4);    off += 4;
+                        if (hdr_n_tok > 0) {
+                            const auto & toks = slot->prompt.tokens.get_text_tokens();
+                            memcpy(v2_blob.data() + off, toks.data(), toks.size() * sizeof(llama_token));
+                            off += toks.size() * sizeof(llama_token);
+                        }
+                        memcpy(v2_blob.data() + off, &hdr_flags, 1);    off += 1;
+                        if (!ckpt_buf.empty()) {
+                            memcpy(v2_blob.data() + off, ckpt_buf.data(), ckpt_buf.size());
+                            off += ckpt_buf.size();
+                        }
+                        if (state_size > 0) {
+                            llama_state_seq_get_data(ctx_tgt, v2_blob.data() + off, state_size, slot->id);
+                        }
+                    }
+
+                    // Append logits for activation handoff — eliminates the 1-token trick on the
+                    // decode GPU. llama_state_seq_get_data saves KV (k/v tensors) but not the
+                    // logits buffer; without these, common_sampler_sample reads garbage after
+                    // StatePut. Appending n_vocab floats here lets STATE_PUT inject them directly
+                    // into ctx->logits so DECODE can sample immediately.
+                    uint64_t logits_size = 0;
+                    const int n_vocab = llama_vocab_n_tokens(vocab);
+                    const float * logits_ptr = llama_get_logits(ctx_tgt);
+                    if (logits_ptr && n_vocab > 0) {
+                        logits_size = (uint64_t)n_vocab * sizeof(float);
+                        const size_t old_sz = v2_blob.size();
+                        v2_blob.resize(old_sz + (size_t)logits_size);
+                        memcpy(v2_blob.data() + old_sz, logits_ptr, (size_t)logits_size);
+                    }
+
+                    SRV_INF("hydra: PREFILL slot=%d done n_past=%d kv=%zu logits=%" PRIu64 "B total=%zu\n",
+                            id_slot, n_tokens, state_size, logits_size, v2_blob.size());
+
+                    res->rpc_status  = HYDRA_STATUS_OK;
+                    res->n_past      = n_tokens;
+                    res->state_data  = std::move(v2_blob);
+                    res->state_size  = state_size;
+                    res->logits_size = logits_size;
                     queue_results.send(std::move(res));
                 } break;
 
@@ -2994,39 +3069,45 @@ private:
                     const int n_predict = task.hydra_action.n_predict;
                     const int stream_fd = task.hydra_action.stream_fd;
 
-                    // If request_json is present (atomic mode), parse messages,
-                    // tokenize, and prefill before decoding using the same
-                    // tokenization pipeline as HYDRA_PREFILL.
+                    // Determine if atomic (has messages) or cross-GPU (KV already on slot).
+                    // Always called via RPC with a JSON payload; cross-GPU sends
+                    // {"n_predict":N,"messages":null} while atomic sends messages as an array.
+                    bool atomically_prefill = false;
+                    std::vector<llama_token> prompt_tokens;
                     if (!task.hydra_action.request_json.empty()) {
-                        SRV_INF("hydra: DECODE slot=%d n_predict=%d atomic mode (JSON prefill)\n",
-                                id_slot, n_predict);
-
-                        // Tokenize from JSON messages
-                        std::vector<llama_token> prompt_tokens;
                         try {
                             json body = json::parse(task.hydra_action.request_json);
-                            std::vector<raw_buffer> dummy_files;
-                            json parsed = oaicompat_chat_params_parse(body, chat_params, dummy_files);
-                            if (!parsed.contains("prompt")) {
-                                res->rpc_status = HYDRA_STATUS_ERROR;
-                                res->error = "chat template produced no prompt";
-                                queue_results.send(std::move(res));
-                                break;
+                            // Only do atomic prefill when messages is present AND not null
+                            if (body.contains("messages") && !body["messages"].is_null()) {
+                                atomically_prefill = true;
+                                std::vector<raw_buffer> dummy_files;
+                                json parsed = oaicompat_chat_params_parse(body, chat_params, dummy_files);
+                                if (!parsed.contains("prompt")) {
+                                    res->rpc_status = HYDRA_STATUS_ERROR;
+                                    res->error = "chat template produced no prompt";
+                                    queue_results.send(std::move(res));
+                                    break;
+                                }
+                                auto tokenized = tokenize_input_prompts(vocab, mctx, parsed["prompt"], true, true);
+                                if (tokenized.empty()) {
+                                    res->rpc_status = HYDRA_STATUS_ERROR;
+                                    res->error = "tokenization produced no tokens";
+                                    queue_results.send(std::move(res));
+                                    break;
+                                }
+                                prompt_tokens = tokenized[0].get_tokens();
                             }
-                            auto tokenized = tokenize_input_prompts(vocab, mctx, parsed["prompt"], true, true);
-                            if (tokenized.empty()) {
-                                res->rpc_status = HYDRA_STATUS_ERROR;
-                                res->error = "tokenization produced no tokens";
-                                queue_results.send(std::move(res));
-                                break;
-                            }
-                            prompt_tokens = tokenized[0].get_tokens();
                         } catch (const std::exception & e) {
                             res->rpc_status = HYDRA_STATUS_ERROR;
                             res->error = std::string("JSON/tokenization error: ") + e.what();
                             queue_results.send(std::move(res));
                             break;
                         }
+                    }
+
+                    if (atomically_prefill) {
+                        SRV_INF("hydra: DECODE slot=%d n_predict=%d atomic mode (%zu tokens)\n",
+                                id_slot, n_predict, prompt_tokens.size());
 
                         // Clear existing slot state
                         slot->prompt_clear(false);
@@ -3080,7 +3161,7 @@ private:
                         SRV_INF("hydra: DECODE slot=%d atomic prefill done tokens=%d\n",
                                 id_slot, n_tokens);
                     } else {
-                        SRV_INF("hydra: DECODE slot=%d n_predict=%d cross-GPU mode\n",
+                        SRV_INF("hydra: DECODE slot=%d n_predict=%d cross-GPU / KV mode\n",
                                 id_slot, n_predict);
 
                         // Append any additional prompt tokens (cross-GPU: none expected)
@@ -6295,19 +6376,22 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
         return;
     }
 
-    // Return n_past + state_size in meta, KV state blob as payload
+    // Return n_past + sizes in meta; full blob (v2 header + KV + logits) as payload.
+    // logits_size > 0 signals the decode GPU to inject them into ctx->logits via STATE_PUT.
     json meta_j = {
-        {"n_past",     res->n_past},
-        {"state_size", res->state_size}
+        {"n_past",      res->n_past},
+        {"state_size",  res->state_size},
+        {"logits_size", res->logits_size}
     };
     const std::string meta_str = meta_j.dump();
-    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), res->state_size);
+    const uint64_t total_payload = (uint64_t)res->state_data.size();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), total_payload);
     hydra_send_all(fd, meta_str.data(), meta_str.size());
-    if (res->state_size > 0 && !res->state_data.empty()) {
-        hydra_send_all(fd, res->state_data.data(), res->state_size);
+    if (total_payload > 0) {
+        hydra_send_all(fd, res->state_data.data(), (size_t)total_payload);
     }
-    SRV_INF("hydra: PREFILL slot=%d sent n_past=%d state=%" PRIu64 " B\n",
-            slot_id, res->n_past, res->state_size);
+    SRV_INF("hydra: PREFILL slot=%d sent n_past=%d kv=%" PRIu64 "B logits=%" PRIu64 "B total=%" PRIu64 "B\n",
+            slot_id, res->n_past, res->state_size, res->logits_size, total_payload);
 }
 
 // DECODE (0x36): Read JSON payload with {"n_predict": N, "messages": [...]}.
