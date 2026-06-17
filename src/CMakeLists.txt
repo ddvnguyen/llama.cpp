@@ -46,6 +46,7 @@ set(LLAMA_CORE_SOURCES
 add_library(llama
             ../include/llama.h
             ${LLAMA_CORE_SOURCES}
+            llama-hydra.cpp # hydra: isolation-layer wrapper (pick 1b, buffered to_fd)
             unicode.h
             ${LLAMA_MODELS_SOURCES}
             )

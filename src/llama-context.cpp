@@ -3070,6 +3070,54 @@ size_t llama_context::state_get_size() {
     }
 }
 
+// hydra: zero-copy socket streaming (class stays here; C wrapper in llama-hydra.cpp)
+#if !defined(_WIN32)
+#include <sys/socket.h>
+
+class llama_io_write_socket : public llama_io_write_i {
+    static constexpr size_t CHUNK = 256 * 1024;
+
+    int    fd             = -1;
+    size_t bytes_written  = 0;
+    std::vector<uint8_t> staging;
+
+    void send_all(const void * buf, size_t n) {
+        const char * p = static_cast<const char *>(buf);
+        while (n > 0) {
+            ssize_t w = ::send(fd, p, n, MSG_NOSIGNAL);
+            if (w <= 0) {
+                throw std::runtime_error("hydra: socket send failed during state stream");
+            }
+            p += w;
+            n -= (size_t)w;
+        }
+    }
+
+public:
+    explicit llama_io_write_socket(int fd) : fd(fd), staging(CHUNK) {}
+
+    void write(const void * src, size_t size) override {
+        send_all(src, size);
+        bytes_written += size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        size_t rem = size;
+        size_t off = offset;
+        while (rem > 0) {
+            const size_t chunk = std::min(rem, staging.size());
+            ggml_backend_tensor_get(tensor, staging.data(), off, chunk);
+            send_all(staging.data(), chunk);
+            bytes_written += chunk;
+            off += chunk;
+            rem -= chunk;
+        }
+    }
+
+    size_t n_bytes() override { return bytes_written; }
+};
+#endif // !_WIN32
+
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
     llama_io_write_host io(dst, size);
     try {
@@ -4219,6 +4267,8 @@ size_t llama_state_seq_get_size(llama_context * ctx, llama_seq_id seq_id) {
 size_t llama_state_seq_get_data(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id) {
     return llama_state_seq_get_data_ext(ctx, dst, size, seq_id, 0);
 }
+
+// llama_state_seq_get_data_to_fd relocated to llama-hydra.cpp (Hydra isolation layer)
 
 size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id) {
     return llama_state_seq_set_data_ext(ctx, src, size, seq_id, 0);

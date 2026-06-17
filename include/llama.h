@@ -875,7 +875,9 @@ extern "C" {
             struct llama_context * ctx,
                          uint8_t * dst,
                           size_t   size,
-                    llama_seq_id   seq_id);
+                     llama_seq_id   seq_id);
+
+    // hydra: llama_state_seq_get_data_to_fd moved to llama-hydra.h
 
     // Copy the sequence data (originally copied with `llama_state_seq_get_data`) into the specified sequence
     // Returns:
