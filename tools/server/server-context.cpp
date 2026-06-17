@@ -6363,7 +6363,11 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
-    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 60);
+    // Bumped from 60s to 120s to match C# RpcClient.DefaultRequestTimeout. Prefill for
+    // 32k+ token prompts exceeds 60s (we measured 32s for 22k tokens; 48k ≈ 70s). The C++
+    // side was timing out and returning HYDRA_STATUS_ERROR before the C# client gave up,
+    // surfacing as a 503 from the coordinator even though the model was still working.
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 120);
     ctx.queue_results->remove_waiting_task_id(task_id);
     if (!res_ptr) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
@@ -6438,7 +6442,9 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
-    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 60);
+    // Bumped from 60s to 120s to match C# RpcClient.DefaultRequestTimeout. Long
+    // autoregressive decode on P100 (28 tok/s) can take >60s for 1024+ token outputs.
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 120);
     ctx.queue_results->remove_waiting_task_id(task_id);
     if (!res_ptr) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
