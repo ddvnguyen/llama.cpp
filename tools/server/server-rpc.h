@@ -18,6 +18,14 @@ static constexpr uint8_t  HYDRA_OP_STATE_GET    = 0x30; // stream KV state out
 static constexpr uint8_t  HYDRA_OP_STATE_PUT    = 0x31; // stream KV state in
 static constexpr uint8_t  HYDRA_OP_STATE_META   = 0x32; // metadata only, no payload
 
+// ── Engine control opcodes (E1) ───────────────────────────────────────────────
+static constexpr uint8_t  HYDRA_OP_CONFIGURE    = 0x40; // set engine params
+static constexpr uint8_t  HYDRA_OP_INFO         = 0x41; // report capabilities
+static constexpr uint8_t  HYDRA_OP_PREFILL      = 0x42; // run prefill only, return n_past
+static constexpr uint8_t  HYDRA_OP_DECODE       = 0x43; // run decode with streaming
+static constexpr uint8_t  HYDRA_OP_SET_EXPERT_MODE = 0x44; // switch solo/combined
+static constexpr uint8_t  HYDRA_OP_SWAP_QUANT   = 0x45; // swap expert quantization
+
 // ── Status codes (shared with full Hydra spec) ────────────────────────────────
 static constexpr uint8_t  HYDRA_STATUS_OK        = 0x00;
 static constexpr uint8_t  HYDRA_STATUS_NOT_FOUND = 0x01;

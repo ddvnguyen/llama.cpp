@@ -2805,6 +2805,100 @@ private:
                     res->rpc_status    = HYDRA_STATUS_OK;
                     queue_results.send(std::move(res));
                 } break;
+
+            case SERVER_TASK_TYPE_HYDRA_CONFIGURE:
+                {
+                    auto res = std::make_unique<server_task_result_hydra_engine>();
+                    res->id = task.id;
+                    res->op = HYDRA_OP_CONFIGURE;
+                    res->rpc_status = HYDRA_STATUS_OK;
+                    res->success = true;
+                    SRV_INF("hydra: CONFIGURE received (slot %d)\n", task.hydra_action.id_slot);
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_HYDRA_INFO:
+                {
+                    auto res = std::make_unique<server_task_result_hydra_engine>();
+                    res->id = task.id;
+                    res->op = HYDRA_OP_INFO;
+                    res->rpc_status = HYDRA_STATUS_OK;
+                    json info_j = {
+                        {"engine", "llama-engine"},
+                        {"version", "E1"},
+                        {"capabilities", {"prefill", "decode", "state_transfer", "expert_mode", "quant_swap"}}
+                    };
+                    res->info_json = info_j.dump();
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_HYDRA_PREFILL:
+                {
+                    const int id_slot = task.hydra_action.id_slot;
+                    auto res = std::make_unique<server_task_result_hydra_engine>();
+                    res->id = task.id;
+                    res->op = HYDRA_OP_PREFILL;
+
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        res->rpc_status = HYDRA_STATUS_NOT_FOUND;
+                        res->error = "invalid slot ID";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    SRV_INF("hydra: PREFILL slot=%d tokens=%zu\n", id_slot, task.hydra_action.prompt_tokens.size());
+                    res->rpc_status = HYDRA_STATUS_OK;
+                    res->n_past = (int)task.hydra_action.prompt_tokens.size();
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_HYDRA_DECODE:
+                {
+                    const int id_slot = task.hydra_action.id_slot;
+                    auto res = std::make_unique<server_task_result_hydra_engine>();
+                    res->id = task.id;
+                    res->op = HYDRA_OP_DECODE;
+
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        res->rpc_status = HYDRA_STATUS_NOT_FOUND;
+                        res->error = "invalid slot ID";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    SRV_INF("hydra: DECODE slot=%d n_predict=%d tokens=%zu\n",
+                            id_slot, task.hydra_action.n_predict, task.hydra_action.prompt_tokens.size());
+                    res->rpc_status = HYDRA_STATUS_OK;
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_HYDRA_SET_EXPERT_MODE:
+                {
+                    auto res = std::make_unique<server_task_result_hydra_engine>();
+                    res->id = task.id;
+                    res->op = HYDRA_OP_SET_EXPERT_MODE;
+                    res->rpc_status = HYDRA_STATUS_OK;
+                    res->success = true;
+                    SRV_INF("hydra: SET_EXPERT_MODE '%s' (slot %d)\n",
+                            task.hydra_action.expert_mode.c_str(), task.hydra_action.id_slot);
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_HYDRA_SWAP_QUANT:
+                {
+                    auto res = std::make_unique<server_task_result_hydra_engine>();
+                    res->id = task.id;
+                    res->op = HYDRA_OP_SWAP_QUANT;
+                    res->rpc_status = HYDRA_STATUS_OK;
+                    res->success = true;
+                    SRV_INF("hydra: SWAP_QUANT quant='%s' pattern='%s' (slot %d)\n",
+                            task.hydra_action.quant_key.c_str(),
+                            task.hydra_action.tensor_pattern.c_str(),
+                            task.hydra_action.id_slot);
+                    queue_results.send(std::move(res));
+                } break;
         }
     }
 
@@ -5801,6 +5895,262 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
     }
 }
 
+// ── E1 Engine control handlers ────────────────────────────────────────────────
+
+// CONFIGURE (0x33): Read JSON config payload, post task, return success.
+static void hydra_handle_configure(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    std::string config_json(payload_len, '\0');
+    if (payload_len > 0 && !hydra_recv_all(fd, config_json.data(), payload_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_CONFIGURE);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.config_json = std::move(config_json);
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res || !res->success) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    json meta_j = {{"success", true}};
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
+// INFO (0x34): Return engine capabilities as JSON.
+static void hydra_handle_info(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
+    server_task task(SERVER_TASK_TYPE_HYDRA_INFO);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    const std::string & info_str = res->info_json;
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)info_str.size(), 0);
+    hydra_send_all(fd, info_str.data(), info_str.size());
+}
+
+// PREFILL (0x35): Read prompt tokens, run prefill, return n_past.
+static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    if (payload_len % sizeof(llama_token) != 0) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    std::vector<llama_token> tokens(payload_len / sizeof(llama_token));
+    if (!hydra_recv_all(fd, tokens.data(), payload_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_PREFILL);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.prompt_tokens = std::move(tokens);
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 30);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res || res->rpc_status != HYDRA_STATUS_OK) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    json meta_j = {{"n_past", res->n_past}};
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
+// DECODE (0x36): Read prompt tokens + n_predict, run decode, stream tokens back.
+static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    if (payload_len < sizeof(int32_t)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    int32_t n_predict = 0;
+    if (!hydra_recv_all(fd, &n_predict, sizeof(n_predict))) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    const uint64_t tokens_len = payload_len - sizeof(int32_t);
+    if (tokens_len % sizeof(llama_token) != 0) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    std::vector<llama_token> tokens(tokens_len / sizeof(llama_token));
+    if (tokens_len > 0 && !hydra_recv_all(fd, tokens.data(), tokens_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_DECODE);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.prompt_tokens = std::move(tokens);
+    task.hydra_action.n_predict = n_predict;
+    task.hydra_action.stream_fd = fd;
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 60);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res || res->rpc_status != HYDRA_STATUS_OK) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    json meta_j = {
+        {"tokens_generated", (int)res->tokens.size()},
+        {"stop_reason", "complete"}
+    };
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
+// SET_EXPERT_MODE (0x37): Read mode string, post task, return success.
+static void hydra_handle_set_expert_mode(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    std::string mode(payload_len, '\0');
+    if (payload_len > 0 && !hydra_recv_all(fd, mode.data(), payload_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_SET_EXPERT_MODE);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.expert_mode = std::move(mode);
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res || !res->success) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    json meta_j = {{"success", true}};
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
+// SWAP_QUANT (0x38): Read quant_key + tensor_pattern, post task, return success.
+static void hydra_handle_swap_quant(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    if (payload_len < sizeof(uint16_t)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    uint16_t quant_key_len = 0;
+    if (!hydra_recv_all(fd, &quant_key_len, sizeof(quant_key_len))) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    std::string quant_key(quant_key_len, '\0');
+    if (quant_key_len > 0 && !hydra_recv_all(fd, quant_key.data(), quant_key_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    const uint64_t pattern_len = payload_len - sizeof(uint16_t) - quant_key_len;
+    std::string tensor_pattern(pattern_len, '\0');
+    if (pattern_len > 0 && !hydra_recv_all(fd, tensor_pattern.data(), pattern_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_SWAP_QUANT);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.quant_key = std::move(quant_key);
+    task.hydra_action.tensor_pattern = std::move(tensor_pattern);
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 30);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res || !res->success) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    json meta_j = {{"success", true}};
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
 // ── Per-connection loop ───────────────────────────────────────────────────────
 // Persistent: one TCP connection handles many sequential requests.
 
@@ -5856,6 +6206,35 @@ static void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx) {
             case HYDRA_OP_STATE_META:
                 SRV_DBG("hydra rpc: STATE_META slot=%d trace=%s\n", slot_id, trace_id.c_str());
                 hydra_handle_state_meta(fd, slot_id, ctx);
+                break;
+            case HYDRA_OP_CONFIGURE:
+                SRV_DBG("hydra rpc: CONFIGURE slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_configure(fd, slot_id, payload_len, ctx);
+                break;
+            case HYDRA_OP_INFO:
+                SRV_DBG("hydra rpc: INFO slot=%d trace=%s\n", slot_id, trace_id.c_str());
+                hydra_handle_info(fd, slot_id, ctx);
+                break;
+            case HYDRA_OP_PREFILL:
+                SRV_DBG("hydra rpc: PREFILL slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_prefill(fd, slot_id, payload_len, ctx);
+                break;
+            case HYDRA_OP_DECODE:
+                SRV_DBG("hydra rpc: DECODE slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_decode(fd, slot_id, payload_len, ctx);
+                break;
+            case HYDRA_OP_SET_EXPERT_MODE:
+                SRV_DBG("hydra rpc: SET_EXPERT_MODE slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_set_expert_mode(fd, slot_id, payload_len, ctx);
+                break;
+            case HYDRA_OP_SWAP_QUANT:
+                SRV_DBG("hydra rpc: SWAP_QUANT slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_swap_quant(fd, slot_id, payload_len, ctx);
                 break;
             default:
                 SRV_WRN("hydra rpc: unknown op 0x%02x — ignoring\n", (unsigned)op);

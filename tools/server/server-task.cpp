@@ -2012,6 +2012,31 @@ json server_task_result_hydra_state::to_json() {
 }
 
 //
+// server_task_result_hydra_engine (E1)
+//
+
+json server_task_result_hydra_engine::to_json() {
+    json j;
+    j["op"]         = op;
+    j["rpc_status"] = rpc_status;
+    if (!error.empty()) j["error"] = error;
+    if (op == 0x41) { // INFO
+        j["info"] = info_json;
+    }
+    if (op == 0x42) { // PREFILL
+        j["n_past"] = n_past;
+    }
+    if (op == 0x43) { // DECODE
+        j["tokens"]   = tokens;
+        j["logprobs"] = logprobs;
+    }
+    if (op == 0x40 || op == 0x44 || op == 0x45) { // CONFIGURE/SET_EXPERT_MODE/SWAP_QUANT
+        j["success"] = success;
+    }
+    return j;
+}
+
+//
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {

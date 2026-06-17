@@ -32,6 +32,13 @@ enum server_task_type {
     SERVER_TASK_TYPE_HYDRA_STATE_GET,   // 0x30 — serialize slot KV state → result buffer
     SERVER_TASK_TYPE_HYDRA_STATE_PUT,   // 0x31 — restore slot KV state ← task buffer
     SERVER_TASK_TYPE_HYDRA_STATE_META,  // 0x32 — slot metadata only (lightweight)
+    // Hydra engine control tasks (E1):
+    SERVER_TASK_TYPE_HYDRA_CONFIGURE,   // 0x33 — set engine params
+    SERVER_TASK_TYPE_HYDRA_INFO,        // 0x34 — report capabilities
+    SERVER_TASK_TYPE_HYDRA_PREFILL,     // 0x35 — run prefill only, return n_past
+    SERVER_TASK_TYPE_HYDRA_DECODE,      // 0x36 — run decode with streaming
+    SERVER_TASK_TYPE_HYDRA_SET_EXPERT_MODE, // 0x37 — switch solo/combined
+    SERVER_TASK_TYPE_HYDRA_SWAP_QUANT,  // 0x38 — swap expert quantization
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -177,7 +184,7 @@ struct server_task {
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
 
-    // used by SERVER_TASK_TYPE_HYDRA_STATE_*
+    // used by SERVER_TASK_TYPE_HYDRA_STATE_* and SERVER_TASK_TYPE_HYDRA_* (E1)
     struct hydra_action {
         int                  id_slot    = -1;
         // STATE_PUT only: KV bytes to restore
@@ -186,6 +193,21 @@ struct server_task {
         int                  hydra_fd   = -1;
         // STATE_PUT only: clear existing checkpoints before restore (avoids session collision)
         bool                 erase_existing = false;
+        // E1 engine control:
+        // PREFILL/DECODE: prompt tokens to process
+        std::vector<llama_token> prompt_tokens;
+        // DECODE: max tokens to generate
+        int32_t              n_predict  = -1;
+        // DECODE: socket fd for streaming token output
+        int                  stream_fd  = -1;
+        // CONFIGURE: JSON config payload
+        std::string          config_json;
+        // SET_EXPERT_MODE: "solo" or "combined"
+        std::string          expert_mode;
+        // SWAP_QUANT: target quant key (e.g., "Q6_K")
+        std::string          quant_key;
+        // SWAP_QUANT: tensor name pattern (regex)
+        std::string          tensor_pattern;
     };
     hydra_action hydra_action;
 
@@ -630,6 +652,29 @@ struct server_task_result_hydra_state : server_task_result {
     std::string error; // human-readable, non-empty on failure
 
     // is_stop() inherits true (single result, not a stream)
+    virtual json to_json() override;
+};
+
+// Result for SERVER_TASK_TYPE_HYDRA_CONFIGURE/INFO/PREFILL/DECODE/SET_EXPERT_MODE/SWAP_QUANT (E1).
+struct server_task_result_hydra_engine : server_task_result {
+    uint8_t op         = 0;                 // HYDRA_OP_*
+    uint8_t rpc_status = 0x02 /*ERROR*/;    // set by inference thread
+
+    // PREFILL: n_past after prefill
+    int32_t  n_past    = 0;
+
+    // DECODE: generated tokens
+    std::vector<llama_token> tokens;
+    std::vector<float>       logprobs;
+
+    // INFO: capabilities JSON
+    std::string info_json;
+
+    // CONFIGURE/SET_EXPERT_MODE/SWAP_QUANT: success flag
+    bool     success   = false;
+
+    std::string error; // human-readable, non-empty on failure
+
     virtual json to_json() override;
 };
 
