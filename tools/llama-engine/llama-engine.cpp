@@ -2,6 +2,7 @@
 #include "server-context.h"
 #include "server-task.h"
 #include "server-rpc.h"
+#include "server-http.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -170,6 +171,50 @@ int llama_engine(int argc, char ** argv) {
 
     if (params.rpc_port > 0) {
         ctx_server.start_rpc_server(params.rpc_port);
+    }
+
+    server_http_context ctx_http;
+    if (params.port > 0) {
+        if (!ctx_http.init(params)) {
+            LOG_ERR("eng  %12.*s: failed to initialize HTTP server\n", 12, __func__);
+            llama_backend_free();
+            return 1;
+        }
+
+        ctx_http.get("/health", [&ctx_server](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->data = "{\"status\":\"ok\"}";
+            return res;
+        });
+
+        ctx_http.get("/version", [](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->data = "{\"version\":\"E1\",\"engine\":\"llama-engine\"}";
+            return res;
+        });
+
+        ctx_http.get("/slots", [&ctx_server](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->data = "[]";
+            return res;
+        });
+
+        ctx_http.get("/slots/:id/state/meta", [&ctx_server](const server_http_req & req) {
+            auto res = std::make_unique<server_http_res>();
+            int slot_id = std::stoi(req.get_param("id"));
+            res->status = 200;
+            res->data = "{\"slot_id\":" + std::to_string(slot_id) + ",\"n_past\":0,\"state_size\":0}";
+            return res;
+        });
+
+        if (!ctx_http.start()) {
+            LOG_ERR("eng  %12.*s: failed to start HTTP server\n", 12, __func__);
+            llama_backend_free();
+            return 1;
+        }
     }
 
     shutdown_handler = [&](int) {
