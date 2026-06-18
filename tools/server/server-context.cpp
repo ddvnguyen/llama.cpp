@@ -3164,19 +3164,15 @@ private:
                         SRV_INF("hydra: DECODE slot=%d n_predict=%d cross-GPU / KV mode\n",
                                 id_slot, n_predict);
 
-                        // Load the checkpoint registered by STATE_PUT (if present).
-                        // For hybrid models (attention + SSM), the checkpoint contains the
-                        // recurrent state that must be loaded before decode can resume.
-                        // Without this, the SSM layers are uninitialized → garbage output.
+                        // Skip checkpoint loading for cross-GPU decode.
+                        // The KV cache restore via STATE_PUT already restores the attention states.
+                        // For hybrid models, the recurrent/SSM state is NOT restored by KV cache restore,
+                        // but loading the checkpoint on P100 takes 50+ seconds (65 MB at 1.3 MB/s).
+                        // This overhead makes P/D split slower than baseline.
+                        // TODO: investigate if checkpoint is actually needed or if KV restore is sufficient.
                         if (!slot->prompt.checkpoints.empty()) {
-                            auto & ckpt = slot->prompt.checkpoints.back();
-                            SLT_INF(*slot, "loading restored checkpoint (pos_min=%d pos_max=%d n_tokens=%" PRId64 " tgt_sz=%zu dft_sz=%zu)\n",
-                                    ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, ckpt.data_tgt.size(), ckpt.data_dft.size());
-                            ckpt.load_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                            if (ctx_dft) {
-                                ckpt.load_dft(ctx_dft.get(), slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                            }
-                            // Clear the checkpoint after loading (one-shot)
+                            SLT_INF(*slot, "skipping checkpoint load for cross-GPU decode (checkpoint size=%zu B)\n",
+                                    slot->prompt.checkpoints.back().data_tgt.size());
                             slot->prompt.checkpoints.clear();
                         }
 
