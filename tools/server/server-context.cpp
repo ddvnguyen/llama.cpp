@@ -6454,45 +6454,34 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     task.hydra_action.id_slot = slot_id;
     task.hydra_action.n_predict = n_predict;
     task.hydra_action.request_json = std::move(json_str);
-    task.hydra_action.stream_fd = -1; // Disabled for now — tokens collected in result and sent as payload
+    // Enable streaming: pass the RPC socket fd so tokens are streamed as generated
+    task.hydra_action.stream_fd = fd;
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
     ctx.queue_tasks->post(std::move(task));
 
+    // Send response header (status OK, no meta) before streaming tokens
+    // The DECODE handler will write tokens directly to fd via stream_fd
+    hydra_write_res(fd, HYDRA_STATUS_OK, 0, 0);
+
+    // Wait for task completion (tokens are streamed during execution)
     std::unordered_set<int> task_ids = {task_id};
-    // Bumped from 60s to 180s. Long autoregressive decode on P100 (28 tok/s) for
-    // 4k+ token outputs can take >120s. Atomic mode (prefill+decode on same card)
-    // for 100k+ token prompts also takes >120s.
     auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 180);
     ctx.queue_results->remove_waiting_task_id(task_id);
     if (!res_ptr) {
-        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        // Timeout — connection already has header sent, just close
         return;
     }
 
     auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
     if (!res || res->rpc_status != HYDRA_STATUS_OK) {
-        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        // Error during decode — header already sent, can't send error header
+        // Just close the connection
         return;
     }
 
-    json meta_j = {
-        {"n_past", res->n_past},
-        {"tokens_generated", (int)res->tokens.size()},
-        {"stop_reason", "complete"}
-    };
-    const std::string meta_str = meta_j.dump();
-
-    // Response: header + meta + payload (generated token bytes)
-    const std::string & payload = res->generated_text;
-    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), payload.size());
-    hydra_send_all(fd, meta_str.data(), meta_str.size());
-    if (!payload.empty()) {
-        hydra_send_all(fd, payload.data(), payload.size());
-    }
-
-    SRV_INF("hydra: DECODE slot=%d generated %d tokens (%zu B payload)\n",
-            slot_id, (int)res->tokens.size(), payload.size());
+    SRV_INF("hydra: DECODE slot=%d generated %d tokens (streamed)\n",
+            slot_id, (int)res->tokens.size());
 }
 
 // SET_EXPERT_MODE (0x37): Read mode string, post task, return success.
