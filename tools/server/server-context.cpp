@@ -3164,6 +3164,22 @@ private:
                         SRV_INF("hydra: DECODE slot=%d n_predict=%d cross-GPU / KV mode\n",
                                 id_slot, n_predict);
 
+                        // Load the checkpoint registered by STATE_PUT (if present).
+                        // For hybrid models (attention + SSM), the checkpoint contains the
+                        // recurrent state that must be loaded before decode can resume.
+                        // Without this, the SSM layers are uninitialized → garbage output.
+                        if (!slot->prompt.checkpoints.empty()) {
+                            auto & ckpt = slot->prompt.checkpoints.back();
+                            SLT_INF(*slot, "loading restored checkpoint (pos_min=%d pos_max=%d n_tokens=%" PRId64 " tgt_sz=%zu dft_sz=%zu)\n",
+                                    ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, ckpt.data_tgt.size(), ckpt.data_dft.size());
+                            ckpt.load_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            if (ctx_dft) {
+                                ckpt.load_dft(ctx_dft.get(), slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            }
+                            // Clear the checkpoint after loading (one-shot)
+                            slot->prompt.checkpoints.clear();
+                        }
+
                         // Append any additional prompt tokens (cross-GPU: none expected)
                         if (!task.hydra_action.prompt_tokens.empty()) {
                             slot->prompt.tokens.insert(task.hydra_action.prompt_tokens);
