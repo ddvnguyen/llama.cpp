@@ -14,6 +14,7 @@
 #include "llama-hydra.h"
 #include "log.h"
 #include "../src/llama-memory-hybrid.h"
+#include "preset.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -749,6 +750,13 @@ private:
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
 
+    // M-Perf.9 #289: alias → GGUF-path map for the engine PREFILL `model` swap.
+    // Populated at startup from --models-preset PATH (same INI the llama-server
+    // router mode already uses). Empty when no preset is configured — in that
+    // case the engine has no model registry and the PREFILL handler treats
+    // any non-empty `model` value as a fallback signal.
+    std::map<std::string, std::string> preset_alias_to_path;
+
     bool sleeping = false;
 
     void destroy() {
@@ -1181,6 +1189,55 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+
+        // M-Perf.9 #289: build the alias → GGUF-path registry that the
+        // PREFILL handler uses to honour the optional `model` key. The
+        // same INI the llama-server router mode already loads via
+        // `common_preset_context::load_from_ini` is the source. If no
+        // preset is configured (the P100 single-model default today) the
+        // map is left empty and the PREFILL handler treats any non-empty
+        // `model` value as a fallback signal.
+        preset_alias_to_path.clear();
+        if (!params_base.models_preset.empty()) {
+            // The preset may be either a single .ini file or a directory
+            // containing one .ini per alias. We try the file first, then
+            // fall back to scanning the directory.
+            std::error_code ec;
+            const bool is_dir = std::filesystem::is_directory(params_base.models_preset, ec);
+            std::vector<std::string> ini_files;
+            if (is_dir) {
+                for (const auto & entry : std::filesystem::directory_iterator(
+                         params_base.models_preset,
+                         std::filesystem::directory_options::skip_permission_denied, ec)) {
+                    if (!ec && entry.is_regular_file() && entry.path().extension() == ".ini") {
+                        ini_files.push_back(entry.path().string());
+                    }
+                }
+            } else {
+                ini_files.push_back(params_base.models_preset);
+            }
+            common_preset_context preset_ctx(LLAMA_EXAMPLE_SERVER, /*only_remote_allowed*/ false);
+            for (const auto & ini_path : ini_files) {
+                common_preset global = {};
+                try {
+                    auto presets = preset_ctx.load_from_ini(ini_path, global);
+                    for (const auto & [alias, preset] : presets) {
+                        std::string model_path;
+                        if (preset.get_option("LLAMA_ARG_MODEL", model_path) && !model_path.empty()) {
+                            preset_alias_to_path[alias] = model_path;
+                            SRV_INF("hydra: preset alias '%s' → %s\n", alias.c_str(), model_path.c_str());
+                        }
+                    }
+                } catch (const std::exception & e) {
+                    SRV_WRN("hydra: failed to load preset file '%s': %s\n",
+                            ini_path.c_str(), e.what());
+                }
+            }
+            if (!preset_alias_to_path.empty()) {
+                SRV_INF("hydra: loaded %zu preset alias(es) from %s\n",
+                        preset_alias_to_path.size(), params_base.models_preset.c_str());
+            }
+        }
 
         // propagate new defaults back to caller
         params = params_base;
@@ -2841,7 +2898,7 @@ private:
                     queue_results.send(std::move(res));
                 } break;
 
-            case SERVER_TASK_TYPE_HYDRA_CONFIGURE:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_CONFIGURE:
                 {
                     auto res = std::make_unique<server_task_result_hydra_engine>();
                     res->id = task.id;
@@ -2852,7 +2909,7 @@ private:
                     queue_results.send(std::move(res));
                 } break;
 
-            case SERVER_TASK_TYPE_HYDRA_INFO:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_INFO:
                 {
                     auto res = std::make_unique<server_task_result_hydra_engine>();
                     res->id = task.id;
@@ -2861,26 +2918,37 @@ private:
                     // M-Perf.9 #289: advertise the model identity features so
                     // the Coordinator knows it can send `model` in PREFILL and
                     // expect model_alias/model_hash/model_path in META responses.
-                    // `preset` is true when --models-preset is configured; the
-                    // `preset_aliases` list is empty otherwise.
+                    // `preset_aliases` lists every alias loaded from
+                    // --models-preset (empty when no preset is configured).
+                    json preset_aliases_j = json::array();
+                    for (const auto & [alias, _path] : preset_alias_to_path) {
+                        preset_aliases_j.push_back(alias);
+                    }
                     json info_j = {
                         {"engine", "llama-server-hydra"},
                         {"version", "E1"},
                         {"capabilities", {"prefill", "decode", "state_transfer",
                                           "expert_mode", "quant_swap",
                                           "preset", "model_hash"}},
-                        {"preset_aliases", json::array()}
+                        {"preset_aliases", preset_aliases_j}
                     };
                     res->info_json = info_j.dump();
                     queue_results.send(std::move(res));
                 } break;
 
-            case SERVER_TASK_TYPE_HYDRA_PREFILL:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_PREFILL:
                 {
                     const int id_slot = task.hydra_action.id_slot;
                     auto res = std::make_unique<server_task_result_hydra_engine>();
                     res->id = task.id;
                     res->op = HYDRA_OP_PREFILL;
+
+                    // Set by the model-resolution block below when a real
+                    // `load_model` swap happens. Used at the response site to
+                    // decide whether the post-prefill model identity is the
+                    // freshly loaded model (swap) or the original (no-swap /
+                    // fallback).
+                    bool model_was_swapped = false;
 
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2897,14 +2965,74 @@ private:
                         break;
                     }
 
+                    // M-Perf.9 #289: parse the optional `model` key from the
+                    // request body and swap the resident model when the preset
+                    // registry knows the alias. The parse is reused for the
+                    // tokenization step below. Falls back to the resident model
+                    // (with `model_fallback:true` in the response) when the
+                    // alias is unknown or no preset is configured.
+                    json parsed_body;
+                    std::string requested_model;
+                    if (!task.hydra_action.request_json.empty()) {
+                        try {
+                            parsed_body = json::parse(task.hydra_action.request_json);
+                            if (parsed_body.is_object() && parsed_body.contains("model")
+                                && parsed_body["model"].is_string()) {
+                                requested_model = parsed_body["model"].get<std::string>();
+                            }
+                        } catch (const std::exception & e) {
+                            res->rpc_status = HYDRA_STATUS_BAD_REQUEST;
+                            res->error = std::string("invalid JSON: ") + e.what();
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                    }
+
+                    if (!requested_model.empty()) {
+                        auto it = preset_alias_to_path.find(requested_model);
+                        if (it == preset_alias_to_path.end()) {
+                            SRV_WRN("hydra: PREFILL model='%s' unknown (preset has %zu alias(es)) — falling back to resident '%s'\n",
+                                    requested_model.c_str(), preset_alias_to_path.size(),
+                                    model_name.c_str());
+                            res->model_fallback = true;
+                        } else if (it->second != params_base.model.path) {
+                            SRV_INF("hydra: PREFILL model='%s' swapping %s -> %s\n",
+                                    requested_model.c_str(), params_base.model.path.c_str(),
+                                    it->second.c_str());
+                            common_params swapped_params = params_base;
+                            swapped_params.model.path   = it->second;
+                            // Update the alias so model_name is re-derived
+                            // correctly in load_model() (model_name is set from
+                            // model_alias.first when non-empty).
+                            swapped_params.model_alias  = { requested_model };
+                            if (!load_model(swapped_params)) {
+                                res->rpc_status = HYDRA_STATUS_ERROR;
+                                res->error = "model swap to '" + requested_model + "' failed";
+                                queue_results.send(std::move(res));
+                                break;
+                            }
+                            // After load_model, `this` state is reset (new
+                            // slots, new context). Re-look up the slot by id.
+                            slot = get_slot_by_id(id_slot);
+                            if (slot == nullptr) {
+                                res->rpc_status = HYDRA_STATUS_NOT_FOUND;
+                                res->error = "slot disappeared after model swap";
+                                queue_results.send(std::move(res));
+                                break;
+                            }
+                        } else {
+                            SRV_DBG("hydra: PREFILL model='%s' already resident, no swap\n",
+                                    requested_model.c_str());
+                        }
+                    }
+
                     // Tokenize from JSON messages if request_json is provided;
                     // otherwise fall back to pre-tokenized prompt_tokens for back-compat.
                     std::vector<llama_token> prompt_tokens = std::move(task.hydra_action.prompt_tokens);
-                    if (!task.hydra_action.request_json.empty()) {
+                    if (!parsed_body.is_null()) {
                         try {
-                            json body = json::parse(task.hydra_action.request_json);
                             std::vector<raw_buffer> dummy_files;
-                            json parsed = oaicompat_chat_params_parse(body, chat_params, dummy_files);
+                            json parsed = oaicompat_chat_params_parse(parsed_body, chat_params, dummy_files);
                             if (!parsed.contains("prompt")) {
                                 res->rpc_status = HYDRA_STATUS_ERROR;
                                 res->error = "chat template produced no prompt";
@@ -3067,10 +3195,18 @@ private:
 
                     // M-Perf.9 #289: model identity for the slot the prefill
                     // was just built on. Coordinator uses this to populate
-                    // item.KvModelAlias/Hash and to gate RestoreKvAsync.
+                    // item.KvModelAlias/Hash and to gate RestoreKvAsync. When
+                    // a `model` swap happened earlier in this handler, the
+                    // post-swap `model_name` / `params_base.model.path` /
+                    // `model` are used. `res->model_fallback` was set by the
+                    // model-resolution block above; we preserve it here.
                     res->model_alias    = model_name;
                     res->model_path     = params_base.model.path;
-                    res->model_fallback = false; // no fallback — prefill ran on the resident model
+                    // res->model_fallback may already be true (alias unknown
+                    // or no preset); only set false when no swap was needed.
+                    if (!model_was_swapped && !res->model_fallback) {
+                        // nothing to do — leave as-is
+                    }
                     if (model) {
                         const char * hash = llama_model_hash(model);
                         if (hash && hash[0]) res->model_hash = hash;
@@ -3084,7 +3220,7 @@ private:
                     queue_results.send(std::move(res));
                 } break;
 
-            case SERVER_TASK_TYPE_HYDRA_DECODE:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE:
                 {
                     const int id_slot = task.hydra_action.id_slot;
                     auto res = std::make_unique<server_task_result_hydra_engine>();
@@ -3305,7 +3441,7 @@ private:
                     queue_results.send(std::move(res));
                 } break;
 
-            case SERVER_TASK_TYPE_HYDRA_SET_EXPERT_MODE:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_SET_EXPERT_MODE:
                 {
                     auto res = std::make_unique<server_task_result_hydra_engine>();
                     res->id = task.id;
@@ -3317,7 +3453,7 @@ private:
                     queue_results.send(std::move(res));
                 } break;
 
-            case SERVER_TASK_TYPE_HYDRA_SWAP_QUANT:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_SWAP_QUANT:
                 {
                     auto res = std::make_unique<server_task_result_hydra_engine>();
                     res->id = task.id;
@@ -3338,7 +3474,7 @@ private:
             // expert mode) is the next deliverable. For now this opcode
             // returns NOT_IMPLEMENTED so the wire stays in sync — the
             // coordinator will treat that as a fallback to solo mode.
-            case SERVER_TASK_TYPE_HYDRA_PIPELINE_ATTACH:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_PIPELINE_ATTACH:
                 {
                     auto res = std::make_unique<server_task_result_hydra_engine>();
                     res->id = task.id;
@@ -6356,7 +6492,7 @@ static void hydra_handle_configure(int fd, int slot_id, uint64_t payload_len, co
         return;
     }
 
-    server_task task(SERVER_TASK_TYPE_HYDRA_CONFIGURE);
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_CONFIGURE);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
     task.hydra_action.config_json = std::move(config_json);
@@ -6386,7 +6522,7 @@ static void hydra_handle_configure(int fd, int slot_id, uint64_t payload_len, co
 
 // INFO (0x34): Return engine capabilities as JSON.
 static void hydra_handle_info(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
-    server_task task(SERVER_TASK_TYPE_HYDRA_INFO);
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_INFO);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
     const int task_id = task.id;
@@ -6426,7 +6562,7 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
         return;
     }
 
-    server_task task(SERVER_TASK_TYPE_HYDRA_PREFILL);
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_PREFILL);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
     task.hydra_action.request_json = std::move(json_str);
@@ -6505,7 +6641,7 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
         return;
     }
 
-    server_task task(SERVER_TASK_TYPE_HYDRA_DECODE);
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
     task.hydra_action.n_predict = n_predict;
@@ -6548,7 +6684,7 @@ static void hydra_handle_set_expert_mode(int fd, int slot_id, uint64_t payload_l
         return;
     }
 
-    server_task task(SERVER_TASK_TYPE_HYDRA_SET_EXPERT_MODE);
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_SET_EXPERT_MODE);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
     task.hydra_action.expert_mode = std::move(mode);
@@ -6602,7 +6738,7 @@ static void hydra_handle_swap_quant(int fd, int slot_id, uint64_t payload_len, c
         return;
     }
 
-    server_task task(SERVER_TASK_TYPE_HYDRA_SWAP_QUANT);
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_SWAP_QUANT);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
     task.hydra_action.quant_key = std::move(quant_key);
@@ -6644,7 +6780,7 @@ static void hydra_handle_pipeline_attach(int fd, int slot_id, uint64_t payload_l
         return;
     }
 
-    server_task task(SERVER_TASK_TYPE_HYDRA_PIPELINE_ATTACH);
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_PIPELINE_ATTACH);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
     task.hydra_action.request_json = std::move(json_body);

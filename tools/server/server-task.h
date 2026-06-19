@@ -32,13 +32,20 @@ enum server_task_type {
     SERVER_TASK_TYPE_HYDRA_STATE_GET,   // 0x30 — serialize slot KV state → result buffer
     SERVER_TASK_TYPE_HYDRA_STATE_PUT,   // 0x31 — restore slot KV state ← task buffer
     SERVER_TASK_TYPE_HYDRA_STATE_META,  // 0x32 — slot metadata only (lightweight)
-    // Hydra engine control tasks (E1):
-    SERVER_TASK_TYPE_HYDRA_CONFIGURE,   // 0x33 — set engine params
-    SERVER_TASK_TYPE_HYDRA_INFO,        // 0x34 — report capabilities
-    SERVER_TASK_TYPE_HYDRA_PREFILL,     // 0x35 — run prefill only, return n_past
-    SERVER_TASK_TYPE_HYDRA_DECODE,      // 0x36 — run decode with streaming
-    SERVER_TASK_TYPE_HYDRA_SET_EXPERT_MODE, // 0x37 — switch solo/combined
-    SERVER_TASK_TYPE_HYDRA_SWAP_QUANT,  // 0x38 — swap expert quantization
+    // 0x33-0x3F reserved (collision zone — the live C# OpCode.GetManifest
+    // uses 0x33; no Hydra task types may be assigned here).
+    // 0x40-0x46: Hydra engine control plane.
+    // The original 0x33-0x38 (CONFIGURE..SWAP_QUANT) WIP collided with the
+    // C# GetManifest opcode and was re-numbered to 0x40-0x46 in M-Perf.9
+    // (#289). PIPELINE_ATTACH (#287, two-engine routing) was assigned the
+    // next free slot 0x46 to round out the engine opcodes.
+    SERVER_TASK_TYPE_HYDRA_ENGINE_CONFIGURE,       // 0x40 — set engine params
+    SERVER_TASK_TYPE_HYDRA_ENGINE_INFO,            // 0x41 — report capabilities
+    SERVER_TASK_TYPE_HYDRA_ENGINE_PREFILL,         // 0x42 — run prefill only, return n_past
+    SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE,          // 0x43 — run decode with streaming
+    SERVER_TASK_TYPE_HYDRA_ENGINE_SET_EXPERT_MODE, // 0x44 — switch solo/combined
+    SERVER_TASK_TYPE_HYDRA_ENGINE_SWAP_QUANT,      // 0x45 — swap expert quantization
+    SERVER_TASK_TYPE_HYDRA_ENGINE_PIPELINE_ATTACH,  // 0x46 — attach to peer engine (issue #287)
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
