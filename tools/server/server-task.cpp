@@ -2047,6 +2047,9 @@ json server_task_result_hydra_engine::to_json() {
     if (op == 0x40 || op == 0x44 || op == 0x45 || op == 0x46) { // CONFIGURE/SET_EXPERT_MODE/SWAP_QUANT/PIPELINE_ATTACH
         j["success"] = success;
     }
+    if (op == 0x44 && !expert_mode_applied.empty()) { // SET_EXPERT_MODE
+        j["mode"] = expert_mode_applied;
+    }
     return j;
 }
 

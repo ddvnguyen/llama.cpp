@@ -500,12 +500,24 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // Hydra #287/#260 — COMBINED mode: route the routed-expert matmuls through the
+    // dual-resident copies on the peer engine's ggml-RPC backend when active. Falls
+    // back to the local tensors when COMBINED isn't active or the peer copies were
+    // never loaded (e.g. peer was unreachable at startup) — SOLO always works.
+    const bool use_combined =
+        cparams.hydra_expert_mode == 1 &&
+        model.layers[il].ffn_gate_exps_rpc != nullptr;
+
+    ggml_tensor * up_exps   = use_combined ? model.layers[il].ffn_up_exps_rpc   : model.layers[il].ffn_up_exps;
+    ggml_tensor * gate_exps = use_combined ? model.layers[il].ffn_gate_exps_rpc : model.layers[il].ffn_gate_exps;
+    ggml_tensor * down_exps = use_combined ? model.layers[il].ffn_down_exps_rpc : model.layers[il].ffn_down_exps;
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
+            up_exps,
+            gate_exps,
+            down_exps,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,

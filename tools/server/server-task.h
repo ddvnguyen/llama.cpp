@@ -716,6 +716,12 @@ struct server_task_result_hydra_engine : server_task_result {
     // CONFIGURE/SET_EXPERT_MODE/SWAP_QUANT: success flag
     bool     success   = false;
 
+    // SET_EXPERT_MODE: the ACTUAL mode now in effect ("solo" or "combined") —
+    // may differ from the requested mode when COMBINED was requested but the
+    // engine isn't combined-capable (issue #287/#260), letting the Coordinator
+    // detect the fallback via ReportsSolo().
+    std::string expert_mode_applied;
+
     std::string error; // human-readable, non-empty on failure
 
     virtual json to_json() override;

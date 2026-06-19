@@ -703,6 +703,10 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
+void llama_context::hydra_set_expert_mode(int mode) {
+    cparams.hydra_expert_mode = mode;
+}
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }

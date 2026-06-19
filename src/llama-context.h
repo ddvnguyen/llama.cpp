@@ -114,6 +114,9 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // Hydra #287/#260 setter (accessed by llama-hydra.h API)
+    void hydra_set_expert_mode(int mode);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
