@@ -2506,8 +2506,8 @@ private:
                     // the duration of the response.
                     res->model_alias = model_name;
                     res->model_path  = params_base.model.path;
-                    if (model) {
-                        const char * hash = llama_model_hash(model);
+                    if (model_tgt) {
+                        const char * hash = llama_model_hash(model_tgt);
                         if (hash && hash[0]) res->model_hash = hash;
                     }
                     SRV_INF("hydra: STATE_GET slot=%d n_past=%d state=%.1f MiB — async\n",
@@ -2890,8 +2890,8 @@ private:
                     // KV cache must never have it decoded by a Balanced-loaded model.
                     res->model_alias = model_name;
                     res->model_path  = params_base.model.path;
-                    if (model) {
-                        const char * hash = llama_model_hash(model);
+                    if (model_tgt) {
+                        const char * hash = llama_model_hash(model_tgt);
                         if (hash && hash[0]) res->model_hash = hash;
                     }
                     res->rpc_status    = HYDRA_STATUS_OK;
@@ -3207,8 +3207,8 @@ private:
                     if (!model_was_swapped && !res->model_fallback) {
                         // nothing to do — leave as-is
                     }
-                    if (model) {
-                        const char * hash = llama_model_hash(model);
+                    if (model_tgt) {
+                        const char * hash = llama_model_hash(model_tgt);
                         if (hash && hash[0]) res->model_hash = hash;
                     }
 
