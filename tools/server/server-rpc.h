@@ -25,12 +25,15 @@ static constexpr uint8_t  HYDRA_OP_PREFILL      = 0x42; // run prefill only, ret
 static constexpr uint8_t  HYDRA_OP_DECODE       = 0x43; // run decode with streaming
 static constexpr uint8_t  HYDRA_OP_SET_EXPERT_MODE = 0x44; // switch solo/combined
 static constexpr uint8_t  HYDRA_OP_SWAP_QUANT   = 0x45; // swap expert quantization
+static constexpr uint8_t  HYDRA_OP_PIPELINE_ATTACH = 0x46; // two-engine "work together"
 
 // ── Status codes (shared with full Hydra spec) ────────────────────────────────
-static constexpr uint8_t  HYDRA_STATUS_OK        = 0x00;
-static constexpr uint8_t  HYDRA_STATUS_NOT_FOUND = 0x01;
-static constexpr uint8_t  HYDRA_STATUS_ERROR     = 0x02;
-static constexpr uint8_t  HYDRA_STATUS_BUSY      = 0x04;
+static constexpr uint8_t  HYDRA_STATUS_OK               = 0x00;
+static constexpr uint8_t  HYDRA_STATUS_NOT_FOUND        = 0x01;
+static constexpr uint8_t  HYDRA_STATUS_ERROR            = 0x02;
+static constexpr uint8_t  HYDRA_STATUS_BUSY             = 0x04;
+static constexpr uint8_t  HYDRA_STATUS_NOT_IMPLEMENTED   = 0x06; // M-Perf.9 #289: stubbed engine opcodes
+static constexpr uint8_t  HYDRA_STATUS_BAD_REQUEST      = 0x05;
 
 // ── Safety cap (4 GB) ─────────────────────────────────────────────────────────
 static constexpr uint64_t HYDRA_MAX_STATE_BYTES  = 4ULL * 1024 * 1024 * 1024;

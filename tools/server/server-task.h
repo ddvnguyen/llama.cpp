@@ -32,13 +32,20 @@ enum server_task_type {
     SERVER_TASK_TYPE_HYDRA_STATE_GET,   // 0x30 — serialize slot KV state → result buffer
     SERVER_TASK_TYPE_HYDRA_STATE_PUT,   // 0x31 — restore slot KV state ← task buffer
     SERVER_TASK_TYPE_HYDRA_STATE_META,  // 0x32 — slot metadata only (lightweight)
-    // Hydra engine control tasks (E1):
-    SERVER_TASK_TYPE_HYDRA_CONFIGURE,   // 0x33 — set engine params
-    SERVER_TASK_TYPE_HYDRA_INFO,        // 0x34 — report capabilities
-    SERVER_TASK_TYPE_HYDRA_PREFILL,     // 0x35 — run prefill only, return n_past
-    SERVER_TASK_TYPE_HYDRA_DECODE,      // 0x36 — run decode with streaming
-    SERVER_TASK_TYPE_HYDRA_SET_EXPERT_MODE, // 0x37 — switch solo/combined
-    SERVER_TASK_TYPE_HYDRA_SWAP_QUANT,  // 0x38 — swap expert quantization
+    // 0x33-0x3F reserved (collision zone — the live C# OpCode.GetManifest
+    // uses 0x33; no Hydra task types may be assigned here).
+    // 0x40-0x46: Hydra engine control plane.
+    // The original 0x33-0x38 (CONFIGURE..SWAP_QUANT) WIP collided with the
+    // C# GetManifest opcode and was re-numbered to 0x40-0x46 in M-Perf.9
+    // (#289). PIPELINE_ATTACH (#287, two-engine routing) was assigned the
+    // next free slot 0x46 to round out the engine opcodes.
+    SERVER_TASK_TYPE_HYDRA_ENGINE_CONFIGURE,       // 0x40 — set engine params
+    SERVER_TASK_TYPE_HYDRA_ENGINE_INFO,            // 0x41 — report capabilities
+    SERVER_TASK_TYPE_HYDRA_ENGINE_PREFILL,         // 0x42 — run prefill only, return n_past
+    SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE,          // 0x43 — run decode with streaming
+    SERVER_TASK_TYPE_HYDRA_ENGINE_SET_EXPERT_MODE, // 0x44 — switch solo/combined
+    SERVER_TASK_TYPE_HYDRA_ENGINE_SWAP_QUANT,      // 0x45 — swap expert quantization
+    SERVER_TASK_TYPE_HYDRA_ENGINE_PIPELINE_ATTACH,  // 0x46 — attach to peer engine (issue #287)
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -651,13 +658,24 @@ struct server_task_result_hydra_state : server_task_result {
     bool     is_transferring = false;       // true while M1/M2 background send is active
     uint64_t state_size      = 0;
 
+    // M-Perf.9 #289: model identity for the slot. Populated from impl->model_name
+    // (the alias the model is loaded under; "?" / first alias / filename) and
+    // impl->params_base.model.path (the GGUF file the model was loaded from).
+    // model_hash is the 64-char hex SHA-256 of that GGUF file, computed once
+    // at model-load time and exposed via llama_model_hash(). The Coordinator
+    // uses this for cross-model KV safety: a restore is rejected if the
+    // stored KV's model_hash does not match the slot's model_hash.
+    std::string model_alias;                // e.g. "balanced"
+    std::string model_hash;                 // 64-char hex SHA-256 of the GGUF
+    std::string model_path;                 // absolute path to the GGUF
+
     std::string error; // human-readable, non-empty on failure
 
     // is_stop() inherits true (single result, not a stream)
     virtual json to_json() override;
 };
 
-// Result for SERVER_TASK_TYPE_HYDRA_CONFIGURE/INFO/PREFILL/DECODE/SET_EXPERT_MODE/SWAP_QUANT (E1).
+// Result for SERVER_TASK_TYPE_HYDRA_CONFIGURE/INFO/PREFILL/DECODE/SET_EXPERT_MODE/SWAP_QUANT/PIPELINE_ATTACH (E1).
 struct server_task_result_hydra_engine : server_task_result {
     uint8_t op         = 0;                 // HYDRA_OP_*
     uint8_t rpc_status = 0x02 /*ERROR*/;    // set by inference thread
@@ -671,6 +689,19 @@ struct server_task_result_hydra_engine : server_task_result {
     std::vector<uint8_t> state_data;
     uint64_t             state_size  = 0; // raw KV bytes only (from llama_state_seq_get_size)
     uint64_t             logits_size = 0; // appended logits bytes (n_vocab * sizeof(float))
+
+    // M-Perf.9 #289: model identity for the slot the prefill was built on.
+    // model_alias: the alias (or filename if no aliases) the engine reports.
+    // model_hash:  64-char hex SHA-256 of the GGUF (or "" if not available).
+    // model_path:  absolute path to the GGUF.
+    // model_fallback: true when the request asked for a `model` the engine
+    //   could not resolve (no preset match / no preset configured) and the
+    //   engine used the resident model. The Coordinator surfaces this in
+    //   Loki and Prometheus but does not error.
+    std::string model_alias;
+    std::string model_hash;
+    std::string model_path;
+    bool        model_fallback = false;
 
     // DECODE: generated tokens (IDs)
     std::vector<llama_token> tokens;

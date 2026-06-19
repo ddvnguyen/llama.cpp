@@ -592,6 +592,13 @@ struct llama_model {
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
+    // M-Perf.9 (#289): SHA-256 of the GGUF file the model was loaded from, as
+    // a 64-character lowercase hex string. Empty when the model was not loaded
+    // from a file or hashing failed. Computed once in llama_model_load_from_file
+    // after the model is fully constructed; the value is then stable for the
+    // lifetime of the llama_model object.
+    std::string hash_hex;
+
     explicit llama_model(const llama_model_params & params);
     virtual ~llama_model();
 

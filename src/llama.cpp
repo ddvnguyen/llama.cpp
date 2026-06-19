@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "llama-hash.h"
 
 #include "llama-impl.h"
 
@@ -399,6 +400,18 @@ static struct llama_model * llama_model_load_from_file_impl(
             llama_model_free(model);
         }
         return nullptr;
+    }
+
+    // M-Perf.9 (#289): compute SHA-256 of the GGUF file. ~1-2s for a 25 GB
+    // file on NVMe; paid once at model load. Stored on llama_model.hash_hex
+    // and surfaced via llama_model_hash() for the slot META response.
+    if (model && !path_model.empty()) {
+        char hash_buf[65] = {0};
+        if (llama_hash_file_sha256(path_model.c_str(), hash_buf, sizeof(hash_buf)) == 64) {
+            model->hash_hex = hash_buf;
+        } else {
+            LLAMA_LOG_WARN("%s: failed to hash model file %s\n", __func__, path_model.c_str());
+        }
     }
 
     return model;

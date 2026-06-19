@@ -611,6 +611,15 @@ extern "C" {
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 
+    // M-Perf.9 (#289): SHA-256 of the GGUF file the model was loaded from, as
+    // a 64-character lowercase hex string. Returns an empty string when the
+    // model was not loaded from a file (e.g. custom loader) or hashing failed.
+    // The hash is computed once during llama_model_load_from_file and cached on
+    // the llama_model struct; this function returns a pointer to that cached
+    // buffer (stable for the model's lifetime). The pointer is empty-string
+    // when the hash was never computed.
+    LLAMA_API const char * llama_model_hash(const struct llama_model * model);
+
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
 
