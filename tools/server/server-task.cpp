@@ -2008,6 +2008,13 @@ json server_task_result_hydra_state::to_json() {
         j["is_processing"]   = is_processing;
         j["is_transferring"] = is_transferring; // true while M1/M2 async GET is active
     }
+    // M-Perf.9 #289: model identity is returned for every op (it answers
+    // "what model built the KV in this slot?"). Empty strings mean the
+    // server did not populate them (pre-feature build / single-model
+    // server without aliases / hash not yet computed).
+    if (!model_alias.empty()) j["model_alias"] = model_alias;
+    if (!model_hash.empty())  j["model_hash"]  = model_hash;
+    if (!model_path.empty())  j["model_path"]  = model_path;
     return j;
 }
 
@@ -2025,12 +2032,19 @@ json server_task_result_hydra_engine::to_json() {
     }
     if (op == 0x42) { // PREFILL
         j["n_past"] = n_past;
+        // M-Perf.9 #289: model identity of the slot the prefill was built on.
+        // Coordinator uses this to populate item.KvModelAlias/Hash and to
+        // gate RestoreKvAsync against cross-model restores.
+        if (!model_alias.empty()) j["model_alias"] = model_alias;
+        if (!model_hash.empty())  j["model_hash"]  = model_hash;
+        if (!model_path.empty())  j["model_path"]  = model_path;
+        j["model_fallback"] = model_fallback;
     }
     if (op == 0x43) { // DECODE
         j["tokens"]   = tokens;
         j["logprobs"] = logprobs;
     }
-    if (op == 0x40 || op == 0x44 || op == 0x45) { // CONFIGURE/SET_EXPERT_MODE/SWAP_QUANT
+    if (op == 0x40 || op == 0x44 || op == 0x45 || op == 0x46) { // CONFIGURE/SET_EXPERT_MODE/SWAP_QUANT/PIPELINE_ATTACH
         j["success"] = success;
     }
     return j;

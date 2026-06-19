@@ -2529,6 +2529,16 @@ uint64_t llama_model_n_params(const llama_model * model) {
     return model->n_elements();
 }
 
+// M-Perf.9 (#289): return the cached SHA-256 hash of the GGUF file the
+// model was loaded from. The hash is computed once in
+// llama_model_load_from_file_impl after the model is fully constructed;
+// this accessor just returns the cached buffer. Returns "" when the
+// model was not loaded from a file or hashing failed.
+const char * llama_model_hash(const llama_model * model) {
+    if (!model) return "";
+    return model->hash_hex.c_str();
+}
+
 bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
         case LLM_ARCH_T5:        return true;

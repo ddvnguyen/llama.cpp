@@ -2441,6 +2441,18 @@ private:
                     }
                     res->n_past     = actual_n_past;
                     res->rpc_status = HYDRA_STATUS_OK;
+                    // M-Perf.9 #289: surface model identity alongside the state
+                    // bytes so the Coordinator can record the model that built
+                    // the KV (for cross-model safety on restore). The background
+                    // thread that streams the bytes to the socket can mutate
+                    // res->state_data freely; the model fields are immutable for
+                    // the duration of the response.
+                    res->model_alias = model_name;
+                    res->model_path  = params_base.model.path;
+                    if (model) {
+                        const char * hash = llama_model_hash(model);
+                        if (hash && hash[0]) res->model_hash = hash;
+                    }
                     SRV_INF("hydra: STATE_GET slot=%d n_past=%d state=%.1f MiB — async\n",
                             id_slot, res->n_past, state_size / (1024.0 * 1024.0));
 
@@ -2816,6 +2828,15 @@ private:
                     res->is_processing   = slot->is_processing();
                     res->is_transferring = slot->hydra_transferring->load();
                     res->state_size    = (uint64_t)llama_state_seq_get_size(ctx_tgt, slot->id);
+                    // M-Perf.9 #289: surface model identity. The Coordinator uses
+                    // these to detect cross-model restores — a slot holding a Mini
+                    // KV cache must never have it decoded by a Balanced-loaded model.
+                    res->model_alias = model_name;
+                    res->model_path  = params_base.model.path;
+                    if (model) {
+                        const char * hash = llama_model_hash(model);
+                        if (hash && hash[0]) res->model_hash = hash;
+                    }
                     res->rpc_status    = HYDRA_STATUS_OK;
                     queue_results.send(std::move(res));
                 } break;
@@ -2837,10 +2858,18 @@ private:
                     res->id = task.id;
                     res->op = HYDRA_OP_INFO;
                     res->rpc_status = HYDRA_STATUS_OK;
+                    // M-Perf.9 #289: advertise the model identity features so
+                    // the Coordinator knows it can send `model` in PREFILL and
+                    // expect model_alias/model_hash/model_path in META responses.
+                    // `preset` is true when --models-preset is configured; the
+                    // `preset_aliases` list is empty otherwise.
                     json info_j = {
-                        {"engine", "llama-engine"},
+                        {"engine", "llama-server-hydra"},
                         {"version", "E1"},
-                        {"capabilities", {"prefill", "decode", "state_transfer", "expert_mode", "quant_swap"}}
+                        {"capabilities", {"prefill", "decode", "state_transfer",
+                                          "expert_mode", "quant_swap",
+                                          "preset", "model_hash"}},
+                        {"preset_aliases", json::array()}
                     };
                     res->info_json = info_j.dump();
                     queue_results.send(std::move(res));
@@ -3035,6 +3064,17 @@ private:
 
                     SRV_INF("hydra: PREFILL slot=%d done n_past=%d kv=%zu logits=%" PRIu64 "B total=%zu\n",
                             id_slot, n_tokens, state_size, logits_size, v2_blob.size());
+
+                    // M-Perf.9 #289: model identity for the slot the prefill
+                    // was just built on. Coordinator uses this to populate
+                    // item.KvModelAlias/Hash and to gate RestoreKvAsync.
+                    res->model_alias    = model_name;
+                    res->model_path     = params_base.model.path;
+                    res->model_fallback = false; // no fallback — prefill ran on the resident model
+                    if (model) {
+                        const char * hash = llama_model_hash(model);
+                        if (hash && hash[0]) res->model_hash = hash;
+                    }
 
                     res->rpc_status  = HYDRA_STATUS_OK;
                     res->n_past      = n_tokens;
@@ -3287,6 +3327,26 @@ private:
                     SRV_INF("hydra: SWAP_QUANT quant='%s' pattern='%s' (slot %d)\n",
                             task.hydra_action.quant_key.c_str(),
                             task.hydra_action.tensor_pattern.c_str(),
+                            task.hydra_action.id_slot);
+                    queue_results.send(std::move(res));
+                } break;
+
+            // M-Perf.9 (#289) / issue #287: PIPELINE_ATTACH is part of the
+            // two-engine "work together" routing tracked in #287. The
+            // coordinator wires the request; the engine-side scaffolding
+            // (--override-tensor local-load, activation passing, COMBINED
+            // expert mode) is the next deliverable. For now this opcode
+            // returns NOT_IMPLEMENTED so the wire stays in sync — the
+            // coordinator will treat that as a fallback to solo mode.
+            case SERVER_TASK_TYPE_HYDRA_PIPELINE_ATTACH:
+                {
+                    auto res = std::make_unique<server_task_result_hydra_engine>();
+                    res->id = task.id;
+                    res->op = HYDRA_OP_PIPELINE_ATTACH;
+                    res->rpc_status = HYDRA_STATUS_NOT_IMPLEMENTED;
+                    res->success = false;
+                    res->error = "HYDRA_OP_PIPELINE_ATTACH not yet implemented in this build (see issue #287)";
+                    SRV_WRN("hydra: PIPELINE_ATTACH received (slot %d) — stubbed, issue #287\n",
                             task.hydra_action.id_slot);
                     queue_results.send(std::move(res));
                 } break;
@@ -6571,6 +6631,49 @@ static void hydra_handle_swap_quant(int fd, int slot_id, uint64_t payload_len, c
     hydra_send_all(fd, meta_str.data(), meta_str.size());
 }
 
+// PIPELINE_ATTACH (0x46): M-Perf.9 (#289) / issue #287 — two-engine "work
+// together" routing scaffolding. The C# Coordinator sends the peer address
+// and the --override-tensor regex; the engine should load the assigned
+// tensor slice from its OWN local model (no weight transfer). This opcode
+// is stubbed for now (returns NOT_IMPLEMENTED) — full implementation is
+// tracked under issue #287.
+static void hydra_handle_pipeline_attach(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    std::string json_body(payload_len, '\0');
+    if (payload_len > 0 && !hydra_recv_all(fd, json_body.data(), payload_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_PIPELINE_ATTACH);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.request_json = std::move(json_body);
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    // Stubbed: server returns NOT_IMPLEMENTED until issue #287 lands.
+    // Propagate that status to the client so the Coordinator can
+    // distinguish "not yet built" from a real error and fall back to solo.
+    const uint8_t status = (res && res->rpc_status == HYDRA_STATUS_NOT_IMPLEMENTED)
+        ? HYDRA_STATUS_NOT_IMPLEMENTED : HYDRA_STATUS_ERROR;
+    json meta_j;
+    if (res && !res->error.empty()) meta_j["error"] = res->error;
+    meta_j["success"] = res && res->success;
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, status, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
 // ── Per-connection loop ───────────────────────────────────────────────────────
 // Persistent: one TCP connection handles many sequential requests.
 
@@ -6655,6 +6758,13 @@ static void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx) {
                 SRV_DBG("hydra rpc: SWAP_QUANT slot=%d payload=%" PRIu64 " trace=%s\n",
                         slot_id, payload_len, trace_id.c_str());
                 hydra_handle_swap_quant(fd, slot_id, payload_len, ctx);
+                break;
+            // M-Perf.9 (#289) / issue #287: PIPELINE_ATTACH (0x46) is the
+            // two-engine "work together" attach. Stubbed: full impl in #287.
+            case HYDRA_OP_PIPELINE_ATTACH:
+                SRV_DBG("hydra rpc: PIPELINE_ATTACH slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_pipeline_attach(fd, slot_id, payload_len, ctx);
                 break;
             default:
                 SRV_WRN("hydra rpc: unknown op 0x%02x — ignoring\n", (unsigned)op);

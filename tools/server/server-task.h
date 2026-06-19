@@ -651,13 +651,24 @@ struct server_task_result_hydra_state : server_task_result {
     bool     is_transferring = false;       // true while M1/M2 background send is active
     uint64_t state_size      = 0;
 
+    // M-Perf.9 #289: model identity for the slot. Populated from impl->model_name
+    // (the alias the model is loaded under; "?" / first alias / filename) and
+    // impl->params_base.model.path (the GGUF file the model was loaded from).
+    // model_hash is the 64-char hex SHA-256 of that GGUF file, computed once
+    // at model-load time and exposed via llama_model_hash(). The Coordinator
+    // uses this for cross-model KV safety: a restore is rejected if the
+    // stored KV's model_hash does not match the slot's model_hash.
+    std::string model_alias;                // e.g. "balanced"
+    std::string model_hash;                 // 64-char hex SHA-256 of the GGUF
+    std::string model_path;                 // absolute path to the GGUF
+
     std::string error; // human-readable, non-empty on failure
 
     // is_stop() inherits true (single result, not a stream)
     virtual json to_json() override;
 };
 
-// Result for SERVER_TASK_TYPE_HYDRA_CONFIGURE/INFO/PREFILL/DECODE/SET_EXPERT_MODE/SWAP_QUANT (E1).
+// Result for SERVER_TASK_TYPE_HYDRA_CONFIGURE/INFO/PREFILL/DECODE/SET_EXPERT_MODE/SWAP_QUANT/PIPELINE_ATTACH (E1).
 struct server_task_result_hydra_engine : server_task_result {
     uint8_t op         = 0;                 // HYDRA_OP_*
     uint8_t rpc_status = 0x02 /*ERROR*/;    // set by inference thread
@@ -671,6 +682,19 @@ struct server_task_result_hydra_engine : server_task_result {
     std::vector<uint8_t> state_data;
     uint64_t             state_size  = 0; // raw KV bytes only (from llama_state_seq_get_size)
     uint64_t             logits_size = 0; // appended logits bytes (n_vocab * sizeof(float))
+
+    // M-Perf.9 #289: model identity for the slot the prefill was built on.
+    // model_alias: the alias (or filename if no aliases) the engine reports.
+    // model_hash:  64-char hex SHA-256 of the GGUF (or "" if not available).
+    // model_path:  absolute path to the GGUF.
+    // model_fallback: true when the request asked for a `model` the engine
+    //   could not resolve (no preset match / no preset configured) and the
+    //   engine used the resident model. The Coordinator surfaces this in
+    //   Loki and Prometheus but does not error.
+    std::string model_alias;
+    std::string model_hash;
+    std::string model_path;
+    bool        model_fallback = false;
 
     // DECODE: generated tokens (IDs)
     std::vector<llama_token> tokens;

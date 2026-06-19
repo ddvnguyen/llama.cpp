@@ -19,6 +19,8 @@ add_library(llama
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp
+            llama-hash.cpp
+            llama-hash.h
             llama-hparams.cpp
             llama-hydra.cpp
             llama-impl.cpp
