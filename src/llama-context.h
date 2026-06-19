@@ -16,6 +16,9 @@
 struct llama_model;
 class llama_batch_allocr;
 
+// Hydra #287/#260 — Approach A: function pointer type for the post-graph-build placement hook.
+using llama_hydra_graph_hook_fn = void (*)(ggml_backend_sched_t, struct ggml_cgraph *, void *);
+
 class llama_io_read_i;
 class llama_io_write_i;
 
@@ -113,6 +116,10 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+
+    // Hydra #287/#260 setters (accessed by llama-hydra.h API)
+    void hydra_set_placement_hook(llama_hydra_graph_hook_fn fn, void * user_data);
+    void hydra_set_expert_mode(int mode);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -329,6 +336,10 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // Hydra #287/#260 — Approach A
+    llama_hydra_graph_hook_fn hydra_placement_hook      = nullptr;
+    void *                    hydra_placement_hook_user = nullptr;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

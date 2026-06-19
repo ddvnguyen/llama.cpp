@@ -683,8 +683,9 @@ struct llm_graph_params {
         }
 
         return
-            cparams.embeddings  == other.cparams.embeddings  &&
-            cparams.causal_attn == other.cparams.causal_attn &&
+            cparams.embeddings         == other.cparams.embeddings         &&
+            cparams.causal_attn        == other.cparams.causal_attn        &&
+            cparams.hydra_expert_mode  == other.cparams.hydra_expert_mode  &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

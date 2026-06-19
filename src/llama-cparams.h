@@ -49,4 +49,9 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    // Hydra #287/#260: per-request expert placement mode.
+    // 0 = SOLO (local GPU only), 1 = COMBINED (expert matmuls redirected to a peer
+    // engine's ggml-RPC backend via the placement hook in llama_context::process_ubatch).
+    int hydra_expert_mode = 0;
 };
