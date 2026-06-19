@@ -311,6 +311,16 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
 
+    // Hydra #287/#260 — COMBINED mode: dual-resident copies of the routed-expert
+    // tensors, allocated on a peer engine's ggml-RPC backend (see
+    // llama_hydra_load_combined_experts). Non-null only when COMBINED was
+    // successfully bootstrapped at engine startup. build_layer_ffn() selects
+    // between these and the normal local ffn_*_exps tensors based on
+    // cparams.hydra_expert_mode, so SOLO always has a local copy to fall back to.
+    struct ggml_tensor * ffn_gate_exps_rpc = nullptr;
+    struct ggml_tensor * ffn_down_exps_rpc = nullptr;
+    struct ggml_tensor * ffn_up_exps_rpc   = nullptr;
+
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
     struct ggml_tensor * ffn_latent_up   = nullptr;

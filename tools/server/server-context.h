@@ -89,6 +89,16 @@ struct server_context {
     // Thread safety: slots must be idle (is_processing() == false) when ops run.
     // TODO(M1): route through task queue for full thread safety under load.
     void start_rpc_server(int port);
+
+    // Hydra #287/#260: record this engine's one-binary role + (for head) the
+    // configured peer/tensor-pattern, so ENGINE_INFO (0x41) can report them.
+    void set_hydra_role(const std::string & role, const std::string & peer, const std::string & combined_pattern);
+
+    // Hydra #287/#260: record whether COMBINED expert dual-loading succeeded
+    // at startup. Must be called (if at all) after load_model() and before
+    // serving requests. SET_EXPERT_MODE("combined") falls back to solo when
+    // this is false (peer was unreachable or had no matching expert tensors).
+    void set_hydra_combined_capable(bool capable);
 };
 
 

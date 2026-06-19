@@ -703,11 +703,6 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
-void llama_context::hydra_set_placement_hook(llama_hydra_graph_hook_fn fn, void * user_data) {
-    hydra_placement_hook      = fn;
-    hydra_placement_hook_user = user_data;
-}
-
 void llama_context::hydra_set_expert_mode(int mode) {
     cparams.hydra_expert_mode = mode;
 }
@@ -1304,13 +1299,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
-        }
-
-        // Hydra #287/#260 — Approach A: let caller redirect expert matmuls to a
-        // different backend (e.g. a peer engine's ggml-RPC device) before the graph
-        // allocator assigns buffers.
-        if (hydra_placement_hook) {
-            hydra_placement_hook(sched.get(), gf, hydra_placement_hook_user);
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {

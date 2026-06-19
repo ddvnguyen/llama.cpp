@@ -679,6 +679,17 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
+    // Hydra #287/#260: this engine's one-binary role + (for head) the
+    // configured peer/tensor-pattern — surfaced via ENGINE_INFO (0x41).
+    std::string hydra_role = "standalone";
+    std::string hydra_peer;
+    std::string hydra_combined_pattern;
+
+    // True once llama_hydra_load_combined_experts() has successfully
+    // dual-loaded expert tensors onto a peer. Gates whether
+    // SET_EXPERT_MODE("combined") is honored or falls back to solo.
+    bool hydra_combined_capable = false;
+
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
@@ -2924,13 +2935,25 @@ private:
                     for (const auto & [alias, _path] : preset_alias_to_path) {
                         preset_aliases_j.push_back(alias);
                     }
+                    // Hydra #287/#260: two-engine "work together" status — see
+                    // specs/rpc-protocol.md's ENGINE_INFO (0x41) contract.
+                    // pipeline_capable stays false until #287's PIPELINE half
+                    // lands; mode only ever reports solo/combined until then.
+                    const int32_t expert_mode = ctx_tgt ? llama_hydra_get_expert_mode(ctx_tgt) : 0;
                     json info_j = {
                         {"engine", "llama-server-hydra"},
                         {"version", "E1"},
                         {"capabilities", {"prefill", "decode", "state_transfer",
                                           "expert_mode", "quant_swap",
                                           "preset", "model_hash"}},
-                        {"preset_aliases", preset_aliases_j}
+                        {"preset_aliases", preset_aliases_j},
+                        {"role",             hydra_role},
+                        {"mode",             expert_mode == 1 ? "combined" : "solo"},
+                        {"peer_connected",   hydra_combined_capable},
+                        {"peer_addr",        hydra_peer},
+                        {"layer_split",      hydra_combined_pattern},
+                        {"combined_capable", hydra_combined_capable},
+                        {"pipeline_capable", false}
                     };
                     res->info_json = info_j.dump();
                     queue_results.send(std::move(res));
@@ -3446,10 +3469,30 @@ private:
                     auto res = std::make_unique<server_task_result_hydra_engine>();
                     res->id = task.id;
                     res->op = HYDRA_OP_SET_EXPERT_MODE;
+
+                    const std::string & requested = task.hydra_action.expert_mode;
+                    if (requested != "solo" && requested != "combined") {
+                        res->rpc_status = HYDRA_STATUS_ERROR;
+                        res->success = false;
+                        res->error = "expert_mode must be 'solo' or 'combined'";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // Hydra #287/#260: only honor "combined" when this engine
+                    // successfully dual-loaded expert tensors onto a peer at
+                    // startup (set_hydra_combined_capable) — otherwise fall
+                    // back to solo so the Coordinator can detect it via
+                    // ReportsSolo() and never block a request on a half-built
+                    // COMBINED path.
+                    const bool want_combined = requested == "combined" && hydra_combined_capable;
+                    llama_hydra_set_expert_mode(ctx_tgt, want_combined ? 1 : 0);
+                    res->expert_mode_applied = want_combined ? "combined" : "solo";
+
                     res->rpc_status = HYDRA_STATUS_OK;
                     res->success = true;
-                    SRV_INF("hydra: SET_EXPERT_MODE '%s' (slot %d)\n",
-                            task.hydra_action.expert_mode.c_str(), task.hydra_action.id_slot);
+                    SRV_INF("hydra: SET_EXPERT_MODE requested='%s' applied='%s' (slot %d)\n",
+                            requested.c_str(), res->expert_mode_applied.c_str(), task.hydra_action.id_slot);
                     queue_results.send(std::move(res));
                 } break;
 
@@ -4744,6 +4787,16 @@ void server_context::terminate() {
 
 llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
+}
+
+void server_context::set_hydra_role(const std::string & role, const std::string & peer, const std::string & combined_pattern) {
+    impl->hydra_role             = role;
+    impl->hydra_peer             = peer;
+    impl->hydra_combined_pattern = combined_pattern;
+}
+
+void server_context::set_hydra_combined_capable(bool capable) {
+    impl->hydra_combined_capable = capable;
 }
 
 server_response_reader server_context::get_response_reader() {
@@ -6702,11 +6755,19 @@ static void hydra_handle_set_expert_mode(int fd, int slot_id, uint64_t payload_l
 
     auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
     if (!res || !res->success) {
-        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        const std::string err = (res && !res->error.empty()) ? res->error : std::string();
+        json err_j = {{"success", false}};
+        if (!err.empty()) err_j["error"] = err;
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
         return;
     }
 
-    json meta_j = {{"success", true}};
+    // Report the ACTUAL mode applied (may be "solo" even though "combined" was
+    // requested, if this engine never dual-loaded combined experts) — the
+    // Coordinator's ReportsSolo() reads this key to detect the fallback.
+    json meta_j = {{"success", true}, {"mode", res->expert_mode_applied}};
     const std::string meta_str = meta_j.dump();
     hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
     hydra_send_all(fd, meta_str.data(), meta_str.size());

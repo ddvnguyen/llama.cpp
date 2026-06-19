@@ -21,6 +21,34 @@ LLAMA_API size_t llama_state_seq_get_data_to_fd(
 // falls back to SOLO mode (all tensors on local GPU).
 LLAMA_API bool llama_hydra_peer_reachable(const char * host_port);
 
+// Hydra #287/#260 — COMBINED expert-split mode.
+//
+// Dual-resident routed-expert tensors: a "head" engine keeps its normal local
+// copy of every ffn_*_exps tensor (so SOLO always works) and additionally loads
+// a second copy of the tensors matching `tensor_pattern` (an ERE regex matched
+// against each tensor's name, e.g. "blk\\.(2[0-9]|3[0-9])\\.ffn_.*_exps\\.weight")
+// onto a peer engine's embedded ggml-RPC backend at `peer_endpoint` ("host:port").
+// This is a one-time network copy paid once at startup, not per-request — the
+// "no weight transfer" decision applies to steady-state inference, which never
+// re-sends weights once dual-residency is established here.
+//
+// Call once after the model is loaded and before serving any requests. Returns
+// the number of layers that got a dual-resident copy, or -1 if the peer is
+// unreachable (caller should treat COMBINED as unavailable and stay SOLO-only).
+LLAMA_API int32_t llama_hydra_load_combined_experts(
+        struct llama_context * ctx,
+                   const char * peer_endpoint,
+                   const char * tensor_pattern);
+
+// Set/get the per-context expert placement mode for subsequent decode/prefill
+// calls. 0 = SOLO (local GPU only). 1 = COMBINED (use the dual-resident peer
+// copies loaded by llama_hydra_load_combined_experts — caller must have called
+// it successfully first, otherwise COMBINED silently behaves like SOLO since
+// the _rpc tensor pointers are null). The mode is part of the graph-reuse key,
+// so a mode change forces a graph rebuild.
+LLAMA_API void    llama_hydra_set_expert_mode(struct llama_context * ctx, int32_t mode);
+LLAMA_API int32_t llama_hydra_get_expert_mode(const struct llama_context * ctx);
+
 #ifdef __cplusplus
 }
 #endif
