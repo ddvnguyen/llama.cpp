@@ -4142,6 +4142,7 @@ private:
                     // - the model does not support partial sequence removal
                     // - the model uses SWA (and we are not using `swa_full`)
                     // - the model supports partial sequence removal but only up to a fixed bound
+                    // - the model is recurrent/hybrid (see below)
                     // Hydra: when the binary RPC port is enabled this server participates in
                     // cross-node KV migration. The restore target may not support rollback
                     // (e.g. it reports SEQ_RM_TYPE_FULL for the same model), so create native
@@ -4149,10 +4150,22 @@ private:
                     // the latest checkpoint in the v2 blob, and without one the receiver
                     // fabricates a checkpoint at the final position, which corrupts
                     // hybrid/recurrent decode (recurrent state ends up past the resume point).
+                    // Hydra (#316): the generic seq_rm probe in common_context_can_seq_rm()
+                    // reports PART (not RS) for this hybrid arch's mixed attention/recurrent
+                    // memory, since llama_n_rs_seq() is 0 and the smoke-test removal succeeds.
+                    // That left checkpoint creation gated on rpc_port (only true for in-cluster
+                    // nodes), so a standalone server with no RPC peer never created checkpoints
+                    // and every cache-search below (which already special-cases is_rec, see
+                    // ik_llama.cpp#1762) found nothing to restore — forcing a full re-prefill
+                    // on every request. Recurrent/hybrid models need checkpoints on their own
+                    // merits, independent of rpc_port.
+                    const bool is_rec = llama_model_is_recurrent(model_tgt) ||
+                                        llama_model_is_hybrid(model_tgt);
                     do_checkpoint = do_checkpoint && (
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0 ||
+                            is_rec ||
                             params_base.rpc_port > 0);
 
                     bool has_mtmd = false;
