@@ -2792,7 +2792,11 @@ size_t llama_context::state_get_size() {
 #include <sys/socket.h>
 
 class llama_io_write_socket : public llama_io_write_i {
-    static constexpr size_t CHUNK = 256 * 1024;
+    // hydra#334: 256 KB was too small — each chunk pays a fixed
+    // cudaMemcpyAsync+cudaStreamSynchronize round trip plus a send() syscall,
+    // and at 256 KB that per-call overhead dominates over actual transfer
+    // time (~4800 chunks for a 1.2 GB state). 8 MB amortizes it ~32x.
+    static constexpr size_t CHUNK = 8 * 1024 * 1024;
 
     int    fd             = -1;
     size_t bytes_written  = 0;
