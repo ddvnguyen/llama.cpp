@@ -148,6 +148,10 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+# hydra#334: pure function, no model/context needed — exported via LLAMA_API
+# so this runs on every platform (incl. Windows + shared libs).
+llama_build_and_test(test-hydra-state-chunk-size.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)

@@ -24,6 +24,10 @@ LLAMA_API size_t llama_state_seq_get_data_to_fd(
 LLAMA_API void   llama_hydra_set_state_chunk_size(struct llama_context * ctx, size_t bytes);
 LLAMA_API size_t llama_hydra_get_state_chunk_size(const struct llama_context * ctx);
 
+// Pure clamp helper used by llama_hydra_set_state_chunk_size — exposed so it can
+// be unit-tested without spinning up a llama_context (see tests/test-hydra-state-chunk-size.cpp).
+LLAMA_API size_t llama_hydra_clamp_state_chunk_size(size_t bytes);
+
 // Hydra: try to connect to an RPC engine peer. Returns true if reachable.
 // Used at startup for graceful degradation — if the peer is down, the engine
 // falls back to SOLO mode (all tensors on local GPU).

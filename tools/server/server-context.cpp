@@ -2926,8 +2926,12 @@ private:
                             if (ctx_tgt && cfg.contains("state_chunk_size")) {
                                 const size_t bytes = cfg.at("state_chunk_size").get<size_t>();
                                 llama_hydra_set_state_chunk_size(ctx_tgt, bytes);
-                                SRV_INF("hydra: CONFIGURE state_chunk_size=%zu (slot %d)\n",
-                                        llama_hydra_get_state_chunk_size(ctx_tgt), task.hydra_action.id_slot);
+                                // Echo the post-clamp value back so the Coordinator can
+                                // tell a silent clamp from "exactly what I asked for"
+                                // instead of trusting an unconditional success response.
+                                res->state_chunk_size_applied = (uint64_t)llama_hydra_get_state_chunk_size(ctx_tgt);
+                                SRV_INF("hydra: CONFIGURE state_chunk_size requested=%zu applied=%" PRIu64 " (slot %d)\n",
+                                        bytes, res->state_chunk_size_applied, task.hydra_action.id_slot);
                             }
                         } catch (const std::exception & e) {
                             res->success = false;
@@ -6602,6 +6606,12 @@ static void hydra_handle_configure(int fd, int slot_id, uint64_t payload_len, co
     }
 
     json meta_j = {{"success", true}};
+    // hydra#334: echo the post-clamp value so the Coordinator can tell a
+    // silent clamp from "exactly what I asked for" instead of trusting an
+    // unconditional success response.
+    if (res->state_chunk_size_applied > 0) {
+        meta_j["state_chunk_size_applied"] = res->state_chunk_size_applied;
+    }
     const std::string meta_str = meta_j.dump();
     hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
     hydra_send_all(fd, meta_str.data(), meta_str.size());

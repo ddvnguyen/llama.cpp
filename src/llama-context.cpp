@@ -11,6 +11,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "llama-hydra.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -707,16 +708,26 @@ void llama_context::hydra_set_expert_mode(int mode) {
     cparams.hydra_expert_mode = mode;
 }
 
-void llama_context::hydra_set_state_chunk_size(size_t bytes) {
-    // Clamp: this is reachable from the network via CONFIGURE (0x40), so an
+size_t llama_hydra_clamp_state_chunk_size(size_t bytes) {
+    // This is reachable from the network via CONFIGURE (0x40), so an
     // out-of-range value must not be able to wedge the STATE_GET stream
     // (0 would spin forever in write_tensor's chunk loop; an unbounded value
     // could force a huge one-shot staging allocation).
     constexpr size_t k_min = 64ull * 1024;
     constexpr size_t k_max = 64ull * 1024 * 1024;
-    if (bytes < k_min) bytes = k_min;
-    if (bytes > k_max) bytes = k_max;
-    cparams.hydra_state_chunk_size = bytes;
+    if (bytes < k_min) return k_min;
+    if (bytes > k_max) return k_max;
+    return bytes;
+}
+
+void llama_context::hydra_set_state_chunk_size(size_t bytes) {
+    // Benign data race: written here from the CONFIGURE task thread, read by
+    // state_seq_get_data_to_fd on whichever thread issues the next STATE_GET.
+    // Not synchronized, same as hydra_expert_mode above — acceptable because
+    // CONFIGURE is a one-time startup call that always lands before the first
+    // STATE_GET in practice, and size_t load/store is atomic on every target
+    // this engine builds for.
+    cparams.hydra_state_chunk_size = llama_hydra_clamp_state_chunk_size(bytes);
 }
 
 uint32_t llama_context::n_ctx() const {
