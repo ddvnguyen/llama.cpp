@@ -2916,6 +2916,31 @@ private:
                     res->op = HYDRA_OP_CONFIGURE;
                     res->rpc_status = HYDRA_STATUS_OK;
                     res->success = true;
+                    // hydra#334: "state_chunk_size" (bytes) tunes the STATE_GET
+                    // socket-stream chunk size (llama_io_write_socket) without a
+                    // rebuild. Unknown/absent keys are ignored — CONFIGURE is meant
+                    // to accept a superset of engine params over time.
+                    if (!task.hydra_action.config_json.empty()) {
+                        try {
+                            const json cfg = json::parse(task.hydra_action.config_json);
+                            if (ctx_tgt && cfg.contains("state_chunk_size")) {
+                                const size_t bytes = cfg.at("state_chunk_size").get<size_t>();
+                                llama_hydra_set_state_chunk_size(ctx_tgt, bytes);
+                                // Echo the post-clamp value back so the Coordinator can
+                                // tell a silent clamp from "exactly what I asked for"
+                                // instead of trusting an unconditional success response.
+                                res->state_chunk_size_applied = (uint64_t)llama_hydra_get_state_chunk_size(ctx_tgt);
+                                SRV_INF("hydra: CONFIGURE state_chunk_size requested=%zu applied=%" PRIu64 " (slot %d)\n",
+                                        bytes, res->state_chunk_size_applied, task.hydra_action.id_slot);
+                            }
+                        } catch (const std::exception & e) {
+                            res->success = false;
+                            res->rpc_status = HYDRA_STATUS_ERROR;
+                            res->error = std::string("CONFIGURE: invalid config_json: ") + e.what();
+                            SRV_WRN("hydra: CONFIGURE failed to parse config_json (slot %d): %s\n",
+                                    task.hydra_action.id_slot, e.what());
+                        }
+                    }
                     SRV_INF("hydra: CONFIGURE received (slot %d)\n", task.hydra_action.id_slot);
                     queue_results.send(std::move(res));
                 } break;
@@ -6581,6 +6606,12 @@ static void hydra_handle_configure(int fd, int slot_id, uint64_t payload_len, co
     }
 
     json meta_j = {{"success", true}};
+    // hydra#334: echo the post-clamp value so the Coordinator can tell a
+    // silent clamp from "exactly what I asked for" instead of trusting an
+    // unconditional success response.
+    if (res->state_chunk_size_applied > 0) {
+        meta_j["state_chunk_size_applied"] = res->state_chunk_size_applied;
+    }
     const std::string meta_str = meta_j.dump();
     hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
     hydra_send_all(fd, meta_str.data(), meta_str.size());

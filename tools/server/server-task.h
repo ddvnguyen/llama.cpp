@@ -722,6 +722,13 @@ struct server_task_result_hydra_engine : server_task_result {
     // detect the fallback via ReportsSolo().
     std::string expert_mode_applied;
 
+    // CONFIGURE: the ACTUAL state_chunk_size now in effect, after clamping
+    // (hydra#334) — may differ from the requested value if it was out of
+    // [64 KiB, 64 MiB]. 0 means "state_chunk_size was not part of this
+    // CONFIGURE request". Lets the Coordinator detect a silent clamp instead
+    // of trusting an unconditional success response.
+    uint64_t state_chunk_size_applied = 0;
+
     std::string error; // human-readable, non-empty on failure
 
     virtual json to_json() override;
