@@ -8,13 +8,21 @@ extern "C" {
 
 // Hydra M2: stream the KV state of a single sequence directly to an open POSIX file descriptor
 // (typically a TCP socket). No intermediate 800 MB buffer is allocated — GPU tensors are
-// copied in 256 KB chunks and written to fd immediately.
+// copied in chunks (size set by llama_hydra_set_state_chunk_size, default 2 MiB) and
+// written to fd immediately.
 // Returns bytes written (== llama_state_seq_get_size for the same seq_id), or 0 on error.
 // Not supported on Windows (returns 0 with a log warning).
 LLAMA_API size_t llama_state_seq_get_data_to_fd(
         struct llama_context * ctx,
                 llama_seq_id   seq_id,
                          int   fd);
+
+// Hydra #334: set/get the chunk size (bytes) used by llama_state_seq_get_data_to_fd's
+// GPU->host copy + socket send loop. Settable at runtime via CONFIGURE (0x40)
+// "state_chunk_size" so Hydra can tune it without a rebuild. Clamped internally
+// to [64 KiB, 64 MiB]; defaults to 2 MiB.
+LLAMA_API void   llama_hydra_set_state_chunk_size(struct llama_context * ctx, size_t bytes);
+LLAMA_API size_t llama_hydra_get_state_chunk_size(const struct llama_context * ctx);
 
 // Hydra: try to connect to an RPC engine peer. Returns true if reachable.
 // Used at startup for graceful degradation — if the peer is down, the engine

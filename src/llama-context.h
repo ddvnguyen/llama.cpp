@@ -117,6 +117,10 @@ struct llama_context {
     // Hydra #287/#260 setter (accessed by llama-hydra.h API)
     void hydra_set_expert_mode(int mode);
 
+    // Hydra #334 setter (accessed by llama-hydra.h API) — clamps to a sane
+    // range since this is reachable from the network via CONFIGURE (0x40).
+    void hydra_set_state_chunk_size(size_t bytes);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);

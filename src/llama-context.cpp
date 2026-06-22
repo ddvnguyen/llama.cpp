@@ -707,6 +707,18 @@ void llama_context::hydra_set_expert_mode(int mode) {
     cparams.hydra_expert_mode = mode;
 }
 
+void llama_context::hydra_set_state_chunk_size(size_t bytes) {
+    // Clamp: this is reachable from the network via CONFIGURE (0x40), so an
+    // out-of-range value must not be able to wedge the STATE_GET stream
+    // (0 would spin forever in write_tensor's chunk loop; an unbounded value
+    // could force a huge one-shot staging allocation).
+    constexpr size_t k_min = 64ull * 1024;
+    constexpr size_t k_max = 64ull * 1024 * 1024;
+    if (bytes < k_min) bytes = k_min;
+    if (bytes > k_max) bytes = k_max;
+    cparams.hydra_state_chunk_size = bytes;
+}
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }
@@ -2792,11 +2804,12 @@ size_t llama_context::state_get_size() {
 #include <sys/socket.h>
 
 class llama_io_write_socket : public llama_io_write_i {
-    // hydra#334: 256 KB was too small — each chunk pays a fixed
+    // hydra#334: chunk size is caller-supplied (see llama_cparams::hydra_state_chunk_size,
+    // settable at runtime via CONFIGURE/0x40 "state_chunk_size") rather than a
+    // compile-time constant. 256 KB was too small — each chunk pays a fixed
     // cudaMemcpyAsync+cudaStreamSynchronize round trip plus a send() syscall,
     // and at 256 KB that per-call overhead dominates over actual transfer
-    // time (~4800 chunks for a 1.2 GB state). 8 MB amortizes it ~32x.
-    static constexpr size_t CHUNK = 8 * 1024 * 1024;
+    // time (~4800 chunks for a 1.2 GB state). The 2 MiB default amortizes it ~8x.
 
     int    fd             = -1;
     size_t bytes_written  = 0;
@@ -2815,7 +2828,7 @@ class llama_io_write_socket : public llama_io_write_i {
     }
 
 public:
-    explicit llama_io_write_socket(int fd) : fd(fd), staging(CHUNK) {}
+    llama_io_write_socket(int fd, size_t chunk_size) : fd(fd), staging(chunk_size) {}
 
     void write(const void * src, size_t size) override {
         send_all(src, size);
@@ -2894,11 +2907,12 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 // Hydra M2: stream KV state for one sequence directly to a socket fd.
-// No intermediate 800 MB buffer — GPU tensors are copied to a 256 KB staging area and sent.
+// No intermediate 800 MB buffer — GPU tensors are copied to a staging area
+// (size set by cparams.hydra_state_chunk_size, see CONFIGURE/0x40) and sent.
 // Returns bytes streamed (same as llama_state_seq_get_size would return), 0 on error.
 size_t llama_context::state_seq_get_data_to_fd(llama_seq_id seq_id, int fd) {
 #if !defined(_WIN32)
-    llama_io_write_socket io(fd);
+    llama_io_write_socket io(fd, cparams.hydra_state_chunk_size);
     try {
         io.write(&io_magic, sizeof(io_magic));
         io.write(&seq_id,   sizeof(seq_id));

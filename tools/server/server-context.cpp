@@ -2916,6 +2916,27 @@ private:
                     res->op = HYDRA_OP_CONFIGURE;
                     res->rpc_status = HYDRA_STATUS_OK;
                     res->success = true;
+                    // hydra#334: "state_chunk_size" (bytes) tunes the STATE_GET
+                    // socket-stream chunk size (llama_io_write_socket) without a
+                    // rebuild. Unknown/absent keys are ignored — CONFIGURE is meant
+                    // to accept a superset of engine params over time.
+                    if (!task.hydra_action.config_json.empty()) {
+                        try {
+                            const json cfg = json::parse(task.hydra_action.config_json);
+                            if (ctx_tgt && cfg.contains("state_chunk_size")) {
+                                const size_t bytes = cfg.at("state_chunk_size").get<size_t>();
+                                llama_hydra_set_state_chunk_size(ctx_tgt, bytes);
+                                SRV_INF("hydra: CONFIGURE state_chunk_size=%zu (slot %d)\n",
+                                        llama_hydra_get_state_chunk_size(ctx_tgt), task.hydra_action.id_slot);
+                            }
+                        } catch (const std::exception & e) {
+                            res->success = false;
+                            res->rpc_status = HYDRA_STATUS_ERROR;
+                            res->error = std::string("CONFIGURE: invalid config_json: ") + e.what();
+                            SRV_WRN("hydra: CONFIGURE failed to parse config_json (slot %d): %s\n",
+                                    task.hydra_action.id_slot, e.what());
+                        }
+                    }
                     SRV_INF("hydra: CONFIGURE received (slot %d)\n", task.hydra_action.id_slot);
                     queue_results.send(std::move(res));
                 } break;

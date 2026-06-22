@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <cstddef>
 #include <cstdint>
 
 #define LLAMA_MAX_SEQ 256
@@ -54,4 +55,11 @@ struct llama_cparams {
     // 0 = SOLO (local GPU only), 1 = COMBINED (expert matmuls redirected to a peer
     // engine's ggml-RPC backend via the placement hook in llama_context::process_ubatch).
     int hydra_expert_mode = 0;
+
+    // Hydra #334: chunk size (bytes) for STATE_GET socket streaming
+    // (llama_io_write_socket in llama-context.cpp). Set via CONFIGURE (0x40)
+    // "state_chunk_size" so Hydra can tune it without a rebuild; defaults to
+    // 2 MiB, which already amortizes the per-chunk cudaMemcpy+send overhead
+    // far better than the original 256 KiB.
+    size_t hydra_state_chunk_size = 2 * 1024 * 1024;
 };
