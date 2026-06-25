@@ -7,6 +7,7 @@ int LLAMA_BUILD_NUMBER = @LLAMA_BUILD_NUMBER@;
 char const * LLAMA_COMMIT = "@LLAMA_BUILD_COMMIT@";
 char const * LLAMA_COMPILER = "@BUILD_COMPILER@";
 char const * LLAMA_BUILD_TARGET = "@BUILD_TARGET@";
+char const * LLAMA_HYDRA_BUILD_TYPE = "@LLAMA_HYDRA_BUILD_TYPE@";
 
 int llama_build_number(void) {
     return LLAMA_BUILD_NUMBER;
@@ -24,12 +25,20 @@ const char * llama_build_target(void) {
     return LLAMA_BUILD_TARGET;
 }
 
+const char * llama_hydra_build_type(void) {
+    return LLAMA_HYDRA_BUILD_TYPE;
+}
+
 const char * llama_build_info(void) {
-    static std::string s = "b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT;
+    static std::string s = "b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT + " [" + LLAMA_HYDRA_BUILD_TYPE + "]";
     return s.c_str();
 }
 
 void llama_print_build_info(void) {
-    fprintf(stderr, "%s: build = %d (%s)\n",      __func__, llama_build_number(), llama_commit());
+    // [shared]/[static] is the canonical build-type label, matched by
+    // scripts/ci/check-build-type.sh (hydra_vortex#349). Keep the
+    // bracket form here so all sinks of this string are grep-friendly
+    // with the same regex.
+    fprintf(stderr, "%s: build = %d (%s) [%s]\n",      __func__, llama_build_number(), llama_commit(), LLAMA_HYDRA_BUILD_TYPE);
     fprintf(stderr, "%s: built with %s for %s\n", __func__, llama_compiler(), llama_build_target());
 }

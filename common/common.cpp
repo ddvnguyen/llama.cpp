@@ -379,7 +379,7 @@ void common_params_print_info(const common_params & params, bool print_devices) 
 #else
     const char * build_type = " (debug)";
 #endif
-    LOG_TRC("%s: build %d (%s) with %s for %s%s\n", __func__, llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
+    LOG_TRC("%s: build %d (%s) [%s] with %s for %s%s\n", __func__, llama_build_number(), llama_commit(), llama_hydra_build_type(), llama_compiler(), llama_build_target(), build_type);
 
     LOG_INF("log_info: verbosity = %d (adjust with the `-lv N` CLI arg)\n", common_log_get_verbosity_thold());
 
