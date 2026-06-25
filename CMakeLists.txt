@@ -61,6 +61,18 @@ endif()
 
 option(BUILD_SHARED_LIBS "build shared libraries" ${BUILD_SHARED_LIBS_DEFAULT})
 
+# Build-type metadata: auto-derives from BUILD_SHARED_LIBS unless overridden.
+# Used by llama_hydra_build_type() and surfaced in `llama-server --version`
+# so the OCI image self-identifies (see ddvnguyen/hydra_vortex#349).
+if(DEFINED LLAMA_HYDRA_BUILD_TYPE)
+    set(_hydra_build_type "${LLAMA_HYDRA_BUILD_TYPE}")
+elseif(BUILD_SHARED_LIBS)
+    set(_hydra_build_type "shared")
+else()
+    set(_hydra_build_type "static")
+endif()
+set(LLAMA_HYDRA_BUILD_TYPE "${_hydra_build_type}" CACHE STRING "Hydra build-type label (static|shared|...)")
+
 if (WIN32)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
