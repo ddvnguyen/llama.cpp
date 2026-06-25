@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +61,44 @@ LLAMA_API int32_t llama_hydra_load_combined_experts(
 // so a mode change forces a graph rebuild.
 LLAMA_API void    llama_hydra_set_expert_mode(struct llama_context * ctx, int32_t mode);
 LLAMA_API int32_t llama_hydra_get_expert_mode(const struct llama_context * ctx);
+
+// Hydra #348: write up to `cap` non-CPU backend instances ctx's scheduler
+// already built for local inference into `out` (the SAME instances local
+// decode dispatches to, not independent ones) and return the actual count.
+// If the true count exceeds `cap`, only the first `cap` are written but the
+// full count is still returned, so the caller can retry with a bigger
+// buffer. Exposed here (rather than called directly from llama-engine.cpp)
+// because llama_context is only forward-declared in llama.h — this header's
+// .cpp can see the full definition (it already includes llama-context.h).
+LLAMA_API size_t llama_hydra_get_compute_backends(struct llama_context * ctx, ggml_backend_t * out, size_t cap);
+
+// Hydra #348: call once at startup, after exposing this engine's backend(s)
+// over the embedded ggml-RPC server (ggml_backend_rpc_start_server_with_backends),
+// so that subsequent local llama_decode/prefill calls serialize their GPU
+// dispatch against the same per-device lock the RPC server holds while
+// computing an inbound graph (rpc_server::graph_compute/graph_recompute in
+// ggml-rpc.cpp) — the two share the same backend instance per physical
+// device rather than each owning an independent one. If this is never
+// called (the common case for an engine that never opts into
+// --ggml-rpc-port), llama_hydra_lock_compute/unlock_compute/
+// force_sync_if_shared are all no-ops and the decode hot path pays no cost.
+LLAMA_API void llama_hydra_enable_shared_backend_compute_lock(void);
+
+// Cheap no-ops unless llama_hydra_enable_shared_backend_compute_lock() was
+// called for this process. `device` is the backend index shared by both
+// llama_context's sched and the RPC server's backend list (today always 0 —
+// one GPU per node in this fork).
+LLAMA_API void llama_hydra_lock_compute(int32_t device);
+LLAMA_API void llama_hydra_unlock_compute(int32_t device);
+
+// Hydra #348: if shared-backend mode is active, force the context's
+// scheduler to finish outstanding async compute before the caller unlocks
+// (see llama_hydra_lock_compute) — otherwise the RPC server's synchronous
+// graph_compute could start on the same backend while the local dispatch is
+// still in flight. No-op otherwise, preserving the existing
+// pipeline-parallel overlap optimization (llama-context.cpp's
+// process_ubatch) for engines that never expose an RPC backend.
+LLAMA_API void llama_hydra_force_sync_if_shared(struct llama_context * ctx);
 
 #ifdef __cplusplus
 }

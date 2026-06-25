@@ -679,16 +679,22 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
-    // Hydra #287/#260: this engine's one-binary role + (for head) the
-    // configured peer/tensor-pattern — surfaced via ENGINE_INFO (0x41).
-    std::string hydra_role = "standalone";
-    std::string hydra_peer;
-    std::string hydra_combined_pattern;
+    // Hydra #348: independent capability flags (replaces the old single
+    // hydra_role string — a node can be any combination of these, not one
+    // exclusive label) — surfaced via ENGINE_INFO (0x41).
+    bool        hydra_solo_active        = true;  // always true - model is always loaded now
+    bool        hydra_rpc_backend_active  = false; // --ggml-rpc-port set & RPC thread running
+    std::string hydra_peer;                        // configured --rpc-engine peer, empty if none
+    bool        hydra_peer_reachable     = false;  // startup TCP-probe result for hydra_peer
+    std::string hydra_combined_pattern;            // configured --combined-ot-pattern
 
     // True once llama_hydra_load_combined_experts() has successfully
-    // dual-loaded expert tensors onto a peer. Gates whether
-    // SET_EXPERT_MODE("combined") is honored or falls back to solo.
-    bool hydra_combined_capable = false;
+    // dual-loaded expert tensors onto hydra_peer. Gates whether
+    // SET_EXPERT_MODE("combined") is honored or falls back to solo. Renamed
+    // from hydra_combined_capable, which was confusingly aliased to both
+    // "peer configured+reachable" and "dual-load succeeded" in the old INFO
+    // JSON — those are now distinct (hydra_peer_reachable vs this field).
+    bool hydra_combined_head_attached = false;
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -2960,10 +2966,14 @@ private:
                     for (const auto & [alias, _path] : preset_alias_to_path) {
                         preset_aliases_j.push_back(alias);
                     }
-                    // Hydra #287/#260: two-engine "work together" status — see
-                    // specs/rpc-protocol.md's ENGINE_INFO (0x41) contract.
-                    // pipeline_capable stays false until #287's PIPELINE half
-                    // lands; mode only ever reports solo/combined until then.
+                    // Hydra #287/#260/#348: two-engine "work together" status
+                    // — see specs/rpc-protocol.md's ENGINE_INFO (0x41)
+                    // contract. pipeline_capable stays false until #287's
+                    // PIPELINE half lands; mode only ever reports
+                    // solo/combined until then. solo_active/rpc_backend_active/
+                    // peer_reachable/combined_head_attached are independent
+                    // booleans (#348) — replaces the old single "role" string
+                    // and the peer_connected/combined_capable field-aliasing.
                     const int32_t expert_mode = ctx_tgt ? llama_hydra_get_expert_mode(ctx_tgt) : 0;
                     json info_j = {
                         {"engine", "llama-server-hydra"},
@@ -2972,13 +2982,14 @@ private:
                                           "expert_mode", "quant_swap",
                                           "preset", "model_hash"}},
                         {"preset_aliases", preset_aliases_j},
-                        {"role",             hydra_role},
-                        {"mode",             expert_mode == 1 ? "combined" : "solo"},
-                        {"peer_connected",   hydra_combined_capable},
-                        {"peer_addr",        hydra_peer},
-                        {"layer_split",      hydra_combined_pattern},
-                        {"combined_capable", hydra_combined_capable},
-                        {"pipeline_capable", false}
+                        {"solo_active",            hydra_solo_active},
+                        {"rpc_backend_active",     hydra_rpc_backend_active},
+                        {"mode",                   expert_mode == 1 ? "combined" : "solo"},
+                        {"peer_addr",              hydra_peer},
+                        {"peer_reachable",         hydra_peer_reachable},
+                        {"layer_split",            hydra_combined_pattern},
+                        {"combined_head_attached", hydra_combined_head_attached},
+                        {"pipeline_capable",       false}
                     };
                     res->info_json = info_j.dump();
                     queue_results.send(std::move(res));
@@ -3504,13 +3515,13 @@ private:
                         break;
                     }
 
-                    // Hydra #287/#260: only honor "combined" when this engine
-                    // successfully dual-loaded expert tensors onto a peer at
-                    // startup (set_hydra_combined_capable) — otherwise fall
-                    // back to solo so the Coordinator can detect it via
-                    // ReportsSolo() and never block a request on a half-built
-                    // COMBINED path.
-                    const bool want_combined = requested == "combined" && hydra_combined_capable;
+                    // Hydra #287/#260/#348: only honor "combined" when this
+                    // engine successfully dual-loaded expert tensors onto a
+                    // peer at startup (set_hydra_combined_head_attached) —
+                    // otherwise fall back to solo so the Coordinator can
+                    // detect it via ReportsSolo() and never block a request
+                    // on a half-built COMBINED path.
+                    const bool want_combined = requested == "combined" && hydra_combined_head_attached;
                     llama_hydra_set_expert_mode(ctx_tgt, want_combined ? 1 : 0);
                     res->expert_mode_applied = want_combined ? "combined" : "solo";
 
@@ -4827,14 +4838,16 @@ llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
 }
 
-void server_context::set_hydra_role(const std::string & role, const std::string & peer, const std::string & combined_pattern) {
-    impl->hydra_role             = role;
-    impl->hydra_peer             = peer;
-    impl->hydra_combined_pattern = combined_pattern;
+void server_context::set_hydra_capabilities(bool rpc_backend_active, const std::string & peer,
+        bool peer_reachable, const std::string & combined_pattern) {
+    impl->hydra_rpc_backend_active = rpc_backend_active;
+    impl->hydra_peer               = peer;
+    impl->hydra_peer_reachable     = peer_reachable;
+    impl->hydra_combined_pattern   = combined_pattern;
 }
 
-void server_context::set_hydra_combined_capable(bool capable) {
-    impl->hydra_combined_capable = capable;
+void server_context::set_hydra_combined_head_attached(bool attached) {
+    impl->hydra_combined_head_attached = attached;
 }
 
 server_response_reader server_context::get_response_reader() {

@@ -2358,10 +2358,24 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    // Hydra #348: when this engine also exposes its backend(s) over the
+    // embedded RPC server (shared-backend mode, see llama-hydra.h), serialize
+    // this dispatch against the RPC server's own graph_compute/graph_recompute
+    // so the two never execute on the same device concurrently. No-op
+    // (near-zero cost) otherwise.
+    llama_hydra_lock_compute(0);
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    } else {
+        // Force completion before unlocking so a concurrent RPC-driven
+        // compute on the shared backend can't start while this async
+        // dispatch is still in flight. This forfeits the pipeline-parallel
+        // overlap optimization (see process_ubatch's synchronize-before-reuse
+        // comment) only while shared-backend mode is active.
+        llama_hydra_force_sync_if_shared(this);
     }
+    llama_hydra_unlock_compute(0);
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 

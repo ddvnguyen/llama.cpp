@@ -7,6 +7,7 @@
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
 
+#include <atomic>
 #include <cstring>
 #include <regex>
 #include <string>
@@ -162,6 +163,46 @@ int32_t llama_hydra_load_combined_experts(
         return 0;
     }
 
+    // Hydra #348: the peer's VRAM is no longer guaranteed empty — under the
+    // always-on dual-role design it may already be running its own resident
+    // SOLO model + KV cache. Check headroom before committing to a copy that
+    // could otherwise starve the peer's own inference or fail to allocate.
+    {
+        size_t total_bytes = 0;
+        for (auto & p : pending) {
+            total_bytes += ggml_nbytes(p.src);
+        }
+
+        using get_mem_fn_t = void (*)(const char *, uint32_t, size_t *, size_t *);
+        auto get_mem_fn = (get_mem_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_get_device_memory");
+        size_t peer_free = 0, peer_total = 0;
+        if (get_mem_fn) {
+            get_mem_fn(peer_endpoint, /*device=*/0, &peer_free, &peer_total);
+        } else {
+            LLAMA_LOG_WARN("hydra: COMBINED — failed to resolve ggml_backend_rpc_get_device_memory, "
+                    "skipping VRAM headroom check (failing open)\n");
+        }
+
+        // Headroom for the peer's own KV cache growth during decode, which
+        // isn't reflected in a free-VRAM snapshot taken at head-startup
+        // time. Starting heuristic — revisit against real measurements
+        // (docs/spike-engine-mode-switch.md) if it's wrong in either
+        // direction. peer_free == 0 (query failed or genuinely zero) fails
+        // open — does not block — consistent with this function's existing
+        // "log + stay solo, never abort" philosophy elsewhere.
+        constexpr double kHeadroomFactor = 1.25;
+        const size_t required_bytes = static_cast<size_t>(total_bytes * kHeadroomFactor);
+
+        if (peer_free > 0 && required_bytes > peer_free) {
+            LLAMA_LOG_WARN("hydra: COMBINED — peer %s has %zu MB free, dual-load needs ~%zu MB "
+                    "(with %.0f%% headroom) for %zu tensor(s) — skipping COMBINED, staying solo-only\n",
+                    peer_endpoint, peer_free / (1024*1024), required_bytes / (1024*1024),
+                    (kHeadroomFactor - 1.0) * 100.0, pending.size());
+            for (auto & p : pending) { *p.dst_field = nullptr; }
+            return 0;
+        }
+    }
+
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(meta_ctx.get(), peer_buft);
     if (!buf) {
         LLAMA_LOG_ERROR("hydra: COMBINED — failed to allocate %zu expert tensors on peer %s\n",
@@ -193,4 +234,69 @@ void llama_hydra_set_expert_mode(struct llama_context * ctx, int32_t mode) {
 
 int32_t llama_hydra_get_expert_mode(const struct llama_context * ctx) {
     return ctx->get_cparams().hydra_expert_mode;
+}
+
+size_t llama_hydra_get_compute_backends(struct llama_context * ctx, ggml_backend_t * out, size_t cap) {
+    ggml_backend_sched_t sched = ctx->get_sched();
+    size_t count = 0;
+    const int n_backends = ggml_backend_sched_get_n_backends(sched);
+    for (int i = 0; i < n_backends; i++) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            if (count < cap) {
+                out[count] = backend;
+            }
+            count++;
+        }
+    }
+    return count;
+}
+
+// Hydra #348: glue between llama_context's local decode path and the
+// embedded ggml-RPC server's per-device compute lock (ggml-rpc.cpp's
+// ggml_backend_rpc_server_compute_lock/unlock), resolved dynamically the
+// same way llama_hydra_load_combined_experts resolves other ggml_backend_rpc_*
+// symbols. Kept disabled (near-zero-cost) unless a process actually starts
+// the shared-backend RPC server.
+namespace {
+std::atomic<bool> g_hydra_shared_backend_mode{false};
+using hydra_rpc_lock_fn_t = void (*)(uint32_t);
+hydra_rpc_lock_fn_t g_hydra_rpc_lock_fn   = nullptr;
+hydra_rpc_lock_fn_t g_hydra_rpc_unlock_fn = nullptr;
+} // namespace
+
+void llama_hydra_enable_shared_backend_compute_lock() {
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        LLAMA_LOG_WARN("hydra: shared-backend compute lock requested but the RPC backend is not available in this build\n");
+        return;
+    }
+    g_hydra_rpc_lock_fn   = (hydra_rpc_lock_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_server_compute_lock");
+    g_hydra_rpc_unlock_fn = (hydra_rpc_lock_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_server_compute_unlock");
+    if (!g_hydra_rpc_lock_fn || !g_hydra_rpc_unlock_fn) {
+        LLAMA_LOG_ERROR("hydra: failed to resolve RPC server compute lock functions\n");
+        g_hydra_rpc_lock_fn = g_hydra_rpc_unlock_fn = nullptr;
+        return;
+    }
+    g_hydra_shared_backend_mode.store(true, std::memory_order_release);
+}
+
+void llama_hydra_lock_compute(int32_t device) {
+    if (g_hydra_shared_backend_mode.load(std::memory_order_acquire)) {
+        g_hydra_rpc_lock_fn(static_cast<uint32_t>(device));
+    }
+}
+
+void llama_hydra_unlock_compute(int32_t device) {
+    if (g_hydra_shared_backend_mode.load(std::memory_order_acquire)) {
+        g_hydra_rpc_unlock_fn(static_cast<uint32_t>(device));
+    }
+}
+
+void llama_hydra_force_sync_if_shared(struct llama_context * ctx) {
+    if (g_hydra_shared_backend_mode.load(std::memory_order_acquire)) {
+        ggml_backend_sched_synchronize(ctx->get_sched());
+    }
 }

@@ -27,6 +27,23 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
 
+// Hydra #348: like ggml_backend_rpc_start_server, but serves pre-built backend
+// instances (e.g. the ones a local llama_context's ggml_backend_sched already
+// created) instead of creating independent ones for the same devices. The
+// caller retains ownership of `backends` - this never frees them. Pair with
+// ggml_backend_rpc_server_compute_lock/unlock to serialize GPU compute against
+// a caller that also dispatches local work to the same backend instances.
+GGML_BACKEND_API void ggml_backend_rpc_start_server_with_backends(const char * endpoint, const char * cache_dir,
+                                                    size_t n_threads, size_t n_backends, ggml_backend_t * backends);
+
+// Hydra #348: acquire/release the per-device mutex this RPC server holds
+// while computing a graph (rpc_server::graph_compute/graph_recompute). A
+// caller sharing the same backend instance for local inference (see
+// ggml_backend_rpc_start_server_with_backends) must hold the same lock around
+// its own dispatch so the two never execute on the device concurrently.
+GGML_BACKEND_API void ggml_backend_rpc_server_compute_lock(uint32_t device);
+GGML_BACKEND_API void ggml_backend_rpc_server_compute_unlock(uint32_t device);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
 
