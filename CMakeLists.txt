@@ -61,17 +61,36 @@ endif()
 
 option(BUILD_SHARED_LIBS "build shared libraries" ${BUILD_SHARED_LIBS_DEFAULT})
 
-# Build-type metadata: auto-derives from BUILD_SHARED_LIBS unless overridden.
-# Used by llama_hydra_build_type() and surfaced in `llama-server --version`
-# so the OCI image self-identifies (see ddvnguyen/hydra_vortex#349).
-if(DEFINED LLAMA_HYDRA_BUILD_TYPE)
-    set(_hydra_build_type "${LLAMA_HYDRA_BUILD_TYPE}")
+# Build-type metadata: auto-derives from BUILD_SHARED_LIBS unless
+# overridden. Used by llama_hydra_build_type() and surfaced in
+# `llama-server --version` so the OCI image self-identifies (see
+# ddvnguyen/hydra_vortex#349).
+#
+# Cache handling — the BUG we're avoiding:
+#   Naive impl caches LLAMA_HYDRA_BUILD_TYPE (the derived label) so
+#   re-running `cmake -B build_x -DBUILD_SHARED_LIBS=OFF` on an
+#   existing dir that was previously -DBUILD_SHARED_LIBS=ON keeps
+#   the stale [shared] label, and the #351 gate is silently bypassed.
+#   (Review round 2.)
+#
+# Fix: cache the *override* (empty by default, only set by the
+# user), not the derived label. The derived label is a normal
+# variable recomputed every configure. The template substitution
+# (`@LLAMA_HYDRA_BUILD_TYPE@` in common/build-info.cpp.in) reads
+# the current value of the variable at configure time, so the
+# freshly-derived label is what gets baked into the build.
+set(LLAMA_HYDRA_BUILD_TYPE_OVERRIDE "" CACHE STRING
+    "Override the auto-derived build-type label (e.g. 'experimental' for abi-benchmark bundles). Empty = auto-derive from BUILD_SHARED_LIBS. Cached so it persists across reconfigures.")
+if(NOT "${LLAMA_HYDRA_BUILD_TYPE_OVERRIDE}" STREQUAL "")
+    set(_hydra_build_type "${LLAMA_HYDRA_BUILD_TYPE_OVERRIDE}")
 elseif(BUILD_SHARED_LIBS)
     set(_hydra_build_type "shared")
 else()
     set(_hydra_build_type "static")
 endif()
-set(LLAMA_HYDRA_BUILD_TYPE "${_hydra_build_type}" CACHE STRING "Hydra build-type label (static|shared|...)")
+# Derived label: a normal (non-cache) variable. configure_file() picks
+# it up at configure time.
+set(LLAMA_HYDRA_BUILD_TYPE "${_hydra_build_type}")
 
 if (WIN32)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)

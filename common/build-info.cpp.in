@@ -35,6 +35,10 @@ const char * llama_build_info(void) {
 }
 
 void llama_print_build_info(void) {
-    fprintf(stderr, "%s: build = %d (%s) type=%s\n",      __func__, llama_build_number(), llama_commit(), LLAMA_HYDRA_BUILD_TYPE);
+    // [shared]/[static] is the canonical build-type label, matched by
+    // scripts/ci/check-build-type.sh (hydra_vortex#349). Keep the
+    // bracket form here so all sinks of this string are grep-friendly
+    // with the same regex.
+    fprintf(stderr, "%s: build = %d (%s) [%s]\n",      __func__, llama_build_number(), llama_commit(), LLAMA_HYDRA_BUILD_TYPE);
     fprintf(stderr, "%s: built with %s for %s\n", __func__, llama_compiler(), llama_build_target());
 }
