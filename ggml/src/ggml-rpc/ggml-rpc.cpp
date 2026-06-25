@@ -1776,19 +1776,22 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
 // inference (ggml_backend_rpc_start_server_with_backends). A standalone
 // rpc-server process with no such caller just pays the cost of an
 // uncontended lock/unlock per graph_compute.
+//
+// HYDRA_RPC_MAX_LOCAL_DEVICES=8 is generous headroom (this fork only ever
+// runs one GPU per node); device >= this bound asserts rather than silently
+// skipping the lock, since a silent no-op here would mean "no serialization
+// happened" with no signal that the safety property is no longer held.
 static constexpr size_t HYDRA_RPC_MAX_LOCAL_DEVICES = 8;
 static std::array<std::mutex, HYDRA_RPC_MAX_LOCAL_DEVICES> g_hydra_server_compute_mutexes;
 
 void ggml_backend_rpc_server_compute_lock(uint32_t device) {
-    if (device < g_hydra_server_compute_mutexes.size()) {
-        g_hydra_server_compute_mutexes[device].lock();
-    }
+    GGML_ASSERT(device < g_hydra_server_compute_mutexes.size());
+    g_hydra_server_compute_mutexes[device].lock();
 }
 
 void ggml_backend_rpc_server_compute_unlock(uint32_t device) {
-    if (device < g_hydra_server_compute_mutexes.size()) {
-        g_hydra_server_compute_mutexes[device].unlock();
-    }
+    GGML_ASSERT(device < g_hydra_server_compute_mutexes.size());
+    g_hydra_server_compute_mutexes[device].unlock();
 }
 
 // Hydra #348: like ggml_backend_rpc_start_server above, but serves the given
