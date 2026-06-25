@@ -114,115 +114,110 @@ static bool try_tcp_connect(const std::string & host, int port, int timeout_sec)
     return ret > 0;
 }
 
-static std::string extract_rpc_engine_peer(int argc, char ** argv, std::vector<char *> & filtered_argv) {
-    std::string peer;
-    filtered_argv.push_back(argv[0]);
+// Hydra #348: composable, independent capability flags — replaces the
+// tri-state --role standalone|head|worker. Every engine always loads its
+// model (SOLO). A node can independently, additionally, opt into exposing
+// itself as a COMBINED-peer RPC backend and/or reaching out to a peer as a
+// COMBINED head — any combination, no restart to change which. Filtered out
+// of argv before common_params_parse (these aren't stock llama.cpp args).
+//   --ggml-rpc-port <port>        opt-in: expose this engine's local GPU(s)
+//                                 as an embedded ggml-RPC backend on <port>,
+//                                 sharing the SAME backend instances this
+//                                 engine already built for local inference
+//                                 (not a duplicate context — see
+//                                 start_shared_backend_rpc_server below).
+//   --rpc-engine <host:port>      opt-in: this engine acts as a COMBINED
+//                                 head reaching out to the named peer.
+//   --combined-ot-pattern <regex> required alongside --rpc-engine: which
+//                                 expert tensors (by name) get a dual-resident
+//                                 copy on the peer.
+struct hydra_capability_flags {
+    int         ggml_rpc_port = 0;
+    std::string rpc_engine_peer;
+    std::string combined_ot_pattern;
+
+    bool wants_rpc_backend()   const { return ggml_rpc_port > 0; }
+    bool wants_combined_head() const { return !rpc_engine_peer.empty(); }
+};
+
+// Filters Hydra capability flags out of argv into filtered_argv, mirroring
+// the previous extract_rpc_engine_peer()/extract_hydra_role_flags()'s
+// filtering style (now merged into one pass).
+static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** argv, std::vector<char *> & filtered_argv) {
+    hydra_capability_flags flags;
+    filtered_argv.clear();
+    if (argc > 0) filtered_argv.push_back(argv[0]);
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rpc-engine") == 0 && i + 1 < argc) {
-            peer = argv[i + 1];
-            i++;
+            flags.rpc_engine_peer = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--combined-ot-pattern") == 0 && i + 1 < argc) {
+            flags.combined_ot_pattern = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--ggml-rpc-port") == 0 && i + 1 < argc) {
+            flags.ggml_rpc_port = std::atoi(argv[++i]);
             continue;
         }
         filtered_argv.push_back(argv[i]);
     }
 
-    return peer;
-}
-
-// Hydra #287/#260: one-binary role flag, filtered out before common_params_parse
-// the same way extract_rpc_engine_peer() is (these aren't stock llama.cpp args).
-//   --role <standalone|head|worker>   default: standalone (no behavior change)
-//   --combined-ot-pattern <regex>     head only: which expert tensors (matched
-//                                     by name) get a dual-resident copy on the
-//                                     peer named by --rpc-engine (COMBINED mode)
-//   --ggml-rpc-port <port>            worker only: port for the embedded
-//                                     ggml-RPC backend server (NOT the Hydra
-//                                     control-RPC port — different wire protocol)
-struct hydra_role_flags {
-    std::string role = "standalone";
-    std::string combined_ot_pattern;
-    int         ggml_rpc_port = 0;
-};
-
-// Filters role flags out of argv_inout in place (same vector serves as input
-// and output), mirroring extract_rpc_engine_peer()'s filtering style.
-static hydra_role_flags extract_hydra_role_flags(std::vector<char *> & argv_inout) {
-    hydra_role_flags flags;
-    std::vector<char *> in = std::move(argv_inout);
-    argv_inout.clear();
-    if (!in.empty()) argv_inout.push_back(in[0]);
-
-    for (size_t i = 1; i < in.size(); i++) {
-        if (strcmp(in[i], "--role") == 0 && i + 1 < in.size()) {
-            flags.role = in[++i];
-            continue;
-        }
-        if (strcmp(in[i], "--combined-ot-pattern") == 0 && i + 1 < in.size()) {
-            flags.combined_ot_pattern = in[++i];
-            continue;
-        }
-        if (strcmp(in[i], "--ggml-rpc-port") == 0 && i + 1 < in.size()) {
-            flags.ggml_rpc_port = std::atoi(in[++i]);
-            continue;
-        }
-        argv_inout.push_back(in[i]);
-    }
-
     return flags;
 }
 
-// Hydra #287/#260 — COMBINED worker role: this engine process does not load a
-// model or serve completions at all. It is purely an embedded ggml-RPC backend
-// server exposing its local GPU(s) for a head engine's --rpc-engine link, the
-// same protocol tools/rpc/rpc-server.cpp serves as a standalone process — here
-// it's embedded directly in the engine binary so a single role flag switches
-// between solo/head/worker without a separate process to manage. Blocks forever
-// (the worker has nothing else to do; this sidesteps ever running local
-// inference and the embedded RPC server concurrently against the same GPU
-// context, which is not a supported pattern upstream).
-static int run_combined_worker(int ggml_rpc_port) {
-    if (ggml_rpc_port <= 0) {
-        LOG_ERR("eng  %12.*s: --role worker requires --ggml-rpc-port\n", 12, __func__);
-        return 1;
-    }
-
+// Hydra #348: starts the embedded ggml-RPC backend on a background thread,
+// serving the SAME backend instances `ctx`'s scheduler already built for
+// local inference — not independent ones for the same devices (the previous
+// design's run_combined_worker() created its own via ggml_backend_dev_init,
+// which is why a --role worker process could never also serve SOLO). One
+// backend instance per physical device for the whole process, shared
+// between local inference and inbound RPC compute, serialized via the
+// per-device lock enabled below (see llama_hydra_enable_shared_backend_compute_lock,
+// llama-hydra.cpp, and ggml-rpc.cpp's ggml_backend_rpc_server_compute_lock).
+// The thread is detached: ggml_backend_rpc_start_server_with_backends blocks
+// in its own accept loop with no stop hook, the same "runs for process
+// lifetime, no teardown path" choice already made for
+// llama_hydra_load_combined_experts's static leak-on-purpose buffers.
+static void start_shared_backend_rpc_server(struct llama_context * ctx, int ggml_rpc_port) {
     ggml_backend_load_all();
     ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
     if (!rpc_reg) {
-        LOG_ERR("eng  %12.*s: RPC backend not available in this build\n", 12, __func__);
-        return 1;
+        LOG_ERR("eng  %12.*s: RPC backend not available in this build — --ggml-rpc-port ignored\n", 12, __func__);
+        return;
     }
-    using start_server_fn_t = void (*)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *);
-    auto start_server_fn = (start_server_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
+    using start_server_fn_t = void (*)(const char *, const char *, size_t, size_t, ggml_backend_t *);
+    auto start_server_fn = (start_server_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server_with_backends");
     if (!start_server_fn) {
-        LOG_ERR("eng  %12.*s: failed to resolve ggml_backend_rpc_start_server\n", 12, __func__);
-        return 1;
+        LOG_ERR("eng  %12.*s: failed to resolve ggml_backend_rpc_start_server_with_backends\n", 12, __func__);
+        return;
     }
 
-    std::vector<ggml_backend_dev_t> devices;
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-            devices.push_back(dev);
-        }
+    std::vector<ggml_backend_t> backends(8);
+    size_t n_backends = llama_hydra_get_compute_backends(ctx, backends.data(), backends.size());
+    if (n_backends > backends.size()) {
+        backends.resize(n_backends);
+        n_backends = llama_hydra_get_compute_backends(ctx, backends.data(), backends.size());
     }
-    if (devices.empty()) {
-        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (cpu) devices.push_back(cpu);
+    backends.resize(n_backends);
+    if (backends.empty()) {
+        LOG_ERR("eng  %12.*s: no non-CPU backends found to expose for the embedded RPC server\n", 12, __func__);
+        return;
     }
-    if (devices.empty()) {
-        LOG_ERR("eng  %12.*s: no devices found for the embedded RPC server\n", 12, __func__);
-        return 1;
-    }
+
+    // Local decode dispatch (llama-context.cpp's graph_compute) must now
+    // serialize against this RPC server's compute on the same backend(s).
+    llama_hydra_enable_shared_backend_compute_lock();
 
     const std::string endpoint = "0.0.0.0:" + std::to_string(ggml_rpc_port);
-    LOG_INF("eng  %12.*s: role=worker — serving %zu device(s) as a ggml-RPC backend on %s\n",
-            12, __func__, devices.size(), endpoint.c_str());
+    const size_t n_threads = std::max(1u, std::thread::hardware_concurrency() / 2);
+    LOG_INF("eng  %12.*s: exposing %zu shared backend(s) as a ggml-RPC server on %s\n",
+            12, __func__, backends.size(), endpoint.c_str());
 
-    start_server_fn(endpoint.c_str(), nullptr, std::max(1u, std::thread::hardware_concurrency() / 2),
-                     devices.size(), devices.data());
-    return 0;
+    std::thread([start_server_fn, endpoint, n_threads, backends]() mutable {
+        start_server_fn(endpoint.c_str(), nullptr, n_threads, backends.size(), backends.data());
+    }).detach();
 }
 
 int llama_engine(int argc, char ** argv);
@@ -235,14 +230,7 @@ int llama_engine(int argc, char ** argv) {
     common_init();
 
     std::vector<char *> filtered_argv;
-    std::string rpc_engine_peer = extract_rpc_engine_peer(argc, argv, filtered_argv);
-    hydra_role_flags role_flags = extract_hydra_role_flags(filtered_argv);
-
-    if (role_flags.role != "standalone" && role_flags.role != "head" && role_flags.role != "worker") {
-        LOG_ERR("eng  %12.*s: --role must be 'standalone', 'head', or 'worker' (got '%s')\n",
-                12, __func__, role_flags.role.c_str());
-        return 1;
-    }
+    hydra_capability_flags flags = extract_hydra_capability_flags(argc, argv, filtered_argv);
 
     int filtered_argc = filtered_argv.size();
     char ** filtered_argv_ptr = filtered_argv.data();
@@ -251,28 +239,26 @@ int llama_engine(int argc, char ** argv) {
         return 1;
     }
 
-    // Hydra #287/#260: a COMBINED worker is purely an embedded ggml-RPC
-    // backend — no model load, no HTTP/control-RPC serving. It blocks here
-    // for the lifetime of the process.
-    if (role_flags.role == "worker") {
-        llama_backend_init();
-        int rc = run_combined_worker(role_flags.ggml_rpc_port);
-        llama_backend_free();
-        return rc;
+    const bool wants_combined_head = flags.wants_combined_head() && !flags.combined_ot_pattern.empty();
+    if (flags.wants_combined_head() && flags.combined_ot_pattern.empty()) {
+        LOG_WRN("eng  %12.*s: --rpc-engine given without --combined-ot-pattern — "
+                "COMBINED head capability disabled, running solo-only\n", 12, __func__);
     }
 
-    if (!rpc_engine_peer.empty()) {
-        std::string host = rpc_engine_peer;
+    bool peer_reachable = false;
+    if (wants_combined_head) {
+        std::string host = flags.rpc_engine_peer;
         int port = 8080;
-        size_t colon = rpc_engine_peer.find(':');
+        size_t colon = flags.rpc_engine_peer.find(':');
         if (colon != std::string::npos) {
-            host = rpc_engine_peer.substr(0, colon);
-            port = std::stoi(rpc_engine_peer.substr(colon + 1));
+            host = flags.rpc_engine_peer.substr(0, colon);
+            port = std::stoi(flags.rpc_engine_peer.substr(colon + 1));
         }
 
-        if (!try_tcp_connect(host, port, 3)) {
+        peer_reachable = try_tcp_connect(host, port, 3);
+        if (!peer_reachable) {
             LOG_WRN("eng  %12.*s: rpc-engine peer %s unreachable, entering solo mode\n",
-                    12, __func__, rpc_engine_peer.c_str());
+                    12, __func__, flags.rpc_engine_peer.c_str());
         }
     }
 
@@ -283,32 +269,40 @@ int llama_engine(int argc, char ** argv) {
 
     server_context ctx_server;
 
+    // Hydra #348: every engine always loads its model now — there is no more
+    // --role worker path that skips this. SOLO duty is unconditional; the
+    // capabilities below layer on top of it instead of replacing it.
     if (!ctx_server.load_model(params)) {
         LOG_ERR("eng  %12.*s: failed to load model\n", 12, __func__);
         llama_backend_free();
         return 1;
     }
 
-    ctx_server.set_hydra_role(role_flags.role, rpc_engine_peer, role_flags.combined_ot_pattern);
+    ctx_server.set_hydra_capabilities(flags.wants_rpc_backend(), flags.rpc_engine_peer,
+            peer_reachable, flags.combined_ot_pattern);
 
-    // Hydra #287/#260: a head dual-loads its configured expert tensors onto
-    // the --rpc-engine peer once, here, before serving any requests. Missing
-    // config or an unreachable peer degrades to solo-only (never aborts
-    // startup) — SET_EXPERT_MODE("combined") will report "solo" until fixed.
-    if (role_flags.role == "head") {
-        if (rpc_engine_peer.empty() || role_flags.combined_ot_pattern.empty()) {
-            LOG_WRN("eng  %12.*s: role=head needs --rpc-engine and --combined-ot-pattern for "
-                    "COMBINED — running solo-only\n", 12, __func__);
+    // Hydra #348: expose this engine's own backend(s) as an embedded
+    // ggml-RPC server, shared with local inference rather than a duplicate
+    // context — see start_shared_backend_rpc_server.
+    if (flags.wants_rpc_backend()) {
+        start_shared_backend_rpc_server(ctx_server.get_llama_context(), flags.ggml_rpc_port);
+    }
+
+    // Hydra #287/#260/#348: a COMBINED head dual-loads its configured expert
+    // tensors onto the --rpc-engine peer once, here, before serving any
+    // requests. An unreachable peer or insufficient peer VRAM (see
+    // llama_hydra_load_combined_experts's headroom check) degrades to
+    // solo-only (never aborts startup) — SET_EXPERT_MODE("combined") will
+    // report "solo" until fixed.
+    if (wants_combined_head) {
+        int32_t n = llama_hydra_load_combined_experts(ctx_server.get_llama_context(),
+                flags.rpc_engine_peer.c_str(), flags.combined_ot_pattern.c_str());
+        ctx_server.set_hydra_combined_head_attached(n > 0);
+        if (n > 0) {
+            LOG_INF("eng  %12.*s: COMBINED ready — %d layer(s) dual-loaded onto %s\n",
+                    12, __func__, n, flags.rpc_engine_peer.c_str());
         } else {
-            int32_t n = llama_hydra_load_combined_experts(ctx_server.get_llama_context(),
-                    rpc_engine_peer.c_str(), role_flags.combined_ot_pattern.c_str());
-            ctx_server.set_hydra_combined_capable(n > 0);
-            if (n > 0) {
-                LOG_INF("eng  %12.*s: COMBINED ready — %d layer(s) dual-loaded onto %s\n",
-                        12, __func__, n, rpc_engine_peer.c_str());
-            } else {
-                LOG_WRN("eng  %12.*s: COMBINED dual-load failed — running solo-only\n", 12, __func__);
-            }
+            LOG_WRN("eng  %12.*s: COMBINED dual-load failed — running solo-only\n", 12, __func__);
         }
     }
 
@@ -513,6 +507,13 @@ int llama_engine(int argc, char ** argv) {
             llama_backend_free();
             return 1;
         }
+
+        // Pre-existing gap, found while live-verifying #348: unlike
+        // tools/server/server.cpp's main(), llama_engine() never flipped
+        // ctx_http.is_ready — server-http.cpp's middleware_server_state
+        // gates EVERY endpoint on this flag, so every HTTP route 503'd
+        // "Loading model" forever, even after the model finished loading.
+        ctx_http.is_ready.store(true);
     }
 
     shutdown_handler = [&](int) {

@@ -1384,7 +1384,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }
+    // Hydra #348: serialize against a caller that shares this backend
+    // instance for local inference (ggml_backend_rpc_start_server_with_backends).
+    ggml_backend_rpc_server_compute_lock(device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    ggml_backend_rpc_server_compute_unlock(device);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].graph = graph;
     return true;
@@ -1400,7 +1404,9 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
+    ggml_backend_rpc_server_compute_lock(device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    ggml_backend_rpc_server_compute_unlock(device);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
 }
@@ -1765,6 +1771,105 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     }
 }
 
+// Hydra #348: per-device mutex serializing GPU compute between this embedded
+// RPC server and a caller that shares the same backend instance for local
+// inference (ggml_backend_rpc_start_server_with_backends). A standalone
+// rpc-server process with no such caller just pays the cost of an
+// uncontended lock/unlock per graph_compute.
+//
+// HYDRA_RPC_MAX_LOCAL_DEVICES=8 is generous headroom (this fork only ever
+// runs one GPU per node); device >= this bound asserts rather than silently
+// skipping the lock, since a silent no-op here would mean "no serialization
+// happened" with no signal that the safety property is no longer held.
+static constexpr size_t HYDRA_RPC_MAX_LOCAL_DEVICES = 8;
+static std::array<std::mutex, HYDRA_RPC_MAX_LOCAL_DEVICES> g_hydra_server_compute_mutexes;
+
+void ggml_backend_rpc_server_compute_lock(uint32_t device) {
+    GGML_ASSERT(device < g_hydra_server_compute_mutexes.size());
+    g_hydra_server_compute_mutexes[device].lock();
+}
+
+void ggml_backend_rpc_server_compute_unlock(uint32_t device) {
+    GGML_ASSERT(device < g_hydra_server_compute_mutexes.size());
+    g_hydra_server_compute_mutexes[device].unlock();
+}
+
+// Hydra #348: like ggml_backend_rpc_start_server above, but serves the given
+// pre-built backend instances instead of creating independent ones via
+// ggml_backend_dev_init for the same devices. This is what lets a process
+// expose its own already-loaded llama_context's backend(s) over the embedded
+// RPC server - one backend instance per physical device for the whole
+// process, shared between local inference and inbound RPC compute, rather
+// than two independent CUDA contexts contending for the same device. The
+// caller retains ownership of `backends_in` - this function never frees them
+// (unlike ggml_backend_rpc_start_server's cleanup loop above, which created
+// and therefore owns its own).
+void ggml_backend_rpc_start_server_with_backends(const char * endpoint, const char * cache_dir,
+                                                 size_t n_threads, size_t n_backends, ggml_backend_t * backends_in) {
+    if (n_backends == 0 || backends_in == nullptr) {
+        fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server_with_backends\n");
+        return;
+    }
+    std::vector<ggml_backend_t> backends(backends_in, backends_in + n_backends);
+    printf("Starting RPC server v%d.%d.%d (shared local backend instances)\n",
+        RPC_PROTO_MAJOR_VERSION,
+        RPC_PROTO_MINOR_VERSION,
+        RPC_PROTO_PATCH_VERSION);
+    printf("  endpoint       : %s\n", endpoint);
+    printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    printf("Devices (shared with local inference):\n");
+    for (size_t i = 0; i < n_backends; i++) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[i]);
+        size_t free, total;
+        ggml_backend_dev_memory(dev, &free, &total);
+        printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+               total / 1024 / 1024, free / 1024 / 1024);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+            if (ggml_backend_set_n_threads_fn) {
+                ggml_backend_set_n_threads_fn(backends[i], n_threads);
+            }
+        }
+    }
+
+    std::string host;
+    int port;
+    if (!parse_endpoint(endpoint, host, port)) {
+        return;
+    }
+
+#ifdef GGML_RPC_RDMA
+    printf("  transport      : TCP (RDMA auto-negotiate enabled)\n");
+#else
+    printf("  transport      : TCP\n");
+#endif // GGML_RPC_RDMA
+    if (!rpc_transport_init()) {
+        fprintf(stderr, "Failed to initialize RPC transport\n");
+        return;
+    }
+    auto server_socket = socket_t::create_server(host.c_str(), port);
+    if (server_socket == nullptr) {
+        fprintf(stderr, "Failed to create server socket\n");
+        return;
+    }
+    while (true) {
+        auto client_socket = server_socket->accept();
+        if (client_socket == nullptr) {
+            fprintf(stderr, "Failed to accept client connection\n");
+            return;
+        }
+        printf("Accepted client connection\n");
+        fflush(stdout);
+        rpc_serve_client(backends, cache_dir, client_socket);
+        printf("Client connection closed\n");
+        fflush(stdout);
+    }
+    rpc_transport_shutdown();
+    // Hydra #348: deliberately do not free `backends` here - they are owned
+    // by the caller (e.g. a llama_context's sched), not by this function.
+}
+
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
 
@@ -1886,6 +1991,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_start_server_with_backends") == 0) {
+        return (void *)ggml_backend_rpc_start_server_with_backends;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_compute_lock") == 0) {
+        return (void *)ggml_backend_rpc_server_compute_lock;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_compute_unlock") == 0) {
+        return (void *)ggml_backend_rpc_server_compute_unlock;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_get_device_memory") == 0) {
+        return (void *)ggml_backend_rpc_get_device_memory;
     }
     return NULL;
 

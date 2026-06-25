@@ -2339,6 +2339,24 @@ llm_graph_params llama_context::graph_params(
     };
 }
 
+namespace {
+// Hydra #348: RAII wrapper around llama_hydra_lock_compute/unlock_compute so
+// the lock can't leak on an early return or exception between lock and
+// unlock (the manual-pairing version this replaced had no such guarantee).
+struct hydra_compute_lock_guard {
+    explicit hydra_compute_lock_guard(int32_t device) : device(device) {
+        llama_hydra_lock_compute(device);
+    }
+    ~hydra_compute_lock_guard() {
+        llama_hydra_unlock_compute(device);
+    }
+    hydra_compute_lock_guard(const hydra_compute_lock_guard &) = delete;
+    hydra_compute_lock_guard & operator=(const hydra_compute_lock_guard &) = delete;
+private:
+    int32_t device;
+};
+} // namespace
+
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
@@ -2358,9 +2376,41 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    // Hydra #348: when this engine also exposes its backend(s) over the
+    // embedded RPC server (shared-backend mode, see llama-hydra.h), serialize
+    // this dispatch against the RPC server's own graph_compute/graph_recompute
+    // so the two never execute on the same device concurrently. No-op
+    // (near-zero cost) otherwise. RAII guard (see hydra_compute_lock_guard
+    // above) so the lock can't leak on an early return or exception.
+    //
+    // Device index is hardcoded to 0: this fork only ever runs one GPU per
+    // node, and it must match the device index the embedded RPC server (see
+    // ggml-rpc.cpp's rpc_server::graph_compute) uses for the SAME physical
+    // backend — if a future change adds multi-GPU-per-node support, this and
+    // the RPC server's device indexing need to be derived from the same
+    // source instead of two independently hardcoded 0s.
+    hydra_compute_lock_guard hydra_lock(0);
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    } else {
+        // Force completion before unlocking so a concurrent RPC-driven
+        // compute on the shared backend can't start while this async
+        // dispatch is still in flight. This forfeits the pipeline-parallel
+        // overlap optimization (see process_ubatch's synchronize-before-reuse
+        // comment) only while shared-backend mode is active.
+        //
+        // Note: only graph-compute is serialized here and on the RPC-server
+        // side (ggml-rpc.cpp's rpc_server::graph_compute/graph_recompute) -
+        // inbound RPC set_tensor/get_tensor/copy_tensor/buffer alloc-free
+        // (used during llama_hydra_load_combined_experts's one-time startup
+        // dual-load) are NOT covered by this lock. That's safe only because
+        // the current usage pattern is "head writes expert tensors once at
+        // startup, then only ever sends graph_compute/graph_recompute" - if
+        // a future change mutates shared-backend tensors after startup
+        // (e.g. a live SWAP_QUANT against a shared backend), it would need
+        // its own synchronization against this same lock.
+        llama_hydra_force_sync_if_shared(this);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

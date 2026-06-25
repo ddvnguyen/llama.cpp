@@ -90,15 +90,23 @@ struct server_context {
     // TODO(M1): route through task queue for full thread safety under load.
     void start_rpc_server(int port);
 
-    // Hydra #287/#260: record this engine's one-binary role + (for head) the
+    // Hydra #348: record this engine's independent capability flags (replaces
+    // the old single hydra_role string) + (for a COMBINED head) the
     // configured peer/tensor-pattern, so ENGINE_INFO (0x41) can report them.
-    void set_hydra_role(const std::string & role, const std::string & peer, const std::string & combined_pattern);
+    // `rpc_backend_active`: true once the shared-backend RPC thread is
+    // running (--ggml-rpc-port was set). `peer_reachable`: the startup
+    // TCP-probe result for `peer`, distinct from whether the dual-load
+    // (set_hydra_combined_head_attached) actually succeeded.
+    void set_hydra_capabilities(bool rpc_backend_active, const std::string & peer,
+            bool peer_reachable, const std::string & combined_pattern);
 
-    // Hydra #287/#260: record whether COMBINED expert dual-loading succeeded
-    // at startup. Must be called (if at all) after load_model() and before
-    // serving requests. SET_EXPERT_MODE("combined") falls back to solo when
-    // this is false (peer was unreachable or had no matching expert tensors).
-    void set_hydra_combined_capable(bool capable);
+    // Hydra #348 (renamed from set_hydra_combined_capable): record whether
+    // COMBINED expert dual-loading succeeded at startup. Must be called (if
+    // at all) after load_model() and before serving requests.
+    // SET_EXPERT_MODE("combined") falls back to solo when this is false
+    // (peer was unreachable, had no matching expert tensors, or didn't have
+    // enough free VRAM for the dual-load).
+    void set_hydra_combined_head_attached(bool attached);
 };
 
 
