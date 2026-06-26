@@ -353,12 +353,18 @@ int llama_engine(int argc, char ** argv) {
 
     // Hydra #356: server_routes owns the schema-correct handlers
     // (post_chat_completions, post_completions_oai) and the chat-template
-    // meta (read by oaicompat_chat_params_parse). Declared BEFORE
-    // server_http_context ctx_http so the captured-lambda handlers stored
-    // in ctx_http are destroyed before `routes` is destroyed — reverse
-    // declaration order would leave dangling captures in ctx_http. Mirrors
-    // the lifetime layout in tools/server/server.cpp (the routes struct is
-    // constructed in the same scope as ctx_http and used until shutdown).
+    // meta (read by oaicompat_chat_params_parse). Declared before
+    // server_http_context ctx_http so `routes` outlives the HTTP server:
+    // the std::function handlers stored in ctx_http.handlers are *copies*
+    // of routes.post_* (made by ex_wrapper's value-capture), and
+    // post_chat_completions dereferences `routes` on every request. Note
+    // that server.cpp declares them in the opposite order (ctx_http at
+    // server.cpp:122, routes at server.cpp:133) — that order is also safe
+    // because std::function destruction doesn't access its captures, but
+    // the "outer before inner" convention used here keeps `routes` alive
+    // for the full ctx_http lifetime. See #17 for the comment cleanup;
+    // see #16 for the unjoined-shutdown-thread hazard that this PR newly
+    // depends on.
     server_routes routes(params, ctx_server);
 
     server_http_context ctx_http;
@@ -603,6 +609,22 @@ int llama_engine(int argc, char ** argv) {
 #endif
 
     ctx_server.start_loop();
+
+    // Hydra #356 (review finding, ddvnguyen/llama.cpp#16): stop and join
+    // the HTTP server thread before scope exit. server_http_context::thread
+    // (server-http.h:68) is a std::thread with a defaulted destructor; the
+    // thread is blocked in listen_after_bind() (server-http.cpp:385) for the
+    // entire process lifetime, so without a stop+join, destroying the
+    // still-joinable thread at scope exit calls std::terminate() → SIGABRT.
+    // The shutdown_handler above unblocks start_loop() on SIGTERM/SIGINT
+    // (hydra-head restart) but does not stop the HTTP server, so this
+    // belongs here. Mirrors tools/server/server.cpp:369-372.
+    if (params.port > 0) {
+        ctx_http.stop();
+        if (ctx_http.thread.joinable()) {
+            ctx_http.thread.join();
+        }
+    }
 
     ctx_server.terminate();
     llama_backend_free();
