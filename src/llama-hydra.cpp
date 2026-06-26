@@ -222,6 +222,18 @@ int32_t llama_hydra_load_combined_experts(
     s_ctxs.push_back(std::move(meta_ctx));
     s_bufs.emplace_back(buf);
 
+    // Hydra #353 / llama.cpp#12: the expert tensors above live on the peer's
+    // buffer, but the context's scheduler was built at load time without the
+    // peer. Register the peer device as a scheduler backend now so the routed-
+    // expert ops are schedulable once SET_EXPERT_MODE("combined") is active;
+    // otherwise the first COMBINED PREFILL asserts in ggml-backend.cpp:898.
+    if (!ctx->hydra_add_combined_rpc_backend(peer_dev)) {
+        LLAMA_LOG_ERROR("hydra: COMBINED — peer %s dual-loaded but could not be registered "
+                "with the scheduler; clearing _rpc tensors and staying solo-only\n", peer_endpoint);
+        for (auto & p : pending) { *p.dst_field = nullptr; }
+        return -1;
+    }
+
     LLAMA_LOG_INFO("hydra: COMBINED dual-loaded %zu expert tensors across %d layers onto peer %s\n",
             pending.size(), n_layers_loaded, peer_endpoint);
 

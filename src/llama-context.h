@@ -54,6 +54,11 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // (re)build backend_ptrs / backend_buft / backend_buf_exp_size from `backends`.
+    // Shared by the constructor and the Hydra COMBINED path that appends a peer
+    // backend (hydra_add_combined_rpc_backend).
+    void build_backend_buffer_vectors();
+
     void synchronize();
 
     const llama_model   & get_model()   const;
@@ -120,6 +125,16 @@ struct llama_context {
     // Hydra #334 setter (accessed by llama-hydra.h API) — clamps to a sane
     // range since this is reachable from the network via CONFIGURE (0x40).
     void hydra_set_state_chunk_size(size_t bytes);
+
+    // Hydra #353 / llama.cpp#12 (accessed by llama-hydra.cpp COMBINED setup):
+    // add the COMBINED peer device as a scheduler backend AFTER model load, so
+    // the dual-loaded ffn_*_exps_rpc expert tensors (which live on the peer's
+    // buffer) are schedulable. Without this, ggml_backend_sched has no backend
+    // owning the RPC buffer and split_graph asserts on the first COMBINED
+    // PREFILL (ggml-backend.cpp:898). Base-model placement is untouched — only
+    // the peer backend is appended and the scheduler re-reserved. Must be called
+    // before the first decode. Returns false if the peer backend can't be init'd.
+    bool hydra_add_combined_rpc_backend(ggml_backend_dev_t peer_dev);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
