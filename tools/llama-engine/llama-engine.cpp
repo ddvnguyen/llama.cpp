@@ -40,6 +40,47 @@
 #include <unistd.h>
 #endif
 
+// Hydra #356: ex_wrapper is a verbatim copy of tools/server/server.cpp's
+// static helper. The HTTP handlers registered below (post_chat_completions,
+// post_completions_oai) return std::unique_ptr<server_res_generator>, but
+// server_http_context::handler_t expects std::unique_ptr<server_http_res>.
+// ex_wrapper bridges the two: it owns the streaming generator, drains it
+// into a server_http_res, and converts any thrown exception into a JSON
+// error response with the right HTTP status (400 invalid_argument, 500
+// otherwise). The chat handler reads meta->chat_params; we must call
+// routes.update_meta(ctx_server) before flipping ctx_http.is_ready.
+static server_http_context::handler_t ex_wrapper(server_http_context::handler_t func) {
+    return [func = std::move(func)](const server_http_req & req) -> server_http_res_ptr {
+        std::string message;
+        error_type error;
+        try {
+            return func(req);
+        } catch (const std::invalid_argument & e) {
+            error = ERROR_TYPE_INVALID_REQUEST;
+            message = e.what();
+        } catch (const std::exception & e) {
+            error = ERROR_TYPE_SERVER;
+            message = e.what();
+        } catch (...) {
+            error = ERROR_TYPE_SERVER;
+            message = "unknown error";
+        }
+
+        auto res = std::make_unique<server_http_res>();
+        res->status = 500;
+        try {
+            json error_data = format_error_response(message, error);
+            res->status = json_value(error_data, "code", 500);
+            res->data = safe_json_to_str({{ "error", error_data }});
+            SRV_WRN("got exception: %s\n", res->data.c_str());
+        } catch (const std::exception & e) {
+            SRV_ERR("got another exception: %s | while handling exception: %s\n", e.what(), message.c_str());
+            res->data = "Internal Server Error";
+        }
+        return res;
+    };
+}
+
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
@@ -310,6 +351,16 @@ int llama_engine(int argc, char ** argv) {
         ctx_server.start_rpc_server(params.rpc_port);
     }
 
+    // Hydra #356: server_routes owns the schema-correct handlers
+    // (post_chat_completions, post_completions_oai) and the chat-template
+    // meta (read by oaicompat_chat_params_parse). Declared BEFORE
+    // server_http_context ctx_http so the captured-lambda handlers stored
+    // in ctx_http are destroyed before `routes` is destroyed — reverse
+    // declaration order would leave dangling captures in ctx_http. Mirrors
+    // the lifetime layout in tools/server/server.cpp (the routes struct is
+    // constructed in the same scope as ctx_http and used until shutdown).
+    server_routes routes(params, ctx_server);
+
     server_http_context ctx_http;
     if (params.port > 0) {
         if (!ctx_http.init(params)) {
@@ -502,6 +553,18 @@ int llama_engine(int argc, char ** argv) {
             return res;
         });
 
+        // Hydra #356: route OpenAI-schema completions through the
+        // schema-correct server_routes handlers so the existing
+        // CompletionProxyService on Hydra.Core can target engine-mode
+        // workers. Hand-rolled routes above are unchanged; the routes
+        // struct just adds these three. Unused server_routes handlers
+        // (embeddings, anthropic, lora, etc.) stay unregistered — full
+        // llama-server parity is a larger, riskier refactor deferred as
+        // a follow-up.
+        ctx_http.post("/v1/chat/completions", ex_wrapper(routes.post_chat_completions));
+        ctx_http.post("/chat/completions",    ex_wrapper(routes.post_chat_completions));
+        ctx_http.post("/v1/completions",      ex_wrapper(routes.post_completions_oai));
+
         if (!ctx_http.start()) {
             LOG_ERR("eng  %12.*s: failed to start HTTP server\n", 12, __func__);
             llama_backend_free();
@@ -513,6 +576,11 @@ int llama_engine(int argc, char ** argv) {
         // ctx_http.is_ready — server-http.cpp's middleware_server_state
         // gates EVERY endpoint on this flag, so every HTTP route 503'd
         // "Loading model" forever, even after the model finished loading.
+        // Hydra #356: server_routes::post_chat_completions reads
+        // meta->chat_params, which is only populated by update_meta() —
+        // must run before ctx_http.is_ready flips or the first chat
+        // request will see a default-constructed (empty) chat template.
+        routes.update_meta(ctx_server);
         ctx_http.is_ready.store(true);
     }
 
