@@ -152,6 +152,10 @@ endif ()
 # so this runs on every platform (incl. Windows + shared libs).
 llama_build_and_test(test-hydra-state-chunk-size.cpp)
 
+# hydra#316/#8: pins the checkpoint-creation gate (server_should_create_checkpoint),
+# pure header function — guards the recurrent/hybrid term that hybrid KV restore needs.
+llama_build_and_test(test-hydra-checkpoint-policy.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
