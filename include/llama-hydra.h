@@ -100,6 +100,17 @@ LLAMA_API void llama_hydra_unlock_compute(int32_t device);
 // process_ubatch) for engines that never expose an RPC backend.
 LLAMA_API void llama_hydra_force_sync_if_shared(struct llama_context * ctx);
 
+// Hydra: zero-copy COMBINED expert tensors (llama.cpp#20, follow-up to
+// #287/#260/#353). Registers every tensor of ctx's already-loaded model with
+// the embedded ggml-RPC server (ggml_backend_rpc_register_local_tensor) so a
+// COMBINED head can later bind directly to this engine's own resident
+// weights by name instead of dual-loading a copy. Call once at startup,
+// after start_shared_backend_rpc_server (i.e. only meaningful when
+// --ggml-rpc-port is configured) and after the model is loaded. Cheap,
+// unconditional bookkeeping — does not require knowing in advance which
+// tensors a future peer will ask for.
+LLAMA_API void llama_hydra_register_local_tensors_for_rpc(struct llama_context * ctx);
+
 #ifdef __cplusplus
 }
 #endif

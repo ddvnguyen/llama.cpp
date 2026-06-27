@@ -3,7 +3,6 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 
-#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
 
@@ -61,18 +60,29 @@ bool llama_hydra_peer_reachable(const char * host_port) {
 #endif
 }
 
-// Copies tensor data from src (any backend) to dst (any backend) via a bounded
-// host staging buffer, so dual-loading multi-GB expert tensors over the RPC
-// link never requires holding the whole tensor in host RAM at once.
-static void hydra_copy_tensor_chunked(struct ggml_tensor * dst, const struct ggml_tensor * src) {
-    constexpr size_t CHUNK = 16ull * 1024 * 1024;
-    const size_t      nbytes = ggml_nbytes(src);
-    std::vector<uint8_t> buf(std::min(nbytes, CHUNK));
-    for (size_t off = 0; off < nbytes; off += CHUNK) {
-        const size_t n = std::min(CHUNK, nbytes - off);
-        ggml_backend_tensor_get(src, buf.data(), off, n);
-        ggml_backend_tensor_set(dst, buf.data(), off, n);
+void llama_hydra_register_local_tensors_for_rpc(struct llama_context * ctx) {
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        LLAMA_LOG_WARN("hydra: local-tensor registration requested but the RPC backend is not available in this build\n");
+        return;
     }
+    using register_fn_t = void (*)(const char *, struct ggml_tensor *);
+    auto register_fn = (register_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_register_local_tensor");
+    if (!register_fn) {
+        LLAMA_LOG_ERROR("hydra: failed to resolve ggml_backend_rpc_register_local_tensor\n");
+        return;
+    }
+
+    const llama_model & model = ctx->get_model();
+    size_t n = 0;
+    for (const auto & kv : model.tensors_by_name) {
+        if (kv.second && kv.second->buffer && kv.second->data) {
+            register_fn(kv.first.c_str(), kv.second);
+            n++;
+        }
+    }
+    LLAMA_LOG_INFO("hydra: registered %zu resident tensor(s) for zero-copy RPC resolution\n", n);
 }
 
 int32_t llama_hydra_load_combined_experts(
@@ -105,10 +115,17 @@ int32_t llama_hydra_load_combined_experts(
     }
     ggml_backend_register(peer_reg);
 
-    ggml_backend_dev_t        peer_dev  = ggml_backend_reg_dev_get(peer_reg, 0);
-    ggml_backend_buffer_type_t peer_buft = ggml_backend_dev_buffer_type(peer_dev);
-    if (!peer_buft) {
-        LLAMA_LOG_ERROR("hydra: COMBINED — peer %s has no buffer type\n", peer_endpoint);
+    ggml_backend_dev_t peer_dev = ggml_backend_reg_dev_get(peer_reg, 0);
+
+    // Hydra llama.cpp#20: zero-copy — bind directly to tensors the peer
+    // already has resident (its own model load, registered via
+    // llama_hydra_register_local_tensors_for_rpc), instead of allocating a
+    // buffer on the peer and copying bytes into it. No VRAM-headroom check
+    // needed: nothing new is allocated on the peer.
+    using bind_remote_fn_t = struct ggml_tensor * (*)(const char *, uint32_t, struct ggml_context *, const char *);
+    auto bind_remote_fn = (bind_remote_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_bind_remote_tensor");
+    if (!bind_remote_fn) {
+        LLAMA_LOG_ERROR("hydra: COMBINED — failed to resolve ggml_backend_rpc_bind_remote_tensor\n");
         return -1;
     }
 
@@ -122,11 +139,11 @@ int32_t llama_hydra_load_combined_experts(
         return -1;
     }
 
-    struct pending_copy {
-        ggml_tensor *  src;
+    struct pending_bind {
         ggml_tensor ** dst_field; // address of the layer's ffn_*_exps_rpc member
+        std::string    name;
     };
-    std::vector<pending_copy> pending;
+    std::vector<pending_bind> pending;
 
     const size_t n_layer = model.layers.size();
     const size_t ctx_mem = n_layer * 3 * ggml_tensor_overhead() + ggml_tensor_overhead() * 4;
@@ -141,21 +158,14 @@ int32_t llama_hydra_load_combined_experts(
         if (!src || !std::regex_match(ggml_get_name(src), re)) {
             return;
         }
-        ggml_tensor * dup = ggml_dup_tensor(meta_ctx.get(), src);
-        ggml_set_name(dup, ggml_get_name(src));
-        pending.push_back({src, dst_field});
-        *dst_field = dup;
+        pending.push_back({dst_field, ggml_get_name(src)});
     };
 
-    int32_t n_layers_loaded = 0;
     for (size_t il = 0; il < n_layer; il++) {
         llama_layer & layer = model.layers[il];
         consider(layer.ffn_gate_exps, &layer.ffn_gate_exps_rpc);
         consider(layer.ffn_up_exps,   &layer.ffn_up_exps_rpc);
         consider(layer.ffn_down_exps, &layer.ffn_down_exps_rpc);
-        if (layer.ffn_gate_exps_rpc || layer.ffn_up_exps_rpc || layer.ffn_down_exps_rpc) {
-            n_layers_loaded++;
-        }
     }
 
     if (pending.empty()) {
@@ -163,64 +173,38 @@ int32_t llama_hydra_load_combined_experts(
         return 0;
     }
 
-    // Hydra #348: the peer's VRAM is no longer guaranteed empty — under the
-    // always-on dual-role design it may already be running its own resident
-    // SOLO model + KV cache. Check headroom before committing to a copy that
-    // could otherwise starve the peer's own inference or fail to allocate.
-    {
-        size_t total_bytes = 0;
-        for (auto & p : pending) {
-            total_bytes += ggml_nbytes(p.src);
-        }
-
-        using get_mem_fn_t = void (*)(const char *, uint32_t, size_t *, size_t *);
-        auto get_mem_fn = (get_mem_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_get_device_memory");
-        size_t peer_free = 0, peer_total = 0;
-        if (get_mem_fn) {
-            get_mem_fn(peer_endpoint, /*device=*/0, &peer_free, &peer_total);
-        } else {
-            LLAMA_LOG_WARN("hydra: COMBINED — failed to resolve ggml_backend_rpc_get_device_memory, "
-                    "skipping VRAM headroom check (failing open)\n");
-        }
-
-        // Headroom for the peer's own KV cache growth during decode, which
-        // isn't reflected in a free-VRAM snapshot taken at head-startup
-        // time. Starting heuristic — revisit against real measurements
-        // (docs/spike-engine-mode-switch.md) if it's wrong in either
-        // direction. peer_free == 0 (query failed or genuinely zero) fails
-        // open — does not block — consistent with this function's existing
-        // "log + stay solo, never abort" philosophy elsewhere.
-        constexpr double kHeadroomFactor = 1.25;
-        const size_t required_bytes = static_cast<size_t>(total_bytes * kHeadroomFactor);
-
-        if (peer_free > 0 && required_bytes > peer_free) {
-            LLAMA_LOG_WARN("hydra: COMBINED — peer %s has %zu MB free, dual-load needs ~%zu MB "
-                    "(with %.0f%% headroom) for %zu tensor(s) — skipping COMBINED, staying solo-only\n",
-                    peer_endpoint, peer_free / (1024*1024), required_bytes / (1024*1024),
-                    (kHeadroomFactor - 1.0) * 100.0, pending.size());
-            for (auto & p : pending) { *p.dst_field = nullptr; }
-            return 0;
-        }
-    }
-
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(meta_ctx.get(), peer_buft);
-    if (!buf) {
-        LLAMA_LOG_ERROR("hydra: COMBINED — failed to allocate %zu expert tensors on peer %s\n",
-                pending.size(), peer_endpoint);
-        for (auto & p : pending) { *p.dst_field = nullptr; }
-        return -1;
-    }
-
+    size_t n_bound = 0;
     for (auto & p : pending) {
-        hydra_copy_tensor_chunked(*p.dst_field, p.src);
+        ggml_tensor * remote = bind_remote_fn(peer_endpoint, /*device=*/0, meta_ctx.get(), p.name.c_str());
+        *p.dst_field = remote;
+        if (remote) {
+            n_bound++;
+        } else {
+            LLAMA_LOG_WARN("hydra: COMBINED — peer %s has no resident tensor named '%s' (zero-copy bind failed)\n",
+                    peer_endpoint, p.name.c_str());
+        }
     }
 
-    // Keep the metadata context + backing buffer alive for the lifetime of the
-    // process — this is one-time startup setup, never torn down before exit.
-    static std::vector<ggml_context_ptr>        s_ctxs;
-    static std::vector<ggml_backend_buffer_ptr>  s_bufs;
+    if (n_bound == 0) {
+        LLAMA_LOG_WARN("hydra: COMBINED — zero-copy bind failed for all %zu matched tensor(s) on peer %s, staying solo-only\n",
+                pending.size(), peer_endpoint);
+        return 0;
+    }
+
+    // Keep the metadata context alive for the lifetime of the process — this
+    // is one-time startup setup, never torn down before exit. (The bound
+    // tensors' synthetic client-side buffers are intentionally leaked too,
+    // same "runs for process lifetime" choice as the rest of this function.)
+    static std::vector<ggml_context_ptr> s_ctxs;
     s_ctxs.push_back(std::move(meta_ctx));
-    s_bufs.emplace_back(buf);
+
+    int32_t n_layers_loaded = 0;
+    for (size_t il = 0; il < n_layer; il++) {
+        const llama_layer & layer = model.layers[il];
+        if (layer.ffn_gate_exps_rpc || layer.ffn_up_exps_rpc || layer.ffn_down_exps_rpc) {
+            n_layers_loaded++;
+        }
+    }
 
     // Hydra #353 / llama.cpp#12: the expert tensors above live on the peer's
     // buffer, but the context's scheduler was built at load time without the
@@ -228,14 +212,14 @@ int32_t llama_hydra_load_combined_experts(
     // expert ops are schedulable once SET_EXPERT_MODE("combined") is active;
     // otherwise the first COMBINED PREFILL asserts in ggml-backend.cpp:898.
     if (!ctx->hydra_add_combined_rpc_backend(peer_dev)) {
-        LLAMA_LOG_ERROR("hydra: COMBINED — peer %s dual-loaded but could not be registered "
+        LLAMA_LOG_ERROR("hydra: COMBINED — peer %s bound but could not be registered "
                 "with the scheduler; clearing _rpc tensors and staying solo-only\n", peer_endpoint);
         for (auto & p : pending) { *p.dst_field = nullptr; }
         return -1;
     }
 
-    LLAMA_LOG_INFO("hydra: COMBINED dual-loaded %zu expert tensors across %d layers onto peer %s\n",
-            pending.size(), n_layers_loaded, peer_endpoint);
+    LLAMA_LOG_INFO("hydra: COMBINED zero-copy bound %zu/%zu expert tensors across %d layers to peer %s (no bytes copied)\n",
+            n_bound, pending.size(), n_layers_loaded, peer_endpoint);
 
     return n_layers_loaded;
 }
