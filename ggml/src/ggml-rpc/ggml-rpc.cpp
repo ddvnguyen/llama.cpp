@@ -71,6 +71,11 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    // Hydra: zero-copy COMBINED expert tensors (llama.cpp#20). Resolves a
+    // tensor the server already has resident (loaded from its own local
+    // model, not via RPC_CMD_ALLOC_BUFFER) by name, so a peer can bind
+    // directly to it instead of allocating + copying bytes over the wire.
+    RPC_CMD_RESOLVE_TENSOR,
     RPC_CMD_COUNT,
 };
 
@@ -188,6 +193,21 @@ struct rpc_msg_get_device_memory_rsp {
 
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
+};
+
+// Hydra: zero-copy COMBINED expert tensors (llama.cpp#20).
+struct rpc_msg_resolve_tensor_req {
+    char name[GGML_MAX_NAME];
+};
+
+struct rpc_msg_resolve_tensor_rsp {
+    uint8_t  found;
+    uint32_t type;
+    uint32_t ne[GGML_MAX_DIMS];
+    uint32_t nb[GGML_MAX_DIMS];
+    uint64_t buffer;       // server-side ggml_backend_buffer_t handle (opaque, same convention as ALLOC_BUFFER's remote_ptr)
+    uint64_t buffer_size;  // size of the *owning* buffer (for get_base/bounds-check parity with allocated buffers)
+    uint64_t data;         // absolute tensor->data pointer in the server's address space
 };
 
 #pragma pack(pop)
@@ -814,6 +834,87 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
     get_device_memory(sock, device, free, total);
 }
 
+// Hydra: zero-copy COMBINED expert tensors (llama.cpp#20).
+//
+// A worker process that already has a model resident (its own SOLO load,
+// possibly a different quant than any future peer's) registers its own
+// tensors here by name, once, at model-load time. Any RPC connection can
+// then RESOLVE_TENSOR by that name and bind directly to the already-loaded
+// memory — no RPC_CMD_ALLOC_BUFFER, no bytes copied. The registry is
+// process-wide (not per-connection, unlike rpc_server::buffers) because
+// registration happens once at startup, before any peer has connected.
+namespace {
+struct hydra_local_tensor_info {
+    ggml_backend_buffer_t buffer; // the tensor's own (already-allocated) owning buffer
+    uint64_t              data;   // absolute tensor->data pointer
+    uint32_t              type;
+    uint32_t               ne[GGML_MAX_DIMS];
+    uint32_t               nb[GGML_MAX_DIMS];
+};
+std::mutex g_hydra_local_tensors_mutex;
+std::unordered_map<std::string, hydra_local_tensor_info> g_hydra_local_tensors;
+} // namespace
+
+void ggml_backend_rpc_register_local_tensor(const char * name, struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->buffer || !tensor->data) {
+        return;
+    }
+    hydra_local_tensor_info info;
+    info.buffer = tensor->buffer;
+    info.data   = reinterpret_cast<uint64_t>(tensor->data);
+    info.type   = tensor->type;
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+        info.ne[i] = tensor->ne[i];
+        info.nb[i] = tensor->nb[i];
+    }
+    std::lock_guard<std::mutex> lock(g_hydra_local_tensors_mutex);
+    g_hydra_local_tensors[name] = info;
+}
+
+// Client side: resolve `name` on `endpoint` and bind a local ggml_tensor
+// directly to the peer's already-resident memory (no allocation, no copy).
+// Returns nullptr if the peer doesn't have a tensor registered under that
+// name (caller falls back, same "log + stay solo" philosophy as the rest of
+// the COMBINED path).
+struct ggml_tensor * ggml_backend_rpc_bind_remote_tensor(const char * endpoint, uint32_t device,
+                                                          struct ggml_context * ctx, const char * name) {
+    auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        return nullptr;
+    }
+    rpc_msg_resolve_tensor_req request = {};
+    snprintf(request.name, GGML_MAX_NAME, "%s", name);
+    rpc_msg_resolve_tensor_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_RESOLVE_TENSOR, &request, sizeof(request), &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    if (!response.found) {
+        return nullptr;
+    }
+    if (response.type >= GGML_TYPE_COUNT) {
+        GGML_LOG_ERROR("[%s] peer returned invalid tensor type %u for '%s'\n", __func__, response.type, name);
+        return nullptr;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_rpc_buffer_type(endpoint, device);
+    ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
+        ggml_backend_rpc_buffer_interface,
+        new ggml_backend_rpc_buffer_context{sock, nullptr, response.buffer},
+        response.buffer_size);
+
+    ggml_tensor * tensor = ggml_new_tensor_4d(ctx, (ggml_type) response.type,
+            response.ne[0], response.ne[1], response.ne[2], response.ne[3]);
+    if (!tensor) {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+        tensor->nb[i] = response.nb[i];
+    }
+    tensor->buffer = buffer;
+    tensor->data   = reinterpret_cast<void *>(response.data);
+    ggml_set_name(tensor, name);
+    return tensor;
+}
+
 // RPC server-side implementation
 
 class rpc_server {
@@ -840,6 +941,7 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    bool resolve_tensor(const rpc_msg_resolve_tensor_req & request, rpc_msg_resolve_tensor_rsp & response);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -853,14 +955,25 @@ private:
                               struct ggml_context * ctx,
                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
-
+    bool is_known_buffer(ggml_backend_buffer_t buffer) const;
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    // Hydra: buffers resolved via RPC_CMD_RESOLVE_TENSOR (llama.cpp#20) — the
+    // server doesn't own these (they belong to its own resident model), so
+    // unlike `buffers` they are never freed in the destructor. Valid for
+    // deserialize_tensor's ownership check (read paths / graph_compute), but
+    // deliberately NOT accepted by free_buffer/buffer_clear, which must stay
+    // restricted to buffers this rpc_server actually allocated.
+    std::unordered_set<ggml_backend_buffer_t> foreign_buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
 };
+
+bool rpc_server::is_known_buffer(ggml_backend_buffer_t buffer) const {
+    return buffers.find(buffer) != buffers.end() || foreign_buffers.find(buffer) != foreign_buffers.end();
+}
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
@@ -957,7 +1070,7 @@ bool rpc_server::get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_
 bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
+    if (!is_known_buffer(buffer)) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
@@ -1015,7 +1128,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->nb[i] = tensor->nb[i];
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
-    if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
+    if (result->buffer && !is_known_buffer(result->buffer)) {
         result->buffer = nullptr;
     }
 
@@ -1411,6 +1524,43 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     return true;
 }
 
+bool rpc_server::resolve_tensor(const rpc_msg_resolve_tensor_req & request, rpc_msg_resolve_tensor_rsp & response) {
+    // request.name may not be NUL-terminated if the client sent a full
+    // GGML_MAX_NAME buffer; force termination before using it as a C string.
+    char name[GGML_MAX_NAME];
+    memcpy(name, request.name, GGML_MAX_NAME);
+    name[GGML_MAX_NAME - 1] = '\0';
+
+    hydra_local_tensor_info info;
+    {
+        std::lock_guard<std::mutex> lock(g_hydra_local_tensors_mutex);
+        auto it = g_hydra_local_tensors.find(name);
+        if (it == g_hydra_local_tensors.end()) {
+            response.found = 0;
+            return true;
+        }
+        info = it->second;
+    }
+
+    // Bless this connection to read through the tensor's owning buffer —
+    // it's not in `buffers` (this rpc_server never allocated it), so
+    // deserialize_tensor would otherwise reject it. Never freed here (see
+    // foreign_buffers' declaration comment).
+    foreign_buffers.insert(info.buffer);
+
+    response.found       = 1;
+    response.type        = info.type;
+    response.buffer       = reinterpret_cast<uint64_t>(info.buffer);
+    response.buffer_size  = ggml_backend_buffer_get_size(info.buffer);
+    response.data         = info.data;
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+        response.ne[i] = info.ne[i];
+        response.nb[i] = info.nb[i];
+    }
+    LOG_DBG("[%s] name: %s, buffer: %p, data: 0x%" PRIx64 "\n", __func__, name, (void*)info.buffer, info.data);
+    return true;
+}
+
 bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response) {
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
@@ -1683,6 +1833,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_get_device_memory_rsp response;
                 if (!server.get_device_memory(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_RESOLVE_TENSOR: {
+                rpc_msg_resolve_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_resolve_tensor_rsp response;
+                if (!server.resolve_tensor(request, response)) {
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
@@ -2003,6 +2167,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_get_device_memory") == 0) {
         return (void *)ggml_backend_rpc_get_device_memory;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_register_local_tensor") == 0) {
+        return (void *)ggml_backend_rpc_register_local_tensor;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_bind_remote_tensor") == 0) {
+        return (void *)ggml_backend_rpc_bind_remote_tensor;
     }
     return NULL;
 
