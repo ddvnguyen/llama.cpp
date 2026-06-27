@@ -900,6 +900,19 @@ struct ggml_tensor * ggml_backend_rpc_bind_remote_tensor(const char * endpoint, 
         ggml_backend_rpc_buffer_interface,
         new ggml_backend_rpc_buffer_context{sock, nullptr, response.buffer},
         response.buffer_size);
+    // Every current caller binds a weight tensor (COMBINED expert tensors).
+    // ggml_backend_buffer_init defaults usage to ANY; the scheduler's
+    // weight-affinity heuristic (ggml-backend.cpp's
+    // ggml_backend_sched_backend_id_from_cur, "operations with weights are
+    // preferably run on the same backend as the weights") only fires for
+    // GGML_BACKEND_BUFFER_USAGE_WEIGHTS buffers — llama-model.cpp sets this
+    // for normal model loads (llama_model::load_tensors). Without it, the
+    // scheduler doesn't recognize this buffer as weights, assigns the
+    // consuming op to the wrong backend, and ends up fetching the whole
+    // tensor back over RPC_CMD_GET_TENSOR instead of computing where the
+    // weight already lives — confirmed on real hardware as a multi-hundred-
+    // MB stall under concurrent load (llama.cpp#21).
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     ggml_tensor * tensor = ggml_new_tensor_4d(ctx, (ggml_type) response.type,
             response.ne[0], response.ne[1], response.ne[2], response.ne[3]);
