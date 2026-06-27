@@ -314,27 +314,7 @@ llama_context::llama_context(
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
 
-        backend_buft.clear();
-        backend_ptrs.clear();
-        backend_buf_exp_size.clear();
-
-        for (auto & backend : backends) {
-            auto * buft = ggml_backend_get_default_buffer_type(backend.get());
-            auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
-
-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
-                // use the host buffer of the first device CPU for faster transfer of the intermediate state
-                const auto & dev = model.devices[0];
-                auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
-                if (host_buft) {
-                    buft = host_buft;
-                }
-            }
-
-            backend_buft.push_back(buft);
-            backend_ptrs.push_back(backend.get());
-            backend_buf_exp_size.push_back(0);
-        }
+        build_backend_buffer_vectors();
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
@@ -411,6 +391,63 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+}
+
+void llama_context::build_backend_buffer_vectors() {
+    backend_buft.clear();
+    backend_ptrs.clear();
+    backend_buf_exp_size.clear();
+
+    for (auto & backend : backends) {
+        auto * buft = ggml_backend_get_default_buffer_type(backend.get());
+        auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+
+        if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
+            // use the host buffer of the first device CPU for faster transfer of the intermediate state
+            const auto & dev = model.devices[0];
+            auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
+            if (host_buft) {
+                buft = host_buft;
+            }
+        }
+
+        backend_buft.push_back(buft);
+        backend_ptrs.push_back(backend.get());
+        backend_buf_exp_size.push_back(0);
+    }
+}
+
+bool llama_context::hydra_add_combined_rpc_backend(ggml_backend_dev_t peer_dev) {
+    // Hydra #353 / llama.cpp#12. The COMBINED dual-load (llama_hydra_load_combined_experts)
+    // allocates ffn_*_exps_rpc expert tensors on the peer's buffer type, but the scheduler
+    // was built once at construction from a fixed backend list that never included the peer.
+    // Append a backend for the peer device and re-reserve so split_graph can place the
+    // routed-expert ops on the peer instead of asserting in ggml-backend.cpp:898.
+    if (!peer_dev) {
+        return false;
+    }
+
+    ggml_backend_t backend = ggml_backend_dev_init(peer_dev, nullptr);
+    if (!backend) {
+        LLAMA_LOG_ERROR("%s: failed to init COMBINED peer backend\n", __func__);
+        return false;
+    }
+
+    // Insert before the CPU backend (always last) so the scheduler keeps its
+    // GPU/RPC-before-CPU ordering. The context takes ownership of the backend.
+    auto insert_pos = backends.empty() ? backends.end() : std::prev(backends.end());
+    backends.insert(insert_pos, ggml_backend_ptr(backend));
+
+    // Rebuild the derived backend vectors from the new `backends` list and force a
+    // scheduler rebuild that now includes the peer. Safe here because COMBINED setup
+    // runs right after model load, before the first decode (KV cache still empty).
+    build_backend_buffer_vectors();
+    sched_need_reserve = true;
+    sched_reserve();
+
+    LLAMA_LOG_INFO("%s: COMBINED peer backend %s added to scheduler (%zu backends total)\n",
+            __func__, ggml_backend_dev_name(peer_dev), backend_ptrs.size());
+    return true;
 }
 
 void llama_context::sched_reserve() {

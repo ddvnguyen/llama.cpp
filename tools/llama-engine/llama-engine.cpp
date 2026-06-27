@@ -327,6 +327,10 @@ int llama_engine(int argc, char ** argv) {
     // context — see start_shared_backend_rpc_server.
     if (flags.wants_rpc_backend()) {
         start_shared_backend_rpc_server(ctx_server.get_llama_context(), flags.ggml_rpc_port);
+        // Hydra llama.cpp#20: make this engine's own resident tensors
+        // resolvable by name, so a COMBINED peer can zero-copy bind to them
+        // instead of dual-loading a copy (llama_hydra_load_combined_experts).
+        llama_hydra_register_local_tensors_for_rpc(ctx_server.get_llama_context());
     }
 
     // Hydra #287/#260/#348: a COMBINED head dual-loads its configured expert

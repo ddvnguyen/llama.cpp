@@ -152,6 +152,17 @@ endif ()
 # so this runs on every platform (incl. Windows + shared libs).
 llama_build_and_test(test-hydra-state-chunk-size.cpp)
 
+# hydra#316/#8: pins the checkpoint-creation gate (server_should_create_checkpoint),
+# pure header function — guards the recurrent/hybrid term that hybrid KV restore needs.
+llama_build_and_test(test-hydra-checkpoint-policy.cpp)
+
+# llama.cpp#20: zero-copy COMBINED expert tensors — loopback RPC protocol
+# test (RESOLVE_TENSOR + register_local_tensor/bind_remote_tensor), CPU
+# backend only, no GPU/model needed. Skips itself at runtime if this build
+# doesn't have GGML_RPC enabled.
+llama_build_and_test(test-hydra-rpc-bind.cpp)
+target_link_libraries(test-hydra-rpc-bind PRIVATE ggml)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)

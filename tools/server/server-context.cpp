@@ -2,6 +2,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-checkpoint-policy.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -4168,13 +4169,8 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
-
-                    // make checkpoints only for completion tasks
-                    do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
-
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
-                    // checkpoints are created only if:
+                    // checkpoints are created only if (see server_should_create_checkpoint):
                     // - the model does not support partial sequence removal
                     // - the model uses SWA (and we are not using `swa_full`)
                     // - the model supports partial sequence removal but only up to a fixed bound
@@ -4195,14 +4191,18 @@ private:
                     // ik_llama.cpp#1762) found nothing to restore — forcing a full re-prefill
                     // on every request. Recurrent/hybrid models need checkpoints on their own
                     // merits, independent of rpc_port.
+                    // Hydra (#8): the gate is extracted to server_should_create_checkpoint()
+                    // and pinned by tests/test-hydra-checkpoint-policy.cpp so the is_rec term
+                    // can't be silently dropped — doing so breaks hybrid KV-cache restore.
                     const bool is_rec = llama_model_is_recurrent(model_tgt) ||
                                         llama_model_is_hybrid(model_tgt);
-                    do_checkpoint = do_checkpoint && (
-                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
-                            n_swa > 0 ||
-                            is_rec ||
-                            params_base.rpc_port > 0);
+                    bool do_checkpoint = server_should_create_checkpoint(
+                            params_base.n_ctx_checkpoints,
+                            slot.task->type == SERVER_TASK_TYPE_COMPLETION,
+                            ctx_tgt_seq_rm_type,
+                            n_swa,
+                            is_rec,
+                            params_base.rpc_port);
 
                     bool has_mtmd = false;
 

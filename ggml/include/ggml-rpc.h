@@ -47,6 +47,15 @@ GGML_BACKEND_API void ggml_backend_rpc_server_compute_unlock(uint32_t device);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
 
+// Hydra: zero-copy COMBINED expert tensors (llama.cpp#20). A worker registers
+// its own already-loaded tensors by name (once, at model-load time); a peer
+// resolves + binds directly to that memory instead of allocating a buffer
+// and copying bytes over the wire. See ggml-rpc.cpp for the wire protocol
+// (RPC_CMD_RESOLVE_TENSOR).
+GGML_BACKEND_API void ggml_backend_rpc_register_local_tensor(const char * name, struct ggml_tensor * tensor);
+GGML_BACKEND_API struct ggml_tensor * ggml_backend_rpc_bind_remote_tensor(const char * endpoint, uint32_t device,
+                                                          struct ggml_context * ctx, const char * name);
+
 #ifdef  __cplusplus
 }
 #endif
