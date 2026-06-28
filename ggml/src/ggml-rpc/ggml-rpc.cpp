@@ -5,6 +5,7 @@
 #include "transport.h"
 
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <optional>
 #include <string>
@@ -202,6 +203,11 @@ struct rpc_msg_resolve_tensor_req {
 
 struct rpc_msg_resolve_tensor_rsp {
     uint8_t  found;
+    uint32_t registry_epoch; // #368: monotonic version of the local-tensor registry.
+                             // Bumped on every clear (or on the first register after a clear
+                             // is a no-op). The head records this on every bound tensor and
+                             // rejects a later use of the binding when the peer has since
+                             // swapped (no UAF on freed resident memory).
     uint32_t type;
     uint32_t ne[GGML_MAX_DIMS];
     uint32_t nb[GGML_MAX_DIMS];
@@ -843,6 +849,14 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 // memory — no RPC_CMD_ALLOC_BUFFER, no bytes copied. The registry is
 // process-wide (not per-connection, unlike rpc_server::buffers) because
 // registration happens once at startup, before any peer has connected.
+//
+// #368 (epoch + re-callable registration): the registry carries a monotonic
+// version (g_hydra_registry_epoch). Bumped on every clear, and observed by
+// a binding head so it can refuse to use a stale binding after the peer's
+// model was swapped (the resident buffer has been freed/replaced; the raw
+// tensor->data pointer is no longer safe to read). Foreign buffers cleared
+// on every clear too — a binding made at epoch N is invalid for any later
+// epoch.
 namespace {
 struct hydra_local_tensor_info {
     ggml_backend_buffer_t buffer; // the tensor's own (already-allocated) owning buffer
@@ -853,7 +867,12 @@ struct hydra_local_tensor_info {
 };
 std::mutex g_hydra_local_tensors_mutex;
 std::unordered_map<std::string, hydra_local_tensor_info> g_hydra_local_tensors;
+std::atomic<uint32_t> g_hydra_registry_epoch{0};
 } // namespace
+
+uint32_t ggml_backend_rpc_get_registry_epoch(void) {
+    return g_hydra_registry_epoch.load(std::memory_order_acquire);
+}
 
 void ggml_backend_rpc_register_local_tensor(const char * name, struct ggml_tensor * tensor) {
     if (!tensor || !tensor->buffer || !tensor->data) {
@@ -871,13 +890,50 @@ void ggml_backend_rpc_register_local_tensor(const char * name, struct ggml_tenso
     g_hydra_local_tensors[name] = info;
 }
 
+// #368: clear the entire local-tensor registry and bump the epoch so any
+// outstanding binding (which the head recorded at the previous epoch)
+// becomes observably stale on its next use. Called before a fresh batch
+// of register_local_tensor — e.g. after a model swap (SWAP_QUANT) frees
+// and reloads the resident tensors, or before llama_hydra_register_local_
+// tensors_for_rpc is called a second time. Idempotent.
+//
+// TODO(#368-foreign): also clear any per-rpc_server::foreign_buffers entries
+// that point into the freed registry's buffers. The head's epoch check is
+// the primary safety; foreign_buffers clearing is defense-in-depth and can
+// be a follow-up. The registry is process-global; the rpc_server instances
+// are not, so the cleanest path is making foreign_buffers a global too.
+void ggml_backend_rpc_clear_local_tensors(void) {
+    std::lock_guard<std::mutex> lock(g_hydra_local_tensors_mutex);
+    g_hydra_local_tensors.clear();
+    g_hydra_registry_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
 // Client side: resolve `name` on `endpoint` and bind a local ggml_tensor
 // directly to the peer's already-resident memory (no allocation, no copy).
 // Returns nullptr if the peer doesn't have a tensor registered under that
 // name (caller falls back, same "log + stay solo" philosophy as the rest of
 // the COMBINED path).
+//
+// #368 (fail-open + ne-guard + epoch):
+// - Fail-open: if the RPC call itself fails (network, malformed response),
+//   return nullptr — do NOT GGML_ABORT. The head is allowed to keep running
+//   solo if the peer is unreachable or temporarily wedged. This is the
+//   "fail-open" behavior called out in issue #368 §2 and the review-finding
+//   #1 from PR #19: RPC_STATUS_ASSERT was wrong here, RPC failures must not
+//   crash the engine.
+// - ne-guard: the head's expectation of a tensor's shape (`expected_ne`)
+//   is checked against the peer's response. Only `type`/`nb` (i.e. the
+//   quant layout) may differ across bindings — `ne` (the count along each
+//   axis) is structural. A mismatch means the peer's resident model is not
+//   the one the head was built for (a different llama-arch build, a
+//   different routing rule, etc.) and the binding must be refused.
+// - epoch: written through to *out_epoch (or NULL) so the caller can stash
+//   the binding's generation and refuse to use it after a later
+//   ggml_backend_rpc_clear_local_tensors on the peer.
 struct ggml_tensor * ggml_backend_rpc_bind_remote_tensor(const char * endpoint, uint32_t device,
-                                                          struct ggml_context * ctx, const char * name) {
+                                                          struct ggml_context * ctx, const char * name,
+                                                          const uint32_t * expected_ne,
+                                                          uint32_t * out_epoch) {
     auto sock = get_socket(endpoint);
     if (sock == nullptr) {
         return nullptr;
@@ -886,13 +942,31 @@ struct ggml_tensor * ggml_backend_rpc_bind_remote_tensor(const char * endpoint, 
     snprintf(request.name, GGML_MAX_NAME, "%s", name);
     rpc_msg_resolve_tensor_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_RESOLVE_TENSOR, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("[%s] RPC_CMD_RESOLVE_TENSOR RPC failed for '%s' on %s — fail-open, returning null\n",
+                __func__, name, endpoint);
+        return nullptr;
+    }
     if (!response.found) {
         return nullptr;
     }
     if (response.type >= GGML_TYPE_COUNT) {
         GGML_LOG_ERROR("[%s] peer returned invalid tensor type %u for '%s'\n", __func__, response.type, name);
         return nullptr;
+    }
+    // ne-guard: only `type`/`nb` (the quant layout) may differ between
+    // bindings; the shape (ne[]) is structural. Reject mismatches so a
+    // head bound to a different peer's resident model fails loud, not by
+    // running on the wrong weights (which would corrupt the KV cache
+    // silently — harder to diagnose than a refused bind).
+    if (expected_ne) {
+        for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+            if (response.ne[i] != expected_ne[i]) {
+                GGML_LOG_ERROR("[%s] ne-guard rejected '%s' on %s: dim %u expected %u got %u (peer model is not the one this head was built for)\n",
+                        __func__, name, endpoint, i, expected_ne[i], response.ne[i]);
+                return nullptr;
+            }
+        }
     }
 
     ggml_backend_buffer_type_t buft = ggml_backend_rpc_buffer_type(endpoint, device);
@@ -925,7 +999,32 @@ struct ggml_tensor * ggml_backend_rpc_bind_remote_tensor(const char * endpoint, 
     tensor->buffer = buffer;
     tensor->data   = reinterpret_cast<void *>(response.data);
     ggml_set_name(tensor, name);
+    if (out_epoch) {
+        *out_epoch = response.registry_epoch;
+    }
     return tensor;
+}
+
+// #368: fetch the peer's current registry epoch over RPC. Implementation
+// note: we reuse RPC_CMD_RESOLVE_TENSOR with a sentinel name — the server
+// returns `found = 0` for an unknown name but still populates the epoch
+// field of the response, so this single round trip is enough. Returns 0
+// on any failure (peer unreachable, RPC error) — callers must treat
+// "got 0" as "couldn't verify" (not "epoch is 0") and fall back to
+// rebinding or solo.
+uint32_t ggml_backend_rpc_get_remote_registry_epoch(const char * endpoint) {
+    auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        return 0;
+    }
+    rpc_msg_resolve_tensor_req request = {};
+    snprintf(request.name, GGML_MAX_NAME, "%s", "__hydra_epoch_probe__");
+    rpc_msg_resolve_tensor_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_RESOLVE_TENSOR, &request, sizeof(request), &response, sizeof(response));
+    if (!status) {
+        return 0;
+    }
+    return response.registry_epoch;
 }
 
 // RPC server-side implementation
@@ -1562,6 +1661,7 @@ bool rpc_server::resolve_tensor(const rpc_msg_resolve_tensor_req & request, rpc_
     foreign_buffers.insert(info.buffer);
 
     response.found       = 1;
+    response.registry_epoch = g_hydra_registry_epoch.load(std::memory_order_acquire);
     response.type        = info.type;
     response.buffer       = reinterpret_cast<uint64_t>(info.buffer);
     response.buffer_size  = ggml_backend_buffer_get_size(info.buffer);
@@ -2186,6 +2286,15 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_bind_remote_tensor") == 0) {
         return (void *)ggml_backend_rpc_bind_remote_tensor;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_clear_local_tensors") == 0) {
+        return (void *)ggml_backend_rpc_clear_local_tensors;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_get_registry_epoch") == 0) {
+        return (void *)ggml_backend_rpc_get_registry_epoch;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_get_remote_registry_epoch") == 0) {
+        return (void *)ggml_backend_rpc_get_remote_registry_epoch;
     }
     return NULL;
 

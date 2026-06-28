@@ -10,6 +10,7 @@
 #include <cstring>
 #include <regex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -68,10 +69,21 @@ void llama_hydra_register_local_tensors_for_rpc(struct llama_context * ctx) {
         return;
     }
     using register_fn_t = void (*)(const char *, struct ggml_tensor *);
+    using clear_fn_t    = void (*)(void);
     auto register_fn = (register_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_register_local_tensor");
+    auto clear_fn    = (clear_fn_t)    ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_clear_local_tensors");
     if (!register_fn) {
         LLAMA_LOG_ERROR("hydra: failed to resolve ggml_backend_rpc_register_local_tensor\n");
         return;
+    }
+
+    // #368: re-callable registration. Clear the existing registry first so
+    // any prior binding (which recorded the old epoch) is observably
+    // stale; the head will rebind on the next SET_EXPERT_MODE("combined").
+    // This is safe even on first call (clear is a no-op on an empty
+    // registry, just bumps the epoch from 0 → 1).
+    if (clear_fn) {
+        clear_fn();
     }
 
     const llama_model & model = ctx->get_model();
@@ -82,7 +94,7 @@ void llama_hydra_register_local_tensors_for_rpc(struct llama_context * ctx) {
             n++;
         }
     }
-    LLAMA_LOG_INFO("hydra: registered %zu resident tensor(s) for zero-copy RPC resolution\n", n);
+    LLAMA_LOG_INFO("hydra: registered %zu resident tensor(s) for zero-copy RPC resolution (epoch bumped)\n", n);
 }
 
 int32_t llama_hydra_load_combined_experts(
@@ -117,31 +129,85 @@ int32_t llama_hydra_load_combined_experts(
 
     ggml_backend_dev_t peer_dev = ggml_backend_reg_dev_get(peer_reg, 0);
 
-    // Hydra llama.cpp#20: zero-copy — bind directly to tensors the peer
-    // already has resident (its own model load, registered via
-    // llama_hydra_register_local_tensors_for_rpc), instead of allocating a
-    // buffer on the peer and copying bytes into it. No VRAM-headroom check
-    // needed: nothing new is allocated on the peer.
-    using bind_remote_fn_t = struct ggml_tensor * (*)(const char *, uint32_t, struct ggml_context *, const char *);
+    return llama_hydra_rebind_combined_experts(ctx, peer_endpoint, peer_dev, tensor_pattern);
+}
+
+// #368: per-peer resource tracking. Maps peer_endpoint → the bound state
+// (the meta_ctx whose lifetime backs the bound tensors' storage, and the
+// peer backend device that the scheduler was extended with). Keyed by
+// the endpoint string so different peers get different bindings.
+namespace {
+struct hydra_combined_peer_binding {
+    ggml_context_ptr      meta_ctx;
+    ggml_backend_dev_t    peer_dev = nullptr;
+    uint32_t              last_bound_epoch = 0;
+    size_t                n_layers_loaded = 0;
+};
+static std::unordered_map<std::string, hydra_combined_peer_binding> s_hydra_combined_bindings;
+} // namespace
+
+// #368: rebind the peer's expert tensors on demand. Public (called from
+// the SET_EXPERT_MODE("combined") handler in server-context.cpp). Behavior:
+//   - peer reachable + tensors bind cleanly → all _rpc fields populated, the
+//     scheduler has the peer's backend, returns the new layer count.
+//   - peer unreachable, ne-guard fails, RPC error, or no tensors match
+//     pattern → all _rpc fields cleared, returns 0 or -1 (caller falls back
+//     to solo). The previous binding's meta_ctx is freed BEFORE the new
+//     meta_ctx is allocated, so the per-rebind synthetic buffer count is
+//     steady (no growth across N rebinds).
+//
+// meta_ctx leak fix: the old code pushed meta_ctx into a static vector on
+// first call and never freed subsequent allocations — fine for one-shot
+// startup, a leak per rebind otherwise. Here the meta_ctx is owned by the
+// per-peer map; on rebind we replace it, which destroys the previous
+// ggml_context and frees its backing storage.
+int32_t llama_hydra_rebind_combined_experts(
+        struct llama_context * ctx,
+                   const char * peer_endpoint,
+                   ggml_backend_dev_t peer_dev,
+                   const char * tensor_pattern) {
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        LLAMA_LOG_ERROR("hydra: COMBINED rebind — RPC backend not available\n");
+        return -1;
+    }
+
+    using bind_remote_fn_t = struct ggml_tensor * (*)(const char *, uint32_t, struct ggml_context *, const char *, const uint32_t *, uint32_t *);
     auto bind_remote_fn = (bind_remote_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_bind_remote_tensor");
     if (!bind_remote_fn) {
-        LLAMA_LOG_ERROR("hydra: COMBINED — failed to resolve ggml_backend_rpc_bind_remote_tensor\n");
+        LLAMA_LOG_ERROR("hydra: COMBINED rebind — failed to resolve ggml_backend_rpc_bind_remote_tensor\n");
         return -1;
     }
 
     llama_model & model = const_cast<llama_model &>(ctx->get_model());
 
+    // Free the previous binding first (clears _rpc fields, drops the
+    // previous meta_ctx). This is the per-rebind leak fix.
+    if (auto it = s_hydra_combined_bindings.find(peer_endpoint);
+        it != s_hydra_combined_bindings.end()) {
+        for (size_t il = 0; il < model.layers.size(); il++) {
+            llama_layer & layer = model.layers[il];
+            layer.ffn_gate_exps_rpc = nullptr;
+            layer.ffn_up_exps_rpc   = nullptr;
+            layer.ffn_down_exps_rpc = nullptr;
+        }
+        // it->second.meta_ctx.reset() is invoked by the assignment below
+        // (replacing the entry destroys the old meta_ctx).
+    }
+
     std::regex re;
     try {
         re = std::regex(tensor_pattern);
     } catch (const std::regex_error & e) {
-        LLAMA_LOG_ERROR("hydra: COMBINED — invalid tensor_pattern '%s': %s\n", tensor_pattern, e.what());
+        LLAMA_LOG_ERROR("hydra: COMBINED rebind — invalid tensor_pattern '%s': %s\n", tensor_pattern, e.what());
         return -1;
     }
 
     struct pending_bind {
-        ggml_tensor ** dst_field; // address of the layer's ffn_*_exps_rpc member
+        ggml_tensor ** dst_field;
         std::string    name;
+        uint32_t       expected_ne[GGML_MAX_DIMS];
     };
     std::vector<pending_bind> pending;
 
@@ -150,7 +216,7 @@ int32_t llama_hydra_load_combined_experts(
     ggml_init_params iparams = { /*.mem_size =*/ ctx_mem, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
     ggml_context_ptr meta_ctx(ggml_init(iparams));
     if (!meta_ctx) {
-        LLAMA_LOG_ERROR("hydra: COMBINED — failed to allocate metadata context\n");
+        LLAMA_LOG_ERROR("hydra: COMBINED rebind — failed to allocate metadata context\n");
         return -1;
     }
 
@@ -158,7 +224,13 @@ int32_t llama_hydra_load_combined_experts(
         if (!src || !std::regex_match(ggml_get_name(src), re)) {
             return;
         }
-        pending.push_back({dst_field, ggml_get_name(src)});
+        pending_bind pb;
+        pb.dst_field = dst_field;
+        pb.name      = ggml_get_name(src);
+        for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+            pb.expected_ne[i] = (uint32_t) src->ne[i];
+        }
+        pending.push_back(std::move(pb));
     };
 
     for (size_t il = 0; il < n_layer; il++) {
@@ -169,34 +241,47 @@ int32_t llama_hydra_load_combined_experts(
     }
 
     if (pending.empty()) {
-        LLAMA_LOG_WARN("hydra: COMBINED — tensor_pattern '%s' matched no expert tensors\n", tensor_pattern);
+        LLAMA_LOG_WARN("hydra: COMBINED rebind — tensor_pattern '%s' matched no expert tensors on %s\n",
+                tensor_pattern, peer_endpoint);
         return 0;
     }
 
     size_t n_bound = 0;
+    uint32_t bound_epoch = 0;
     for (auto & p : pending) {
-        ggml_tensor * remote = bind_remote_fn(peer_endpoint, /*device=*/0, meta_ctx.get(), p.name.c_str());
+        ggml_tensor * remote = bind_remote_fn(peer_endpoint, /*device=*/0, meta_ctx.get(),
+                p.name.c_str(), p.expected_ne, &bound_epoch);
         *p.dst_field = remote;
         if (remote) {
             n_bound++;
         } else {
-            LLAMA_LOG_WARN("hydra: COMBINED — peer %s has no resident tensor named '%s' (zero-copy bind failed)\n",
+            LLAMA_LOG_WARN("hydra: COMBINED rebind — peer %s has no resident tensor named '%s' (zero-copy bind failed)\n",
                     peer_endpoint, p.name.c_str());
         }
     }
 
     if (n_bound == 0) {
-        LLAMA_LOG_WARN("hydra: COMBINED — zero-copy bind failed for all %zu matched tensor(s) on peer %s, staying solo-only\n",
+        LLAMA_LOG_WARN("hydra: COMBINED rebind — zero-copy bind failed for all %zu matched tensor(s) on peer %s, staying solo-only\n",
                 pending.size(), peer_endpoint);
         return 0;
     }
 
-    // Keep the metadata context alive for the lifetime of the process — this
-    // is one-time startup setup, never torn down before exit. (The bound
-    // tensors' synthetic client-side buffers are intentionally leaked too,
-    // same "runs for process lifetime" choice as the rest of this function.)
-    static std::vector<ggml_context_ptr> s_ctxs;
-    s_ctxs.push_back(std::move(meta_ctx));
+    // Hydra #353 / llama.cpp#12: register the peer device as a scheduler
+    // backend so the routed-expert ops are schedulable once
+    // SET_EXPERT_MODE("combined") is active. Only register once — the
+    // scheduler's hydra_add_combined_rpc_backend is not idempotent (it
+    // appends to the backend list). We check the per-peer map: if a
+    // previous binding for this endpoint exists, the backend was added
+    // already and we skip.
+    bool already_added = s_hydra_combined_bindings.count(peer_endpoint) > 0;
+    if (!already_added) {
+        if (!ctx->hydra_add_combined_rpc_backend(peer_dev)) {
+            LLAMA_LOG_ERROR("hydra: COMBINED rebind — peer %s bound but could not be registered "
+                    "with the scheduler; clearing _rpc tensors and staying solo-only\n", peer_endpoint);
+            for (auto & p : pending) { *p.dst_field = nullptr; }
+            return -1;
+        }
+    }
 
     int32_t n_layers_loaded = 0;
     for (size_t il = 0; il < n_layer; il++) {
@@ -206,20 +291,17 @@ int32_t llama_hydra_load_combined_experts(
         }
     }
 
-    // Hydra #353 / llama.cpp#12: the expert tensors above live on the peer's
-    // buffer, but the context's scheduler was built at load time without the
-    // peer. Register the peer device as a scheduler backend now so the routed-
-    // expert ops are schedulable once SET_EXPERT_MODE("combined") is active;
-    // otherwise the first COMBINED PREFILL asserts in ggml-backend.cpp:898.
-    if (!ctx->hydra_add_combined_rpc_backend(peer_dev)) {
-        LLAMA_LOG_ERROR("hydra: COMBINED — peer %s bound but could not be registered "
-                "with the scheduler; clearing _rpc tensors and staying solo-only\n", peer_endpoint);
-        for (auto & p : pending) { *p.dst_field = nullptr; }
-        return -1;
-    }
+    // Track the binding for the next rebind. Replacing the entry drops the
+    // previous meta_ctx — the no-leak invariant.
+    hydra_combined_peer_binding b;
+    b.meta_ctx         = std::move(meta_ctx);
+    b.peer_dev         = peer_dev;
+    b.last_bound_epoch = bound_epoch;
+    b.n_layers_loaded  = n_layers_loaded;
+    s_hydra_combined_bindings[peer_endpoint] = std::move(b);
 
-    LLAMA_LOG_INFO("hydra: COMBINED zero-copy bound %zu/%zu expert tensors across %d layers to peer %s (no bytes copied)\n",
-            n_bound, pending.size(), n_layers_loaded, peer_endpoint);
+    LLAMA_LOG_INFO("hydra: COMBINED zero-copy bound %zu/%zu expert tensors across %d layers to peer %s (no bytes copied, epoch=%u)\n",
+            n_bound, pending.size(), n_layers_loaded, peer_endpoint, bound_epoch);
 
     return n_layers_loaded;
 }

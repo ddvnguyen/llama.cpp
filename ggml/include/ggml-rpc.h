@@ -52,9 +52,37 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * end
 // resolves + binds directly to that memory instead of allocating a buffer
 // and copying bytes over the wire. See ggml-rpc.cpp for the wire protocol
 // (RPC_CMD_RESOLVE_TENSOR).
+//
+// #368: bind takes optional `expected_ne` and `out_epoch` so the caller can
+// guard the shape (ne) and record the registry generation. `expected_ne` may
+// be NULL to skip the ne-guard (legacy callers); `out_epoch` may be NULL to
+// discard the epoch.
 GGML_BACKEND_API void ggml_backend_rpc_register_local_tensor(const char * name, struct ggml_tensor * tensor);
 GGML_BACKEND_API struct ggml_tensor * ggml_backend_rpc_bind_remote_tensor(const char * endpoint, uint32_t device,
-                                                          struct ggml_context * ctx, const char * name);
+                                                          struct ggml_context * ctx, const char * name,
+                                                          const uint32_t * expected_ne,
+                                                          uint32_t * out_epoch);
+
+// #368: clear every registered local tensor and bump the epoch so any
+// outstanding binding (which the head recorded at the previous epoch)
+// becomes observably stale on its next use. Called before re-registering
+// (e.g. after a model swap that freed/reloaded the resident tensors, or
+// when llama_hydra_register_local_tensors_for_rpc is called a second time
+// on a different quant). Idempotent. Safe to call from any thread.
+GGML_BACKEND_API void ggml_backend_rpc_clear_local_tensors(void);
+
+// #368: return the current epoch of the local-tensor registry. The head
+// records the epoch at bind time and re-fetches before each use of the
+// binding; if the new value differs, the binding is stale and the head
+// must rebind (or fall back to solo). Cheap — reads one atomic.
+GGML_BACKEND_API uint32_t ggml_backend_rpc_get_registry_epoch(void);
+
+// #368: fetch the peer's current registry epoch over RPC (uses
+// RPC_CMD_RESOLVE_TENSOR on a sentinel name and reads back the epoch).
+// Returns 0 on any failure (peer unreachable, RPC error, peer doesn't
+// support the epoch field). The head uses this before each use of a
+// binding to detect that the peer has cleared/reloaded.
+GGML_BACKEND_API uint32_t ggml_backend_rpc_get_remote_registry_epoch(const char * endpoint);
 
 #ifdef  __cplusplus
 }

@@ -3517,14 +3517,57 @@ private:
                     }
 
                     // Hydra #287/#260/#348: only honor "combined" when this
-                    // engine successfully dual-loaded expert tensors onto a
-                    // peer at startup (set_hydra_combined_head_attached) —
-                    // otherwise fall back to solo so the Coordinator can
-                    // detect it via ReportsSolo() and never block a request
-                    // on a half-built COMBINED path.
+                    // engine is configured for COMBINED head role — otherwise
+                    // fall back to solo so the Coordinator can detect it via
+                    // ReportsSolo() and never block a request on a half-built
+                    // COMBINED path.
                     const bool want_combined = requested == "combined" && hydra_combined_head_attached;
-                    llama_hydra_set_expert_mode(ctx_tgt, want_combined ? 1 : 0);
-                    res->expert_mode_applied = want_combined ? "combined" : "solo";
+
+                    // #368 (#357 fix): bind-on-activation. Instead of relying
+                    // on a one-shot startup binding (which the original
+                    // llama_hydra_load_combined_experts did, and which
+                    // degraded to permanent solo if the peer was down at
+                    // boot), re-bind the peer's expert tensors on each
+                    // SET_EXPERT_MODE("combined") request. Fail-open: if the
+                    // rebind fails (peer unreachable, ne-guard mismatch, RPC
+                    // error) we stay solo and the Coordinator's ReportsSolo
+                    // path handles it — no abort, no head crash.
+                    bool actually_combined = want_combined;
+                    if (want_combined) {
+                        if (hydra_peer.empty() || hydra_combined_pattern.empty()) {
+                            SRV_WRN("%s\n", "hydra: SET_EXPERT_MODE(combined) but no peer/pattern configured; staying solo");
+                            actually_combined = false;
+                        } else {
+                            // ggml_backend_rpc_add_server is idempotent — returns
+                            // the existing reg if the peer was registered before.
+                            ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+                            if (!rpc_reg) {
+                                SRV_WRN("%s\n", "hydra: SET_EXPERT_MODE(combined) but RPC backend not available; staying solo");
+                                actually_combined = false;
+                            } else {
+                                using add_server_fn_t = ggml_backend_reg_t (*)(const char *);
+                                auto add_server_fn = (add_server_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+                                ggml_backend_reg_t peer_reg = add_server_fn ? add_server_fn(hydra_peer.c_str()) : nullptr;
+                                ggml_backend_dev_t  peer_dev = (peer_reg && ggml_backend_reg_dev_count(peer_reg) > 0) ? ggml_backend_reg_dev_get(peer_reg, 0) : nullptr;
+                                if (!peer_dev) {
+                                    SRV_WRN("hydra: SET_EXPERT_MODE(combined) but peer %s has no registered device; staying solo\n",
+                                            hydra_peer.c_str());
+                                    actually_combined = false;
+                                } else {
+                                    int32_t n_bound = llama_hydra_rebind_combined_experts(
+                                            ctx_tgt, hydra_peer.c_str(), peer_dev, hydra_combined_pattern.c_str());
+                                    if (n_bound <= 0) {
+                                        SRV_WRN("hydra: SET_EXPERT_MODE(combined) rebind on peer %s returned %d; staying solo\n",
+                                                hydra_peer.c_str(), n_bound);
+                                        actually_combined = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    llama_hydra_set_expert_mode(ctx_tgt, actually_combined ? 1 : 0);
+                    res->expert_mode_applied = actually_combined ? "combined" : "solo";
 
                     res->rpc_status = HYDRA_STATUS_OK;
                     res->success = true;

@@ -53,6 +53,23 @@ LLAMA_API int32_t llama_hydra_load_combined_experts(
                    const char * peer_endpoint,
                    const char * tensor_pattern);
 
+// #368: re-establish the COMBINED expert-tensor binding on demand. The
+// SET_EXPERT_MODE("combined") handler in server-context.cpp calls this
+// instead of relying on the one-shot llama_hydra_load_combined_experts
+// startup binding — that fixes the #357 startup race (head binds on demand
+// when the peer is reachable, every time) and makes the binding re-callable
+// (so a future model swap / re-register on the peer side can be reflected
+// by re-binding). The previous binding's metadata context is freed before
+// the new one is allocated (no synthetic-buffer leak across N rebinds).
+// Returns the number of layers that got a binding, 0 if no tensors matched
+// the pattern, or -1 on hard failure. Fail-open: a peer drop, ne-guard
+// mismatch, or RPC error degrades to "stay solo" — no abort.
+LLAMA_API int32_t llama_hydra_rebind_combined_experts(
+        struct llama_context * ctx,
+                   const char * peer_endpoint,
+        ggml_backend_dev_t      peer_dev,
+                   const char * tensor_pattern);
+
 // Set/get the per-context expert placement mode for subsequent decode/prefill
 // calls. 0 = SOLO (local GPU only). 1 = COMBINED (use the dual-resident peer
 // copies loaded by llama_hydra_load_combined_experts — caller must have called
