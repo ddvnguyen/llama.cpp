@@ -2976,11 +2976,25 @@ private:
                     // booleans (#348) — replaces the old single "role" string
                     // and the peer_connected/combined_capable field-aliasing.
                     const int32_t expert_mode = ctx_tgt ? llama_hydra_get_expert_mode(ctx_tgt) : 0;
+                    // hydra_vortex#375: advertise "combined" and "pipeline" as
+                    // capabilities so the C# MultiEngineRouter can key off
+                    // EngineInfo.Capabilities (parsed from this JSON in
+                    // HydraEngineClient.cs:33) rather than only the static
+                    // workers.json fields. The C# side historically keys off
+                    // workers.json's `combined_capable` + `combined_ot_split`,
+                    // but those are operator-set config; the engine is the
+                    // source of truth for "is this build actually able to
+                    // drive expert-mode at all?". The `#ifdef HYDRA_LLAMA_ENGINE`
+                    // gate is implicit — the build that produces this binary
+                    // is always the llama-engine fork, which carries the
+                    // COMBINED code path; advertising the capability is just
+                    // surfacing that fact to the C# Coordinator.
                     json info_j = {
                         {"engine", "llama-server-hydra"},
                         {"version", "E1"},
                         {"capabilities", {"prefill", "decode", "state_transfer",
                                           "expert_mode", "quant_swap",
+                                          "combined", "pipeline",
                                           "preset", "model_hash"}},
                         {"preset_aliases", preset_aliases_j},
                         {"solo_active",            hydra_solo_active},

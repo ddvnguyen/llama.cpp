@@ -2217,7 +2217,21 @@ static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
     }
     rpc_msg_device_count_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    // hydra_vortex#376: fail-open instead of RPC_STATUS_ASSERT. The previous
+    // behavior was to GGML_ABORT on any RPC error, which crashed the head
+    // when the peer was reachable at the TCP level (ggml-rpc server
+    // already accept()ing) but the RPC handshake hadn't completed yet
+    // (e.g. compose orders the 5060 Ti's llama-engine to start before the
+    // 3060's, so the head's load_combined_experts races the peer's RPC
+    // server bring-up). Returning 0 lets ggml_backend_rpc_add_server
+    // produce a null reg, which llama_hydra_load_combined_experts already
+    // handles (returns -1, the head stays solo) — no abort, no head
+    // crash, no hydra-head restart loop.
+    if (!status) {
+        GGML_LOG_ERROR("%s: RPC_CMD_DEVICE_COUNT failed for %s — peer RPC server not ready, fail-open returning 0 devices\n",
+                __func__, endpoint);
+        return 0;
+    }
     return response.device_count;
 }
 
