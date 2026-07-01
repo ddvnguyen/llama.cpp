@@ -3516,22 +3516,23 @@ private:
                         break;
                     }
 
-                    // Hydra #287/#260/#348: only honor "combined" when this
-                    // engine is configured for COMBINED head role — otherwise
-                    // fall back to solo so the Coordinator can detect it via
-                    // ReportsSolo() and never block a request on a half-built
-                    // COMBINED path.
-                    const bool want_combined = requested == "combined" && hydra_combined_head_attached;
+                    // #368 fix: gate on "configured as combined head" (non-empty
+                    // peer addr + OT pattern), NOT on whether the startup
+                    // dual-load succeeded. The rebind path below is fail-open —
+                    // if the peer is still unreachable it stays solo — so
+                    // hydra_combined_head_attached (set only when startup
+                    // succeeded) must NOT block the attempt. Hydra #287/#260/#348
+                    // intent is preserved: an unconfigured engine (no peer/
+                    // pattern) still falls back to solo immediately.
+                    const bool want_combined = requested == "combined" &&
+                        !hydra_peer.empty() && !hydra_combined_pattern.empty();
 
-                    // #368 (#357 fix): bind-on-activation. Instead of relying
-                    // on a one-shot startup binding (which the original
-                    // llama_hydra_load_combined_experts did, and which
-                    // degraded to permanent solo if the peer was down at
-                    // boot), re-bind the peer's expert tensors on each
-                    // SET_EXPERT_MODE("combined") request. Fail-open: if the
-                    // rebind fails (peer unreachable, ne-guard mismatch, RPC
-                    // error) we stay solo and the Coordinator's ReportsSolo
-                    // path handles it — no abort, no head crash.
+                    // #368 (#357 fix): bind-on-activation. Re-bind the peer's
+                    // expert tensors on each SET_EXPERT_MODE("combined") request
+                    // so a peer that was down at boot is picked up on the first
+                    // COMBINED request after it comes up. Fail-open: if the
+                    // rebind fails we stay solo and the Coordinator's
+                    // ReportsSolo path handles it.
                     bool actually_combined = want_combined;
                     if (want_combined) {
                         if (hydra_peer.empty() || hydra_combined_pattern.empty()) {
@@ -3560,6 +3561,9 @@ private:
                                         SRV_WRN("hydra: SET_EXPERT_MODE(combined) rebind on peer %s returned %d; staying solo\n",
                                                 hydra_peer.c_str(), n_bound);
                                         actually_combined = false;
+                                    } else {
+                                        // Peer is up — latch so INFO RPC advertises combined.
+                                        hydra_combined_head_attached = true;
                                     }
                                 }
                             }

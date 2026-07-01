@@ -360,7 +360,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     sock->get_caps(request.conn_caps);
 
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("RPC handshake (HELLO) failed — RPC server not ready or incompatible\n");
+        return false;
+    }
 
     // #368: rpc_msg_resolve_tensor_rsp grew a field (registry_epoch); an old
     // server (minor < 1) would size-mismatch on RESOLVE_TENSOR and silently

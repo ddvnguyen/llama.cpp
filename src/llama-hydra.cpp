@@ -196,11 +196,21 @@ int32_t llama_hydra_rebind_combined_experts(
         // (replacing the entry destroys the old meta_ctx).
     }
 
+    // --combined-ot-pattern uses override-tensor syntax: "<name_regex>=<backend>".
+    // The tensor name is everything before the last '='. Strip the suffix so
+    // the regex matches actual tensor names (e.g. "blk.0.ffn_gate_exps.weight").
+    std::string name_pattern = tensor_pattern;
+    {
+        auto eq = name_pattern.rfind('=');
+        if (eq != std::string::npos) {
+            name_pattern = name_pattern.substr(0, eq);
+        }
+    }
     std::regex re;
     try {
-        re = std::regex(tensor_pattern);
+        re = std::regex(name_pattern);
     } catch (const std::regex_error & e) {
-        LLAMA_LOG_ERROR("hydra: COMBINED rebind — invalid tensor_pattern '%s': %s\n", tensor_pattern, e.what());
+        LLAMA_LOG_ERROR("hydra: COMBINED rebind — invalid tensor_pattern '%s': %s\n", name_pattern.c_str(), e.what());
         return -1;
     }
 
@@ -242,7 +252,7 @@ int32_t llama_hydra_rebind_combined_experts(
 
     if (pending.empty()) {
         LLAMA_LOG_WARN("hydra: COMBINED rebind — tensor_pattern '%s' matched no expert tensors on %s\n",
-                tensor_pattern, peer_endpoint);
+                name_pattern.c_str(), peer_endpoint);
         return 0;
     }
 
