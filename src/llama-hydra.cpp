@@ -206,7 +206,6 @@ int32_t llama_hydra_rebind_combined_experts(
             name_pattern = name_pattern.substr(0, eq);
         }
     }
-
     std::regex re;
     try {
         re = std::regex(name_pattern);
