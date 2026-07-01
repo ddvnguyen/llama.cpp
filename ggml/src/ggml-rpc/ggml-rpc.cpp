@@ -362,9 +362,14 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
 
-    if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
-        GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
-                       response.major, response.minor, response.patch);
+    // #368: rpc_msg_resolve_tensor_rsp grew a field (registry_epoch); an old
+    // server (minor < 1) would size-mismatch on RESOLVE_TENSOR and silently
+    // return indeterminate bytes. Reject old AND new servers at hello so the
+    // mismatch is diagnosed here, not buried in a silent fail-open solo.
+    if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor != RPC_PROTO_MINOR_VERSION) {
+        GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d (expected %d.%d.x)\n",
+                       response.major, response.minor, response.patch,
+                       RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION);
         return false;
     }
 
@@ -1649,6 +1654,10 @@ bool rpc_server::resolve_tensor(const rpc_msg_resolve_tensor_req & request, rpc_
         auto it = g_hydra_local_tensors.find(name);
         if (it == g_hydra_local_tensors.end()) {
             response.found = 0;
+            // Always populate registry_epoch even on not-found — the sentinel
+            // probe in ggml_backend_rpc_get_remote_registry_epoch relies on
+            // this. Without it, indeterminate stack bytes would be returned.
+            response.registry_epoch = g_hydra_registry_epoch.load(std::memory_order_acquire);
             return true;
         }
         info = it->second;

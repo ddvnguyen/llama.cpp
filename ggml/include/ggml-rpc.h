@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    0
+#define RPC_PROTO_MINOR_VERSION    1  // #368: rpc_msg_resolve_tensor_rsp gained registry_epoch
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
