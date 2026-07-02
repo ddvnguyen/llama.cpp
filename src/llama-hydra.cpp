@@ -97,6 +97,29 @@ void llama_hydra_register_local_tensors_for_rpc(struct llama_context * ctx) {
     LLAMA_LOG_INFO("hydra: registered %zu resident tensor(s) for zero-copy RPC resolution (epoch bumped)\n", n);
 }
 
+int llama_hydra_preload_rpc_device(const char * peer_endpoint) {
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        LLAMA_LOG_ERROR("hydra: layer-split COMBINED requires RPC backend, not available in this build\n");
+        return -1;
+    }
+    using add_server_fn_t = ggml_backend_reg_t (*)(const char *);
+    auto add_server_fn = (add_server_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+    if (!add_server_fn) {
+        LLAMA_LOG_ERROR("hydra: layer-split COMBINED — failed to resolve ggml_backend_rpc_add_server\n");
+        return -1;
+    }
+    ggml_backend_reg_t peer_reg = add_server_fn(peer_endpoint);
+    if (!peer_reg || ggml_backend_reg_dev_count(peer_reg) == 0) {
+        LLAMA_LOG_ERROR("hydra: layer-split COMBINED — failed to register peer %s as RPC device\n", peer_endpoint);
+        return -1;
+    }
+    ggml_backend_register(peer_reg);
+    LLAMA_LOG_INFO("hydra: layer-split COMBINED — peer %s registered as RPC device (pre-load)\n", peer_endpoint);
+    return 0;
+}
+
 int32_t llama_hydra_load_combined_experts(
         struct llama_context * ctx,
                    const char * peer_endpoint,

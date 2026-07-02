@@ -585,6 +585,25 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
+// GGML_RPC_TCP_BUFFER_SIZE=<bytes>: override SO_SNDBUF/SO_RCVBUF on RPC data sockets.
+// Unset (default) leaves the OS defaults untouched. Diagnostic knob, not a persisted tune.
+static void apply_tcp_buffer_size_override(sockfd_t sockfd) {
+    static const char * env = std::getenv("GGML_RPC_TCP_BUFFER_SIZE");
+    if (!env || !*env) {
+        return;
+    }
+    int size = std::atoi(env);
+    if (size <= 0) {
+        return;
+    }
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&size, sizeof(int)) != 0) {
+        GGML_LOG_ERROR("Failed to set SO_SNDBUF to %d\n", size);
+    }
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&size, sizeof(int)) != 0) {
+        GGML_LOG_ERROR("Failed to set SO_RCVBUF to %d\n", size);
+    }
+}
+
 socket_ptr socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
@@ -594,6 +613,7 @@ socket_ptr socket_t::accept() {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
     }
+    apply_tcp_buffer_size_override(client_socket_fd);
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
 
@@ -645,6 +665,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         return nullptr;
     }
+    apply_tcp_buffer_size_override(sockfd);
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 }
 

@@ -161,24 +161,36 @@ static bool try_tcp_connect(const std::string & host, int port, int timeout_sec)
 // itself as a COMBINED-peer RPC backend and/or reaching out to a peer as a
 // COMBINED head — any combination, no restart to change which. Filtered out
 // of argv before common_params_parse (these aren't stock llama.cpp args).
-//   --ggml-rpc-port <port>        opt-in: expose this engine's local GPU(s)
-//                                 as an embedded ggml-RPC backend on <port>,
-//                                 sharing the SAME backend instances this
-//                                 engine already built for local inference
-//                                 (not a duplicate context — see
-//                                 start_shared_backend_rpc_server below).
-//   --rpc-engine <host:port>      opt-in: this engine acts as a COMBINED
-//                                 head reaching out to the named peer.
-//   --combined-ot-pattern <regex> required alongside --rpc-engine: which
-//                                 expert tensors (by name) get a dual-resident
-//                                 copy on the peer.
+//   --ggml-rpc-port <port>          opt-in: expose this engine's local GPU(s)
+//                                   as an embedded ggml-RPC backend on <port>,
+//                                   sharing the SAME backend instances this
+//                                   engine already built for local inference
+//                                   (not a duplicate context — see
+//                                   start_shared_backend_rpc_server below).
+//   --rpc-engine <host:port>        opt-in: this engine acts as a COMBINED
+//                                   head reaching out to the named peer.
+//   --combined-ot-pattern <regex>   required alongside --rpc-engine for expert
+//                                   split mode: which expert tensors (by name)
+//                                   get a dual-resident copy on the peer.
+//   --combined-split-mode <mode>    "expert" (default) = post-load dual-resident
+//                                   expert tensors via --combined-ot-pattern.
+//                                   "layer" (#383 T1) = pre-load RPC device
+//                                   registration + stock tensor_split at load
+//                                   time; peer is required at startup (no
+//                                   graceful degrade to solo).
+//   --combined-tensor-split <r/r>   required in layer mode: comma- or slash-
+//                                   separated proportions, RPC-device first
+//                                   (e.g. "21/44" → peer:21, local:44).
 struct hydra_capability_flags {
     int         ggml_rpc_port = 0;
     std::string rpc_engine_peer;
     std::string combined_ot_pattern;
+    std::string combined_split_mode  = "expert"; // "expert" | "layer"
+    std::string combined_tensor_split;            // e.g. "21/44" (layer mode only)
 
     bool wants_rpc_backend()   const { return ggml_rpc_port > 0; }
     bool wants_combined_head() const { return !rpc_engine_peer.empty(); }
+    bool is_layer_split()      const { return combined_split_mode == "layer"; }
 };
 
 // Filters Hydra capability flags out of argv into filtered_argv, mirroring
@@ -200,6 +212,14 @@ static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** a
         }
         if (strcmp(argv[i], "--ggml-rpc-port") == 0 && i + 1 < argc) {
             flags.ggml_rpc_port = std::atoi(argv[++i]);
+            continue;
+        }
+        if (strcmp(argv[i], "--combined-split-mode") == 0 && i + 1 < argc) {
+            flags.combined_split_mode = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--combined-tensor-split") == 0 && i + 1 < argc) {
+            flags.combined_tensor_split = argv[++i];
             continue;
         }
         filtered_argv.push_back(argv[i]);
@@ -280,14 +300,54 @@ int llama_engine(int argc, char ** argv) {
         return 1;
     }
 
-    const bool wants_combined_head = flags.wants_combined_head() && !flags.combined_ot_pattern.empty();
-    if (flags.wants_combined_head() && flags.combined_ot_pattern.empty()) {
+    // Hydra #383 T1: validate flag combinations for layer-split mode.
+    if (flags.is_layer_split()) {
+        if (!flags.combined_ot_pattern.empty()) {
+            LOG_ERR("eng  %12.*s: --combined-ot-pattern is incompatible with "
+                    "--combined-split-mode layer (use --combined-tensor-split instead)\n", 12, __func__);
+            return 1;
+        }
+        if (flags.combined_tensor_split.empty()) {
+            LOG_ERR("eng  %12.*s: --combined-split-mode layer requires --combined-tensor-split\n", 12, __func__);
+            return 1;
+        }
+        if (!flags.wants_combined_head()) {
+            LOG_ERR("eng  %12.*s: --combined-split-mode layer requires --rpc-engine\n", 12, __func__);
+            return 1;
+        }
+    }
+
+    // Expert-split: --rpc-engine without --combined-ot-pattern is a no-op (existing behavior).
+    const bool wants_combined_expert = flags.wants_combined_head()
+                                    && !flags.is_layer_split()
+                                    && !flags.combined_ot_pattern.empty();
+    if (flags.wants_combined_head() && !flags.is_layer_split() && flags.combined_ot_pattern.empty()) {
         LOG_WRN("eng  %12.*s: --rpc-engine given without --combined-ot-pattern — "
                 "COMBINED head capability disabled, running solo-only\n", 12, __func__);
     }
 
     bool peer_reachable = false;
-    if (wants_combined_head) {
+    if (flags.is_layer_split()) {
+        // Hydra #383 T1: layer-split COMBINED requires the peer at startup —
+        // fail fast if unreachable. Unlike expert-split, no model can be loaded
+        // without the peer device registered; hydra-head's backoff owns retry.
+        std::string host = flags.rpc_engine_peer;
+        int port = 9506;
+        size_t colon = flags.rpc_engine_peer.find(':');
+        if (colon != std::string::npos) {
+            host = flags.rpc_engine_peer.substr(0, colon);
+            port = std::stoi(flags.rpc_engine_peer.substr(colon + 1));
+        }
+        if (!try_tcp_connect(host, port, 5)) {
+            LOG_ERR("eng  %12.*s: layer-split COMBINED: peer %s unreachable — "
+                    "aborting startup (cannot load model without peer device)\n",
+                    12, __func__, flags.rpc_engine_peer.c_str());
+            return 1;
+        }
+        peer_reachable = true;
+        LOG_INF("eng  %12.*s: layer-split COMBINED: peer %s reachable\n",
+                12, __func__, flags.rpc_engine_peer.c_str());
+    } else if (wants_combined_expert) {
         std::string host = flags.rpc_engine_peer;
         int port = 8080;
         size_t colon = flags.rpc_engine_peer.find(':');
@@ -295,7 +355,6 @@ int llama_engine(int argc, char ** argv) {
             host = flags.rpc_engine_peer.substr(0, colon);
             port = std::stoi(flags.rpc_engine_peer.substr(colon + 1));
         }
-
         peer_reachable = try_tcp_connect(host, port, 3);
         if (!peer_reachable) {
             LOG_WRN("eng  %12.*s: rpc-engine peer %s unreachable, entering solo mode\n",
@@ -305,6 +364,57 @@ int llama_engine(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    // Hydra #383 T1: register the peer as an RPC backend device BEFORE model
+    // load so llama.cpp's device-enumeration code (src/llama.cpp:239) places
+    // it at the front of the device list (device[0] = peer, device[1] = local
+    // CUDA). tensor_split[0] then controls how many layers go to the peer.
+    // Must come after llama_backend_init() (GGML init) and before load_model().
+    if (flags.is_layer_split()) {
+        if (llama_hydra_preload_rpc_device(flags.rpc_engine_peer.c_str()) != 0) {
+            LOG_ERR("eng  %12.*s: layer-split COMBINED: failed to register peer %s "
+                    "as RPC device — aborting startup\n",
+                    12, __func__, flags.rpc_engine_peer.c_str());
+            llama_backend_free();
+            return 1;
+        }
+        // Parse "21/44" or "21,44" into params.tensor_split.
+        // Split on '/' or ',' — same delimiters as the stock --tensor-split arg parser.
+        {
+            std::string ts = flags.combined_tensor_split;
+            std::vector<float> splits;
+            size_t pos = 0;
+            while (pos <= ts.size()) {
+                size_t end = ts.find_first_of(",/", pos);
+                if (end == std::string::npos) end = ts.size();
+                std::string token = ts.substr(pos, end - pos);
+                if (!token.empty()) {
+                    try {
+                        splits.push_back(std::stof(token));
+                    } catch (...) {
+                        LOG_ERR("eng  %12.*s: layer-split COMBINED: invalid value '%s' "
+                                "in --combined-tensor-split '%s'\n",
+                                12, __func__, token.c_str(), flags.combined_tensor_split.c_str());
+                        llama_backend_free();
+                        return 1;
+                    }
+                }
+                if (end == ts.size()) break;
+                pos = end + 1;
+            }
+            if (splits.empty()) {
+                LOG_ERR("eng  %12.*s: layer-split COMBINED: could not parse --combined-tensor-split '%s'\n",
+                        12, __func__, flags.combined_tensor_split.c_str());
+                llama_backend_free();
+                return 1;
+            }
+            for (size_t i = 0; i < 128; i++) {
+                params.tensor_split[i] = (i < splits.size()) ? splits[i] : 0.0f;
+            }
+            LOG_INF("eng  %12.*s: layer-split COMBINED: tensor_split='%s' (%zu device(s))\n",
+                    12, __func__, flags.combined_tensor_split.c_str(), splits.size());
+        }
+    }
 
     common_params_print_info(params, true);
 
@@ -319,8 +429,21 @@ int llama_engine(int argc, char ** argv) {
         return 1;
     }
 
-    ctx_server.set_hydra_capabilities(flags.wants_rpc_backend(), flags.rpc_engine_peer,
-            peer_reachable, flags.combined_ot_pattern);
+    // Set capabilities — split_mode "layer" or "expert" — before serving requests.
+    if (flags.is_layer_split()) {
+        // Hydra #383 T1: layer-split static COMBINED. The peer is registered at
+        // device[0]; the model already spans both GPUs. No dual-load needed.
+        // combined_pattern stores the tensor_split string for INFO reporting.
+        ctx_server.set_hydra_capabilities(flags.wants_rpc_backend(), flags.rpc_engine_peer,
+                peer_reachable, flags.combined_tensor_split, "layer");
+        ctx_server.set_hydra_combined_static(true);
+        ctx_server.set_hydra_combined_head_attached(true);
+        LOG_INF("eng  %12.*s: COMBINED layer-split ready — peer %s, split %s\n",
+                12, __func__, flags.rpc_engine_peer.c_str(), flags.combined_tensor_split.c_str());
+    } else {
+        ctx_server.set_hydra_capabilities(flags.wants_rpc_backend(), flags.rpc_engine_peer,
+                peer_reachable, flags.combined_ot_pattern, "expert");
+    }
 
     // Hydra #348: expose this engine's own backend(s) as an embedded
     // ggml-RPC server, shared with local inference rather than a duplicate
@@ -333,13 +456,12 @@ int llama_engine(int argc, char ** argv) {
         llama_hydra_register_local_tensors_for_rpc(ctx_server.get_llama_context());
     }
 
-    // Hydra #287/#260/#348: a COMBINED head dual-loads its configured expert
-    // tensors onto the --rpc-engine peer once, here, before serving any
-    // requests. An unreachable peer or insufficient peer VRAM (see
-    // llama_hydra_load_combined_experts's headroom check) degrades to
-    // solo-only (never aborts startup) — SET_EXPERT_MODE("combined") will
-    // report "solo" until fixed.
-    if (wants_combined_head) {
+    // Hydra #287/#260/#348: expert-split COMBINED head dual-loads its configured
+    // expert tensors onto the --rpc-engine peer once, before serving any requests.
+    // An unreachable peer or insufficient peer VRAM degrades to solo-only (never
+    // aborts startup) — SET_EXPERT_MODE("combined") will report "solo" until fixed.
+    // Skipped in layer-split mode (#383 T1): the model already spans both devices.
+    if (wants_combined_expert && peer_reachable) {
         int32_t n = llama_hydra_load_combined_experts(ctx_server.get_llama_context(),
                 flags.rpc_engine_peer.c_str(), flags.combined_ot_pattern.c_str());
         ctx_server.set_hydra_combined_head_attached(n > 0);
