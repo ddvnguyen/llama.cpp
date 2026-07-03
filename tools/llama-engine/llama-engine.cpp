@@ -145,6 +145,15 @@ static bool try_tcp_connect(const std::string & host, int port, int timeout_sec)
     tv.tv_usec = 0;
 
     ret = select(fd + 1, NULL, &wfds, NULL, &tv);
+    if (ret > 0) {
+        // select() reports writable even on failed non-blocking connects
+        // (e.g. ECONNREFUSED). Check SO_ERROR to distinguish success.
+        int so_error = 0;
+        socklen_t so_len = sizeof(so_error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&so_error, &so_len) < 0 || so_error != 0) {
+            ret = 0;
+        }
+    }
 
 #if defined(_WIN32)
     closesocket(fd);
@@ -187,10 +196,12 @@ struct hydra_capability_flags {
     std::string combined_ot_pattern;
     std::string combined_split_mode  = "expert"; // "expert" | "layer"
     std::string combined_tensor_split;            // e.g. "21/44" (layer mode only)
+    bool        peer_only        = false; // no model, just RPC backend + HTTP health
 
     bool wants_rpc_backend()   const { return ggml_rpc_port > 0; }
     bool wants_combined_head() const { return !rpc_engine_peer.empty(); }
     bool is_layer_split()      const { return combined_split_mode == "layer"; }
+    bool is_peer_only()        const { return peer_only; }
 };
 
 // Filters Hydra capability flags out of argv into filtered_argv, mirroring
@@ -222,6 +233,10 @@ static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** a
             flags.combined_tensor_split = argv[++i];
             continue;
         }
+        if (strcmp(argv[i], "--peer-only") == 0) {
+            flags.peer_only = true;
+            continue;
+        }
         filtered_argv.push_back(argv[i]);
     }
 
@@ -248,13 +263,16 @@ static void start_shared_backend_rpc_server(struct llama_context * ctx, int ggml
         LOG_ERR("eng  %12.*s: RPC backend not available in this build — --ggml-rpc-port ignored\n", 12, __func__);
         return;
     }
-    using start_server_fn_t = void (*)(const char *, const char *, size_t, size_t, ggml_backend_t *);
-    auto start_server_fn = (start_server_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server_with_backends");
-    if (!start_server_fn) {
-        LOG_ERR("eng  %12.*s: failed to resolve ggml_backend_rpc_start_server_with_backends\n", 12, __func__);
+    using start_server_fn_t      = void (*)(const char *, const char *, size_t, size_t, ggml_backend_t *);
+    using start_server_dev_fn_t  = void (*)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *);
+    auto start_server_fn         = (start_server_fn_t)     ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server_with_backends");
+    auto start_server_dev_fn     = (start_server_dev_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
+    if (!start_server_fn || !start_server_dev_fn) {
+        LOG_ERR("eng  %12.*s: failed to resolve ggml_backend_rpc_start_server function\n", 12, __func__);
         return;
     }
 
+    // Try context's compute backends first (shared-backend mode).
     std::vector<ggml_backend_t> backends(8);
     size_t n_backends = llama_hydra_get_compute_backends(ctx, backends.data(), backends.size());
     if (n_backends > backends.size()) {
@@ -262,23 +280,160 @@ static void start_shared_backend_rpc_server(struct llama_context * ctx, int ggml
         n_backends = llama_hydra_get_compute_backends(ctx, backends.data(), backends.size());
     }
     backends.resize(n_backends);
-    if (backends.empty()) {
+
+    if (!backends.empty()) {
+        // Shared-backend mode: the RPC server shares the same backend
+        // instances the local decoder uses.
+        llama_hydra_enable_shared_backend_compute_lock();
+
+        const std::string endpoint = "0.0.0.0:" + std::to_string(ggml_rpc_port);
+        const size_t n_threads = std::max(1u, std::thread::hardware_concurrency() / 2);
+        LOG_INF("eng  %12.*s: exposing %zu shared backend(s) as a ggml-RPC server on %s\n",
+                12, __func__, backends.size(), endpoint.c_str());
+
+        std::thread([start_server_fn, endpoint, n_threads, backends]() mutable {
+            start_server_fn(endpoint.c_str(), nullptr, n_threads, backends.size(), backends.data());
+        }).detach();
+        return;
+    }
+
+    // Fallback: the context's scheduler has no non-CPU backends (e.g. a tiny
+    // placeholder model or CPU-only tensors). Enumerate globally registered
+    // accelerator devices instead, like rpc-server does.
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.empty()) {
         LOG_ERR("eng  %12.*s: no non-CPU backends found to expose for the embedded RPC server\n", 12, __func__);
         return;
     }
 
-    // Local decode dispatch (llama-context.cpp's graph_compute) must now
-    // serialize against this RPC server's compute on the same backend(s).
-    llama_hydra_enable_shared_backend_compute_lock();
+    const std::string endpoint = "0.0.0.0:" + std::to_string(ggml_rpc_port);
+    const size_t n_threads = std::max(1u, std::thread::hardware_concurrency() / 2);
+    LOG_INF("eng  %12.*s: exposing %zu device(s) as a ggml-RPC server on %s (fallback — no shared compute)\n",
+            12, __func__, devices.size(), endpoint.c_str());
+
+    std::thread([start_server_dev_fn, endpoint, n_threads, devices]() mutable {
+        start_server_dev_fn(endpoint.c_str(), nullptr, n_threads, devices.size(), devices.data());
+    }).detach();
+}
+
+// Hydra #383 T2: start a bare ggml-RPC server with globally registered non-CPU
+// devices, without loading any model. Used by --peer-only mode.
+static void start_backend_rpc_peer_server(int ggml_rpc_port) {
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        LOG_ERR("eng  %12.*s: --peer-only requires RPC backend, not available\n", 12, __func__);
+        return;
+    }
+    using start_server_dev_fn_t = void (*)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *);
+    auto start_server_dev_fn = (start_server_dev_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
+    if (!start_server_dev_fn) {
+        LOG_ERR("eng  %12.*s: --peer-only: failed to resolve ggml_backend_rpc_start_server\n", 12, __func__);
+        return;
+    }
+
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.empty()) {
+        LOG_ERR("eng  %12.*s: --peer-only: no non-CPU backends found\n", 12, __func__);
+        return;
+    }
 
     const std::string endpoint = "0.0.0.0:" + std::to_string(ggml_rpc_port);
     const size_t n_threads = std::max(1u, std::thread::hardware_concurrency() / 2);
-    LOG_INF("eng  %12.*s: exposing %zu shared backend(s) as a ggml-RPC server on %s\n",
-            12, __func__, backends.size(), endpoint.c_str());
+    LOG_INF("eng  %12.*s: peer-only: exposing %zu device(s) as ggml-RPC server on %s\n",
+            12, __func__, devices.size(), endpoint.c_str());
 
-    std::thread([start_server_fn, endpoint, n_threads, backends]() mutable {
-        start_server_fn(endpoint.c_str(), nullptr, n_threads, backends.size(), backends.data());
+    std::thread([start_server_dev_fn, endpoint, n_threads, devices]() mutable {
+        start_server_dev_fn(endpoint.c_str(), nullptr, n_threads, devices.size(), devices.data());
     }).detach();
+}
+
+// Hydra #383 T2: peer-only engine entry point. No model loaded — just exposes
+// the local GPU backend(s) as a ggml-RPC server and serves HTTP health checks.
+// The hydra-head uses the health endpoint to determine liveness.
+static int start_peer_only_engine(common_params & params, const hydra_capability_flags & flags) {
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
+    // Start ggml-RPC server exposing local GPU backends.
+    if (!flags.wants_rpc_backend()) {
+        LOG_ERR("eng  %12.*s: --peer-only requires --ggml-rpc-port\n", 12, __func__);
+        llama_backend_free();
+        return 1;
+    }
+    start_backend_rpc_peer_server(flags.ggml_rpc_port);
+
+    // Start HTTP server for health checks.
+    server_http_context ctx_http;
+    if (params.port > 0) {
+        if (!ctx_http.init(params)) {
+            LOG_ERR("eng  %12.*s: --peer-only: failed to init HTTP server\n", 12, __func__);
+            llama_backend_free();
+            return 1;
+        }
+
+        ctx_http.get("/health", [](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->data = "{\"status\":\"ok\"}";
+            return res;
+        });
+
+        ctx_http.get("/version", [](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->data = "{\"version\":\"E1\",\"engine\":\"llama-engine\",\"mode\":\"peer\"}";
+            return res;
+        });
+
+        if (!ctx_http.start()) {
+            LOG_ERR("eng  %12.*s: --peer-only: failed to start HTTP server\n", 12, __func__);
+            llama_backend_free();
+            return 1;
+        }
+        ctx_http.is_ready.store(true);
+    }
+
+    LOG_INF("eng  %12.*s: peer-only ready — GPU backend on ggml-rpc://0.0.0.0:%d, HTTP on :%d\n",
+            12, __func__, flags.ggml_rpc_port, params.port);
+
+    // Block until signal.
+    // We can't use ctx_server.start_loop() because there's no model.
+    // Instead, install a simple signal handler and sleep.
+    {
+        struct sigaction sa;
+        sa.sa_handler = +[](int) { /* no-op, start_loop handles it */ };
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
+    // Busy-wait loop — the HTTP server thread is detached; we just
+    // keep the main thread alive for signal handling and cleanup on exit.
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    if (params.port > 0) {
+        ctx_http.stop();
+        if (ctx_http.thread.joinable()) {
+            ctx_http.thread.join();
+        }
+    }
+    llama_backend_free();
+    return 0;
 }
 
 int llama_engine(int argc, char ** argv);
@@ -315,6 +470,11 @@ int llama_engine(int argc, char ** argv) {
             LOG_ERR("eng  %12.*s: --combined-split-mode layer requires --rpc-engine\n", 12, __func__);
             return 1;
         }
+    }
+
+    // Hydra #383 T2: peer-only mode — no model, just backend + HTTP health.
+    if (flags.is_peer_only()) {
+        return start_peer_only_engine(params, flags);
     }
 
     // Expert-split: --rpc-engine without --combined-ot-pattern is a no-op (existing behavior).
