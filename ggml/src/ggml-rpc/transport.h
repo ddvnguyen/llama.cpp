@@ -23,6 +23,7 @@ struct socket_t {
 
     static socket_ptr create_server(const char * host, int port);
     static socket_ptr connect(const char * host, int port);
+    static socket_ptr from_fd(int fd);
 
 private:
     struct impl;

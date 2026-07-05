@@ -140,6 +140,13 @@ LLAMA_API void llama_hydra_force_sync_if_shared(struct llama_context * ctx);
 // tensors a future peer will ask for.
 LLAMA_API void llama_hydra_register_local_tensors_for_rpc(struct llama_context * ctx);
 
+// Hydra #29 Phase B: clear the combined expert-tensor binding for the given
+// peer endpoint. Nulls all _rpc fields on every layer, drops the metadata
+// context, and erases the binding from the internal map. Does NOT remove the
+// backend from the scheduler or unregister the RPC server (caller must also
+// call llama_context::hydra_remove_combined_rpc_backend for full cleanup).
+LLAMA_API void llama_hydra_clear_combined_bindings(struct llama_context * ctx, const char * endpoint);
+
 #ifdef __cplusplus
 }
 #endif

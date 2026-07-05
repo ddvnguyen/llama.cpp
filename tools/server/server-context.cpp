@@ -12,7 +12,9 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../src/llama-context.h"
 #include "llama-hydra.h"
+#include "ggml-rpc.h"
 #include "log.h"
 #include "../src/llama-memory-hybrid.h"
 #include "preset.h"
@@ -702,6 +704,11 @@ public:
     // (layer-split) mode. The split is fixed at model load time; the mode
     // cannot be changed at runtime — SET_EXPERT_MODE("solo") is rejected.
     bool hydra_combined_static = false;
+
+    // #29 Phase B: tracks the currently active peer endpoint for per-request
+    // peer switching. Protected by the task queue (process_single_task is
+    // serialized), so no separate mutex needed.
+    std::string hydra_current_peer;
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -3525,13 +3532,59 @@ private:
                     res->id = task.id;
                     res->op = HYDRA_OP_SET_EXPERT_MODE;
 
-                    const std::string & requested = task.hydra_action.expert_mode;
+                    // Parse the payload. For backward compatibility, a raw string
+                    // ("solo" or "combined") is accepted. Phase D (C# side) sends
+                    // a JSON payload: {"mode":"combined","peer":"host:port",...}.
+                    std::string requested;
+                    std::string peer_override;
+                    const std::string & raw = task.hydra_action.expert_mode;
+                    if (!raw.empty() && raw[0] == '{') {
+                        try {
+                            json j = json::parse(raw);
+                            requested    = j.value("mode", "solo");
+                            peer_override = j.value("peer", "");
+                        } catch (...) {
+                            requested = "solo";
+                        }
+                    } else {
+                        requested = raw;
+                    }
+
                     if (requested != "solo" && requested != "combined") {
                         res->rpc_status = HYDRA_STATUS_ERROR;
                         res->success = false;
                         res->error = "expert_mode must be 'solo' or 'combined'";
                         queue_results.send(std::move(res));
                         break;
+                    }
+
+                    // #29 Phase B: per-request peer switching. If the peer changes,
+                    // clean up the old binding and register the new one. The peer
+                    // info comes from the SET_EXPERT_MODE control-plane payload
+                    // (JSON {"mode":"combined","peer":"host:port"}), NOT from the
+                    // HTTP inference body — keeping control and data separate.
+                    if (!peer_override.empty() && peer_override != hydra_current_peer) {
+                        // Guard: peer switch is unsafe while any slot is decoding.
+                        // sched_reserve() destroys and rebuilds the scheduler, which
+                        // invalidates in-flight decode state across all slots.
+                        bool any_active = false;
+                        for (const auto & s : slots) {
+                            if (s.is_processing()) { any_active = true; break; }
+                        }
+                        if (any_active) {
+                            SRV_WRN("hydra: cannot switch peers — %zu slot(s) are processing, rejecting SET_EXPERT_MODE\n", slots.size());
+                            res->rpc_status = HYDRA_STATUS_BUSY;
+                            res->success = false;
+                            res->error = "cannot switch peers while slots are processing";
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                        if (!hydra_current_peer.empty()) {
+                            SRV_INF("hydra: switching from peer %s to %s — cleaning up old binding\n",
+                                    hydra_current_peer.c_str(), peer_override.c_str());
+                            ctx_tgt->hydra_remove_combined_rpc_backend(hydra_current_peer.c_str());
+                        }
+                        hydra_current_peer = peer_override;
                     }
 
                     // Hydra #383 T1: layer-split (static combined) engines cannot
@@ -7119,19 +7172,57 @@ static void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx) {
     ::close(fd);
 }
 
-// ── server_context::start_rpc_server (M1) ────────────────────────────────────
-// Extract queue pointers and pass to connection handlers via context struct.
+// ── Unified RPC server implementation ───────────────────────────────────────
+// Protocol-detecting accept loop. Called from both:
+//   - server_context::start_rpc_server (model path, with Hydra queues)
+//   - no-model path in llama-engine.cpp (ggml-RPC only, ctx not valid)
 
-void server_context::start_rpc_server(int port) {
+void start_rpc_accept_loop(int srv_fd,
+                            std::vector<ggml_backend *> backends,
+                            void * hydra_ctx_vp) {
+    const bool has_hydra = (hydra_ctx_vp != nullptr);
+    hydra_rpc_ctx * ctx = static_cast<hydra_rpc_ctx *>(hydra_ctx_vp);
+    std::thread([srv_fd, backends, ctx, has_hydra]() {
+        while (true) {
+            const int conn_fd = ::accept(srv_fd, nullptr, nullptr);
+            if (conn_fd < 0) continue;
+
+            std::thread([conn_fd, backends, ctx, has_hydra]() mutable {
+                // Peek first byte — MSG_PEEK does not consume it.
+                uint8_t first_byte;
+                if (::recv(conn_fd, &first_byte, 1, MSG_PEEK) != 1) {
+                    ::close(conn_fd);
+                    return;
+                }
+                // RPC_CMD_HELLO = 14 = 0x0E. Hydra opcodes are 0x30-0x46.
+                if (first_byte == 0x0E) {
+                    ggml_backend_rpc_handle_client(conn_fd, nullptr,
+                        backends.size(), backends.data());
+                } else if (has_hydra && ctx) {
+                    hydra_handle_connection(conn_fd, *ctx);
+                } else {
+                    ::close(conn_fd);
+                }
+            }).detach();
+        }
+    }).detach();
+}
+
+// ── Bind + accept ────────────────────────────────────────────────────────────
+// Server-context path: creates a socket, binds, listens, then delegates to the
+// shared start_rpc_accept_loop with Hydra queue pointers.
+
+void server_context::start_rpc_server(int port,
+                                       std::vector<ggml_backend *> backends) {
     if (port <= 0) return;
 
-    // server_context is a friend of server_context_impl, so we can access private fields.
-    // Extract queue pointers (PUBLIC members of server_context_impl).
-    hydra_rpc_ctx ctx;
-    ctx.queue_tasks = &impl->queue_tasks;
-    ctx.queue_results = &impl->queue_results;
+    hydra_rpc_ctx ctx{};
+    if (impl) {
+        ctx.queue_tasks   = &impl->queue_tasks;
+        ctx.queue_results = &impl->queue_results;
+    }
 
-    std::thread([port, ctx]() {
+    std::thread([port, backends = std::move(backends), ctx]() mutable {
         const int srv_fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (srv_fd < 0) {
             SRV_ERR("hydra rpc: socket() failed: %s\n", strerror(errno));
@@ -7151,21 +7242,26 @@ void server_context::start_rpc_server(int port) {
             return;
         }
         ::listen(srv_fd, 16);
-        SRV_INF("hydra rpc: listening on 0.0.0.0:%d (M1: task-queue routing)\n", port);
 
-        while (true) {
-            const int conn_fd = ::accept(srv_fd, nullptr, nullptr);
-            if (conn_fd < 0) continue;
-            std::thread(hydra_handle_connection, conn_fd, ctx).detach();
+        if (ctx.queue_tasks && ctx.queue_results) {
+            SRV_INF("hydra rpc: unified server on 0.0.0.0:%d (ggml-RPC + Hydra protocol)\n", port);
+        } else {
+            SRV_INF("hydra rpc: unified server on 0.0.0.0:%d (ggml-RPC only)\n", port);
         }
+
+        start_rpc_accept_loop(srv_fd, backends,
+            (ctx.queue_tasks && ctx.queue_results) ? &ctx : nullptr);
     }).detach();
 }
 
 #else
 // Windows: RPC server not implemented — target hardware is Linux-only for M0.
-void server_context::start_rpc_server(int port) {
+void server_context::start_rpc_server(int port, std::vector<ggml_backend *>) {
     if (port > 0) {
         SRV_WRN("hydra rpc: not supported on Windows (port %d ignored)\n", port);
     }
+    GGML_UNUSED(port);
 }
+
+void start_rpc_accept_loop(int, std::vector<ggml_backend *>, void *) {}
 #endif // !_WIN32

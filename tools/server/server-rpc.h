@@ -1,5 +1,10 @@
 #pragma once
 
+#include <vector>
+#include <cstddef>
+
+struct ggml_backend;
+
 // Hydra binary RPC wire-format constants for llama-server state transfer.
 // See hydra_vortex/specs/rpc-protocol.md for the full spec.
 // llama-server only implements ops 0x30-0x32; it knows nothing about Store.
@@ -37,3 +42,21 @@ static constexpr uint8_t  HYDRA_STATUS_BAD_REQUEST      = 0x05;
 
 // ── Safety cap (4 GB) ─────────────────────────────────────────────────────────
 static constexpr uint64_t HYDRA_MAX_STATE_BYTES  = 4ULL * 1024 * 1024 * 1024;
+
+// ── Unified RPC server ───────────────────────────────────────────────────────
+// Start a protocol-detecting RPC accept loop on a pre-bound socket.
+// Accepts connections, peeks the first byte, and dispatches:
+//   0x0E (RPC_CMD_HELLO) → ggml-backend RPC handler (GPU compute)
+//   otherwise            → Hydra protocol handler (if ctx != nullptr)
+// Declared here so both server-context.cpp and llama-engine.cpp share the
+// same dispatch logic. See server-context.cpp for the implementation.
+//
+// `hydra_ctx` is an opaque pointer to a hydra_rpc_ctx struct (defined in
+// server-context.cpp). If nullptr, Hydra protocol connections are closed;
+// only ggml-RPC is served. The struct fields are accessed only from
+// server-context.cpp, so the opaque pointer avoids exposing queue types here.
+//
+// `backends` are the ggml backend instances to expose via ggml-RPC.
+void start_rpc_accept_loop(int srv_fd,
+                           std::vector<ggml_backend *> backends,
+                           void * hydra_ctx);

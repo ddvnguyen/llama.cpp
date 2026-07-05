@@ -19,6 +19,9 @@
 #include <limits>
 #include <stdexcept>
 
+// ggml-backend RPC functions with C linkage (declared in ggml-rpc.h)
+extern "C" bool ggml_backend_rpc_remove_server(const char * endpoint);
+
 //
 // llama_context
 //
@@ -447,6 +450,56 @@ bool llama_context::hydra_add_combined_rpc_backend(ggml_backend_dev_t peer_dev) 
 
     LLAMA_LOG_INFO("%s: COMBINED peer backend %s added to scheduler (%zu backends total)\n",
             __func__, ggml_backend_dev_name(peer_dev), backend_ptrs.size());
+    return true;
+}
+
+bool llama_context::hydra_remove_combined_rpc_backend(const char * endpoint) {
+    if (!endpoint || !endpoint[0]) {
+        return false;
+    }
+
+    // CAUTION: sched_reserve() below destroys and recreates the scheduler.
+    // This is safe here because remove is called from the serialized task
+    // queue (process_single_task in server-context.cpp), which guarantees
+    // no concurrent decode is in-flight. Callers from other contexts must
+    // ensure is_processing() == false before calling.
+
+    // Clear combined expert-tensor bindings first (nulls _rpc pointers, frees meta_ctx).
+    // This must be called through the C API since the binding map is in llama-hydra.cpp.
+    // We use the declaration from llama-hydra.h (included via llama-context.h).
+    llama_hydra_clear_combined_bindings(this, endpoint);
+
+    // Find and remove the peer backend from the backends vector by matching
+    // the device description (set to the endpoint string by ggml_backend_rpc_add_server).
+    bool found = false;
+    for (auto it = backends.begin(); it != backends.end(); ++it) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(it->get());
+        if (dev) {
+            const char * desc = ggml_backend_dev_description(dev);
+            if (desc && strcmp(desc, endpoint) == 0) {
+                backends.erase(it);
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (!found) {
+        LLAMA_LOG_INFO("%s: peer backend for %s not found in backends vector (already removed)\n",
+                __func__, endpoint);
+        // Still proceed to unregister the RPC server — the socket may still be open.
+    }
+
+    // Rebuild derived backend vectors and reserve the scheduler without the peer.
+    build_backend_buffer_vectors();
+    sched_need_reserve = true;
+    sched_reserve();
+
+    // Unregister the remote server from the ggml-RPC registry.
+    ggml_backend_rpc_remove_server(endpoint);
+
+    LLAMA_LOG_INFO("%s: COMBINED peer %s removed from scheduler (%zu backends total)\n",
+            __func__, endpoint, backend_ptrs.size());
     return true;
 }
 
