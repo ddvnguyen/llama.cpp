@@ -19,6 +19,9 @@
 #include <limits>
 #include <stdexcept>
 
+// ggml-backend RPC functions with C linkage (declared in ggml-rpc.h)
+extern "C" bool ggml_backend_rpc_remove_server(const char * endpoint);
+
 //
 // llama_context
 //
@@ -455,6 +458,12 @@ bool llama_context::hydra_remove_combined_rpc_backend(const char * endpoint) {
         return false;
     }
 
+    // CAUTION: sched_reserve() below destroys and recreates the scheduler.
+    // This is safe here because remove is called from the serialized task
+    // queue (process_single_task in server-context.cpp), which guarantees
+    // no concurrent decode is in-flight. Callers from other contexts must
+    // ensure is_processing() == false before calling.
+
     // Clear combined expert-tensor bindings first (nulls _rpc pointers, frees meta_ctx).
     // This must be called through the C API since the binding map is in llama-hydra.cpp.
     // We use the declaration from llama-hydra.h (included via llama-context.h).
@@ -487,8 +496,6 @@ bool llama_context::hydra_remove_combined_rpc_backend(const char * endpoint) {
     sched_reserve();
 
     // Unregister the remote server from the ggml-RPC registry.
-    // This is an exported function from the ggml-rpc library.
-    extern bool ggml_backend_rpc_remove_server(const char * ep);
     ggml_backend_rpc_remove_server(endpoint);
 
     LLAMA_LOG_INFO("%s: COMBINED peer %s removed from scheduler (%zu backends total)\n",

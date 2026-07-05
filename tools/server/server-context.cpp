@@ -14,6 +14,7 @@
 #include "llama.h"
 #include "../src/llama-context.h"
 #include "llama-hydra.h"
+#include "ggml-rpc.h"
 #include "log.h"
 #include "../src/llama-memory-hybrid.h"
 #include "preset.h"
@@ -703,6 +704,11 @@ public:
     // (layer-split) mode. The split is fixed at model load time; the mode
     // cannot be changed at runtime — SET_EXPERT_MODE("solo") is rejected.
     bool hydra_combined_static = false;
+
+    // #29 Phase B: tracks the currently active peer endpoint for per-request
+    // peer switching. Protected by the task queue (process_single_task is
+    // serialized), so no separate mutex needed.
+    std::string hydra_current_peer;
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -3552,16 +3558,16 @@ private:
                         break;
                     }
 
-                    // #29 Phase B: per-request peer switching. If the request
-                    // specifies a different peer, clean up the old one first.
-                    static std::string g_current_peer;
-                    if (!peer_override.empty() && peer_override != g_current_peer) {
-                        if (!g_current_peer.empty()) {
+                    // #29 Phase B: per-request peer switching (thread-safe through
+                    // process_single_task serialization). If the peer changes, clean
+                    // up the old binding before registering the new one.
+                    if (!peer_override.empty() && peer_override != hydra_current_peer) {
+                        if (!hydra_current_peer.empty()) {
                             SRV_INF("hydra: switching from peer %s to %s — cleaning up old binding\n",
-                                    g_current_peer.c_str(), peer_override.c_str());
-                            ctx_tgt->hydra_remove_combined_rpc_backend(g_current_peer.c_str());
+                                    hydra_current_peer.c_str(), peer_override.c_str());
+                            ctx_tgt->hydra_remove_combined_rpc_backend(hydra_current_peer.c_str());
                         }
-                        g_current_peer = peer_override;
+                        hydra_current_peer = peer_override;
                         // Override the configured peer for the rest of this handler
                         const_cast<server_context_impl *>(this)->hydra_peer = peer_override;
                     }
@@ -7162,12 +7168,8 @@ static void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx) {
 // in the model-loaded path, or globally enumerated devices in the no-model path).
 // When `this` is null (no server_context), Hydra connections are rejected.
 
-// Forward declaration for ggml backend library symbol
-extern void ggml_backend_rpc_handle_client(int fd, const char * cache_dir,
-                                            size_t n_backends, ggml_backend_t * backends);
-
 void server_context::start_rpc_server(int port,
-                                       const std::vector<ggml_backend *> & rpc_backends) {
+                                       std::vector<ggml_backend *> backends) {
     if (port <= 0) return;
 
     // Extract Hydra queue pointers (only needed if server_context exists)
@@ -7177,10 +7179,7 @@ void server_context::start_rpc_server(int port,
         ctx.queue_results = &impl->queue_results;
     }
 
-    // Copy backends for the accept thread — the vector is captured by value.
-    std::vector<ggml_backend *> backends = rpc_backends;
-
-    std::thread([port, backends, ctx, has_hydra = (this != nullptr && impl != nullptr)]() {
+    std::thread([port, backends = std::move(backends), ctx, has_hydra = (this != nullptr && impl != nullptr)]() {
         const int srv_fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (srv_fd < 0) {
             SRV_ERR("hydra rpc: socket() failed: %s\n", strerror(errno));
@@ -7211,7 +7210,7 @@ void server_context::start_rpc_server(int port,
             const int conn_fd = ::accept(srv_fd, nullptr, nullptr);
             if (conn_fd < 0) continue;
 
-            std::thread([conn_fd, backends, ctx, has_hydra]() {
+            std::thread([conn_fd, backends, ctx, has_hydra]() mutable {
                 // Peek first byte to determine protocol — MSG_PEEK does not consume it.
                 uint8_t first_byte;
                 if (::recv(conn_fd, &first_byte, 1, MSG_PEEK) != 1) {
@@ -7223,7 +7222,7 @@ void server_context::start_rpc_server(int port,
                 if (first_byte == 0x0E) {
                     // ggml-RPC client — dispatch to ggml backend library handler
                     ggml_backend_rpc_handle_client(conn_fd, nullptr,
-                        backends.size(), const_cast<ggml_backend_t *>(backends.data()));
+                        backends.size(), backends.data());
                 } else if (has_hydra) {
                     // Hydra protocol client
                     hydra_handle_connection(conn_fd, ctx);

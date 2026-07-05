@@ -171,6 +171,10 @@ static std::unordered_map<std::string, hydra_combined_peer_binding> s_hydra_comb
 
 // #29 Phase B: clear the combined expert-tensor binding for the given peer
 // endpoint. Nulls all _rpc fields, drops the meta_ctx, and erases the binding.
+// #29 Phase B: clear the combined expert-tensor binding for the given peer.
+// Nulls all _rpc fields on EVERY layer because the current design supports
+// only one peer at a time. If a future design supports multiple peers
+// simultaneously, this should be scoped per-peer endpoint.
 void llama_hydra_clear_combined_bindings(struct llama_context * ctx, const char * endpoint) {
     auto it = s_hydra_combined_bindings.find(endpoint);
     if (it == s_hydra_combined_bindings.end()) {

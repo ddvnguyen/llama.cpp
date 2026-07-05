@@ -16,11 +16,6 @@
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
 
-// ggml-backend RPC functions — exported from ggml-rpc library
-extern void ggml_backend_rpc_handle_client(int fd, const char * cache_dir,
-                                            size_t n_backends, ggml_backend_t * backends);
-extern bool ggml_backend_rpc_remove_server(const char * endpoint);
-
 #include <atomic>
 #include <clocale>
 #include <cstdio>
@@ -193,10 +188,21 @@ static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** a
             flags.rpc_engine_peer = argv[++i];
             continue;
         }
-        // Strip remaining Hydra-only flags so they never reach common_params_parse
-        if (strcmp(argv[i], "--ggml-rpc-port") == 0 && i + 1 < argc) { ++i; continue; }
-        if (strcmp(argv[i], "--peer-only") == 0) { continue; }
-        if (strcmp(argv[i], "--combined-ot-pattern") == 0 && i + 1 < argc) { ++i; continue; }
+        // Strip remaining Hydra-only flags so they never reach common_params_parse.
+        // All COMBINE config is now request-driven at runtime — CLI flags are
+        // removed. Log a one-time warning to help operators update their configs.
+        if (strcmp(argv[i], "--ggml-rpc-port") == 0 && i + 1 < argc) {
+            LOG_WRN("eng  %12.*s: --ggml-rpc-port is removed — RPC server port is auto-derived\n", 12, __func__ );
+            ++i; continue;
+        }
+        if (strcmp(argv[i], "--peer-only") == 0) {
+            LOG_WRN("eng  %12.*s: --peer-only is removed — omit --model for compute-only mode\n", 12, __func__);
+            continue;
+        }
+        if (strcmp(argv[i], "--combined-ot-pattern") == 0 && i + 1 < argc) {
+            LOG_WRN("eng  %12.*s: --combined-ot-pattern is removed — split config comes from request\n", 12, __func__);
+            ++i; continue;
+        }
         if (strcmp(argv[i], "--combined-split-mode") == 0 && i + 1 < argc) { ++i; continue; }
         if (strcmp(argv[i], "--combined-tensor-split") == 0 && i + 1 < argc) { ++i; continue; }
         filtered_argv.push_back(argv[i]);
@@ -266,17 +272,16 @@ int llama_engine(int argc, char ** argv) {
         rpc_port = (params.port > 0) ? params.port + 1 : 9504;
     }
 
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
     // If --rpc-engine was given (testing shortcut), pre-connect the peer now.
     if (has_peer) {
-        ggml_backend_load_all();
         if (ggml_backend_rpc_add_server(flags.rpc_engine_peer.c_str()) == nullptr) {
             LOG_WRN("eng  %12.*s: rpc-engine peer %s unreachable — running in solo mode\n",
                     12, __func__, flags.rpc_engine_peer.c_str());
         }
     }
-
-    llama_backend_init();
-    llama_numa_init(params.numa);
 
     // ── Model-loaded path ──
     if (has_model) {
@@ -551,6 +556,11 @@ int llama_engine(int argc, char ** argv) {
     {
         // Start the unified RPC server, serving globally registered non-CPU
         // devices via ggml-RPC. No Hydra protocol — no server_context exists.
+        // No tensor registration either: without a model there are no local
+        // tensors to register for zero-copy COMBINE (RPC_CMD_RESOLVE_TENSOR
+        // will find nothing — expert-split requires the peer to have a model).
+        // Layer-split COMBINE works fine: the head owns the model and uses
+        // the peer's ggml-RPC buffers for compute only.
         auto backends = enumerate_non_cpu_devices();
         if (backends.empty()) {
             LOG_ERR("eng  %12.*s: no non-CPU backends found\n", 12, __func__);
@@ -588,9 +598,9 @@ int llama_engine(int argc, char ** argv) {
             while (true) {
                 int conn_fd = ::accept(srv_fd, nullptr, nullptr);
                 if (conn_fd < 0) continue;
-                std::thread([conn_fd, backends]() {
+                std::thread([conn_fd, backends]() mutable {
                     ggml_backend_rpc_handle_client(conn_fd, nullptr,
-                        backends.size(), const_cast<ggml_backend_t *>(backends.data()));
+                        backends.size(), backends.data());
                 }).detach();
             }
         }).detach();

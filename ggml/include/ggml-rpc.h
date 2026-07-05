@@ -84,6 +84,19 @@ GGML_BACKEND_API uint32_t ggml_backend_rpc_get_registry_epoch(void);
 // binding to detect that the peer has cleared/reloaded.
 GGML_BACKEND_API uint32_t ggml_backend_rpc_get_remote_registry_epoch(const char * endpoint);
 
+// Unified RPC server: handle a pre-accepted client fd as a ggml-RPC connection.
+// The caller must have accepted the connection and determined it is a ggml-RPC
+// client (e.g. via protocol detection with MSG_PEEK). The backends array is
+// not modified.
+GGML_BACKEND_API void ggml_backend_rpc_handle_client(int fd, const char * cache_dir,
+                                                     size_t n_backends, ggml_backend_t * backends);
+
+// Remove a previously registered RPC server endpoint from the global registry
+// and free its resources. Returns false if the endpoint was never registered.
+// Must only be called after all buffers allocated through this endpoint's
+// devices have been freed (otherwise the buffer objects reference freed memory).
+GGML_BACKEND_API bool ggml_backend_rpc_remove_server(const char * endpoint);
+
 #ifdef  __cplusplus
 }
 #endif

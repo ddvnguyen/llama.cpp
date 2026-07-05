@@ -2426,7 +2426,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     return reg;
 }
 
-bool ggml_backend_rpc_remove_server(const char * endpoint) {
+GGML_BACKEND_API bool ggml_backend_rpc_remove_server(const char * endpoint) {
     auto & reg_map = get_rpc_reg_map();
     auto & mutex   = get_rpc_mutex();
     std::lock_guard<std::mutex> lock(mutex);
