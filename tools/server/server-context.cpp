@@ -12,6 +12,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../src/llama-context.h"
 #include "llama-hydra.h"
 #include "log.h"
 #include "../src/llama-memory-hybrid.h"
@@ -3525,13 +3526,44 @@ private:
                     res->id = task.id;
                     res->op = HYDRA_OP_SET_EXPERT_MODE;
 
-                    const std::string & requested = task.hydra_action.expert_mode;
+                    // Parse the payload. For backward compatibility, a raw string
+                    // ("solo" or "combined") is accepted. Phase D (C# side) sends
+                    // a JSON payload: {"mode":"combined","peer":"host:port",...}.
+                    std::string requested;
+                    std::string peer_override;
+                    const std::string & raw = task.hydra_action.expert_mode;
+                    if (!raw.empty() && raw[0] == '{') {
+                        try {
+                            json j = json::parse(raw);
+                            requested    = j.value("mode", "solo");
+                            peer_override = j.value("peer", "");
+                        } catch (...) {
+                            requested = "solo";
+                        }
+                    } else {
+                        requested = raw;
+                    }
+
                     if (requested != "solo" && requested != "combined") {
                         res->rpc_status = HYDRA_STATUS_ERROR;
                         res->success = false;
                         res->error = "expert_mode must be 'solo' or 'combined'";
                         queue_results.send(std::move(res));
                         break;
+                    }
+
+                    // #29 Phase B: per-request peer switching. If the request
+                    // specifies a different peer, clean up the old one first.
+                    static std::string g_current_peer;
+                    if (!peer_override.empty() && peer_override != g_current_peer) {
+                        if (!g_current_peer.empty()) {
+                            SRV_INF("hydra: switching from peer %s to %s — cleaning up old binding\n",
+                                    g_current_peer.c_str(), peer_override.c_str());
+                            ctx_tgt->hydra_remove_combined_rpc_backend(g_current_peer.c_str());
+                        }
+                        g_current_peer = peer_override;
+                        // Override the configured peer for the rest of this handler
+                        const_cast<server_context_impl *>(this)->hydra_peer = peer_override;
                     }
 
                     // Hydra #383 T1: layer-split (static combined) engines cannot

@@ -2283,6 +2283,11 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
     }
 }
 
+// Forward declarations for functions defined after get_proc_address
+void ggml_backend_rpc_handle_client(int fd, const char * cache_dir,
+                                     size_t n_backends, ggml_backend_t * backends);
+bool ggml_backend_rpc_remove_server(const char * endpoint);
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
@@ -2319,6 +2324,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_handle_client") == 0) {
         return (void *)ggml_backend_rpc_handle_client;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_remove_server") == 0) {
+        return (void *)ggml_backend_rpc_remove_server;
     }
     return NULL;
 
@@ -2361,10 +2369,25 @@ static const ggml_backend_reg_i ggml_backend_rpc_reg_interface = {
     /* .get_proc_address  = */ ggml_backend_rpc_get_proc_address,
 };
 
-ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
+namespace {
+std::unordered_map<std::string, ggml_backend_reg_t> & get_rpc_reg_map() {
     static std::unordered_map<std::string, ggml_backend_reg_t> reg_map;
+    return reg_map;
+}
+std::mutex & get_rpc_mutex() {
     static std::mutex mutex;
+    return mutex;
+}
+uint32_t & get_rpc_dev_id() {
     static uint32_t dev_id = 0;
+    return dev_id;
+}
+} // anonymous namespace
+
+ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
+    auto & reg_map = get_rpc_reg_map();
+    auto & mutex   = get_rpc_mutex();
+    auto & dev_id  = get_rpc_dev_id();
     std::lock_guard<std::mutex> lock(mutex);
     if (reg_map.find(endpoint) != reg_map.end()) {
         return reg_map[endpoint];
@@ -2401,6 +2424,30 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     };
     reg_map[endpoint] = reg;
     return reg;
+}
+
+bool ggml_backend_rpc_remove_server(const char * endpoint) {
+    auto & reg_map = get_rpc_reg_map();
+    auto & mutex   = get_rpc_mutex();
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = reg_map.find(endpoint);
+    if (it == reg_map.end()) {
+        return false;
+    }
+    ggml_backend_reg_t reg = it->second;
+    // Unregister from global registry
+    ggml_backend_unload(reg);
+    // Free the context and its devices
+    auto * ctx = static_cast<ggml_backend_rpc_reg_context *>(reg->context);
+    for (auto dev : ctx->devices) {
+        auto * dev_ctx = static_cast<ggml_backend_rpc_device_context *>(dev->context);
+        delete dev_ctx;
+        delete dev;
+    }
+    delete ctx;
+    delete reg;
+    reg_map.erase(it);
+    return true;
 }
 
 

@@ -16,9 +16,10 @@
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
 
-// ggml-backend RPC per-connection handler — exported from ggml-rpc library
+// ggml-backend RPC functions — exported from ggml-rpc library
 extern void ggml_backend_rpc_handle_client(int fd, const char * cache_dir,
                                             size_t n_backends, ggml_backend_t * backends);
+extern bool ggml_backend_rpc_remove_server(const char * endpoint);
 
 #include <atomic>
 #include <clocale>

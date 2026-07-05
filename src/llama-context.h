@@ -136,6 +136,13 @@ struct llama_context {
     // before the first decode. Returns false if the peer backend can't be init'd.
     bool hydra_add_combined_rpc_backend(ggml_backend_dev_t peer_dev);
 
+    // Hydra (Phase B #29): remove a previously added COMBINED peer backend
+    // from the scheduler. Clears all _rpc tensor bindings for the given peer,
+    // removes the backend from the backend vector, rebuilds the scheduler, and
+    // unregisters the RPC server. Returns false if the endpoint was never added.
+    // Caller must ensure no decode is in-flight.
+    bool hydra_remove_combined_rpc_backend(const char * endpoint);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);

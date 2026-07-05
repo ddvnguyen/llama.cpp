@@ -169,6 +169,24 @@ struct hydra_combined_peer_binding {
 static std::unordered_map<std::string, hydra_combined_peer_binding> s_hydra_combined_bindings;
 } // namespace
 
+// #29 Phase B: clear the combined expert-tensor binding for the given peer
+// endpoint. Nulls all _rpc fields, drops the meta_ctx, and erases the binding.
+void llama_hydra_clear_combined_bindings(struct llama_context * ctx, const char * endpoint) {
+    auto it = s_hydra_combined_bindings.find(endpoint);
+    if (it == s_hydra_combined_bindings.end()) {
+        return;
+    }
+    llama_model & model = const_cast<llama_model &>(ctx->get_model());
+    for (size_t il = 0; il < model.layers.size(); il++) {
+        llama_layer & layer = model.layers[il];
+        layer.ffn_gate_exps_rpc = nullptr;
+        layer.ffn_up_exps_rpc   = nullptr;
+        layer.ffn_down_exps_rpc = nullptr;
+    }
+    s_hydra_combined_bindings.erase(it);
+    LLAMA_LOG_INFO("hydra: cleared combined bindings for peer %s\n", endpoint);
+}
+
 // #368: rebind the peer's expert tensors on demand. Public (called from
 // the SET_EXPERT_MODE("combined") handler in server-context.cpp). Behavior:
 //   - peer reachable + tensors bind cleanly → all _rpc fields populated, the
