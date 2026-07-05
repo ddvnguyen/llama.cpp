@@ -633,14 +633,9 @@ int llama_engine(int argc, char ** argv) {
             LOG_INF("eng  %12.*s: no-model RPC server on 0.0.0.0:%d (%zu GPU backend(s))\n",
                     12, __func__, rpc_port, backends.size());
 
-            while (true) {
-                int conn_fd = ::accept(srv_fd, nullptr, nullptr);
-                if (conn_fd < 0) continue;
-                std::thread([conn_fd, backends]() mutable {
-                    ggml_backend_rpc_handle_client(conn_fd, nullptr,
-                        backends.size(), backends.data());
-                }).detach();
-            }
+            // Use the shared accept loop from server-rpc.h. No Hydra queue
+            // context — only ggml-RPC protocol is accepted.
+            start_rpc_accept_loop(srv_fd, backends, nullptr);
         }).detach();
 
         // ── Minimal HTTP server (health + version only) ──
