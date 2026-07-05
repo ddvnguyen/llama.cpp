@@ -171,8 +171,10 @@ static bool try_tcp_connect(const std::string & host, int port, int timeout_sec)
 // runtime — CLI flags are only for testing.
 struct hydra_capability_flags {
     std::string rpc_engine_peer;     // testing shortcut: reach out to this peer
+    std::string tensor_split_str;    // testing: layer-split proportions (e.g. "25/40")
 
     bool wants_combined_head() const { return !rpc_engine_peer.empty(); }
+    bool has_tensor_split()    const { return !tensor_split_str.empty(); }
 };
 
 // Filters Hydra flags out of argv before common_params_parse sees them.
@@ -186,6 +188,10 @@ static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** a
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rpc-engine") == 0 && i + 1 < argc) {
             flags.rpc_engine_peer = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--tensor-split") == 0 && i + 1 < argc) {
+            flags.tensor_split_str = argv[++i];
             continue;
         }
         // Strip remaining Hydra-only flags so they never reach common_params_parse.
@@ -272,13 +278,45 @@ int llama_engine(int argc, char ** argv) {
         rpc_port = (params.port > 0) ? params.port + 1 : 9504;
     }
 
+    // Apply tensor_split from --tensor-split flag (testing convenience).
+    // Parses "25/40" or "25,40" into params.tensor_split[128].
+    if (flags.has_tensor_split()) {
+        std::string ts = flags.tensor_split_str;
+        std::vector<float> splits;
+        size_t pos = 0;
+        while (pos <= ts.size()) {
+            size_t end = ts.find_first_of(",/", pos);
+            if (end == std::string::npos) end = ts.size();
+            std::string token = ts.substr(pos, end - pos);
+            if (!token.empty()) {
+                try { splits.push_back(std::stof(token)); }
+                catch (...) { break; }
+            }
+            if (end == ts.size()) break;
+            pos = end + 1;
+        }
+        for (size_t i = 0; i < 128 && i < splits.size(); i++) {
+            params.tensor_split[i] = splits[i];
+        }
+        LOG_INF("eng  %12.*s: tensor_split=%s applied (%zu device(s))\n",
+                12, __func__, flags.tensor_split_str.c_str(), splits.size());
+    }
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
     // If --rpc-engine was given (testing shortcut), pre-connect the peer now.
+    // Register the peer as a GGML backend device so it's visible for model
+    // loading (layer-split needs the peer device in the device list).
     if (has_peer) {
-        if (ggml_backend_rpc_add_server(flags.rpc_engine_peer.c_str()) == nullptr) {
+        ggml_backend_reg_t peer_reg = ggml_backend_rpc_add_server(flags.rpc_engine_peer.c_str());
+        if (peer_reg == nullptr) {
             LOG_WRN("eng  %12.*s: rpc-engine peer %s unreachable — running in solo mode\n",
+                    12, __func__, flags.rpc_engine_peer.c_str());
+        } else {
+            // Register peer with GGML so llama.cpp can place layers on it
+            ggml_backend_register(peer_reg);
+            LOG_INF("eng  %12.*s: rpc-engine peer %s registered for layer-split\n",
                     12, __func__, flags.rpc_engine_peer.c_str());
         }
     }
