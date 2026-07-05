@@ -34,6 +34,18 @@ LLAMA_API size_t llama_hydra_clamp_state_chunk_size(size_t bytes);
 // falls back to SOLO mode (all tensors on local GPU).
 LLAMA_API bool llama_hydra_peer_reachable(const char * host_port);
 
+// Hydra #383 T1: COMBINED layer-split mode — register `peer_endpoint` as an
+// RPC backend device BEFORE model load so llama.cpp's stock layer allocator
+// places ~tensor_split[0] layers on the peer and the remainder on the local
+// GPU at load time (RPC devices are inserted at the FRONT of the device list,
+// src/llama.cpp:239). Call after llama_backend_init() and before
+// llama_model_load_from_file / server_context::load_model.
+// Returns 0 on success, -1 on failure (peer not reachable, RPC backend
+// unavailable, or ggml_backend_rpc_add_server failed). Failure in layer-split
+// mode MUST abort startup — unlike expert-split, the model cannot load without
+// the peer device present.
+LLAMA_API int llama_hydra_preload_rpc_device(const char * peer_endpoint);
+
 // Hydra #287/#260 — COMBINED expert-split mode.
 //
 // Dual-resident routed-expert tensors: a "head" engine keeps its normal local

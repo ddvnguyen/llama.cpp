@@ -97,8 +97,11 @@ struct server_context {
     // running (--ggml-rpc-port was set). `peer_reachable`: the startup
     // TCP-probe result for `peer`, distinct from whether the dual-load
     // (set_hydra_combined_head_attached) actually succeeded.
+    // `split_mode`: "expert" (default, --combined-ot-pattern path) or
+    // "layer" (#383 T1, --combined-tensor-split pre-load path).
     void set_hydra_capabilities(bool rpc_backend_active, const std::string & peer,
-            bool peer_reachable, const std::string & combined_pattern);
+            bool peer_reachable, const std::string & combined_pattern,
+            const std::string & split_mode = "expert");
 
     // Hydra #348 (renamed from set_hydra_combined_capable): record whether
     // COMBINED expert dual-loading succeeded at startup. Must be called (if
@@ -107,6 +110,11 @@ struct server_context {
     // (peer was unreachable, had no matching expert tensors, or didn't have
     // enough free VRAM for the dual-load).
     void set_hydra_combined_head_attached(bool attached);
+
+    // Hydra #383 T1: record that this engine started in COMBINED static
+    // (layer-split) mode. Unlike expert-split, the split is fixed at model
+    // load time — SET_EXPERT_MODE("solo") is an error, "combined" is a no-op.
+    void set_hydra_combined_static(bool is_static);
 };
 
 

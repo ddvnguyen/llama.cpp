@@ -145,6 +145,15 @@ static bool try_tcp_connect(const std::string & host, int port, int timeout_sec)
     tv.tv_usec = 0;
 
     ret = select(fd + 1, NULL, &wfds, NULL, &tv);
+    if (ret > 0) {
+        // select() reports writable even on failed non-blocking connects
+        // (e.g. ECONNREFUSED). Check SO_ERROR to distinguish success.
+        int so_error = 0;
+        socklen_t so_len = sizeof(so_error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&so_error, &so_len) < 0 || so_error != 0) {
+            ret = 0;
+        }
+    }
 
 #if defined(_WIN32)
     closesocket(fd);
@@ -161,24 +170,38 @@ static bool try_tcp_connect(const std::string & host, int port, int timeout_sec)
 // itself as a COMBINED-peer RPC backend and/or reaching out to a peer as a
 // COMBINED head — any combination, no restart to change which. Filtered out
 // of argv before common_params_parse (these aren't stock llama.cpp args).
-//   --ggml-rpc-port <port>        opt-in: expose this engine's local GPU(s)
-//                                 as an embedded ggml-RPC backend on <port>,
-//                                 sharing the SAME backend instances this
-//                                 engine already built for local inference
-//                                 (not a duplicate context — see
-//                                 start_shared_backend_rpc_server below).
-//   --rpc-engine <host:port>      opt-in: this engine acts as a COMBINED
-//                                 head reaching out to the named peer.
-//   --combined-ot-pattern <regex> required alongside --rpc-engine: which
-//                                 expert tensors (by name) get a dual-resident
-//                                 copy on the peer.
+//   --ggml-rpc-port <port>          opt-in: expose this engine's local GPU(s)
+//                                   as an embedded ggml-RPC backend on <port>,
+//                                   sharing the SAME backend instances this
+//                                   engine already built for local inference
+//                                   (not a duplicate context — see
+//                                   start_shared_backend_rpc_server below).
+//   --rpc-engine <host:port>        opt-in: this engine acts as a COMBINED
+//                                   head reaching out to the named peer.
+//   --combined-ot-pattern <regex>   required alongside --rpc-engine for expert
+//                                   split mode: which expert tensors (by name)
+//                                   get a dual-resident copy on the peer.
+//   --combined-split-mode <mode>    "expert" (default) = post-load dual-resident
+//                                   expert tensors via --combined-ot-pattern.
+//                                   "layer" (#383 T1) = pre-load RPC device
+//                                   registration + stock tensor_split at load
+//                                   time; peer is required at startup (no
+//                                   graceful degrade to solo).
+//   --combined-tensor-split <r/r>   required in layer mode: comma- or slash-
+//                                   separated proportions, RPC-device first
+//                                   (e.g. "21/44" → peer:21, local:44).
 struct hydra_capability_flags {
     int         ggml_rpc_port = 0;
     std::string rpc_engine_peer;
     std::string combined_ot_pattern;
+    std::string combined_split_mode  = "expert"; // "expert" | "layer"
+    std::string combined_tensor_split;            // e.g. "21/44" (layer mode only)
+    bool        peer_only        = false; // no model, just RPC backend + HTTP health
 
     bool wants_rpc_backend()   const { return ggml_rpc_port > 0; }
     bool wants_combined_head() const { return !rpc_engine_peer.empty(); }
+    bool is_layer_split()      const { return combined_split_mode == "layer"; }
+    bool is_peer_only()        const { return peer_only; }
 };
 
 // Filters Hydra capability flags out of argv into filtered_argv, mirroring
@@ -200,6 +223,18 @@ static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** a
         }
         if (strcmp(argv[i], "--ggml-rpc-port") == 0 && i + 1 < argc) {
             flags.ggml_rpc_port = std::atoi(argv[++i]);
+            continue;
+        }
+        if (strcmp(argv[i], "--combined-split-mode") == 0 && i + 1 < argc) {
+            flags.combined_split_mode = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--combined-tensor-split") == 0 && i + 1 < argc) {
+            flags.combined_tensor_split = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--peer-only") == 0) {
+            flags.peer_only = true;
             continue;
         }
         filtered_argv.push_back(argv[i]);
@@ -228,13 +263,16 @@ static void start_shared_backend_rpc_server(struct llama_context * ctx, int ggml
         LOG_ERR("eng  %12.*s: RPC backend not available in this build — --ggml-rpc-port ignored\n", 12, __func__);
         return;
     }
-    using start_server_fn_t = void (*)(const char *, const char *, size_t, size_t, ggml_backend_t *);
-    auto start_server_fn = (start_server_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server_with_backends");
-    if (!start_server_fn) {
-        LOG_ERR("eng  %12.*s: failed to resolve ggml_backend_rpc_start_server_with_backends\n", 12, __func__);
+    using start_server_fn_t      = void (*)(const char *, const char *, size_t, size_t, ggml_backend_t *);
+    using start_server_dev_fn_t  = void (*)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *);
+    auto start_server_fn         = (start_server_fn_t)     ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server_with_backends");
+    auto start_server_dev_fn     = (start_server_dev_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
+    if (!start_server_fn || !start_server_dev_fn) {
+        LOG_ERR("eng  %12.*s: failed to resolve ggml_backend_rpc_start_server function\n", 12, __func__);
         return;
     }
 
+    // Try context's compute backends first (shared-backend mode).
     std::vector<ggml_backend_t> backends(8);
     size_t n_backends = llama_hydra_get_compute_backends(ctx, backends.data(), backends.size());
     if (n_backends > backends.size()) {
@@ -242,23 +280,160 @@ static void start_shared_backend_rpc_server(struct llama_context * ctx, int ggml
         n_backends = llama_hydra_get_compute_backends(ctx, backends.data(), backends.size());
     }
     backends.resize(n_backends);
-    if (backends.empty()) {
+
+    if (!backends.empty()) {
+        // Shared-backend mode: the RPC server shares the same backend
+        // instances the local decoder uses.
+        llama_hydra_enable_shared_backend_compute_lock();
+
+        const std::string endpoint = "0.0.0.0:" + std::to_string(ggml_rpc_port);
+        const size_t n_threads = std::max(1u, std::thread::hardware_concurrency() / 2);
+        LOG_INF("eng  %12.*s: exposing %zu shared backend(s) as a ggml-RPC server on %s\n",
+                12, __func__, backends.size(), endpoint.c_str());
+
+        std::thread([start_server_fn, endpoint, n_threads, backends]() mutable {
+            start_server_fn(endpoint.c_str(), nullptr, n_threads, backends.size(), backends.data());
+        }).detach();
+        return;
+    }
+
+    // Fallback: the context's scheduler has no non-CPU backends (e.g. a tiny
+    // placeholder model or CPU-only tensors). Enumerate globally registered
+    // accelerator devices instead, like rpc-server does.
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.empty()) {
         LOG_ERR("eng  %12.*s: no non-CPU backends found to expose for the embedded RPC server\n", 12, __func__);
         return;
     }
 
-    // Local decode dispatch (llama-context.cpp's graph_compute) must now
-    // serialize against this RPC server's compute on the same backend(s).
-    llama_hydra_enable_shared_backend_compute_lock();
+    const std::string endpoint = "0.0.0.0:" + std::to_string(ggml_rpc_port);
+    const size_t n_threads = std::max(1u, std::thread::hardware_concurrency() / 2);
+    LOG_INF("eng  %12.*s: exposing %zu device(s) as a ggml-RPC server on %s (fallback — no shared compute)\n",
+            12, __func__, devices.size(), endpoint.c_str());
+
+    std::thread([start_server_dev_fn, endpoint, n_threads, devices]() mutable {
+        start_server_dev_fn(endpoint.c_str(), nullptr, n_threads, devices.size(), devices.data());
+    }).detach();
+}
+
+// Hydra #383 T2: start a bare ggml-RPC server with globally registered non-CPU
+// devices, without loading any model. Used by --peer-only mode.
+static void start_backend_rpc_peer_server(int ggml_rpc_port) {
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        LOG_ERR("eng  %12.*s: --peer-only requires RPC backend, not available\n", 12, __func__);
+        return;
+    }
+    using start_server_dev_fn_t = void (*)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *);
+    auto start_server_dev_fn = (start_server_dev_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
+    if (!start_server_dev_fn) {
+        LOG_ERR("eng  %12.*s: --peer-only: failed to resolve ggml_backend_rpc_start_server\n", 12, __func__);
+        return;
+    }
+
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.empty()) {
+        LOG_ERR("eng  %12.*s: --peer-only: no non-CPU backends found\n", 12, __func__);
+        return;
+    }
 
     const std::string endpoint = "0.0.0.0:" + std::to_string(ggml_rpc_port);
     const size_t n_threads = std::max(1u, std::thread::hardware_concurrency() / 2);
-    LOG_INF("eng  %12.*s: exposing %zu shared backend(s) as a ggml-RPC server on %s\n",
-            12, __func__, backends.size(), endpoint.c_str());
+    LOG_INF("eng  %12.*s: peer-only: exposing %zu device(s) as ggml-RPC server on %s\n",
+            12, __func__, devices.size(), endpoint.c_str());
 
-    std::thread([start_server_fn, endpoint, n_threads, backends]() mutable {
-        start_server_fn(endpoint.c_str(), nullptr, n_threads, backends.size(), backends.data());
+    std::thread([start_server_dev_fn, endpoint, n_threads, devices]() mutable {
+        start_server_dev_fn(endpoint.c_str(), nullptr, n_threads, devices.size(), devices.data());
     }).detach();
+}
+
+// Hydra #383 T2: peer-only engine entry point. No model loaded — just exposes
+// the local GPU backend(s) as a ggml-RPC server and serves HTTP health checks.
+// The hydra-head uses the health endpoint to determine liveness.
+static int start_peer_only_engine(common_params & params, const hydra_capability_flags & flags) {
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
+    // Start ggml-RPC server exposing local GPU backends.
+    if (!flags.wants_rpc_backend()) {
+        LOG_ERR("eng  %12.*s: --peer-only requires --ggml-rpc-port\n", 12, __func__);
+        llama_backend_free();
+        return 1;
+    }
+    start_backend_rpc_peer_server(flags.ggml_rpc_port);
+
+    // Start HTTP server for health checks.
+    server_http_context ctx_http;
+    if (params.port > 0) {
+        if (!ctx_http.init(params)) {
+            LOG_ERR("eng  %12.*s: --peer-only: failed to init HTTP server\n", 12, __func__);
+            llama_backend_free();
+            return 1;
+        }
+
+        ctx_http.get("/health", [](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->data = "{\"status\":\"ok\"}";
+            return res;
+        });
+
+        ctx_http.get("/version", [](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->data = "{\"version\":\"E1\",\"engine\":\"llama-engine\",\"mode\":\"peer\"}";
+            return res;
+        });
+
+        if (!ctx_http.start()) {
+            LOG_ERR("eng  %12.*s: --peer-only: failed to start HTTP server\n", 12, __func__);
+            llama_backend_free();
+            return 1;
+        }
+        ctx_http.is_ready.store(true);
+    }
+
+    LOG_INF("eng  %12.*s: peer-only ready — GPU backend on ggml-rpc://0.0.0.0:%d, HTTP on :%d\n",
+            12, __func__, flags.ggml_rpc_port, params.port);
+
+    // Block until signal.
+    // We can't use ctx_server.start_loop() because there's no model.
+    // Instead, install a simple signal handler and sleep.
+    {
+        struct sigaction sa;
+        sa.sa_handler = +[](int) { /* no-op, start_loop handles it */ };
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
+    // Busy-wait loop — the HTTP server thread is detached; we just
+    // keep the main thread alive for signal handling and cleanup on exit.
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    if (params.port > 0) {
+        ctx_http.stop();
+        if (ctx_http.thread.joinable()) {
+            ctx_http.thread.join();
+        }
+    }
+    llama_backend_free();
+    return 0;
 }
 
 int llama_engine(int argc, char ** argv);
@@ -280,14 +455,59 @@ int llama_engine(int argc, char ** argv) {
         return 1;
     }
 
-    const bool wants_combined_head = flags.wants_combined_head() && !flags.combined_ot_pattern.empty();
-    if (flags.wants_combined_head() && flags.combined_ot_pattern.empty()) {
+    // Hydra #383 T1: validate flag combinations for layer-split mode.
+    if (flags.is_layer_split()) {
+        if (!flags.combined_ot_pattern.empty()) {
+            LOG_ERR("eng  %12.*s: --combined-ot-pattern is incompatible with "
+                    "--combined-split-mode layer (use --combined-tensor-split instead)\n", 12, __func__);
+            return 1;
+        }
+        if (flags.combined_tensor_split.empty()) {
+            LOG_ERR("eng  %12.*s: --combined-split-mode layer requires --combined-tensor-split\n", 12, __func__);
+            return 1;
+        }
+        if (!flags.wants_combined_head()) {
+            LOG_ERR("eng  %12.*s: --combined-split-mode layer requires --rpc-engine\n", 12, __func__);
+            return 1;
+        }
+    }
+
+    // Hydra #383 T2: peer-only mode — no model, just backend + HTTP health.
+    if (flags.is_peer_only()) {
+        return start_peer_only_engine(params, flags);
+    }
+
+    // Expert-split: --rpc-engine without --combined-ot-pattern is a no-op (existing behavior).
+    const bool wants_combined_expert = flags.wants_combined_head()
+                                    && !flags.is_layer_split()
+                                    && !flags.combined_ot_pattern.empty();
+    if (flags.wants_combined_head() && !flags.is_layer_split() && flags.combined_ot_pattern.empty()) {
         LOG_WRN("eng  %12.*s: --rpc-engine given without --combined-ot-pattern — "
                 "COMBINED head capability disabled, running solo-only\n", 12, __func__);
     }
 
     bool peer_reachable = false;
-    if (wants_combined_head) {
+    if (flags.is_layer_split()) {
+        // Hydra #383 T1: layer-split COMBINED requires the peer at startup —
+        // fail fast if unreachable. Unlike expert-split, no model can be loaded
+        // without the peer device registered; hydra-head's backoff owns retry.
+        std::string host = flags.rpc_engine_peer;
+        int port = 9506;
+        size_t colon = flags.rpc_engine_peer.find(':');
+        if (colon != std::string::npos) {
+            host = flags.rpc_engine_peer.substr(0, colon);
+            port = std::stoi(flags.rpc_engine_peer.substr(colon + 1));
+        }
+        if (!try_tcp_connect(host, port, 5)) {
+            LOG_ERR("eng  %12.*s: layer-split COMBINED: peer %s unreachable — "
+                    "aborting startup (cannot load model without peer device)\n",
+                    12, __func__, flags.rpc_engine_peer.c_str());
+            return 1;
+        }
+        peer_reachable = true;
+        LOG_INF("eng  %12.*s: layer-split COMBINED: peer %s reachable\n",
+                12, __func__, flags.rpc_engine_peer.c_str());
+    } else if (wants_combined_expert) {
         std::string host = flags.rpc_engine_peer;
         int port = 8080;
         size_t colon = flags.rpc_engine_peer.find(':');
@@ -295,7 +515,6 @@ int llama_engine(int argc, char ** argv) {
             host = flags.rpc_engine_peer.substr(0, colon);
             port = std::stoi(flags.rpc_engine_peer.substr(colon + 1));
         }
-
         peer_reachable = try_tcp_connect(host, port, 3);
         if (!peer_reachable) {
             LOG_WRN("eng  %12.*s: rpc-engine peer %s unreachable, entering solo mode\n",
@@ -305,6 +524,57 @@ int llama_engine(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    // Hydra #383 T1: register the peer as an RPC backend device BEFORE model
+    // load so llama.cpp's device-enumeration code (src/llama.cpp:239) places
+    // it at the front of the device list (device[0] = peer, device[1] = local
+    // CUDA). tensor_split[0] then controls how many layers go to the peer.
+    // Must come after llama_backend_init() (GGML init) and before load_model().
+    if (flags.is_layer_split()) {
+        if (llama_hydra_preload_rpc_device(flags.rpc_engine_peer.c_str()) != 0) {
+            LOG_ERR("eng  %12.*s: layer-split COMBINED: failed to register peer %s "
+                    "as RPC device — aborting startup\n",
+                    12, __func__, flags.rpc_engine_peer.c_str());
+            llama_backend_free();
+            return 1;
+        }
+        // Parse "21/44" or "21,44" into params.tensor_split.
+        // Split on '/' or ',' — same delimiters as the stock --tensor-split arg parser.
+        {
+            std::string ts = flags.combined_tensor_split;
+            std::vector<float> splits;
+            size_t pos = 0;
+            while (pos <= ts.size()) {
+                size_t end = ts.find_first_of(",/", pos);
+                if (end == std::string::npos) end = ts.size();
+                std::string token = ts.substr(pos, end - pos);
+                if (!token.empty()) {
+                    try {
+                        splits.push_back(std::stof(token));
+                    } catch (...) {
+                        LOG_ERR("eng  %12.*s: layer-split COMBINED: invalid value '%s' "
+                                "in --combined-tensor-split '%s'\n",
+                                12, __func__, token.c_str(), flags.combined_tensor_split.c_str());
+                        llama_backend_free();
+                        return 1;
+                    }
+                }
+                if (end == ts.size()) break;
+                pos = end + 1;
+            }
+            if (splits.empty()) {
+                LOG_ERR("eng  %12.*s: layer-split COMBINED: could not parse --combined-tensor-split '%s'\n",
+                        12, __func__, flags.combined_tensor_split.c_str());
+                llama_backend_free();
+                return 1;
+            }
+            for (size_t i = 0; i < 128; i++) {
+                params.tensor_split[i] = (i < splits.size()) ? splits[i] : 0.0f;
+            }
+            LOG_INF("eng  %12.*s: layer-split COMBINED: tensor_split='%s' (%zu device(s))\n",
+                    12, __func__, flags.combined_tensor_split.c_str(), splits.size());
+        }
+    }
 
     common_params_print_info(params, true);
 
@@ -319,8 +589,21 @@ int llama_engine(int argc, char ** argv) {
         return 1;
     }
 
-    ctx_server.set_hydra_capabilities(flags.wants_rpc_backend(), flags.rpc_engine_peer,
-            peer_reachable, flags.combined_ot_pattern);
+    // Set capabilities — split_mode "layer" or "expert" — before serving requests.
+    if (flags.is_layer_split()) {
+        // Hydra #383 T1: layer-split static COMBINED. The peer is registered at
+        // device[0]; the model already spans both GPUs. No dual-load needed.
+        // combined_pattern stores the tensor_split string for INFO reporting.
+        ctx_server.set_hydra_capabilities(flags.wants_rpc_backend(), flags.rpc_engine_peer,
+                peer_reachable, flags.combined_tensor_split, "layer");
+        ctx_server.set_hydra_combined_static(true);
+        ctx_server.set_hydra_combined_head_attached(true);
+        LOG_INF("eng  %12.*s: COMBINED layer-split ready — peer %s, split %s\n",
+                12, __func__, flags.rpc_engine_peer.c_str(), flags.combined_tensor_split.c_str());
+    } else {
+        ctx_server.set_hydra_capabilities(flags.wants_rpc_backend(), flags.rpc_engine_peer,
+                peer_reachable, flags.combined_ot_pattern, "expert");
+    }
 
     // Hydra #348: expose this engine's own backend(s) as an embedded
     // ggml-RPC server, shared with local inference rather than a duplicate
@@ -333,13 +616,12 @@ int llama_engine(int argc, char ** argv) {
         llama_hydra_register_local_tensors_for_rpc(ctx_server.get_llama_context());
     }
 
-    // Hydra #287/#260/#348: a COMBINED head dual-loads its configured expert
-    // tensors onto the --rpc-engine peer once, here, before serving any
-    // requests. An unreachable peer or insufficient peer VRAM (see
-    // llama_hydra_load_combined_experts's headroom check) degrades to
-    // solo-only (never aborts startup) — SET_EXPERT_MODE("combined") will
-    // report "solo" until fixed.
-    if (wants_combined_head) {
+    // Hydra #287/#260/#348: expert-split COMBINED head dual-loads its configured
+    // expert tensors onto the --rpc-engine peer once, before serving any requests.
+    // An unreachable peer or insufficient peer VRAM degrades to solo-only (never
+    // aborts startup) — SET_EXPERT_MODE("combined") will report "solo" until fixed.
+    // Skipped in layer-split mode (#383 T1): the model already spans both devices.
+    if (wants_combined_expert && peer_reachable) {
         int32_t n = llama_hydra_load_combined_experts(ctx_server.get_llama_context(),
                 flags.rpc_engine_peer.c_str(), flags.combined_ot_pattern.c_str());
         ctx_server.set_hydra_combined_head_attached(n > 0);

@@ -687,7 +687,8 @@ public:
     bool        hydra_rpc_backend_active  = false; // --ggml-rpc-port set & RPC thread running
     std::string hydra_peer;                        // configured --rpc-engine peer, empty if none
     bool        hydra_peer_reachable     = false;  // startup TCP-probe result for hydra_peer
-    std::string hydra_combined_pattern;            // configured --combined-ot-pattern
+    std::string hydra_combined_pattern;            // --combined-ot-pattern (expert) or tensor_split ratio (layer)
+    std::string hydra_split_mode        = "expert"; // "expert" or "layer" (#383 T1)
 
     // True once llama_hydra_load_combined_experts() has successfully
     // dual-loaded expert tensors onto hydra_peer. Gates whether
@@ -696,6 +697,11 @@ public:
     // "peer configured+reachable" and "dual-load succeeded" in the old INFO
     // JSON — those are now distinct (hydra_peer_reachable vs this field).
     bool hydra_combined_head_attached = false;
+
+    // Hydra #383 T1: true when this engine was started in COMBINED static
+    // (layer-split) mode. The split is fixed at model load time; the mode
+    // cannot be changed at runtime — SET_EXPERT_MODE("solo") is rejected.
+    bool hydra_combined_static = false;
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -2976,20 +2982,32 @@ private:
                     // booleans (#348) — replaces the old single "role" string
                     // and the peer_connected/combined_capable field-aliasing.
                     const int32_t expert_mode = ctx_tgt ? llama_hydra_get_expert_mode(ctx_tgt) : 0;
+                    // Hydra #383 T1 / #375: advertise "combined" capability when this
+                    // engine is ready to serve in COMBINED mode — either via expert-split
+                    // (hydra_combined_head_attached) or via layer-split (hydra_combined_static).
+                    json capabilities_j = {"prefill", "decode", "state_transfer",
+                                           "expert_mode", "quant_swap",
+                                           "preset", "model_hash"};
+                    if (hydra_combined_head_attached || hydra_combined_static) {
+                        capabilities_j.push_back("combined");
+                    }
+                    // In layer-split static mode the engine is always in combined mode;
+                    // in expert-split mode it follows the per-request SET_EXPERT_MODE state.
+                    const std::string mode_str = hydra_combined_static ? "combined"
+                                               : (expert_mode == 1 ? "combined" : "solo");
                     json info_j = {
                         {"engine", "llama-server-hydra"},
                         {"version", "E1"},
-                        {"capabilities", {"prefill", "decode", "state_transfer",
-                                          "expert_mode", "quant_swap",
-                                          "preset", "model_hash"}},
+                        {"capabilities", capabilities_j},
                         {"preset_aliases", preset_aliases_j},
                         {"solo_active",            hydra_solo_active},
                         {"rpc_backend_active",     hydra_rpc_backend_active},
-                        {"mode",                   expert_mode == 1 ? "combined" : "solo"},
+                        {"mode",                   mode_str},
+                        {"split_mode",             hydra_split_mode},
                         {"peer_addr",              hydra_peer},
                         {"peer_reachable",         hydra_peer_reachable},
                         {"layer_split",            hydra_combined_pattern},
-                        {"combined_head_attached", hydra_combined_head_attached},
+                        {"combined_head_attached", hydra_combined_head_attached || hydra_combined_static},
                         {"pipeline_capable",       false}
                     };
                     res->info_json = info_j.dump();
@@ -3512,6 +3530,27 @@ private:
                         res->rpc_status = HYDRA_STATUS_ERROR;
                         res->success = false;
                         res->error = "expert_mode must be 'solo' or 'combined'";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // Hydra #383 T1: layer-split (static combined) engines cannot
+                    // switch modes at runtime — the split is baked in at model load.
+                    // "combined" is a no-op (already combined); "solo" is rejected.
+                    if (hydra_combined_static) {
+                        if (requested == "solo") {
+                            res->rpc_status = HYDRA_STATUS_ERROR;
+                            res->success = false;
+                            res->error = "combined_static: this engine loaded in layer-split COMBINED mode; cannot switch to solo at runtime";
+                            LOG_WRN("srv  %12.*s: hydra: SET_EXPERT_MODE solo rejected — engine is combined_static (layer-split)\n", 12, __func__);
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                        // requested == "combined": success no-op
+                        res->expert_mode_applied = "combined";
+                        res->rpc_status = HYDRA_STATUS_OK;
+                        res->success = true;
+                        LOG_INF("srv  %12.*s: hydra: SET_EXPERT_MODE combined no-op — engine is combined_static (layer-split)\n", 12, __func__);
                         queue_results.send(std::move(res));
                         break;
                     }
@@ -4886,15 +4925,20 @@ llama_context * server_context::get_llama_context() const {
 }
 
 void server_context::set_hydra_capabilities(bool rpc_backend_active, const std::string & peer,
-        bool peer_reachable, const std::string & combined_pattern) {
+        bool peer_reachable, const std::string & combined_pattern, const std::string & split_mode) {
     impl->hydra_rpc_backend_active = rpc_backend_active;
     impl->hydra_peer               = peer;
     impl->hydra_peer_reachable     = peer_reachable;
     impl->hydra_combined_pattern   = combined_pattern;
+    impl->hydra_split_mode         = split_mode;
 }
 
 void server_context::set_hydra_combined_head_attached(bool attached) {
     impl->hydra_combined_head_attached = attached;
+}
+
+void server_context::set_hydra_combined_static(bool is_static) {
+    impl->hydra_combined_static = is_static;
 }
 
 server_response_reader server_context::get_response_reader() {
