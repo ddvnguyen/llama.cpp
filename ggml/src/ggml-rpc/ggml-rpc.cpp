@@ -2159,6 +2159,15 @@ void ggml_backend_rpc_start_server_with_backends(const char * endpoint, const ch
     // by the caller (e.g. a llama_context's sched), not by this function.
 }
 
+// Unified RPC server: handle a pre-accepted client fd as a ggml-RPC connection.
+// The caller must have accepted the connection and determined it is a ggml-RPC
+// client (e.g. via protocol detection with MSG_PEEK).
+void ggml_backend_rpc_handle_client(int fd, const char * cache_dir,
+                                     size_t n_backends, ggml_backend_t * backends) {
+    std::vector<ggml_backend_t> b(backends, backends + n_backends);
+    rpc_serve_client(b, cache_dir, socket_t::from_fd(fd));
+}
+
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
 
@@ -2307,6 +2316,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_get_remote_registry_epoch") == 0) {
         return (void *)ggml_backend_rpc_get_remote_registry_epoch;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_handle_client") == 0) {
+        return (void *)ggml_backend_rpc_handle_client;
     }
     return NULL;
 

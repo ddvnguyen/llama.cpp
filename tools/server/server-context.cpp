@@ -7119,19 +7119,36 @@ static void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx) {
     ::close(fd);
 }
 
-// ── server_context::start_rpc_server (M1) ────────────────────────────────────
-// Extract queue pointers and pass to connection handlers via context struct.
+// ── Unified RPC server ──────────────────────────────────────────────────────
+// Single TCP listener on `port` that serves BOTH:
+//   - ggml-RPC protocol (first byte = RPC_CMD_HELLO = 0x0E) via
+//     ggml_backend_rpc_handle_client — for GPU compute (COMBINE peer role)
+//   - Hydra protocol (first byte in 0x30-0x46 range) via
+//     hydra_handle_connection — for KV state transfer / coordination
+//
+// The ggml-RPC handler uses the given backend list (shared with local inference
+// in the model-loaded path, or globally enumerated devices in the no-model path).
+// When `this` is null (no server_context), Hydra connections are rejected.
 
-void server_context::start_rpc_server(int port) {
+// Forward declaration for ggml backend library symbol
+extern void ggml_backend_rpc_handle_client(int fd, const char * cache_dir,
+                                            size_t n_backends, ggml_backend_t * backends);
+
+void server_context::start_rpc_server(int port,
+                                       const std::vector<ggml_backend *> & rpc_backends) {
     if (port <= 0) return;
 
-    // server_context is a friend of server_context_impl, so we can access private fields.
-    // Extract queue pointers (PUBLIC members of server_context_impl).
-    hydra_rpc_ctx ctx;
-    ctx.queue_tasks = &impl->queue_tasks;
-    ctx.queue_results = &impl->queue_results;
+    // Extract Hydra queue pointers (only needed if server_context exists)
+    hydra_rpc_ctx ctx{};
+    if (this && impl) {
+        ctx.queue_tasks   = &impl->queue_tasks;
+        ctx.queue_results = &impl->queue_results;
+    }
 
-    std::thread([port, ctx]() {
+    // Copy backends for the accept thread — the vector is captured by value.
+    std::vector<ggml_backend *> backends = rpc_backends;
+
+    std::thread([port, backends, ctx, has_hydra = (this != nullptr && impl != nullptr)]() {
         const int srv_fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (srv_fd < 0) {
             SRV_ERR("hydra rpc: socket() failed: %s\n", strerror(errno));
@@ -7151,21 +7168,48 @@ void server_context::start_rpc_server(int port) {
             return;
         }
         ::listen(srv_fd, 16);
-        SRV_INF("hydra rpc: listening on 0.0.0.0:%d (M1: task-queue routing)\n", port);
+
+        if (has_hydra) {
+            SRV_INF("hydra rpc: unified server on 0.0.0.0:%d (ggml-RPC + Hydra protocol)\n", port);
+        } else {
+            SRV_INF("hydra rpc: unified server on 0.0.0.0:%d (ggml-RPC only, no model loaded)\n", port);
+        }
 
         while (true) {
             const int conn_fd = ::accept(srv_fd, nullptr, nullptr);
             if (conn_fd < 0) continue;
-            std::thread(hydra_handle_connection, conn_fd, ctx).detach();
+
+            std::thread([conn_fd, backends, ctx, has_hydra]() {
+                // Peek first byte to determine protocol — MSG_PEEK does not consume it.
+                uint8_t first_byte;
+                if (::recv(conn_fd, &first_byte, 1, MSG_PEEK) != 1) {
+                    ::close(conn_fd);
+                    return;
+                }
+
+                // RPC_CMD_HELLO = 14 = 0x0E. Hydra opcodes are 0x30-0x46.
+                if (first_byte == 0x0E) {
+                    // ggml-RPC client — dispatch to ggml backend library handler
+                    ggml_backend_rpc_handle_client(conn_fd, nullptr,
+                        backends.size(), const_cast<ggml_backend_t *>(backends.data()));
+                } else if (has_hydra) {
+                    // Hydra protocol client
+                    hydra_handle_connection(conn_fd, ctx);
+                } else {
+                    // No model loaded — Hydra protocol not available
+                    ::close(conn_fd);
+                }
+            }).detach();
         }
     }).detach();
 }
 
 #else
 // Windows: RPC server not implemented — target hardware is Linux-only for M0.
-void server_context::start_rpc_server(int port) {
+void server_context::start_rpc_server(int port, const std::vector<ggml_backend *> &) {
     if (port > 0) {
         SRV_WRN("hydra rpc: not supported on Windows (port %d ignored)\n", port);
     }
+    GGML_UNUSED(port);
 }
 #endif // !_WIN32

@@ -669,6 +669,10 @@ socket_ptr socket_t::connect(const char * host, int port) {
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 }
 
+socket_ptr socket_t::from_fd(int fd) {
+    return socket_ptr(new socket_t(std::make_unique<impl>(fd)));
+}
+
 #ifdef _WIN32
 static std::mutex g_rpc_transport_mu;
 static bool g_rpc_transport_wsa_started = false;

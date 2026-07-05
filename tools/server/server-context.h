@@ -9,6 +9,9 @@
 #include <cstddef>
 #include <memory>
 #include <set>
+#include <vector>
+
+struct ggml_backend;
 
 struct server_context_impl; // private implementation
 
@@ -88,7 +91,7 @@ struct server_context {
     // port = 0 is a no-op (disabled). Must be called after load_model().
     // Thread safety: slots must be idle (is_processing() == false) when ops run.
     // TODO(M1): route through task queue for full thread safety under load.
-    void start_rpc_server(int port);
+    void start_rpc_server(int port, const std::vector<ggml_backend *> & rpc_backends = {});
 
     // Hydra #348: record this engine's independent capability flags (replaces
     // the old single hydra_role string) + (for a COMBINED head) the
