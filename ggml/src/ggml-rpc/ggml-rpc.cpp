@@ -27,8 +27,16 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 namespace fs = std::filesystem;
 
-// macro for RPC error handling — logs error but does NOT abort
-#define RPC_STATUS_ASSERT(x) do { if (!(x)) { GGML_LOG_ERROR("Remote RPC server crashed or returned malformed response\n"); } } while(0)
+// macro for nicer error messages on server crash.
+// Hydra #376: this is fail-STOP by design. ggml-rpc is a fail-stop transport —
+// a mid-graph RPC failure leaves the distributed computation unrecoverable, so
+// aborting loudly at the failure point is correct. Recovery from peer loss is
+// handled ONE LAYER UP (engine/Hydra lifecycle: readiness-gate the peer, and
+// degrade-to-solo on loss), NOT by making individual RPC ops limp forward.
+// The only ops that intentionally do not abort are (a) teardown paths that must
+// tolerate an already-gone peer, and (b) the compute path (graph_compute /
+// init_tensor), which returns GGML_STATUS_FAILED so the engine can degrade.
+#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
 
 // all RPC structures must be packed
 #pragma pack(push, 1)
@@ -418,7 +426,12 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     if (ctx && ctx->sock) {
         rpc_msg_free_buffer_req request = {ctx->remote_ptr};
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
-        RPC_STATUS_ASSERT(status);
+        // Hydra #376: teardown path — fail-SOFT. A free during degrade-to-solo or
+        // shutdown may race a peer that is already gone; that must not abort. The
+        // remote buffer is released when the peer process/socket dies anyway.
+        if (!status) {
+            GGML_LOG_ERROR("RPC free_buffer: peer unreachable during teardown (ignored)\n");
+        }
     }
     delete ctx;
 }
@@ -628,7 +641,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alignment(ggml_backend_buffer_typ
 
 static size_t get_max_size(const std::shared_ptr<socket_t> & sock, uint32_t device) {
     rpc_msg_get_max_size_req request = {device};
-    rpc_msg_get_max_size_rsp response;
+    rpc_msg_get_max_size_rsp response = {}; // #376: zero-init so a fall-through can never read uninit
     bool status = send_rpc_cmd(sock, RPC_CMD_GET_MAX_SIZE, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     return response.max_size;
@@ -667,7 +680,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         }
 
         // TODO: cache the alloc responses to avoid extra RPC calls?
-        rpc_msg_get_alloc_size_rsp response;
+        rpc_msg_get_alloc_size_rsp response = {}; // #376: zero-init so a fall-through can never read uninit
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
 
@@ -852,7 +865,7 @@ bool ggml_backend_is_rpc(ggml_backend_t backend) {
 static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t device, size_t * free, size_t * total) {
     rpc_msg_get_device_memory_req request;
     request.device = device;
-    rpc_msg_get_device_memory_rsp response;
+    rpc_msg_get_device_memory_rsp response = {}; // #376: zero-init so a fall-through can never read uninit
     bool status = send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     *free = response.free_mem;
@@ -2377,7 +2390,7 @@ static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
         GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
         return 0;
     }
-    rpc_msg_device_count_rsp response;
+    rpc_msg_device_count_rsp response = {}; // #376: zero-init so a fall-through can never read uninit
     bool status = send_rpc_cmd(sock, RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     return response.device_count;

@@ -16,7 +16,10 @@
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
 
+#include <cpp-httplib/httplib.h>   // #376: peer /health readiness poll
+
 #include <atomic>
+#include <chrono>
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
@@ -172,9 +175,11 @@ static bool try_tcp_connect(const std::string & host, int port, int timeout_sec)
 struct hydra_capability_flags {
     std::string rpc_engine_peer;     // testing shortcut: reach out to this peer
     std::string tensor_split_str;    // testing: layer-split proportions (e.g. "25/40")
+    std::string peer_health_url;     // #376: peer HTTP "host:port" for readiness poll (optional)
 
     bool wants_combined_head() const { return !rpc_engine_peer.empty(); }
     bool has_tensor_split()    const { return !tensor_split_str.empty(); }
+    bool has_peer_health()     const { return !peer_health_url.empty(); }
 };
 
 // Filters Hydra flags out of argv before common_params_parse sees them.
@@ -192,6 +197,13 @@ static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** a
         }
         if (strcmp(argv[i], "--tensor-split") == 0 && i + 1 < argc) {
             flags.tensor_split_str = argv[++i];
+            continue;
+        }
+        // #376: peer HTTP endpoint ("host:port") used to poll the peer's staged
+        // /health for readiness before COMBINE. Optional — without it the gate
+        // falls back to the RPC HELLO handshake alone.
+        if (strcmp(argv[i], "--peer-health-url") == 0 && i + 1 < argc) {
+            flags.peer_health_url = argv[++i];
             continue;
         }
         // Strip removed flags so they never reach common_params_parse.
@@ -217,6 +229,61 @@ static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** a
     }
 
     return flags;
+}
+
+// #376: gate COMBINE on peer readiness. This is the root-cause fix — the head
+// must not push tensors before the peer's RPC backend is ready to serve, or
+// ggml-rpc aborts (fail-stop) mid-load. Returns the peer's ggml_backend_reg_t
+// once ready, or nullptr on timeout (caller then loads SOLO — never aborts).
+//
+// Two signals, both bounded by `timeout_sec`:
+//   1. (optional) poll the peer's staged /health until stage >= 3 (rpc_active),
+//      which confirms the peer finished its OWN backend/model init. Best-effort:
+//      transient errors are ignored and we keep waiting until the deadline.
+//   2. RPC HELLO handshake retry via ggml_backend_rpc_add_server — safe since
+//      PR #26 (returns nullptr instead of aborting when the peer isn't ready).
+static ggml_backend_reg_t wait_for_peer_ready(const std::string & rpc_endpoint,
+                                              const std::string & health_url,
+                                              int timeout_sec) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
+
+    // Phase 1: optional HTTP /health poll.
+    if (!health_url.empty()) {
+        std::string host = health_url;
+        int port = 80;
+        const auto colon = health_url.rfind(':');
+        if (colon != std::string::npos) {
+            host = health_url.substr(0, colon);
+            try { port = std::stoi(health_url.substr(colon + 1)); } catch (...) { port = 80; }
+        }
+        while (std::chrono::steady_clock::now() < deadline) {
+            httplib::Client cli(host, port);
+            cli.set_connection_timeout(2, 0);
+            cli.set_read_timeout(2, 0);
+            if (auto res = cli.Get("/health"); res && res->status == 200) {
+                try {
+                    if (json::parse(res->body).value("startup_stage", 0) >= 3) {
+                        LOG_INF("eng  %12.*s: peer %s reports rpc_active — proceeding\n",
+                                12, __func__, health_url.c_str());
+                        break;
+                    }
+                } catch (...) { /* not-yet-JSON health — keep waiting */ }
+            }
+            LOG_INF("eng  %12.*s: waiting for peer /health at %s ...\n", 12, __func__, health_url.c_str());
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }
+
+    // Phase 2: RPC HELLO handshake retry.
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (ggml_backend_reg_t reg = ggml_backend_rpc_add_server(rpc_endpoint.c_str())) {
+            return reg;
+        }
+        LOG_INF("eng  %12.*s: waiting for peer RPC handshake at %s ...\n",
+                12, __func__, rpc_endpoint.c_str());
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    return nullptr;
 }
 
 // Extract model compute backends into a vector. Returns empty if no non-CPU
@@ -312,15 +379,23 @@ int llama_engine(int argc, char ** argv) {
     // If --rpc-engine was given (testing shortcut), pre-connect the peer now.
     // Register the peer as a GGML backend device so it's visible for model
     // loading (layer-split needs the peer device in the device list).
+    //
+    // #376: gate on peer readiness before registering. The head must NOT push
+    // tensors before the peer's RPC backend is ready, or ggml-rpc aborts
+    // mid-load (fail-stop). wait_for_peer_ready polls the peer's /health (if
+    // --peer-health-url is set) and retries the RPC handshake, bounded. On
+    // timeout we load SOLO — never abort, never crash-loop.
     if (has_peer) {
-        ggml_backend_reg_t peer_reg = ggml_backend_rpc_add_server(flags.rpc_engine_peer.c_str());
+        const int peer_wait_sec = 180; // matches the peer's own ~2-min model load
+        ggml_backend_reg_t peer_reg =
+            wait_for_peer_ready(flags.rpc_engine_peer, flags.peer_health_url, peer_wait_sec);
         if (peer_reg == nullptr) {
-            LOG_WRN("eng  %12.*s: rpc-engine peer %s unreachable — running in solo mode\n",
-                    12, __func__, flags.rpc_engine_peer.c_str());
+            LOG_WRN("eng  %12.*s: rpc-engine peer %s not ready after %ds — running SOLO\n",
+                    12, __func__, flags.rpc_engine_peer.c_str(), peer_wait_sec);
         } else {
             // Register peer with GGML so llama.cpp can place layers on it
             ggml_backend_register(peer_reg);
-            LOG_INF("eng  %12.*s: rpc-engine peer %s registered for layer-split\n",
+            LOG_INF("eng  %12.*s: rpc-engine peer %s ready + registered for layer-split\n",
                     12, __func__, flags.rpc_engine_peer.c_str());
         }
     }
