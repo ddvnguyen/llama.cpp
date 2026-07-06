@@ -665,8 +665,8 @@ socket_ptr socket_t::accept() {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
     }
-    // Hydra #36: keepalive prevents idle-connection drops during long model
-    // loading (2+ minutes of model init, then sparse RPC traffic).
+    // Hydra #36/#376: keepalive prevents idle-connection drops during long
+    // model loading (2+ minutes of model init, then sparse RPC traffic).
     set_keepalive(client_socket_fd, 30, 10, 3);
     apply_tcp_buffer_size_override(client_socket_fd);
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
@@ -720,14 +720,16 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         return nullptr;
     }
-    // Hydra #36: keepalive prevents idle-connection drops during long model
-    // loading (2+ minutes of model init, then sparse RPC traffic).
+    // Hydra #36/#376: keepalive prevents idle-connection drops during long
+    // model loading (2+ minutes of model init, then sparse RPC traffic).
     set_keepalive(sockfd, /*idle=*/30, /*interval=*/10, /*count=*/3);
     apply_tcp_buffer_size_override(sockfd);
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 }
 
 socket_ptr socket_t::from_fd(int fd) {
+    set_no_delay(fd);
+    set_keepalive(fd, 30, 10, 3);
     return socket_ptr(new socket_t(std::make_unique<impl>(fd)));
 }
 
