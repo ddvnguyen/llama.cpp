@@ -782,7 +782,6 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
     }
     if (!status) {
-        GGML_LOG_ERROR("RPC graph compute failed (peer disconnected?)\n");
         return GGML_STATUS_FAILED;
     }
     return GGML_STATUS_SUCCESS;

@@ -987,10 +987,8 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
     ggml_backend_buffer_type_t buft = NULL;
 
     if (buf) {
-        // the tensor is already allocated
         buft = buf->buft;
     } else {
-        // see if the tensor already has a backend assigned, and use the buffer type of that backend
         int tensor_backend_id = tensor_backend_id(t);
         if (tensor_backend_id == -1 && t->view_src) {
             tensor_backend_id = tensor_backend_id(t->view_src);

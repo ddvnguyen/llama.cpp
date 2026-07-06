@@ -402,6 +402,7 @@ int llama_engine(int argc, char ** argv) {
 
     // ── Model-loaded path ──
     if (has_model) {
+        const int64_t t_start_us = ggml_time_us();
         server_context ctx_server;
         server_http_context ctx_http;
 
@@ -437,8 +438,9 @@ int llama_engine(int argc, char ** argv) {
                 });
                 if (ctx_http.start()) {
                     http_started = true;
-                    LOG_INF("eng  %12.*s: HTTP server live early — /health shows startup stage %d\n",
-                            12, __func__, ctx_server.get_startup_stage());
+                    const auto dt_s = (ggml_time_us() - t_start_us) / 1e6;
+                    LOG_INF("eng  %12.*s: HTTP server live early — /health shows startup stage %d (t=%.1fs)\n",
+                            12, __func__, ctx_server.get_startup_stage(), dt_s);
                 }
             }
             if (!http_started) {
@@ -453,6 +455,9 @@ int llama_engine(int argc, char ** argv) {
             llama_backend_free();
             return 1;
         }
+
+        const auto t_load_s = (ggml_time_us() - t_start_us) / 1e6;
+        LOG_INF("eng  %12.*s: model loaded in %.1fs — stage 1→2\n", 12, __func__, t_load_s);
 
         // Phase E: model loaded
         ctx_server.set_startup_stage(2);
@@ -471,6 +476,8 @@ int llama_engine(int argc, char ** argv) {
         // model's compute backends.
         auto backends = get_model_compute_backends(ctx_server.get_llama_context());
         ctx_server.start_rpc_server(rpc_port, backends);
+        const auto t_rpc_s = (ggml_time_us() - t_start_us) / 1e6;
+        LOG_INF("eng  %12.*s: RPC server active after %.1fs — stage 2→3\n", 12, __func__, t_rpc_s);
         // Phase E: RPC server active
         ctx_server.set_startup_stage(3);
 
@@ -694,6 +701,8 @@ int llama_engine(int argc, char ** argv) {
 
             routes.update_meta(ctx_server);
             ctx_http.is_ready.store(true);
+            const auto t_ready_s = (ggml_time_us() - t_start_us) / 1e6;
+            LOG_INF("eng  %12.*s: engine fully ready after %.1fs — stage 3→4\n", 12, __func__, t_ready_s);
             // Phase E: fully ready
             ctx_server.set_startup_stage(4);
 

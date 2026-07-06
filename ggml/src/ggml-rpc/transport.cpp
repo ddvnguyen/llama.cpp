@@ -468,7 +468,7 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, MSG_NOSIGNAL);
         if (n < 0) {
             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);

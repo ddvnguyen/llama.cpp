@@ -233,6 +233,11 @@ bool server_http_context::init(const common_params & params) {
     };
 
     auto middleware_server_state = [this](const httplib::Request & req, httplib::Response & res) {
+        // Phase E: /health and /version are always accessible to support
+        // staged startup observability (health polling during model loading).
+        if (req.path == "/health" || req.path == "/version") {
+            return true;
+        }
         if (!is_ready.load()) {
 #if defined(LLAMA_UI_HAS_ASSETS)
             if (const auto tmp = string_split<std::string>(req.path, '.');
