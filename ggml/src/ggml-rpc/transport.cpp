@@ -604,6 +604,23 @@ static void apply_tcp_buffer_size_override(sockfd_t sockfd) {
     }
 }
 
+static bool set_keepalive(int fd, int idle_sec, int interval_sec, int count) {
+    int optval = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval)) < 0) {
+        return false;
+    }
+#if defined(TCP_KEEPIDLE)
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_sec, sizeof(idle_sec)) < 0) return false;
+#endif
+#if defined(TCP_KEEPINTVL)
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec)) < 0) return false;
+#endif
+#if defined(TCP_KEEPCNT)
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) < 0) return false;
+#endif
+    return true;
+}
+
 socket_ptr socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
@@ -613,6 +630,7 @@ socket_ptr socket_t::accept() {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
     }
+    set_keepalive(client_socket_fd, 30, 10, 3);
     apply_tcp_buffer_size_override(client_socket_fd);
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
@@ -665,11 +683,16 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         return nullptr;
     }
+    // Keepalive prevents idle-connection drops during long model loading
+    // (can be 2+ minutes with no RPC traffic between tensor transfers).
+    set_keepalive(sockfd, /*idle=*/30, /*interval=*/10, /*count=*/3);
     apply_tcp_buffer_size_override(sockfd);
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 }
 
 socket_ptr socket_t::from_fd(int fd) {
+    set_no_delay(fd);
+    set_keepalive(fd, 30, 10, 3);
     return socket_ptr(new socket_t(std::make_unique<impl>(fd)));
 }
 
