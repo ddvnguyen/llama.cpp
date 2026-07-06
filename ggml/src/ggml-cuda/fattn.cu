@@ -576,7 +576,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
-            GGML_ABORT("fatal error");
+            // #376: was GGML_ABORT — kills the entire process (peer in COMBINE
+            // mode). Log and return instead; the caller graph_compute will
+            // produce a clean RPC error rather than aborting the peer.
+            GGML_LOG_ERROR("%s: #376 — no flash-attn kernel available for device %d (Q=%s, K=%s, cc=%d)\n",
+                           __func__, ggml_cuda_get_device(),
+                           ggml_type_name(dst->src[0]->type),
+                           ggml_type_name(dst->src[1]->type),
+                           ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+            return;
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
