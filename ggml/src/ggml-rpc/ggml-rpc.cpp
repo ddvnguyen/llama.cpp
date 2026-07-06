@@ -1591,6 +1591,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t)) {
+        GGML_LOG_ERROR("[%s] #376: truncated graph header (%zu bytes)\n", __func__, input.size());
         return false;
     }
     const uint8_t * src = input.data();
@@ -1598,12 +1599,19 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     memcpy(&device, src, sizeof(device));
     src += sizeof(device);
     if (device >= backends.size()) {
+        // #376: prime suspect for COMBINE "peer closes connection" — the head
+        // serialized a device index this peer never enumerated. Log both sides.
+        GGML_LOG_ERROR("[%s] #376: device index %u out of range (peer has %zu backend(s)) — "
+                       "COMBINE layer-split device-index mismatch\n",
+                       __func__, device, backends.size());
         return false;
     }
     uint32_t n_nodes;
     memcpy(&n_nodes, src, sizeof(n_nodes));
     src += sizeof(n_nodes);
     if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
+        GGML_LOG_ERROR("[%s] #376: truncated graph (nodes section, n_nodes=%u, %zu bytes)\n",
+                       __func__, n_nodes, input.size());
         return false;
     }
     const uint64_t * nodes = (const uint64_t *)src;
@@ -1612,6 +1620,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     memcpy(&n_tensors, src, sizeof(n_tensors));
     src += sizeof(n_tensors);
     if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rpc_tensor)) {
+        GGML_LOG_ERROR("[%s] #376: truncated graph (tensors section, n_tensors=%u, %zu bytes)\n",
+                       __func__, n_tensors, input.size());
         return false;
     }
     const rpc_tensor * tensors = (const rpc_tensor *)src;
@@ -1656,7 +1666,14 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     ggml_backend_rpc_server_compute_lock(device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     ggml_backend_rpc_server_compute_unlock(device);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    // Hydra #376: was GGML_ASSERT — a peer-side abort on a failed compute killed
+    // the whole peer. Return false instead so the client sees a clean RPC error
+    // (fail-stop at the client) and can degrade-to-solo. Peer stays alive.
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] #376: graph compute returned status %d on device %u\n",
+                       __func__, (int)status, device);
+        return false;
+    }
     stored_graphs[device].graph = graph;
     return true;
 }
@@ -1674,7 +1691,12 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     ggml_backend_rpc_server_compute_lock(device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     ggml_backend_rpc_server_compute_unlock(device);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    // Hydra #376: was GGML_ASSERT — return false instead of aborting the peer.
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] #376: graph recompute returned status %d on device %u\n",
+                       __func__, (int)status, device);
+        return false;
+    }
     return true;
 }
 
