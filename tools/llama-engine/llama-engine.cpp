@@ -403,9 +403,48 @@ int llama_engine(int argc, char ** argv) {
     // ── Model-loaded path ──
     if (has_model) {
         server_context ctx_server;
+        server_http_context ctx_http;
 
         // Phase E: alive
         ctx_server.set_startup_stage(1);
+
+        // Start HTTP server early so /health (with startup progress) is live
+        // during model loading and RPC server setup.
+        bool http_started = false;
+        if (params.port > 0) {
+            if (ctx_http.init(params)) {
+                ctx_http.get("/health", [&ctx_server, &has_model](const server_http_req &) {
+                    auto res = std::make_unique<server_http_res>();
+                    const int stage = ctx_server.get_startup_stage();
+                    json j = {
+                        {"status",        stage >= 4 ? "ok" : "starting"},
+                        {"startup_stage", stage},
+                        {"has_model",     has_model},
+                        {"rpc_active",    stage >= 3}
+                    };
+                    if (stage >= 2) {
+                        auto meta = ctx_server.get_meta();
+                        j["model_name"] = meta.model_name;
+                    }
+                    res->data = j.dump();
+                    return res;
+                });
+                ctx_http.get("/version", [](const server_http_req &) {
+                    auto res = std::make_unique<server_http_res>();
+                    res->status = 200;
+                    res->data = "{\"version\":\"E1\",\"engine\":\"llama-engine\"}";
+                    return res;
+                });
+                if (ctx_http.start()) {
+                    http_started = true;
+                    LOG_INF("eng  %12.*s: HTTP server live early — /health shows startup stage %d\n",
+                            12, __func__, ctx_server.get_startup_stage());
+                }
+            }
+            if (!http_started) {
+                LOG_INF("eng  %12.*s: HTTP server deferred until after model load\n", 12, __func__);
+            }
+        }
 
         common_params_print_info(params, true);
 
@@ -438,35 +477,38 @@ int llama_engine(int argc, char ** argv) {
         // ── HTTP server with full inference routes ──
         server_routes routes(params, ctx_server);
 
-        server_http_context ctx_http;
-        if (params.port > 0) {
+        if (!http_started && params.port > 0) {
             if (!ctx_http.init(params)) {
                 LOG_ERR("eng  %12.*s: failed to initialize HTTP server\n", 12, __func__);
                 llama_backend_free();
                 return 1;
             }
-
             ctx_http.get("/health", [&ctx_server, &has_model](const server_http_req &) {
                 auto res = std::make_unique<server_http_res>();
                 const int stage = ctx_server.get_startup_stage();
-                auto meta = ctx_server.get_meta();
                 json j = {
                     {"status",        stage >= 4 ? "ok" : "starting"},
                     {"startup_stage", stage},
                     {"has_model",     has_model},
-                    {"model_name",    stage >= 2 ? meta.model_name : ""},
                     {"rpc_active",    stage >= 3}
                 };
+                if (stage >= 2) {
+                    auto meta = ctx_server.get_meta();
+                    j["model_name"] = meta.model_name;
+                }
                 res->data = j.dump();
                 return res;
             });
-
             ctx_http.get("/version", [](const server_http_req &) {
                 auto res = std::make_unique<server_http_res>();
                 res->status = 200;
                 res->data = "{\"version\":\"E1\",\"engine\":\"llama-engine\"}";
                 return res;
             });
+        }
+
+        // Remaining routes (can be registered after HTTP start — httplib accepts
+        // handlers at any time, even while the listen thread is running).
 
             // /slots data
             ctx_http.get("/slots", [&ctx_server](const server_http_req & req) {
@@ -642,17 +684,18 @@ int llama_engine(int argc, char ** argv) {
             ctx_http.post("/chat/completions",    ex_wrapper(routes.post_chat_completions));
             ctx_http.post("/v1/completions",      ex_wrapper(routes.post_completions_oai));
 
-            if (!ctx_http.start()) {
-                LOG_ERR("eng  %12.*s: failed to start HTTP server\n", 12, __func__);
-                llama_backend_free();
-                return 1;
+            if (!http_started) {
+                if (!ctx_http.start()) {
+                    LOG_ERR("eng  %12.*s: failed to start HTTP server\n", 12, __func__);
+                    llama_backend_free();
+                    return 1;
+                }
             }
 
             routes.update_meta(ctx_server);
             ctx_http.is_ready.store(true);
             // Phase E: fully ready
             ctx_server.set_startup_stage(4);
-        }
 
         shutdown_handler = [&](int) {
             ctx_server.terminate();
