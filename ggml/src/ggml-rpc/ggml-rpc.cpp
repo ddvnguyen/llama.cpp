@@ -2483,8 +2483,13 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
+    // #376: Flash-attn ops crash the peer when no CUDA kernel is available for
+    // the tensor config on the peer's GPU (e.g. sm_86 vs sm_120 differences).
+    // Short-term: reject FLASH_ATTN_EXT so the scheduler puts it on a local
+    // backend. TODO: forward the query to the remote backend and cache results.
+    if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
     return true;
 }
 
