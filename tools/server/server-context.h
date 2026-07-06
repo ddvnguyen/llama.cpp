@@ -118,6 +118,12 @@ struct server_context {
     // (layer-split) mode. Unlike expert-split, the split is fixed at model
     // load time — SET_EXPERT_MODE("solo") is an error, "combined" is a no-op.
     void set_hydra_combined_static(bool is_static);
+
+    // Hydra #29 Phase E: startup stage tracking for staged health endpoint.
+    // Stages: 0=none, 1=alive, 2=model_loaded, 3=rpc_active, 4=ready.
+    // Thread-safe (atomic).
+    void set_startup_stage(int stage);
+    int  get_startup_stage() const;
 };
 
 

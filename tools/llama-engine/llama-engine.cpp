@@ -194,7 +194,7 @@ static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** a
             flags.tensor_split_str = argv[++i];
             continue;
         }
-        // Strip remaining Hydra-only flags so they never reach common_params_parse.
+        // Strip removed flags so they never reach common_params_parse.
         // All COMBINE config is now request-driven at runtime — CLI flags are
         // removed. Log a one-time warning to help operators update their configs.
         if (strcmp(argv[i], "--ggml-rpc-port") == 0 && i + 1 < argc) {
@@ -211,6 +211,8 @@ static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** a
         }
         if (strcmp(argv[i], "--combined-split-mode") == 0 && i + 1 < argc) { ++i; continue; }
         if (strcmp(argv[i], "--combined-tensor-split") == 0 && i + 1 < argc) { ++i; continue; }
+        if (strcmp(argv[i], "--yarn-ext-ctx") == 0 && i + 1 < argc) { ++i; continue; }
+        if (strcmp(argv[i], "--yarn-orig-ctx") == 0 && i + 1 < argc) { ++i; continue; }
         filtered_argv.push_back(argv[i]);
     }
 
@@ -272,6 +274,8 @@ int llama_engine(int argc, char ** argv) {
         LOG_INF("eng  %12.*s: no model specified — starting in compute-only mode\n", 12, __func__);
     }
 
+
+
     // Determine RPC port: use --rpc-port from common_params, or derive from HTTP port.
     int rpc_port = params.rpc_port;
     if (rpc_port <= 0) {
@@ -325,6 +329,9 @@ int llama_engine(int argc, char ** argv) {
     if (has_model) {
         server_context ctx_server;
 
+        // Phase E: alive
+        ctx_server.set_startup_stage(1);
+
         common_params_print_info(params, true);
 
         if (!ctx_server.load_model(params)) {
@@ -332,6 +339,9 @@ int llama_engine(int argc, char ** argv) {
             llama_backend_free();
             return 1;
         }
+
+        // Phase E: model loaded
+        ctx_server.set_startup_stage(2);
 
         ctx_server.set_hydra_capabilities(true, flags.rpc_engine_peer,
                 false, "", "solo");
@@ -347,6 +357,8 @@ int llama_engine(int argc, char ** argv) {
         // model's compute backends.
         auto backends = get_model_compute_backends(ctx_server.get_llama_context());
         ctx_server.start_rpc_server(rpc_port, backends);
+        // Phase E: RPC server active
+        ctx_server.set_startup_stage(3);
 
         // ── HTTP server with full inference routes ──
         server_routes routes(params, ctx_server);
@@ -359,10 +371,18 @@ int llama_engine(int argc, char ** argv) {
                 return 1;
             }
 
-            ctx_http.get("/health", [&ctx_server](const server_http_req &) {
+            ctx_http.get("/health", [&ctx_server, &has_model](const server_http_req &) {
                 auto res = std::make_unique<server_http_res>();
-                res->status = 200;
-                res->data = "{\"status\":\"ok\"}";
+                const int stage = ctx_server.get_startup_stage();
+                auto meta = ctx_server.get_meta();
+                json j = {
+                    {"status",        stage >= 4 ? "ok" : "starting"},
+                    {"startup_stage", stage},
+                    {"has_model",     has_model},
+                    {"model_name",    stage >= 2 ? meta.model_name : ""},
+                    {"rpc_active",    stage >= 3}
+                };
+                res->data = j.dump();
                 return res;
             });
 
@@ -555,6 +575,8 @@ int llama_engine(int argc, char ** argv) {
 
             routes.update_meta(ctx_server);
             ctx_http.is_ready.store(true);
+            // Phase E: fully ready
+            ctx_server.set_startup_stage(4);
         }
 
         shutdown_handler = [&](int) {
@@ -647,10 +669,16 @@ int llama_engine(int argc, char ** argv) {
                 return 1;
             }
 
-            ctx_http.get("/health", [](const server_http_req &) {
+            ctx_http.get("/health", [&ctx_http](const server_http_req &) {
                 auto res = std::make_unique<server_http_res>();
-                res->status = 200;
-                res->data = "{\"status\":\"ok\"}";
+                const int stage = ctx_http.is_ready.load() ? 4 : 3;
+                json j = {
+                    {"status",        stage >= 4 ? "ok" : "starting"},
+                    {"startup_stage", stage},
+                    {"has_model",     false},
+                    {"rpc_active",    true}
+                };
+                res->data = j.dump();
                 return res;
             });
 

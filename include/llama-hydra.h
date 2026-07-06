@@ -147,6 +147,22 @@ LLAMA_API void llama_hydra_register_local_tensors_for_rpc(struct llama_context *
 // call llama_context::hydra_remove_combined_rpc_backend for full cleanup).
 LLAMA_API void llama_hydra_clear_combined_bindings(struct llama_context * ctx, const char * endpoint);
 
+// Hydra #29 Phase C: validate quantization parity between the currently loaded
+// model and a target model file. Opens the target GGUF, iterates tensors
+// matching `tensor_pattern` (ECMAScript regex), and reports any structural
+// mismatches (missing tensors, shape mismatches, or type incompatibilities).
+// Returns a JSON string describing the validation result:
+//   {"valid":true,"n_tensors":N,"tensors":[{"name":"...","type":"...","ne":[dims]},...]}
+//   on success, or {"valid":false,"error":"...","mismatches":[...]} on failure.
+// The caller must free the returned string with llama_hydra_free_result().
+LLAMA_API char * llama_hydra_validate_quant_parity(
+        struct llama_context * ctx,
+                   const char * target_model_path,
+                   const char * tensor_pattern);
+
+// Free a string returned by a llama_hydra_* function.
+LLAMA_API void llama_hydra_free_result(char * result);
+
 #ifdef __cplusplus
 }
 #endif

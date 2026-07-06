@@ -27,8 +27,8 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 namespace fs = std::filesystem;
 
-// macro for nicer error messages on server crash
-#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
+// macro for RPC error handling — logs error but does NOT abort
+#define RPC_STATUS_ASSERT(x) do { if (!(x)) { GGML_LOG_ERROR("Remote RPC server crashed or returned malformed response\n"); } } while(0)
 
 // all RPC structures must be packed
 #pragma pack(push, 1)
@@ -415,21 +415,27 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    rpc_msg_free_buffer_req request = {ctx->remote_ptr};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
+    if (ctx && ctx->sock) {
+        rpc_msg_free_buffer_req request = {ctx->remote_ptr};
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
+        RPC_STATUS_ASSERT(status);
+    }
     delete ctx;
 }
 
 static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (!ctx || !ctx->sock) return nullptr;
     if (ctx->base_ptr != nullptr) {
         return ctx->base_ptr;
     }
     rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("RPC buffer_get_base failed (peer disconnected?)\n");
+        return nullptr;
+    }
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
     return ctx->base_ptr;
 }
@@ -481,23 +487,23 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 
 static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (!ctx || !ctx->sock) return GGML_STATUS_FAILED;
 
-    // CUDA backend on the server pads everything to 512 due to CUDA limitations.
-    // Due to bandwidth constraints, we only call the server init tensor functions if necessary.
-    // In particular, only quantized tensors need padding
     if (ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr)) {
         rpc_msg_init_tensor_req request;
-
         request.tensor = serialize_tensor(tensor);
-
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
-        RPC_STATUS_ASSERT(status);
+        if (!status) {
+            GGML_LOG_ERROR("RPC init_tensor failed (peer disconnected?)\n");
+            return GGML_STATUS_FAILED;
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (!ctx || !ctx->sock) return;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     if (size > HASH_THRESHOLD) {
         rpc_msg_set_tensor_hash_req request;
@@ -506,49 +512,46 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         request.hash = fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
+        if (!status) return;
         if (response.result) {
-            // the server has the same data, no need to send it
             return;
         }
     }
-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
     std::vector<uint8_t> input(input_size, 0);
     memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
-    RPC_STATUS_ASSERT(status);
+    if (!status) return;
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (!ctx || !ctx->sock) return;
     rpc_msg_get_tensor_req request;
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
     request.size = size;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
-    RPC_STATUS_ASSERT(status);
+    if (!status) return;
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
     if (ggml_backend_buffer_is_rpc(src->buffer)) {
-        // check if src and dst are on the same server
         ggml_backend_buffer_t src_buffer = src->buffer;
         ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *)src_buffer->context;
         ggml_backend_buffer_t dst_buffer = dst->buffer;
         ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *)dst_buffer->context;
-        if (src_ctx->sock != dst_ctx->sock) {
-            return false;
-        }
+        if (!src_ctx || !src_ctx->sock || !dst_ctx || !dst_ctx->sock) return false;
+        if (src_ctx->sock != dst_ctx->sock) return false;
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
         rpc_msg_copy_tensor_req request;
         request.src = serialize_tensor(src);
         request.dst = serialize_tensor(dst);
         rpc_msg_copy_tensor_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
+        if (!status) return false;
         return response.result;
     }
     return false;
@@ -556,9 +559,10 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (!ctx || !ctx->sock) return;
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
+    if (!status) return;
 }
 
 static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
@@ -582,11 +586,18 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
 
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
+    auto sock = get_socket(buft_ctx->endpoint);
+    if (!sock) {
+        GGML_LOG_ERROR("RPC alloc_buffer failed: no connection to %s\n", buft_ctx->endpoint.c_str());
+        return nullptr;
+    }
     rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
     rpc_msg_alloc_buffer_rsp response;
-    auto sock = get_socket(buft_ctx->endpoint);
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("RPC alloc_buffer failed (peer disconnected?)\n");
+        return nullptr;
+    }
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
@@ -599,10 +610,14 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
 }
 
 static size_t get_alignment(const std::shared_ptr<socket_t> & sock, uint32_t device) {
+    if (!sock) {
+        GGML_LOG_ERROR("RPC get_alignment failed: no connection\n");
+        return 0;
+    }
     rpc_msg_get_alignment_req request = {device};
     rpc_msg_get_alignment_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALIGNMENT, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) return 0;
     return response.alignment;
 }
 
@@ -737,19 +752,25 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
+    bool status = false;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (!sock) {
+        GGML_LOG_ERROR("RPC graph_compute failed: no connection to %s\n", rpc_ctx->endpoint.c_str());
+        return GGML_STATUS_FAILED;
+    }
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
-        auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
-        RPC_STATUS_ASSERT(status);
+        status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
-        auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
-        RPC_STATUS_ASSERT(status);
+        status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+    }
+    if (!status) {
+        GGML_LOG_ERROR("RPC graph compute failed (peer disconnected?)\n");
+        return GGML_STATUS_FAILED;
     }
     return GGML_STATUS_SUCCESS;
 }

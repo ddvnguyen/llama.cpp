@@ -29,6 +29,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <regex>
 #include <thread>
 #include <utility>
 
@@ -709,6 +710,10 @@ public:
     // peer switching. Protected by the task queue (process_single_task is
     // serialized), so no separate mutex needed.
     std::string hydra_current_peer;
+
+    // #29 Phase E: startup stage for staged health endpoint.
+    // 0=none, 1=alive, 2=model_loaded, 3=rpc_active, 4=ready.
+    std::atomic<int> startup_stage{0};
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -3677,12 +3682,65 @@ private:
                     auto res = std::make_unique<server_task_result_hydra_engine>();
                     res->id = task.id;
                     res->op = HYDRA_OP_SWAP_QUANT;
-                    res->rpc_status = HYDRA_STATUS_OK;
-                    res->success = true;
+
+                    const std::string & quant_key = task.hydra_action.quant_key;
+                    const std::string & tensor_pattern = task.hydra_action.tensor_pattern;
+
                     SRV_INF("hydra: SWAP_QUANT quant='%s' pattern='%s' (slot %d)\n",
-                            task.hydra_action.quant_key.c_str(),
-                            task.hydra_action.tensor_pattern.c_str(),
+                            quant_key.c_str(), tensor_pattern.c_str(),
                             task.hydra_action.id_slot);
+
+                    // Resolve quant_key to a model path: first try preset aliases,
+                    // then try as a direct file path.
+                    std::string target_path;
+                    auto it = preset_alias_to_path.find(quant_key);
+                    if (it != preset_alias_to_path.end()) {
+                        target_path = it->second;
+                    } else if (std::filesystem::exists(quant_key)) {
+                        target_path = quant_key;
+                    } else {
+                        SRV_WRN("hydra: SWAP_QUANT — quant_key '%s' not found in preset aliases and not a valid path\n",
+                                quant_key.c_str());
+                        res->rpc_status = HYDRA_STATUS_NOT_FOUND;
+                        res->error = "unknown quant_key: '" + quant_key + "'";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // Run quantization parity validation (Phase C)
+                    if (ctx_tgt && !target_path.empty()) {
+                        char * vresult = llama_hydra_validate_quant_parity(
+                            ctx_tgt, target_path.c_str(), tensor_pattern.c_str());
+                        if (vresult) {
+                            res->info_json = vresult;
+                            llama_hydra_free_result(vresult);
+                        }
+                    }
+
+                    // Parse validation result to determine success
+                    bool valid = false;
+                    if (!res->info_json.empty()) {
+                        try {
+                            json j = json::parse(res->info_json);
+                            valid = j.value("valid", false);
+                        } catch (...) {}
+                    }
+
+                    if (valid) {
+                        res->rpc_status = HYDRA_STATUS_OK;
+                        res->success = true;
+                        SRV_INF("hydra: SWAP_QUANT — validated %s tensors OK, quant compatible\n",
+                                target_path.c_str());
+                    } else {
+                        res->rpc_status = HYDRA_STATUS_ERROR;
+                        res->success = false;
+                        if (res->error.empty()) {
+                            res->error = "quant parity validation failed for '" + target_path + "'";
+                        }
+                        SRV_WRN("hydra: SWAP_QUANT — validation FAILED for %s: %s\n",
+                                target_path.c_str(), res->error.c_str());
+                    }
+
                     queue_results.send(std::move(res));
                 } break;
 
@@ -4992,6 +5050,14 @@ void server_context::set_hydra_combined_head_attached(bool attached) {
 
 void server_context::set_hydra_combined_static(bool is_static) {
     impl->hydra_combined_static = is_static;
+}
+
+void server_context::set_startup_stage(int stage) {
+    impl->startup_stage.store(stage, std::memory_order_release);
+}
+
+int server_context::get_startup_stage() const {
+    return impl->startup_stage.load(std::memory_order_acquire);
 }
 
 server_response_reader server_context::get_response_reader() {
@@ -7019,11 +7085,24 @@ static void hydra_handle_swap_quant(int fd, int slot_id, uint64_t payload_len, c
 
     auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
     if (!res || !res->success) {
-        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        // Send the error info back if available
+        json err_j = {{"success", false}};
+        if (res && !res->error.empty()) err_j["error"] = res->error;
+        if (res && !res->info_json.empty()) {
+            try { err_j["validation"] = json::parse(res->info_json); }
+            catch (...) {}
+        }
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
         return;
     }
 
     json meta_j = {{"success", true}};
+    if (!res->info_json.empty()) {
+        try { meta_j["validation"] = json::parse(res->info_json); }
+        catch (...) {}
+    }
     const std::string meta_str = meta_j.dump();
     hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
     hydra_send_all(fd, meta_str.data(), meta_str.size());
