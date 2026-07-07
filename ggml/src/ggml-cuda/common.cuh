@@ -1599,7 +1599,18 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
     }
 
     cudaFuncAttributes attr = {};
-    CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
+    // Hydra: cudaFuncGetAttributes can fail on sm_86 for heavily-templated
+    // flash-attn kernels in fat binaries (86;120) with CUDA 13.2. Rather than
+    // aborting the entire process, treat the failure as "PDL not supported"
+    // and fall back to standard <<<>>> launch. This is safe because non-Hopper
+    // GPUs never have PDL-capable PTX anyway (ptxVersion < 90).
+    cudaError_t err = cudaFuncGetAttributes(&attr, kernel);
+    if (err != cudaSuccess) {
+        GGML_LOG_WARN("hydra: cudaFuncGetAttributes failed for kernel %p (error: %s) — disabling PDL for this kernel\n",
+                kernel, cudaGetErrorString(err));
+        cache.emplace(key, false);
+        return false;
+    }
 
     // PDL device-side primitives are emitted only for PTX versions >= 90.
     // We have to guard on a loaded kernel's PTX version so a kernel forward-JIT'ed

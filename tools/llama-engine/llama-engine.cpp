@@ -212,6 +212,7 @@ static hydra_capability_flags extract_hydra_capability_flags(int argc, char ** a
     filtered_argv.clear();
     if (argc > 0) filtered_argv.push_back(argv[0]);
 
+    // Pass 1: extract Hydra flags
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rpc-engine") == 0 && i + 1 < argc) {
             flags.rpc_engine_peer = argv[++i];
@@ -525,11 +526,6 @@ int llama_engine(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    // Hydra #383 T1: register the peer as an RPC backend device BEFORE model
-    // load so llama.cpp's device-enumeration code (src/llama.cpp:239) places
-    // it at the front of the device list (device[0] = peer, device[1] = local
-    // CUDA). tensor_split[0] then controls how many layers go to the peer.
-    // Must come after llama_backend_init() (GGML init) and before load_model().
     if (flags.is_layer_split()) {
         if (llama_hydra_preload_rpc_device(flags.rpc_engine_peer.c_str()) != 0) {
             LOG_ERR("eng  %12.*s: layer-split COMBINED: failed to register peer %s "
@@ -538,8 +534,7 @@ int llama_engine(int argc, char ** argv) {
             llama_backend_free();
             return 1;
         }
-        // Parse "21/44" or "21,44" into params.tensor_split.
-        // Split on '/' or ',' — same delimiters as the stock --tensor-split arg parser.
+        // Parse "25/40" or "25,40" into params.tensor_split.
         {
             std::string ts = flags.combined_tensor_split;
             std::vector<float> splits;
@@ -583,6 +578,15 @@ int llama_engine(int argc, char ** argv) {
     // Hydra #348: every engine always loads its model now — there is no more
     // --role worker path that skips this. SOLO duty is unconditional; the
     // capabilities below layer on top of it instead of replacing it.
+    // Hydra #383 T1: layer-split COMBINED mode sends graph_compute to the
+    // peer during warmup. The peer doesn't load the model, so weight-
+    // referencing ops crash. Skip warmup — it's a startup optimization,
+    // not required for correctness. The first real request will warm up
+    // the scheduler paths anyway.
+    if (flags.is_layer_split()) {
+        params.warmup = false;
+    }
+
     if (!ctx_server.load_model(params)) {
         LOG_ERR("eng  %12.*s: failed to load model\n", 12, __func__);
         llama_backend_free();

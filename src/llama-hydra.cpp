@@ -279,17 +279,55 @@ int32_t llama_hydra_rebind_combined_experts(
         return 0;
     }
 
+    // Hydra: batch resolve — resolve all pending tensors in one RPC round-trip
+    // instead of N serial calls. Amortizes TCP overhead (144 tensors → 1 call).
+    using batch_resolve_fn_t = uint32_t (*)(const char *, uint32_t, struct ggml_context *,
+            const char **, const uint32_t *, uint32_t, struct ggml_tensor **, uint32_t *);
+    auto batch_resolve_fn = (batch_resolve_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_resolve_tenses_batch");
+
     size_t n_bound = 0;
     uint32_t bound_epoch = 0;
-    for (auto & p : pending) {
-        ggml_tensor * remote = bind_remote_fn(peer_endpoint, /*device=*/0, meta_ctx.get(),
-                p.name.c_str(), p.expected_ne, &bound_epoch);
-        *p.dst_field = remote;
-        if (remote) {
-            n_bound++;
-        } else {
-            LLAMA_LOG_WARN("hydra: COMBINED rebind — peer %s has no resident tensor named '%s' (zero-copy bind failed)\n",
-                    peer_endpoint, p.name.c_str());
+
+    if (batch_resolve_fn && pending.size() > 1) {
+        // Batch path: single RPC call for all tensors
+        std::vector<const char *> names;
+        std::vector<uint32_t> ne_flat;
+        std::vector<ggml_tensor *> tensors(pending.size(), nullptr);
+        std::vector<uint32_t> epochs(pending.size(), 0);
+        names.reserve(pending.size());
+        ne_flat.reserve(pending.size() * GGML_MAX_DIMS);
+
+        for (auto & p : pending) {
+            names.push_back(p.name.c_str());
+            for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+                ne_flat.push_back(p.expected_ne[i]);
+            }
+        }
+
+        uint32_t batch_bound = batch_resolve_fn(peer_endpoint, /*device=*/0, meta_ctx.get(),
+                names.data(), ne_flat.data(), pending.size(), tensors.data(), epochs.data());
+
+        for (size_t i = 0; i < pending.size(); i++) {
+            *pending[i].dst_field = tensors[i];
+            if (tensors[i]) {
+                n_bound++;
+                bound_epoch = epochs[i]; // last successful epoch
+            }
+        }
+        LLAMA_LOG_INFO("hydra: COMBINED batch resolve — %zu/%zu tensors bound to %s (batch, epoch=%u)\n",
+                n_bound, pending.size(), peer_endpoint, bound_epoch);
+    } else {
+        // Fallback: serial per-tensor resolve (for single tensor or if batch not available)
+        for (auto & p : pending) {
+            ggml_tensor * remote = bind_remote_fn(peer_endpoint, /*device=*/0, meta_ctx.get(),
+                    p.name.c_str(), p.expected_ne, &bound_epoch);
+            *p.dst_field = remote;
+            if (remote) {
+                n_bound++;
+            } else {
+                LLAMA_LOG_WARN("hydra: COMBINED rebind — peer %s has no resident tensor named '%s' (zero-copy bind failed)\n",
+                        peer_endpoint, p.name.c_str());
+            }
         }
     }
 

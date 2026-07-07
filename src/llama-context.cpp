@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-rpc.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -397,6 +398,7 @@ void llama_context::build_backend_buffer_vectors() {
     backend_buft.clear();
     backend_ptrs.clear();
     backend_buf_exp_size.clear();
+    rpc_has_peer = false;
 
     for (auto & backend : backends) {
         auto * buft = ggml_backend_get_default_buffer_type(backend.get());
@@ -409,6 +411,10 @@ void llama_context::build_backend_buffer_vectors() {
             if (host_buft) {
                 buft = host_buft;
             }
+        }
+
+        if (ggml_backend_is_rpc(backend.get())) {
+            rpc_has_peer = true;
         }
 
         backend_buft.push_back(buft);
@@ -658,7 +664,15 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        // Hydra #383: in COMBINED layer-split mode, re-allocation frees RPC
+        // buffers whose old pointers are still referenced by tensor objects.
+        // The peer's get_tensor then crashes because it can't find the freed
+        // buffer. Force split_only=true for the re-reserve pass — the first
+        // allocation from the PP reserve above is sufficient. The minor cost
+        // is one extra reallocation on the first inference if the worst-case
+        // graph is larger than the reserve.
+        bool re_reserve_split_only = model.hparams.no_alloc || rpc_has_peer;
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), re_reserve_split_only);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }

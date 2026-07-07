@@ -84,6 +84,23 @@ GGML_BACKEND_API uint32_t ggml_backend_rpc_get_registry_epoch(void);
 // binding to detect that the peer has cleared/reloaded.
 GGML_BACKEND_API uint32_t ggml_backend_rpc_get_remote_registry_epoch(const char * endpoint);
 
+// Hydra: batch resolve — resolves N tensors in one round-trip via
+// RPC_CMD_RESOLVE_TENSES. Amortizes TCP overhead for COMBINED rebind
+// (144 tensors → 1 RPC call instead of 144 serial calls).
+// - names: array of C strings (tensor names to resolve)
+// - n_names: number of names
+// - device: RPC device index (usually 0)
+// - ctx: ggml_context for allocating result tensors
+// - out_tensors: pre-allocated array of n_names ggml_tensor pointers (output)
+// - out_epochs: pre-allocated array of n_names uint32_t (output, may be NULL)
+// Returns number of successfully resolved tensors.
+GGML_BACKEND_API uint32_t ggml_backend_rpc_resolve_tenses_batch(
+        const char * endpoint, uint32_t device,
+        struct ggml_context * ctx,
+        const char ** names, const uint32_t * expected_ne_flat,
+        uint32_t n_names,
+        struct ggml_tensor ** out_tensors, uint32_t * out_epochs);
+
 #ifdef  __cplusplus
 }
 #endif

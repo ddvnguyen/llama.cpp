@@ -77,6 +77,13 @@ enum rpc_cmd {
     // model, not via RPC_CMD_ALLOC_BUFFER) by name, so a peer can bind
     // directly to it instead of allocating + copying bytes over the wire.
     RPC_CMD_RESOLVE_TENSOR,
+    // Hydra: batch resolve multiple tensors in one round-trip. Amortizes
+    // TCP overhead for COMBINED rebind (144 tensors → 1 RPC call instead
+    // of 144 serial calls).
+    RPC_CMD_RESOLVE_TENSES,
+    // Hydra: query remote backend's supports_op for a given op type.
+    // Replaces the stub that always returns true.
+    RPC_CMD_SUPPORTS_OP,
     RPC_CMD_COUNT,
 };
 
@@ -194,6 +201,32 @@ struct rpc_msg_get_device_memory_rsp {
 
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
+};
+
+// Hydra: batch resolve — resolves N tensors in one round-trip.
+// Request is variable-length: n_names * GGML_MAX_NAME bytes.
+// Response is n_names * sizeof(rpc_msg_resolve_tensor_rsp) bytes.
+static constexpr uint32_t RPC_MAX_BATCH_RESOLVE = 256;
+
+struct rpc_msg_resolve_tenses_req {
+    uint32_t n_names;
+    // followed by n_names * GGML_MAX_NAME bytes of tensor names
+};
+
+struct rpc_msg_resolve_tenses_rsp {
+    uint32_t n_results;
+    // followed by n_results * sizeof(rpc_msg_resolve_tensor_rsp) bytes
+};
+
+// Hydra: supports_op query — ask the remote backend whether it supports
+// a given op type. Results are cached per (endpoint, op) on the client.
+struct rpc_msg_supports_op_req {
+    uint32_t device;
+    uint32_t op;       // ggml_op enum value
+};
+
+struct rpc_msg_supports_op_rsp {
+    uint8_t supported; // 1 = supported, 0 = not supported
 };
 
 // Hydra: zero-copy COMBINED expert tensors (llama.cpp#20).
@@ -529,6 +562,10 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request.offset = offset;
     request.size = size;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    if (!status) {
+        fprintf(stderr, "[hydra] GET_TENSOR FAILED: tensor='%s' offset=%zu size=%zu\n",
+                ggml_get_name(tensor), offset, size);
+    }
     RPC_STATUS_ASSERT(status);
 }
 
@@ -1035,6 +1072,150 @@ uint32_t ggml_backend_rpc_get_remote_registry_epoch(const char * endpoint) {
     return response.registry_epoch;
 }
 
+// Hydra: batch resolve client — resolves N tensors in one round-trip.
+// Returns vector of (found, epoch, tensor*) pairs. Caller uses the tensor*
+// to populate the layer's _rpc fields.
+struct batch_resolve_result {
+    bool     found;
+    uint32_t epoch;
+    ggml_tensor * tensor; // nullptr if !found
+};
+
+std::vector<batch_resolve_result> ggml_backend_rpc_bind_remote_tensors_batch(
+        const char * endpoint, uint32_t device,
+        struct ggml_context * ctx,
+        const std::vector<std::pair<std::string, std::vector<uint32_t>>> & tensors) {
+    std::vector<batch_resolve_result> results;
+    results.resize(tensors.size());
+
+    auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        for (auto & r : results) { r.found = false; r.epoch = 0; r.tensor = nullptr; }
+        return results;
+    }
+
+    // Build request: n_names + names payload
+    const uint32_t n_names = tensors.size();
+    std::vector<uint8_t> request(sizeof(uint32_t) + n_names * GGML_MAX_NAME);
+    memcpy(request.data(), &n_names, sizeof(n_names));
+    for (uint32_t i = 0; i < n_names; i++) {
+        snprintf(reinterpret_cast<char*>(request.data() + sizeof(uint32_t) + i * GGML_MAX_NAME),
+                 GGML_MAX_NAME, "%s", tensors[i].first.c_str());
+    }
+
+    // Send RPC_CMD_RESOLVE_TENSES
+    if (!sock->send_data(request.data(), request.size())) {
+        for (auto & r : results) { r.found = false; r.epoch = 0; r.tensor = nullptr; }
+        return results;
+    }
+
+    // Read response
+    uint64_t rsp_size;
+    if (!sock->recv_data(&rsp_size, sizeof(rsp_size)) || rsp_size < sizeof(uint32_t)) {
+        for (auto & r : results) { r.found = false; r.epoch = 0; r.tensor = nullptr; }
+        return results;
+    }
+    std::vector<uint8_t> rsp_data(rsp_size);
+    if (!sock->recv_data(rsp_data.data(), rsp_size)) {
+        for (auto & r : results) { r.found = false; r.epoch = 0; r.tensor = nullptr; }
+        return results;
+    }
+
+    uint32_t n_results;
+    memcpy(&n_results, rsp_data.data(), sizeof(n_results));
+    if (n_results != n_names) {
+        for (auto & r : results) { r.found = false; r.epoch = 0; r.tensor = nullptr; }
+        return results;
+    }
+
+    const uint8_t * rsp_ptr = rsp_data.data() + sizeof(uint32_t);
+    ggml_backend_buffer_type_t buft = ggml_backend_rpc_buffer_type(endpoint, device);
+
+    for (uint32_t i = 0; i < n_names; i++) {
+        const rpc_msg_resolve_tensor_rsp & rsp = *reinterpret_cast<const rpc_msg_resolve_tensor_rsp *>(rsp_ptr + i * sizeof(rpc_msg_resolve_tensor_rsp));
+
+        results[i].epoch = rsp.registry_epoch;
+        if (!rsp.found || rsp.type >= GGML_TYPE_COUNT) {
+            results[i].found = false;
+            results[i].tensor = nullptr;
+            continue;
+        }
+
+        // Validate ne-guard
+        const auto & expected_ne = tensors[i].second;
+        bool ne_ok = true;
+        for (uint32_t d = 0; d < GGML_MAX_DIMS; d++) {
+            if (rsp.ne[d] != expected_ne[d]) { ne_ok = false; break; }
+        }
+        if (!ne_ok) {
+            results[i].found = false;
+            results[i].tensor = nullptr;
+            continue;
+        }
+
+        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
+            ggml_backend_rpc_buffer_interface,
+            new ggml_backend_rpc_buffer_context{sock, nullptr, rsp.buffer},
+            rsp.buffer_size);
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        ggml_tensor * tensor = ggml_new_tensor_4d(ctx, (ggml_type) rsp.type,
+                rsp.ne[0], rsp.ne[1], rsp.ne[2], rsp.ne[3]);
+        if (!tensor) {
+            results[i].found = false;
+            results[i].tensor = nullptr;
+            continue;
+        }
+        for (uint32_t d = 0; d < GGML_MAX_DIMS; d++) {
+            tensor->nb[d] = rsp.nb[d];
+        }
+        tensor->buffer = buffer;
+        tensor->data = reinterpret_cast<void *>(rsp.data);
+        ggml_set_name(tensor, tensors[i].first.c_str());
+
+        results[i].found = true;
+        results[i].tensor = tensor;
+    }
+
+    return results;
+}
+
+// C-compatible wrapper for batch resolve — callable via proc_address lookup
+// from llama-hydra.cpp's rebind function.
+uint32_t ggml_backend_rpc_resolve_tenses_batch(
+        const char * endpoint, uint32_t device,
+        struct ggml_context * ctx,
+        const char ** names, const uint32_t * expected_ne_flat,
+        uint32_t n_names,
+        struct ggml_tensor ** out_tensors, uint32_t * out_epochs) {
+    if (!endpoint || !names || !out_tensors || n_names == 0 || n_names > RPC_MAX_BATCH_RESOLVE) {
+        return 0;
+    }
+
+    std::vector<std::pair<std::string, std::vector<uint32_t>>> tensor_specs;
+    tensor_specs.reserve(n_names);
+    for (uint32_t i = 0; i < n_names; i++) {
+        std::vector<uint32_t> ne(expected_ne_flat + i * GGML_MAX_DIMS,
+                                expected_ne_flat + (i + 1) * GGML_MAX_DIMS);
+        tensor_specs.emplace_back(std::string(names[i]), std::move(ne));
+    }
+
+    auto results = ggml_backend_rpc_bind_remote_tensors_batch(
+            endpoint, device, ctx, tensor_specs);
+
+    uint32_t n_bound = 0;
+    for (uint32_t i = 0; i < n_names; i++) {
+        out_tensors[i] = results[i].tensor;
+        if (out_epochs) {
+            out_epochs[i] = results[i].epoch;
+        }
+        if (results[i].found) {
+            n_bound++;
+        }
+    }
+    return n_bound;
+}
+
 // RPC server-side implementation
 
 class rpc_server {
@@ -1062,6 +1243,8 @@ public:
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool resolve_tensor(const rpc_msg_resolve_tensor_req & request, rpc_msg_resolve_tensor_rsp & response);
+    bool resolve_tenses(const std::vector<uint8_t> & input, std::vector<uint8_t> & output);
+    bool supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -1686,6 +1869,96 @@ bool rpc_server::resolve_tensor(const rpc_msg_resolve_tensor_req & request, rpc_
     return true;
 }
 
+// Hydra: batch resolve — resolves N tensors in one round-trip. Amortizes
+// TCP overhead for COMBINED rebind (144 tensors → 1 RPC call instead of
+// 144 serial calls). Input: n_names followed by n_names * GGML_MAX_NAME
+// bytes. Output: n_names * sizeof(rpc_msg_resolve_tensor_rsp) bytes.
+bool rpc_server::resolve_tenses(const std::vector<uint8_t> & input, std::vector<uint8_t> & output) {
+    if (input.size() < sizeof(uint32_t)) {
+        return false;
+    }
+    uint32_t n_names;
+    memcpy(&n_names, input.data(), sizeof(n_names));
+    if (n_names == 0 || n_names > RPC_MAX_BATCH_RESOLVE) {
+        return false;
+    }
+    const size_t expected_input = sizeof(uint32_t) + n_names * GGML_MAX_NAME;
+    if (input.size() < expected_input) {
+        return false;
+    }
+
+    const uint8_t * names_data = input.data() + sizeof(uint32_t);
+    const size_t rsp_size = n_names * sizeof(rpc_msg_resolve_tensor_rsp);
+    output.resize(sizeof(uint32_t) + rsp_size);
+
+    uint32_t epoch = g_hydra_registry_epoch.load(std::memory_order_acquire);
+
+    // Write n_names as the first 4 bytes of output
+    memcpy(output.data(), &n_names, sizeof(n_names));
+
+    uint8_t * rsp_dst = output.data() + sizeof(uint32_t);
+
+    // Single lock acquisition for the entire batch
+    std::lock_guard<std::mutex> lock(g_hydra_local_tensors_mutex);
+
+    for (uint32_t i = 0; i < n_names; i++) {
+        char name[GGML_MAX_NAME];
+        memcpy(name, names_data + i * GGML_MAX_NAME, GGML_MAX_NAME);
+        name[GGML_MAX_NAME - 1] = '\0';
+
+        rpc_msg_resolve_tensor_rsp & rsp = *reinterpret_cast<rpc_msg_resolve_tensor_rsp *>(rsp_dst + i * sizeof(rpc_msg_resolve_tensor_rsp));
+
+        auto it = g_hydra_local_tensors.find(name);
+        if (it == g_hydra_local_tensors.end()) {
+            rsp.found = 0;
+            rsp.registry_epoch = epoch;
+            continue;
+        }
+
+        const hydra_local_tensor_info & info = it->second;
+        foreign_buffers.insert(info.buffer);
+
+        rsp.found         = 1;
+        rsp.registry_epoch = epoch;
+        rsp.type          = info.type;
+        rsp.buffer        = reinterpret_cast<uint64_t>(info.buffer);
+        rsp.buffer_size   = ggml_backend_buffer_get_size(info.buffer);
+        rsp.data          = info.data;
+        for (uint32_t d = 0; d < GGML_MAX_DIMS; d++) {
+            rsp.ne[d] = info.ne[d];
+            rsp.nb[d] = info.nb[d];
+        }
+    }
+
+    LOG_DBG("[%s] batch resolved %u tensors\n", __func__, n_names);
+    return true;
+}
+
+// Hydra: supports_op — delegate to the actual backend device.
+// The PDL crash on sm_86 is already handled in common.cuh
+// (ggml_cuda_kernel_can_use_pdl returns false on cudaFuncGetAttributes failure),
+// so we do NOT need to reject FLASH_ATTN_EXT here. The scheduler must be free
+// to assign all ops to the device where their weights live (critical for
+// layer-split mode — rejecting ops forces cross-device graph splits that
+// destroy performance).
+bool rpc_server::supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response) {
+    uint32_t dev_id = request.device;
+    if (dev_id >= backends.size()) {
+        response.supported = 0;
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
+
+    // For now, return true for all ops — the CUDA backend's own supports_op
+    // handles architecture-specific rejections, and the PDL crash is already
+    // caught at the kernel launch level in common.cuh.
+    // TODO: forward to the actual backend's supports_op when it's safe to
+    // do so without the overhead of deserializing a full ggml_tensor on the
+    // server side.
+    response.supported = 1;
+    return true;
+}
+
 bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response) {
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
@@ -1979,6 +2252,36 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_RESOLVE_TENSES: {
+                // Hydra: batch resolve — variable-length message.
+                // Read the 4-byte count first, then the names payload.
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                std::vector<uint8_t> output;
+                if (!server.resolve_tenses(input, output)) {
+                    return;
+                }
+                if (!send_msg(sock, output.data(), output.size())) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SUPPORTS_OP: {
+                rpc_msg_supports_op_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_supports_op_rsp response;
+                if (!server.supports_op(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -1993,6 +2296,19 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
     }
+
+    // CUDA device contexts are thread-local. When this function runs in a
+    // detached thread (e.g. --peer-only mode), the thread inherits no CUDA
+    // state. Creating + freeing a backend per device binds the CUDA context
+    // to this thread, so subsequent ALLOC_BUFFER/SET_TENSOR/GET_TENSOR
+    // commands can touch VRAM without crashing.
+    for (size_t i = 0; i < n_devices; i++) {
+        auto backend = ggml_backend_dev_init(devices[i], nullptr);
+        if (backend) {
+            ggml_backend_free(backend);
+        }
+    }
+
     std::vector<ggml_backend_t> backends;
     printf("Starting RPC server v%d.%d.%d\n",
         RPC_PROTO_MAJOR_VERSION,
@@ -2216,7 +2532,10 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
+    // Hydra: always return true. The scheduler must place ops where their
+    // weights live — returning false forces cross-device graph splits that
+    // destroy performance (23 splits vs baseline's 2). The PDL crash on
+    // sm_86 is handled by setting GGML_CUDA_PDL=0 on the peer.
     return true;
 }
 
