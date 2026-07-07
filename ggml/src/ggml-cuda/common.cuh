@@ -1598,6 +1598,18 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
         return it->second;
     }
 
+    // PDL device-side primitives are emitted only for arch >= Hopper (see ggml_cuda_pdl_sync/_lc),
+    // so a pre-Hopper device can never use PDL regardless of the loaded kernel. Gate on the device
+    // compute capability *before* cudaFuncGetAttributes: on some CUDA/driver combinations
+    // (observed: RTX 3060 sm_86 + CUDA 13.2, hydra COMBINE rpc-server path) that query faults for
+    // PDL-carrying flash-attn kernels and CUDA_CHECK turns it into a hard abort. Skip it entirely
+    // and cache a permanent "no" for these GPUs.
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (cc < GGML_CUDA_CC_HOPPER) {
+        cache.emplace(key, false);
+        return false;
+    }
+
     cudaFuncAttributes attr = {};
     CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
 
