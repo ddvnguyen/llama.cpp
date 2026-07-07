@@ -308,6 +308,7 @@ int llama_engine(int argc, char ** argv) {
     // If --rpc-engine was given (testing shortcut), pre-connect the peer now.
     // Register the peer as a GGML backend device so it's visible for model
     // loading (layer-split needs the peer device in the device list).
+    bool peer_registered = false;
     if (has_peer) {
         ggml_backend_reg_t peer_reg = ggml_backend_rpc_add_server(flags.rpc_engine_peer.c_str());
         if (peer_reg == nullptr) {
@@ -316,6 +317,7 @@ int llama_engine(int argc, char ** argv) {
         } else {
             // Register peer with GGML so llama.cpp can place layers on it
             ggml_backend_register(peer_reg);
+            peer_registered = true;
             LOG_INF("eng  %12.*s: rpc-engine peer %s registered for layer-split\n",
                     12, __func__, flags.rpc_engine_peer.c_str());
         }
@@ -333,11 +335,26 @@ int llama_engine(int argc, char ** argv) {
             return 1;
         }
 
-        ctx_server.set_hydra_capabilities(true, flags.rpc_engine_peer,
-                false, "", "solo");
+        // Report the true startup mode. When the peer registered BEFORE load
+        // and a --tensor-split was given, llama.cpp's stock allocator placed
+        // whole layers across CUDA0 + RPC0 at load time (COMBINED-static
+        // layer-split, #383) — advertise split_mode="layer" so Hydra Core routes
+        // to it instead of the runtime expert path. Keep combined_pattern EMPTY:
+        // it is the expert regex consumed by SET_EXPERT_MODE("combined") →
+        // llama_hydra_rebind_combined_experts (server-context.cpp:3651); a
+        // non-empty value here would trigger the after-load expert re-partition
+        // (the 35-graph-split regression) that layer-split exists to avoid.
+        const bool layer_split_active = peer_registered && flags.has_tensor_split();
+        ctx_server.set_hydra_capabilities(
+                /*rpc_backend_active=*/ true,
+                /*peer=*/               flags.rpc_engine_peer,
+                /*peer_reachable=*/     peer_registered,
+                /*combined_pattern=*/   "",
+                /*split_mode=*/         layer_split_active ? "layer" : "solo");
 
-        // Register tensors for expert-split COMBINE (used at runtime when
-        // a request specifies a peer).
+        // Register this engine's resident tensors with the embedded RPC server so
+        // an inbound COMBINED head can bind them zero-copy. Cheap, unconditional
+        // bookkeeping (not the after-load expert re-partition) — always needed.
         llama_hydra_register_local_tensors_for_rpc(ctx_server.get_llama_context());
 
         // Enable shared-backend compute lock for inbound RPC + local inference.
