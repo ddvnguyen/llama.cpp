@@ -468,7 +468,7 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, MSG_NOSIGNAL);
         if (n < 0) {
             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
@@ -604,6 +604,23 @@ static void apply_tcp_buffer_size_override(sockfd_t sockfd) {
     }
 }
 
+static bool set_keepalive(int fd, int idle_sec, int interval_sec, int count) {
+    int optval = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval)) < 0) {
+        return false;
+    }
+#if defined(TCP_KEEPIDLE)
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_sec, sizeof(idle_sec)) < 0) return false;
+#endif
+#if defined(TCP_KEEPINTVL)
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec)) < 0) return false;
+#endif
+#if defined(TCP_KEEPCNT)
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) < 0) return false;
+#endif
+    return true;
+}
+
 socket_ptr socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
@@ -613,6 +630,9 @@ socket_ptr socket_t::accept() {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
     }
+    // Hydra #36: keepalive prevents idle-connection drops during long model
+    // loading (2+ minutes of model init, then sparse RPC traffic).
+    set_keepalive(client_socket_fd, 30, 10, 3);
     apply_tcp_buffer_size_override(client_socket_fd);
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
@@ -665,6 +685,9 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         return nullptr;
     }
+    // Hydra #36: keepalive prevents idle-connection drops during long model
+    // loading (2+ minutes of model init, then sparse RPC traffic).
+    set_keepalive(sockfd, /*idle=*/30, /*interval=*/10, /*count=*/3);
     apply_tcp_buffer_size_override(sockfd);
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 }

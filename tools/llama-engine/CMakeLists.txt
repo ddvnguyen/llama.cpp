@@ -5,6 +5,9 @@ add_library(${TARGET} STATIC
     llama-engine.h
     ../server/server-http.cpp
     ../server/server-http.h
+    hydra_rpc/bounded_thread_pool.h
+    hydra_rpc/hydra_rpc.h
+    hydra_rpc/hydra_rpc.cpp
 )
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ../server)

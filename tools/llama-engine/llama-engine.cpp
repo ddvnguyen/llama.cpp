@@ -1,4 +1,5 @@
 #include "llama-engine.h"
+#include "hydra_rpc/hydra_rpc.h"
 #include "server-common.h"
 #include "server-context.h"
 #include "server-task.h"
@@ -608,35 +609,27 @@ int llama_engine(int argc, char ** argv) {
 
         // The unified RPC server is started as a standalone (no server_context),
         // so only ggml-RPC protocol is accepted — Hydra connections are rejected.
-        // We start an inline TCP server accepting connections and forwarding them
-        // to ggml_backend_rpc_handle_client.
-        std::thread([rpc_port, backends]() {
-            // We can't use server_context::start_rpc_server because there's no
-            // server_context. Inline the accept loop here for the no-model case.
-            const int srv_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-            if (srv_fd < 0) {
-                SRV_ERR("eng  %12.*s: socket() failed: %s\n", 12, __func__);
-                return;
+        // Use the new fork-isolated `hydra_rpc` module (the same module the
+        // model-loaded path uses via `server_context::start_rpc_server`).
+        {
+            hydra_rpc::settings s;
+            s.port     = rpc_port;
+            s.backends = backends;
+            // No Hydra protocol here — `hydra_ctx == nullptr` means the
+            // dispatch falls through to `ggml_backend_rpc_handle_client` only.
+            s.hydra_ctx = nullptr;
+            s.pool_size = 2;
+            s.max_queue = 64;
+            s.host      = "0.0.0.0";
+            if (!hydra_rpc::start(s)) {
+                LOG_ERR("eng  %12.*s: hydra_rpc::start failed on port %d\n",
+                        12, __func__, rpc_port);
+                llama_backend_free();
+                return 1;
             }
-            const int opt = 1;
-            ::setsockopt(srv_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-            struct sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_addr.s_addr = INADDR_ANY;
-            addr.sin_port = htons((uint16_t)rpc_port);
-            if (::bind(srv_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-                SRV_ERR("eng  %12.*s: bind() on port %d failed\n", 12, __func__, rpc_port);
-                ::close(srv_fd);
-                return;
-            }
-            ::listen(srv_fd, 16);
             LOG_INF("eng  %12.*s: no-model RPC server on 0.0.0.0:%d (%zu GPU backend(s))\n",
                     12, __func__, rpc_port, backends.size());
-
-            // Use the shared accept loop from server-rpc.h. No Hydra queue
-            // context — only ggml-RPC protocol is accepted.
-            start_rpc_accept_loop(srv_fd, backends, nullptr);
-        }).detach();
+        }
 
         // ── Minimal HTTP server (health + version only) ──
         server_http_context ctx_http;

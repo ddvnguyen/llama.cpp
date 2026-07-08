@@ -43,20 +43,16 @@ static constexpr uint8_t  HYDRA_STATUS_BAD_REQUEST      = 0x05;
 // ── Safety cap (4 GB) ─────────────────────────────────────────────────────────
 static constexpr uint64_t HYDRA_MAX_STATE_BYTES  = 4ULL * 1024 * 1024 * 1024;
 
-// ── Unified RPC server ───────────────────────────────────────────────────────
-// Start a protocol-detecting RPC accept loop on a pre-bound socket.
-// Accepts connections, peeks the first byte, and dispatches:
+// ── Unified RPC server (Phase 1, #36) ────────────────────────────────────────
+// The protocol-detecting accept loop lives in
+// `tools/llama-engine/hydra_rpc/` (fork-isolated). Both `server_context`
+// (model-loaded path) and the no-model path in `llama-engine.cpp` call
+// `hydra_rpc::start()` from that module. The dispatch is:
 //   0x0E (RPC_CMD_HELLO) → ggml-backend RPC handler (GPU compute)
-//   otherwise            → Hydra protocol handler (if ctx != nullptr)
-// Declared here so both server-context.cpp and llama-engine.cpp share the
-// same dispatch logic. See server-context.cpp for the implementation.
+//   otherwise            → Hydra protocol handler (if `hydra_ctx != nullptr`)
 //
-// `hydra_ctx` is an opaque pointer to a hydra_rpc_ctx struct (defined in
-// server-context.cpp). If nullptr, Hydra protocol connections are closed;
-// only ggml-RPC is served. The struct fields are accessed only from
-// server-context.cpp, so the opaque pointer avoids exposing queue types here.
-//
-// `backends` are the ggml backend instances to expose via ggml-RPC.
-void start_rpc_accept_loop(int srv_fd,
-                           std::vector<ggml_backend *> backends,
-                           void * hydra_ctx);
+// `server_context::start_rpc_server` builds the settings and calls
+// `hydra_rpc::start()`. The Hydra handler
+// `void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx)` is
+// reached from the new module through the `extern "C"` trampoline
+// `hydra_rpc_bridge` (defined in `server-context.cpp`).
