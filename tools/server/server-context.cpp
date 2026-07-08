@@ -7173,44 +7173,15 @@ static void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx) {
 }
 
 // ── Unified RPC server implementation ───────────────────────────────────────
-// Protocol-detecting accept loop. Called from both:
-//   - server_context::start_rpc_server (model path, with Hydra queues)
-//   - no-model path in llama-engine.cpp (ggml-RPC only, ctx not valid)
+//
+// `#36` Phase 1: the merged server lives in `tools/llama-engine/hydra_rpc/`
+// (fork-isolated). `server_context::start_rpc_server` is a thin adapter that
+// builds the settings and delegates to `hydra_rpc::start()`. The Hydra
+// protocol entry `hydra_handle_connection` is reached through the
+// `hydra_rpc_bridge` trampoline (defined below) — the bridge takes a
+// `void*` so the new module can stay decoupled from this file's includes.
 
-void start_rpc_accept_loop(int srv_fd,
-                            std::vector<ggml_backend *> backends,
-                            void * hydra_ctx_vp) {
-    const bool has_hydra = (hydra_ctx_vp != nullptr);
-    hydra_rpc_ctx * ctx = static_cast<hydra_rpc_ctx *>(hydra_ctx_vp);
-    std::thread([srv_fd, backends, ctx, has_hydra]() {
-        while (true) {
-            const int conn_fd = ::accept(srv_fd, nullptr, nullptr);
-            if (conn_fd < 0) continue;
-
-            std::thread([conn_fd, backends, ctx, has_hydra]() mutable {
-                // Peek first byte — MSG_PEEK does not consume it.
-                uint8_t first_byte;
-                if (::recv(conn_fd, &first_byte, 1, MSG_PEEK) != 1) {
-                    ::close(conn_fd);
-                    return;
-                }
-                // RPC_CMD_HELLO = 14 = 0x0E. Hydra opcodes are 0x30-0x46.
-                if (first_byte == 0x0E) {
-                    ggml_backend_rpc_handle_client(conn_fd, nullptr,
-                        backends.size(), backends.data());
-                } else if (has_hydra && ctx) {
-                    hydra_handle_connection(conn_fd, *ctx);
-                } else {
-                    ::close(conn_fd);
-                }
-            }).detach();
-        }
-    }).detach();
-}
-
-// ── Bind + accept ────────────────────────────────────────────────────────────
-// Server-context path: creates a socket, binds, listens, then delegates to the
-// shared start_rpc_accept_loop with Hydra queue pointers.
+#include "../llama-engine/hydra_rpc/hydra_rpc.h"
 
 void server_context::start_rpc_server(int port,
                                        std::vector<ggml_backend *> backends) {
@@ -7222,36 +7193,31 @@ void server_context::start_rpc_server(int port,
         ctx.queue_results = &impl->queue_results;
     }
 
-    std::thread([port, backends = std::move(backends), ctx]() mutable {
-        const int srv_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (srv_fd < 0) {
-            SRV_ERR("hydra rpc: socket() failed: %s\n", strerror(errno));
-            return;
-        }
-        const int opt = 1;
-        ::setsockopt(srv_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    hydra_rpc::settings s;
+    s.port       = port;
+    s.backends   = std::move(backends);
+    s.hydra_ctx  = (ctx.queue_tasks && ctx.queue_results) ? &ctx : nullptr;
+    s.pool_size  = 2;
+    s.max_queue  = 64;
+    s.host       = "0.0.0.0";
 
-        struct sockaddr_in addr{};
-        addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port        = htons((uint16_t)port);
+    if (!hydra_rpc::start(s)) {
+        SRV_ERR("hydra rpc: start() failed on port %d\n", port);
+        return;
+    }
 
-        if (::bind(srv_fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
-            SRV_ERR("hydra rpc: bind() on port %d failed: %s\n", port, strerror(errno));
-            ::close(srv_fd);
-            return;
-        }
-        ::listen(srv_fd, 16);
+    if (s.hydra_ctx) {
+        SRV_INF("hydra rpc: unified server on 0.0.0.0:%d (ggml-RPC + Hydra protocol)\n", port);
+    } else {
+        SRV_INF("hydra rpc: unified server on 0.0.0.0:%d (ggml-RPC only)\n", port);
+    }
+}
 
-        if (ctx.queue_tasks && ctx.queue_results) {
-            SRV_INF("hydra rpc: unified server on 0.0.0.0:%d (ggml-RPC + Hydra protocol)\n", port);
-        } else {
-            SRV_INF("hydra rpc: unified server on 0.0.0.0:%d (ggml-RPC only)\n", port);
-        }
-
-        start_rpc_accept_loop(srv_fd, backends,
-            (ctx.queue_tasks && ctx.queue_results) ? &ctx : nullptr);
-    }).detach();
+// `hydra_rpc_bridge` — extern "C" trampoline. `hydra_rpc.cpp` calls this
+// when the first byte on a new connection is not `RPC_CMD_HELLO`. It
+// re-enters the C++ entry point with the typed `hydra_rpc_ctx &`.
+extern "C" void hydra_rpc_bridge(int fd, const void * ctx) {
+    hydra_handle_connection(fd, *static_cast<const hydra_rpc_ctx *>(ctx));
 }
 
 #else
@@ -7262,6 +7228,4 @@ void server_context::start_rpc_server(int port, std::vector<ggml_backend *>) {
     }
     GGML_UNUSED(port);
 }
-
-void start_rpc_accept_loop(int, std::vector<ggml_backend *>, void *) {}
 #endif // !_WIN32
