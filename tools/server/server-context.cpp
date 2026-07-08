@@ -7216,6 +7216,11 @@ void server_context::start_rpc_server(int port,
 // `hydra_rpc_bridge` — extern "C" trampoline. `hydra_rpc.cpp` calls this
 // when the first byte on a new connection is not `RPC_CMD_HELLO`. It
 // re-enters the C++ entry point with the typed `hydra_rpc_ctx &`.
+//
+// Forward-declared with the matching signature so the new
+// `tools/llama-engine/hydra_rpc/hydra_rpc.cpp` module can take its
+// address without including this heavy header.
+extern "C" void hydra_rpc_bridge(int fd, const void * ctx);
 extern "C" void hydra_rpc_bridge(int fd, const void * ctx) {
     hydra_handle_connection(fd, *static_cast<const hydra_rpc_ctx *>(ctx));
 }

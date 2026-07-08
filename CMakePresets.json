@@ -67,6 +67,24 @@
     { "name": "x64-linux-gcc-reldbg", "inherits": [ "base", "x64-linux-gcc", "reldbg" ] },
     { "name": "x64-linux-gcc+static-release", "inherits": [ "base", "x64-linux-gcc", "release", "static" ] },
 
+    {
+        "name": "hydra-dev",
+        "inherits": [ "base", "release" ],
+        "cacheVariables": {
+            "CMAKE_CUDA_ARCHITECTURES": "86;120",
+            "GGML_CUDA": "ON",
+            "GGML_CUDA_FORCE_CUBLAS": "ON",
+            "GGML_CUDA_FA": "ON",
+            "GGML_RPC": "ON",
+            "GGML_NVML": "ON",
+            "GGML_NATIVE": "ON",
+            "BUILD_SHARED_LIBS": "ON",
+            "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+            "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+            "CMAKE_CUDA_COMPILER_LAUNCHER": "ccache"
+        }
+    },
+
     { "name": "arm64-windows-llvm-debug", "inherits": [ "base", "arm64-windows-llvm", "debug" ] },
     { "name": "arm64-windows-llvm-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg" ] },
     { "name": "arm64-windows-llvm+static-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg", "static" ] },
