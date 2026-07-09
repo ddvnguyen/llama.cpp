@@ -39,6 +39,15 @@ struct settings {
     std::size_t pool_size   = 2; // worker thread count (design default 2).
     std::size_t max_queue   = 64; // max pending connections before `try_enqueue` starts dropping.
     const char * host       = "0.0.0.0"; // bind address; default is INADDR_ANY.
+    bool peer_mode  = false;   // true when no model is loaded (no-model compute-only server).
+                               // Skips the bounded thread pool and uses `std::thread::detach()`
+                               // per connection — matches upstream llama.cpp's `rpc-server.cpp`
+                               // behavior. The bounded thread pool adds ~100us of dispatch overhead
+                               // per RPC request, which throttles the head's compute graph
+                               // (the head sends thousands of ops per prefill, each blocked on
+                               // accept+MSG_PEEK+enqueue+worker-pickup). For trusted internal
+                               // peers in layer-split COMBINE, the simpler per-conn thread
+                               // model gets full GPU throughput.
 };
 
 // Start the RPC server. Returns false on bind/listen failure (port in use,

@@ -617,10 +617,24 @@ int llama_engine(int argc, char ** argv) {
             s.backends = backends;
             // No Hydra protocol here — `hydra_ctx == nullptr` means the
             // dispatch falls through to `ggml_backend_rpc_handle_client` only.
+            // Peer in compute-only mode receives many concurrent ggml-RPC requests
+            // from the head's compute graph (one per layer op for the layers hosted
+            // on the peer). pool_size=2 throttles this — the head serializes most
+            // ops and prefill drops to ~1/3 of the upstream rpc-server baseline.
+            // 8 workers (matching a typical GPU's stream concurrency) is enough to
+            // keep the head's compute graph fed without backpressure.
             s.hydra_ctx = nullptr;
-            s.pool_size = 2;
-            s.max_queue = 64;
+            s.pool_size = 8;
+            s.max_queue = 256;
             s.host      = "0.0.0.0";
+            // Skip the bounded thread pool entirely — the peer is a trusted
+            // internal client (the head) and per-conn `std::thread::detach()` is
+            // the simpler path. The bounded pool's accept+MSG_PEEK+enqueue+worker
+            // pipeline adds ~100us of dispatch overhead per request, which throttles
+            // the head's compute graph (the head sends thousands of ops per prefill,
+            // each blocked on the pool). Without the pool, dispatch overhead
+            // disappears and the peer matches upstream rpc-server throughput.
+            s.peer_mode = true;
             if (!hydra_rpc::start(s)) {
                 LOG_ERR("eng  %12.*s: hydra_rpc::start failed on port %d\n",
                         12, __func__, rpc_port);

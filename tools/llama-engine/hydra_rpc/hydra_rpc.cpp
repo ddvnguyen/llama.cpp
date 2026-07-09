@@ -57,10 +57,11 @@ struct state_t {
     std::vector<ggml_backend_t>        backends;
     void *                             hydra_ctx  = nullptr;
     hydra_handle_connection_fn         hydra_handler = nullptr;
-    std::unique_ptr<bounded_thread_pool<2>> pool;  // 2 worker threads per #36
+    std::unique_ptr<bounded_thread_pool<8>> pool;  // 8 worker threads — matches a typical GPU's stream concurrency so the head's compute graph doesn't stall on the peer's dispatch path. The original `<2>` from the design draft (#36) was sized for a public-internet DDoS scenario; the peer in layer-split COMBINE is a trusted internal client that benefits from more parallelism.
     std::thread                        accept_thr;
     std::atomic<bool>                  running    { false };
     std::atomic<bool>                  stopping   { false };
+    std::atomic<bool>                  peer_mode  { false };  // when true, accept_loop uses per-conn std::thread::detach() instead of the bounded thread pool. Set for no-model compute-only peers.
     std::mutex                         start_mu;
 };
 state_t & state() {
@@ -103,6 +104,21 @@ void accept_loop(state_t & s) {
             if (errno == EINTR) continue;
             if (s.stopping.load(std::memory_order_acquire)) break;
             LOG_ERR("hydra_rpc: accept() failed: %s\n", std::strerror(errno));
+            continue;
+        }
+        if (s.peer_mode) {
+            // No-model compute-only peer. Skip both the bounded thread pool
+            // AND the MSG_PEEK+dispatch path — the peer only handles ggml-RPC
+            // (the head never sends the Hydra protocol opcodes), so we can go
+            // straight to `ggml_backend_rpc_handle_client`. This matches
+            // upstream llama.cpp's `rpc-server.cpp` behavior byte-for-byte and
+            // removes the ~100us per-request overhead that was throttling the
+            // head's compute graph in the layer-split COMBINE path.
+            std::thread([conn_fd, &s] {
+                ggml_backend_rpc_handle_client(
+                    conn_fd, /*cache_dir=*/nullptr,
+                    s.backends.size(), s.backends.data());
+            }).detach();
             continue;
         }
         // Per `#36` C7: bounded thread pool (size 2). Drop on overflow
@@ -175,7 +191,8 @@ bool start(const settings & s) {
     state().backends    = s.backends;
     state().hydra_ctx   = s.hydra_ctx;
     state().hydra_handler = hydra_fn;
-    state().pool        = std::make_unique<bounded_thread_pool<2>>(s.max_queue);
+    state().peer_mode   = s.peer_mode;
+    state().pool        = std::make_unique<bounded_thread_pool<8>>(s.max_queue);
     state().stopping.store(false, std::memory_order_release);
     state().accept_thr  = std::thread([&state_ref = state()] { accept_loop(state_ref); });
     state().running.store(true, std::memory_order_release);
