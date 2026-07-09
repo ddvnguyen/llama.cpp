@@ -842,6 +842,14 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        // Hydra #406: resolve n_parallel = -1 (auto) to 1 before the
+        // conversion to uint32_t n_seq_max in common_context_params_to_llama.
+        // When n_parallel is -1, the int→uint wrap produces UINT32_MAX,
+        // which fails the LLAMA_MAX_SEQ=256 check in llama_context.cpp:54.
+        // The server's "auto" mode should default to 1 slot.
+        if (params_base.n_parallel <= 0) {
+            params_base.n_parallel = 1;
+        }
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         std::string & mmproj_path = params_base.mmproj.path;
@@ -4367,7 +4375,10 @@ private:
                         // The C API requires a stable C string; the
                         // pattern lives as long as ovr (the staged
                         // static, see llama-hydra.cpp:452). The model
-                        // load parses it once.
+                        // load parses it synchronously within
+                        // load_model(), which is called before we clear
+                        // the staged T3 statics — so the pointer is
+                        // valid for the entire load_model() call.
                         llama_model_tensor_buft_override entry;
                         entry.pattern = pattern.c_str();
                         entry.buft = it->second;
@@ -4401,13 +4412,20 @@ private:
         // Full model reload. load_model() handles the unload of the
         // current model, the load of the new model, the new context
         // creation, the MTP/draft paths, and the slot rebuild.
+        // NOTE: load_model() does `params_base = params` internally
+        // (line 844), so after a successful load params_base reflects
+        // swapped_params — no explicit reassignment needed by us.
         if (!load_model(swapped_params)) {
-            SRV_ERR("hydra: T3 reload to '%s' failed; rolling back to old model\n",
+            SRV_ERR("hydra: T3 reload to '%s' failed (load_model returned false); "
+                    "rolling back to old model\n",
                     swapped_params.model.path.c_str());
             if (!load_model(old_params)) {
+                SRV_ERR("%s", "hydra: T3 rollback also failed — engine in unrecoverable state\n");
                 GGML_ABORT("hydra: T3 rollback failed (cannot reload old model). "
                            "Engine exiting to prevent serving with corrupted state.");
             }
+            SRV_INF("hydra: T3 rollback succeeded — restored old model '%s'\n",
+                    old_params.model.path.c_str());
             return false;
         }
 
