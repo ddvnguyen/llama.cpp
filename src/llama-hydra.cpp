@@ -449,6 +449,17 @@ namespace {
 // Pending T3 state. Read by the apply step in server-context when all slots
 // are idle. Cleared by the apply step. If a follow-up CONFIGURE arrives
 // before the apply step runs, it OVERWRITES these (last-write-wins).
+//
+// THREADING INVARIANT (hard constraint): these statics are written by the
+// CONFIGURE handler (in the bounded thread pool) and read/cleared by
+// apply_pending_hydra_config() in update_slots(). Both run on the same
+// thread (the pool dispatches to hydra_handle_connection which runs the
+// CONFIGURE handler, and update_slots is called from process_single_task
+// which runs on the pool thread). This is safe because update_slots runs
+// in the same process_single_task call that received the CONFIGURE task.
+// If a future refactor moves CONFIGURE handling to a different thread,
+// these MUST be moved to the llama_context struct (which already owns
+// hydra_pending_config_json) or protected by a mutex.
 std::string                  s_hydra_pending_override_tensor;
 std::string                  s_hydra_pending_split_mode;            // "" = unchanged
 std::vector<float>            s_hydra_pending_tensor_split;
