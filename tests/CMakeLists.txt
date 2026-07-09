@@ -152,6 +152,13 @@ endif ()
 # so this runs on every platform (incl. Windows + shared libs).
 llama_build_and_test(test-hydra-state-chunk-size.cpp)
 
+# hydra#406: pin the tiered CONFIGURE (T1/T2/T3) response JSON shape. Pure
+# header-only test — no model/context needed. The Coordinator's
+# WorkerSchedulerService reads these fields to confirm exactly what took
+# effect; drift here is a wire-incompatible API change.
+llama_build_and_test(test-hydra-configure-tier.cpp)
+target_link_libraries(test-hydra-configure-tier PRIVATE mtmd server-context)
+
 # hydra#316/#8: pins the checkpoint-creation gate (server_should_create_checkpoint),
 # pure header function — guards the recurrent/hybrid term that hybrid KV restore needs.
 llama_build_and_test(test-hydra-checkpoint-policy.cpp)

@@ -820,6 +820,38 @@ void llama_context::hydra_set_state_chunk_size(size_t bytes) {
     cparams.hydra_state_chunk_size = llama_hydra_clamp_state_chunk_size(bytes);
 }
 
+// Hydra #406: tiered CONFIGURE pending state. Stored as a raw JSON string +
+// tier + set_at timestamp. The owning thread (the task thread, single
+// producer) writes; update_slots() (same thread) reads + clears on apply.
+// No locking needed.
+void llama_context::hydra_set_pending_config(const std::string & cfg_json, const std::string & tier) {
+    hydra_pending_config_json    = cfg_json;
+    hydra_pending_config_tier    = tier;
+    hydra_pending_config_set_at  = std::time(nullptr);
+}
+
+bool llama_context::hydra_has_pending_config() const {
+    return !hydra_pending_config_json.empty();
+}
+
+std::string llama_context::hydra_get_pending_config() const {
+    return hydra_pending_config_json;
+}
+
+std::string llama_context::hydra_get_pending_config_tier() const {
+    return hydra_pending_config_tier;
+}
+
+time_t llama_context::hydra_get_pending_config_set_at() const {
+    return hydra_pending_config_set_at;
+}
+
+void llama_context::hydra_clear_pending_config() {
+    hydra_pending_config_json.clear();
+    hydra_pending_config_tier.clear();
+    hydra_pending_config_set_at = 0;
+}
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }

@@ -729,6 +729,23 @@ struct server_task_result_hydra_engine : server_task_result {
     // of trusting an unconditional success response.
     uint64_t state_chunk_size_applied = 0;
 
+    // CONFIGURE tiered (PR #406): which tier (T1/T2/T3) was the highest in
+    // the request. T1 = applied immediately; T2/T3 = deferred to next
+    // slot-free moment. Empty string for non-CONFIGURE results.
+    std::string tier;
+
+    // CONFIGURE tiered: the keys that were applied immediately, with their
+    // post-clamp / post-conversion value (nested keys use dotted notation,
+    // e.g. "sampling.temp" → 0.5). The Coordinator uses this to confirm
+    // exactly what took effect without a second INFO call.
+    std::map<std::string, json> params_applied;
+
+    // CONFIGURE tiered: keys that were deferred (T2 or T3). The pending
+    // change will be applied by the engine on the next slot-free moment;
+    // the request that issued the CONFIGURE is served with the OLD config
+    // (per Q2 — "old config wins").
+    std::vector<std::string> deferred_keys;
+
     std::string error; // human-readable, non-empty on failure
 
     virtual json to_json() override;

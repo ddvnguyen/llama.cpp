@@ -12,6 +12,8 @@
 
 #include <map>
 #include <vector>
+#include <string>
+#include <ctime>
 
 struct llama_model;
 class llama_batch_allocr;
@@ -125,6 +127,20 @@ struct llama_context {
     // Hydra #334 setter (accessed by llama-hydra.h API) — clamps to a sane
     // range since this is reachable from the network via CONFIGURE (0x40).
     void hydra_set_state_chunk_size(size_t bytes);
+
+    // Hydra #406: tiered CONFIGURE — store / inspect / clear a pending
+    // T2/T3 config that will be applied at the next slot-free moment.
+    // The pending payload is a raw JSON string (nlohmann::json::dump() of
+    // the T2/T3 keys only, with dotted-key flattening) so the core library
+    // does not need to depend on nlohmann::json. The handler in
+    // server-context.cpp re-parses it on apply.
+    //   tier is "" when no config is pending.
+    void        hydra_set_pending_config(const std::string & cfg_json, const std::string & tier);
+    bool        hydra_has_pending_config() const;
+    std::string hydra_get_pending_config() const;
+    std::string hydra_get_pending_config_tier() const;
+    time_t      hydra_get_pending_config_set_at() const;
+    void        hydra_clear_pending_config();
 
     // Hydra #353 / llama.cpp#12 (accessed by llama-hydra.cpp COMBINED setup):
     // add the COMBINED peer device as a scheduler backend AFTER model load, so
@@ -405,4 +421,12 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // Hydra #406: tiered CONFIGURE pending state. Written by the CONFIGURE
+    // task handler, read+cleared by update_slots() when all slots are idle.
+    // Stored as a raw JSON string to avoid pulling nlohmann::json into the
+    // core library; the server-context handler re-parses on apply.
+    std::string hydra_pending_config_json;
+    std::string hydra_pending_config_tier;
+    time_t      hydra_pending_config_set_at = 0;
 };

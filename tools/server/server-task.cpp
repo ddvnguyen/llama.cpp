@@ -2050,6 +2050,17 @@ json server_task_result_hydra_engine::to_json() {
     if (op == 0x40 && state_chunk_size_applied > 0) { // CONFIGURE, hydra#334
         j["state_chunk_size_applied"] = state_chunk_size_applied;
     }
+    if (op == 0x40 && !tier.empty()) { // CONFIGURE tiered (PR #406)
+        j["tier"]           = tier;
+        // Always emit params_applied + deferred_keys, even when empty —
+        // the Coordinator relies on the field names being present so it
+        // can do field-by-field diff without first checking for existence.
+        j["params_applied"] = json::object();
+        for (const auto & kv : params_applied) {
+            j["params_applied"][kv.first] = kv.second;
+        }
+        j["deferred_keys"]  = deferred_keys;
+    }
     if (op == 0x44 && !expert_mode_applied.empty()) { // SET_EXPERT_MODE
         j["mode"] = expert_mode_applied;
     }

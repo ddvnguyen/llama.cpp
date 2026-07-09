@@ -29,6 +29,56 @@ LLAMA_API size_t llama_hydra_get_state_chunk_size(const struct llama_context * c
 // be unit-tested without spinning up a llama_context (see tests/test-hydra-state-chunk-size.cpp).
 LLAMA_API size_t llama_hydra_clamp_state_chunk_size(size_t bytes);
 
+// Hydra #406: tiered CONFIGURE (T1/T2/T3) — the high-level "apply the
+// pending T2/T3 config" entry point. Called from server-context's
+// update_slots() when all slots are idle. Idempotent — if no pending config
+// is set, this is a no-op. Returns 0 on success (applied or nothing to do),
+// -1 on failure (logged; the pending config is cleared regardless to avoid
+// wedging the engine on a permanent bad-state).
+LLAMA_API int llama_hydra_apply_pending_config(struct llama_context * ctx);
+
+// Hydra #406: report the tier of the pending config, or "" if none. Used
+// by the INFO response to advertise "drain in progress" (so the Coordinator
+// can avoid stacking another CONFIGURE while one is in flight).
+LLAMA_API const char * llama_hydra_get_pending_config_tier(const struct llama_context * ctx);
+
+// Hydra #406: T3 mutator — set the override-tensor pattern (the
+// "<name_regex>=<backend>" string used by llama_model's override tensor
+// mechanism, e.g. "blk.*.ffn_*_exps.weight=CPU"). T3 only — caller is
+// expected to defer to the slot-free moment before invoking. Invalidates
+// the model graph cache so the next compute rebuilds with the new pattern.
+// Returns 0 on success, -1 on failure.
+LLAMA_API int llama_hydra_set_override_tensor(struct llama_context * ctx, const char * pattern);
+
+// Hydra #406: T3 mutator — set the split mode ("none"/"layer"/"row") and
+// the per-device tensor split ratio (e.g. [25.0, 40.0] for 25/65+40). The
+// mode + ratio is stored on the context; applied on the next model reload.
+// Returns 0 on success, -1 on failure (unknown mode, out-of-range ratio).
+LLAMA_API int llama_hydra_set_split_mode(struct llama_context * ctx, const char * mode, const float * tensor_split, size_t n_split);
+
+// Hydra #406: getters for the staged T3 mutator state. The apply step in
+// server-context reads these to build a fresh llama_model_params. Returned
+// pointers are owned by llama-hydra.cpp and remain valid until the next
+// mutator call OR hydra_h_clear_pending_t3.
+LLAMA_API const char * llama_hydra_get_pending_override_tensor();
+LLAMA_API const char * llama_hydra_get_pending_split_mode();
+LLAMA_API size_t       llama_hydra_get_pending_tensor_split_count();
+LLAMA_API const float * llama_hydra_get_pending_tensor_split();
+LLAMA_API int32_t      llama_hydra_get_pending_n_gpu_layers();
+LLAMA_API int32_t      llama_hydra_get_pending_n_cpu_moe();
+LLAMA_API const char * llama_hydra_get_pending_model_path();
+
+// Hydra #406: additional T3 mutators (the JSON payload carries these keys
+// directly; the handler calls these to record them in the same statics as
+// set_override_tensor / set_split_mode).
+LLAMA_API void llama_hydra_set_pending_n_gpu_layers(int32_t v);
+LLAMA_API void llama_hydra_set_pending_n_cpu_moe(int32_t v);
+LLAMA_API void llama_hydra_set_pending_model_path(const char * p);
+
+// Hydra #406: clear all staged T3 state. Called by the apply step after
+// the model+context rebuild succeeds, OR by the drain-timeout path.
+LLAMA_API void llama_hydra_clear_pending_t3();
+
 // Hydra: try to connect to an RPC engine peer. Returns true if reachable.
 // Used at startup for graceful degradation — if the peer is down, the engine
 // falls back to SOLO mode (all tensors on local GPU).
