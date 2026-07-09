@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -96,6 +97,18 @@ void dispatch_one(int conn_fd, state_t & s) {
     ::close(conn_fd);
 }
 
+// `::accept()` here bypasses `socket_t::accept()` (ggml-rpc/transport.cpp),
+// which is the only place upstream sets these — so the merged accept loop
+// must set them itself. Without TCP_NODELAY, Nagle's algorithm batches the
+// small request/response ggml-rpc messages that dominate prefill/decode,
+// which is what was actually throttling the peer path (not dispatch
+// overhead — see the `peer_mode` fast path below, which alone didn't fix it).
+void set_conn_socket_options(int fd) {
+    int flag = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+}
+
 void accept_loop(state_t & s) {
     LOG_INF("hydra_rpc: accept loop started on 0.0.0.0:%d\n", s.port);
     while (!s.stopping.load(std::memory_order_acquire)) {
@@ -106,6 +119,7 @@ void accept_loop(state_t & s) {
             LOG_ERR("hydra_rpc: accept() failed: %s\n", std::strerror(errno));
             continue;
         }
+        set_conn_socket_options(conn_fd);
         if (s.peer_mode) {
             // No-model compute-only peer. Skip both the bounded thread pool
             // AND the MSG_PEEK+dispatch path — the peer only handles ggml-RPC
