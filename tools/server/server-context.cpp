@@ -6693,6 +6693,33 @@ void server_routes::init_routes() {
             body,
             meta->chat_params,
             files);
+
+        {
+            auto split_mode_str = [](enum llama_split_mode m) -> const char * {
+                switch (m) {
+                    case LLAMA_SPLIT_MODE_NONE:  return "none";
+                    case LLAMA_SPLIT_MODE_LAYER: return "layer";
+                    case LLAMA_SPLIT_MODE_ROW:   return "row";
+                    default: return "none";
+                }
+            };
+            json metrics = json::object();
+            metrics["model_path"]   = meta->model_path;
+            metrics["split_mode"]   = split_mode_str(meta->split_mode);
+            metrics["t3_reloaded"]  = false;
+            metrics["t3_reload_ms"] = 0.0;
+            json ts_arr = json::array();
+            for (const auto & v : meta->tensor_split) {
+                if (v != 0.0f) {
+                    ts_arr.push_back(v);
+                } else {
+                    break;
+                }
+            }
+            metrics["tensor_split"] = ts_arr;
+            this->hydra_metrics_result = metrics;
+        }
+
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,

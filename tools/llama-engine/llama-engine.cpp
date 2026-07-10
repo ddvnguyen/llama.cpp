@@ -309,8 +309,9 @@ int llama_engine(int argc, char ** argv) {
     // If --rpc-engine was given (testing shortcut), pre-connect the peer now.
     // Register the peer as a GGML backend device so it's visible for model
     // loading (layer-split needs the peer device in the device list).
+    ggml_backend_reg_t peer_reg = nullptr;
     if (has_peer) {
-        ggml_backend_reg_t peer_reg = ggml_backend_rpc_add_server(flags.rpc_engine_peer.c_str());
+        peer_reg = ggml_backend_rpc_add_server(flags.rpc_engine_peer.c_str());
         if (peer_reg == nullptr) {
             LOG_WRN("eng  %12.*s: rpc-engine peer %s unreachable — running in solo mode\n",
                     12, __func__, flags.rpc_engine_peer.c_str());
@@ -335,7 +336,14 @@ int llama_engine(int argc, char ** argv) {
         }
 
         ctx_server.set_hydra_capabilities(true, flags.rpc_engine_peer,
-                false, "", "solo");
+                !flags.rpc_engine_peer.empty() && peer_reg != nullptr,
+                flags.tensor_split_str,
+                peer_reg != nullptr ? "layer" : "none");
+        if (peer_reg != nullptr) {
+            ctx_server.set_hydra_combined_static(true);
+            LOG_INF("eng  %12.*s: combined_static mode activated (layer-split, peer %s)\n",
+                    12, __func__, flags.rpc_engine_peer.c_str());
+        }
 
         // Register tensors for expert-split COMBINE (used at runtime when
         // a request specifies a peer).
