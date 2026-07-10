@@ -24,6 +24,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -675,6 +676,7 @@ struct server_metrics {
 
 struct server_context_impl {
     friend struct server_context;
+    friend struct server_routes;
 
 public:
     // only use these pointers outside of this class:
@@ -4248,7 +4250,7 @@ private:
     // cycle (which handles mmproj, MTP/draft, slot rebuild, etc.).
     // On failure: rollback by reloading the old params_base.
     bool apply_t3_rebuild() {
-        if (!ctx_tgt) return false;
+        bool is_first_load = !ctx_tgt;
 
         common_params old_params = params_base;
         common_params swapped_params = params_base;
@@ -4351,7 +4353,7 @@ private:
         // would inherit a stale binding to the old peer's device.
         // Same pattern as SET_EXPERT_MODE (server-context.cpp:~3890).
         const bool was_combined = hydra_combined_head_attached || hydra_combined_static;
-        if (was_combined) {
+        if (!is_first_load && was_combined) {
             SRV_INF("hydra: T3 rebuild — tearing down COMBINED before model reload (was head_attached=%d, static=%d)\n",
                     (int) hydra_combined_head_attached, (int) hydra_combined_static);
             llama_hydra_set_expert_mode(ctx_tgt, 0);
@@ -4369,6 +4371,10 @@ private:
         // (line 844), so after a successful load params_base reflects
         // swapped_params — no explicit reassignment needed by us.
         if (!load_model(swapped_params)) {
+            if (is_first_load) {
+                SRV_WRN("%s", "hydra: T3 first load failed — engine stays empty\n");
+                return false;
+            }
             SRV_ERR("hydra: T3 reload to '%s' failed (load_model returned false); "
                     "rolling back to old model\n",
                     swapped_params.model.path.c_str());
@@ -5778,6 +5784,8 @@ server_context_meta server_context::get_meta() const {
         /* model_n_embd_inp       */ llama_model_n_embd(impl->model_tgt),
         /* model_n_params         */ llama_model_n_params(impl->model_tgt),
         /* model_size             */ llama_model_size(impl->model_tgt),
+        /* split_mode             */ impl->params_base.split_mode,
+        /* tensor_split           */ std::vector<float>(impl->params_base.tensor_split, impl->params_base.tensor_split + 128),
     };
 }
 
@@ -5955,12 +5963,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         } else {
             json arr = json::array();
             for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
-                arr.push_back(res->to_json());
+                auto * cmpl = dynamic_cast<server_task_result_cmpl_final*>(res.get());
+                GGML_ASSERT(cmpl != nullptr);
+                if (!hydra_metrics_result.is_null()) {
+                    cmpl->hydra_metrics = hydra_metrics_result;
+                }
+                arr.push_back(cmpl->to_json());
             }
             GGML_ASSERT(!arr.empty() && "empty results");
             if (arr.size() == 1) {
                 // if single request, return single object instead of array
+                if (!hydra_metrics_result.is_null()) {
+                    arr[0]["hydra_metrics"] = hydra_metrics_result;
+                }
                 res->ok(arr[0]);
             } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
                 // if multiple results in OAI format, we need to re-format them
@@ -6611,6 +6626,69 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+
+        bool t3_reloaded = false;
+        double t3_reload_ms = 0.0;
+
+        if (!meta && body.contains("hydra_config") && body["hydra_config"].is_object()) {
+            const json & hc = body["hydra_config"];
+            if (hc.contains("model_path") && hc["model_path"].is_string()) {
+                SRV_INF("hydra: first model load from hydra_config: %s\n",
+                        hc["model_path"].get<std::string>().c_str());
+                llama_hydra_set_pending_model_path(hc["model_path"].get<std::string>().c_str());
+                if (hc.contains("split_mode") && hc["split_mode"].is_string()) {
+                    std::string mode = hc["split_mode"].get<std::string>();
+                    const float * split_ptr = nullptr;
+                    size_t split_count = 0;
+                    std::vector<float> split_vec;
+                    if (hc.contains("tensor_split") && hc["tensor_split"].is_array()) {
+                        for (const auto & v : hc["tensor_split"]) {
+                            if (v.is_number()) {
+                                split_vec.push_back(v.get<float>());
+                            }
+                        }
+                        split_ptr = split_vec.data();
+                        split_count = split_vec.size();
+                    }
+                    llama_hydra_set_split_mode(nullptr, mode.c_str(), split_ptr, split_count);
+                }
+                if (hc.contains("n_gpu_layers") && hc["n_gpu_layers"].is_number_integer()) {
+                    llama_hydra_set_pending_n_gpu_layers(hc["n_gpu_layers"].get<int32_t>());
+                }
+                if (hc.contains("override_tensor") && hc["override_tensor"].is_string()) {
+                    llama_hydra_set_override_tensor(nullptr, hc["override_tensor"].get<std::string>().c_str());
+                }
+                auto & impl_ref = const_cast<server_context_impl &>(ctx_server);
+                if (hc.contains("n_ctx") && hc["n_ctx"].is_number_integer()) {
+                    impl_ref.params_base.n_ctx = hc["n_ctx"].get<int32_t>();
+                }
+                if (hc.contains("ubatch_size") && hc["ubatch_size"].is_number_integer()) {
+                    impl_ref.params_base.n_ubatch = hc["ubatch_size"].get<int32_t>();
+                }
+                auto t_start = std::chrono::steady_clock::now();
+                bool ok = const_cast<server_context_impl &>(ctx_server).apply_t3_rebuild();
+                auto t_end = std::chrono::steady_clock::now();
+                t3_reload_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+                t3_reloaded = ok;
+                if (ok) {
+                    SRV_INF("%s", "hydra: first model load succeeded\n");
+                } else {
+                    SRV_WRN("%s", "hydra: first model load failed\n");
+                }
+                json metrics = json::object();
+                metrics["model_path"]   = meta ? meta->model_path : hc["model_path"].get<std::string>();
+                metrics["t3_reloaded"]  = t3_reloaded;
+                metrics["t3_reload_ms"] = t3_reload_ms;
+                this->hydra_metrics_result = metrics;
+                json result = json::object();
+                result["t3_reloaded"]  = t3_reloaded;
+                result["t3_reload_ms"] = t3_reload_ms;
+                result["model_path"]   = meta ? meta->model_path : "";
+                res->ok(result);
+                return res;
+            }
+        }
+
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,

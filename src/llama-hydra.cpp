@@ -469,24 +469,26 @@ std::string                  s_hydra_pending_model_path;            // "" = unch
 } // namespace
 
 int llama_hydra_set_override_tensor(struct llama_context * ctx, const char * pattern) {
-    if (!ctx || !pattern) {
-        LLAMA_LOG_WARN("hydra: set_override_tensor called with null ctx/pattern\n");
+    if (!pattern) {
+        LLAMA_LOG_WARN("hydra: set_override_tensor called with null pattern\n");
         return -1;
     }
     s_hydra_pending_override_tensor = pattern;
     // Invalidate graph cache: the next compute will see the new override
     // and re-place tensors. (See llama-context.cpp: graph reuse key includes
     // tensor placement; a change to override invalidates the cached graph.)
-    if (auto sched = ctx->get_sched()) {
-        ggml_backend_sched_reset(sched);
+    if (ctx) {
+        if (auto sched = ctx->get_sched()) {
+            ggml_backend_sched_reset(sched);
+        }
     }
     LLAMA_LOG_INFO("hydra: CONFIGURE override_tensor staged: '%s' (will apply on next model reload)\n", pattern);
     return 0;
 }
 
 int llama_hydra_set_split_mode(struct llama_context * ctx, const char * mode, const float * tensor_split, size_t n_split) {
-    if (!ctx || !mode) {
-        LLAMA_LOG_WARN("hydra: set_split_mode called with null ctx/mode\n");
+    if (!mode) {
+        LLAMA_LOG_WARN("hydra: set_split_mode called with null mode\n");
         return -1;
     }
     // Only accept known modes — we don't want to silently mutate llama.cpp

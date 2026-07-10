@@ -303,19 +303,24 @@ int llama_server(int argc, char ** argv) {
             });
         }
 
-        if (!ctx_server.load_model(params)) {
-            clean_up();
-            if (ctx_http.thread.joinable()) {
-                ctx_http.thread.join();
+        if (params.model.path.empty()) {
+            SRV_INF("%s", "no model specified — starting empty, waiting for hydra_config\n");
+            ctx_http.is_ready.store(true);
+        } else {
+            if (!ctx_server.load_model(params)) {
+                clean_up();
+                if (ctx_http.thread.joinable()) {
+                    ctx_http.thread.join();
+                }
+                SRV_ERR("%s", "exiting due to model loading error\n");
+                return 1;
             }
-            SRV_ERR("%s", "exiting due to model loading error\n");
-            return 1;
+
+            routes.update_meta(ctx_server);
+            ctx_http.is_ready.store(true);
+
+            SRV_INF("%s", "model loaded\n");
         }
-
-        routes.update_meta(ctx_server);
-        ctx_http.is_ready.store(true);
-
-        SRV_INF("%s", "model loaded\n");
 
         // Hydra RPC: start binary state-transfer listener if --rpc-port is set
         if (params.rpc_port > 0) {
