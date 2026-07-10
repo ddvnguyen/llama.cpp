@@ -7237,11 +7237,24 @@ struct hydra_rpc_ctx {
 
 // ── Low-level I/O helpers ─────────────────────────────────────────────────────
 
+// Hydra #43: failures here were previously silent — every caller treats a
+// `false` return as "give up" but none logged *why*, so a wedged RPC
+// response looked identical to a client that vanished. Log once, centrally,
+// instead of touching the ~30 call sites.
 static bool hydra_recv_all(int fd, void * buf, size_t n) {
     char * p = reinterpret_cast<char *>(buf);
+    const size_t total = n;
     while (n > 0) {
         ssize_t r = ::recv(fd, p, n, 0);
-        if (r <= 0) return false;
+        if (r < 0) {
+            SRV_WRN("hydra rpc: recv failed on fd=%d (%zu/%zu bytes): %s\n",
+                    fd, total - n, total, std::strerror(errno));
+            return false;
+        }
+        if (r == 0) {
+            SRV_DBG("hydra rpc: recv EOF on fd=%d (%zu/%zu bytes)\n", fd, total - n, total);
+            return false;
+        }
         p += r; n -= r;
     }
     return true;
@@ -7249,9 +7262,14 @@ static bool hydra_recv_all(int fd, void * buf, size_t n) {
 
 static bool hydra_send_all(int fd, const void * buf, size_t n) {
     const char * p = reinterpret_cast<const char *>(buf);
+    const size_t total = n;
     while (n > 0) {
         ssize_t w = ::send(fd, p, n, MSG_NOSIGNAL);
-        if (w <= 0) return false;
+        if (w <= 0) {
+            SRV_WRN("hydra rpc: send failed on fd=%d (%zu/%zu bytes) w=%zd: %s\n",
+                    fd, total - n, total, w, std::strerror(errno));
+            return false;
+        }
         p += w; n -= w;
     }
     return true;
@@ -7952,7 +7970,17 @@ void server_context::start_rpc_server(int port,
                                        std::vector<ggml_backend *> backends) {
     if (port <= 0) return;
 
-    hydra_rpc_ctx ctx{};
+    // Hydra #43: MUST outlive this function. `hydra_rpc::start()` below
+    // stores `&ctx` as a raw pointer inside `hydra_rpc::state()`, a
+    // process-lifetime singleton that every subsequent RPC connection reads
+    // (from a bounded-thread-pool worker thread) to recover queue_tasks /
+    // queue_results. An automatic-storage `ctx` here would dangle the
+    // instant this function returns — a stack-use-after-return that "works"
+    // until the freed stack slot gets reused, then silently corrupts the
+    // RPC response path. `start_rpc_server` only ever runs once per process
+    // (hydra_rpc::start() itself guards double-start), so `static` gives it
+    // exactly the lifetime the singleton needs.
+    static hydra_rpc_ctx ctx{};
     if (impl) {
         ctx.queue_tasks   = &impl->queue_tasks;
         ctx.queue_results = &impl->queue_results;
