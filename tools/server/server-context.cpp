@@ -5612,11 +5612,24 @@ void server_routes::update_cached_responses(bool is_sleeping) {
 
 // ── Low-level I/O helpers ─────────────────────────────────────────────────────
 
+// Hydra #43: failures here were previously silent — every caller treats a
+// `false` return as "give up" but none logged *why*, so a wedged RPC
+// response looked identical to a client that vanished. Log once, centrally,
+// instead of touching the ~30 call sites.
 static bool hydra_recv_all(int fd, void * buf, size_t n) {
     char * p = reinterpret_cast<char *>(buf);
+    const size_t total = n;
     while (n > 0) {
         ssize_t r = ::recv(fd, p, n, 0);
-        if (r <= 0) return false;
+        if (r < 0) {
+            SRV_WRN("hydra rpc: recv failed on fd=%d (%zu/%zu bytes): %s\n",
+                    fd, total - n, total, std::strerror(errno));
+            return false;
+        }
+        if (r == 0) {
+            SRV_DBG("hydra rpc: recv EOF on fd=%d (%zu/%zu bytes)\n", fd, total - n, total);
+            return false;
+        }
         p += r; n -= r;
     }
     return true;
@@ -5624,9 +5637,14 @@ static bool hydra_recv_all(int fd, void * buf, size_t n) {
 
 static bool hydra_send_all(int fd, const void * buf, size_t n) {
     const char * p = reinterpret_cast<const char *>(buf);
+    const size_t total = n;
     while (n > 0) {
         ssize_t w = ::send(fd, p, n, MSG_NOSIGNAL);
-        if (w <= 0) return false;
+        if (w <= 0) {
+            SRV_WRN("hydra rpc: send failed on fd=%d (%zu/%zu bytes) w=%zd: %s\n",
+                    fd, total - n, total, w, std::strerror(errno));
+            return false;
+        }
         p += w; n -= w;
     }
     return true;
@@ -5790,7 +5808,10 @@ void server_context::start_rpc_server(int port) {
     if (port <= 0) return;
 
     // server_context is a friend of server_context_impl, so we can access private fields.
-    // We extract a raw pointer to slots — safe for the lifetime of the process (M0: no reload).
+    // We extract a raw pointer to slots - safe for the lifetime of the process (M0: no reload).
+    // NOTE (pick 1c c184c4fbd, partial): that commit's static-hydra_rpc_ctx lifetime fix
+    // does not apply here - this lineage has no hydra_rpc singleton (raw slots_ptr accept
+    // thread instead). Ported only its hydra_send/recv_all failure-logging hunk above.
     auto * slots_ptr = &impl->slots;
 
     std::thread([port, slots_ptr]() {
