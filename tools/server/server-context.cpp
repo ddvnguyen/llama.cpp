@@ -7393,12 +7393,37 @@ struct hydra_rpc_ctx {
 // `false` return as "give up" but none logged *why*, so a wedged RPC
 // response looked identical to a client that vanished. Log once, centrally,
 // instead of touching the ~30 call sites.
+//
+// Hydra #382: EINTR from signals (SIGCHLD etc.) should retry, not fail.
+// EAGAIN/EWOULDBLOCK is retried once to distinguish a signal-induced
+// transient from a genuine SO_RCVTIMEO idle timeout (120s, set in
+// hydra_handle_connection). A persistent EAGAIN after retry is a real
+// idle timeout — the connection is dropped as intended.
 static bool hydra_recv_all(int fd, void * buf, size_t n) {
     char * p = reinterpret_cast<char *>(buf);
     const size_t total = n;
     while (n > 0) {
         ssize_t r = ::recv(fd, p, n, 0);
         if (r < 0) {
+            if (errno == EINTR) {
+                continue; // signal interruption — retry immediately
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Could be signal-induced or genuine SO_RCVTIMEO timeout.
+                // Retry once; if it fires again it's a real idle timeout.
+                r = ::recv(fd, p, n, 0);
+                if (r < 0) {
+                    SRV_WRN("hydra rpc: recv timeout on fd=%d (%zu/%zu bytes)\n",
+                            fd, total - n, total);
+                    return false;
+                }
+                if (r == 0) {
+                    SRV_DBG("hydra rpc: recv EOF on fd=%d (%zu/%zu bytes)\n", fd, total - n, total);
+                    return false;
+                }
+                p += r; n -= r;
+                continue;
+            }
             SRV_WRN("hydra rpc: recv failed on fd=%d (%zu/%zu bytes): %s\n",
                     fd, total - n, total, std::strerror(errno));
             return false;
