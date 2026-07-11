@@ -334,8 +334,17 @@ int llama_engine(int argc, char ** argv) {
             return 1;
         }
 
+        // Hydra #383 T1: detect layer-split (DENSE tensor-split) and
+        // set the combined-static flag so the control plane reports
+        // engine_mode="combined" and accepts SetExpertMode("combined")
+        // as a no-op success.
+        const bool is_combined_static = flags.has_tensor_split();
         ctx_server.set_hydra_capabilities(true, flags.rpc_engine_peer,
-                false, "", "solo");
+                false, "",
+                is_combined_static ? "layer" : "solo");
+        if (is_combined_static) {
+            ctx_server.set_hydra_combined_static(true);
+        }
 
         // Register tensors for expert-split COMBINE (used at runtime when
         // a request specifies a peer).
