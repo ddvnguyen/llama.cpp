@@ -2209,11 +2209,13 @@ private:
             key == "state_chunk_size") {
             return 1;
         }
-        // T2: context-level (KV cache / RoPE / ctx)
-        if (key == "n_ctx"        ||
-            key == "cache_type_k" ||
-            key == "cache_type_v" ||
-            key.rfind("rope_", 0) == 0) {
+        // T2: context-level (KV cache / RoPE / ctx / YaRN / attention)
+        if (key == "n_ctx"           ||
+            key == "cache_type_k"    ||
+            key == "cache_type_v"    ||
+            key == "attention_type"  ||
+            key.rfind("rope_", 0) == 0 ||
+            key.rfind("yarn_", 0) == 0) {
             return 2;
         }
         // T3: model-level (offload / placement / model)
@@ -2239,25 +2241,77 @@ private:
         }
     }
 
-    // Apply the T1 keys from `cfg` to `params` and to the live context (for
-    // state_chunk_size). Echoes each applied key + post-clamp value into
-    // `params_applied`. Returns true on success; false if a key's value is
-    // of the wrong type (which is reported back to the caller — the request
-    // is malformed and we don't want to apply a partial set).
-    bool hydra_apply_t1_config(common_params & params, llama_context * ctx,
+    // Validate T1 keys without applying. Returns true if all present T1
+    // keys have the correct type; false if any key is malformed (the caller
+    // reports the error and does not apply any keys). This two-pass design
+    // ensures we never apply a partial set.
+    bool hydra_validate_t1_config(const json & cfg) {
+        // sampling.* — validate nested types
+        if (cfg.contains("sampling") && cfg["sampling"].is_object()) {
+            const json & s = cfg["sampling"];
+            if (s.contains("temp") && !s["temp"].is_number())            { SRV_WRN("%s", "hydra: CONFIGURE sampling.temp must be a number\n");       return false; }
+            if (s.contains("top_p") && !s["top_p"].is_number())         { SRV_WRN("%s", "hydra: CONFIGURE sampling.top_p must be a number\n");      return false; }
+            if (s.contains("min_p") && !s["min_p"].is_number())         { SRV_WRN("%s", "hydra: CONFIGURE sampling.min_p must be a number\n");      return false; }
+            if (s.contains("penalty_repeat") && !s["penalty_repeat"].is_number()) { SRV_WRN("%s", "hydra: CONFIGURE sampling.penalty_repeat must be a number\n"); return false; }
+            if (s.contains("top_k") && !s["top_k"].is_number_integer()) { SRV_WRN("%s", "hydra: CONFIGURE sampling.top_k must be an integer\n");    return false; }
+            if (s.contains("seed") && !s["seed"].is_number_integer())   { SRV_WRN("%s", "hydra: CONFIGURE sampling.seed must be an integer\n");     return false; }
+        }
+        // n_predict
+        if (cfg.contains("n_predict") && !cfg["n_predict"].is_number_integer()) {
+            SRV_WRN("%s", "hydra: CONFIGURE n_predict must be an integer\n");
+            return false;
+        }
+        // n_keep
+        if (cfg.contains("n_keep") && !cfg["n_keep"].is_number_integer()) {
+            SRV_WRN("%s", "hydra: CONFIGURE n_keep must be an integer\n");
+            return false;
+        }
+        // seed (top-level)
+        if (cfg.contains("seed") && !cfg["seed"].is_number()) {
+            SRV_WRN("%s", "hydra: CONFIGURE seed must be a number\n");
+            return false;
+        }
+        // antiprompt
+        if (cfg.contains("antiprompt")) {
+            if (!cfg["antiprompt"].is_array()) {
+                SRV_WRN("%s", "hydra: CONFIGURE antiprompt must be an array of strings\n");
+                return false;
+            }
+            for (const auto & v : cfg["antiprompt"]) {
+                if (!v.is_string()) {
+                    SRV_WRN("%s", "hydra: CONFIGURE antiprompt entries must be strings\n");
+                    return false;
+                }
+            }
+        }
+        // state_chunk_size
+        if (cfg.contains("state_chunk_size") && !cfg["state_chunk_size"].is_number_unsigned()) {
+            SRV_WRN("%s", "hydra: CONFIGURE state_chunk_size must be a non-negative integer\n");
+            return false;
+        }
+        return true;
+    }
+
+    // Apply validated T1 keys. Called only after hydra_validate_t1_config
+    // returns true, so all keys are guaranteed to have the correct type.
+    // Echoes each applied key + post-clamp value into `params_applied`.
+    void hydra_apply_t1_config(common_params & params, llama_context * ctx,
                                const json & cfg,
                                std::map<std::string, json> & params_applied) {
         // sampling.* — set on the common_params, which the next launch_slot
         // will pick up when re-initializing the slot's common_sampler.
         if (cfg.contains("sampling") && cfg["sampling"].is_object()) {
             const json & s = cfg["sampling"];
+            // Determine if top-level "seed" will override sampling.seed
+            // to avoid echoing both with different values (fix #6: dual seed).
+            const bool seed_overridden = cfg.contains("seed");
             #define COPY_FLOAT(field) \
-                if (s.contains(#field) && s[#field].is_number()) { \
+                if (s.contains(#field)) { \
                     params.sampling.field = s[#field].get<float>(); \
                     params_applied["sampling." #field] = params.sampling.field; \
                 }
             #define COPY_INT(field) \
-                if (s.contains(#field) && s[#field].is_number()) { \
+                if (s.contains(#field)) { \
                     params.sampling.field = s[#field].get<int32_t>(); \
                     params_applied["sampling." #field] = params.sampling.field; \
                 }
@@ -2266,87 +2320,71 @@ private:
             COPY_FLOAT(min_p)
             COPY_FLOAT(penalty_repeat)
             COPY_INT(top_k)
-            COPY_INT(seed)
+            // Skip sampling.seed echo if top-level seed overrides it.
+            if (s.contains("seed") && !seed_overridden) {
+                params.sampling.seed = s["seed"].get<int32_t>();
+                params_applied["sampling.seed"] = params.sampling.seed;
+            }
             #undef COPY_FLOAT
             #undef COPY_INT
         }
         // n_predict
-        if (cfg.contains("n_predict") && cfg["n_predict"].is_number_integer()) {
+        if (cfg.contains("n_predict")) {
             params.n_predict = cfg["n_predict"].get<int32_t>();
             params_applied["n_predict"] = params.n_predict;
-        } else if (cfg.contains("n_predict") && !cfg["n_predict"].is_number_integer()) {
-            SRV_WRN("%s", "hydra: CONFIGURE n_predict must be an integer\n");
-            return false;
         }
         // n_keep
-        if (cfg.contains("n_keep") && cfg["n_keep"].is_number_integer()) {
+        if (cfg.contains("n_keep")) {
             params.n_keep = cfg["n_keep"].get<int32_t>();
             params_applied["n_keep"] = params.n_keep;
-        } else if (cfg.contains("n_keep") && !cfg["n_keep"].is_number_integer()) {
-            SRV_WRN("%s", "hydra: CONFIGURE n_keep must be an integer\n");
-            return false;
         }
         // seed (top-level — sets the sampler's seed via common_params::sampling).
-        // common_params itself has no top-level seed; common_params_sampling does.
-        if (cfg.contains("seed") && cfg["seed"].is_number_unsigned()) {
-            params.sampling.seed = cfg["seed"].get<uint32_t>();
+        // If both sampling.seed and top-level seed are present, the top-level
+        // one wins by code order (applied after sampling.seed in the block above).
+        // The response echoes both keys; the Coordinator should use the
+        // top-level "seed" value as authoritative.
+        if (cfg.contains("seed")) {
+            if (cfg["seed"].is_number_unsigned()) {
+                params.sampling.seed = cfg["seed"].get<uint32_t>();
+            } else {
+                params.sampling.seed = (uint32_t) cfg["seed"].get<int32_t>();
+            }
             params_applied["seed"] = params.sampling.seed;
-        } else if (cfg.contains("seed") && cfg["seed"].is_number_integer()) {
-            params.sampling.seed = (uint32_t) cfg["seed"].get<int32_t>();
-            params_applied["seed"] = params.sampling.seed;
-        } else if (cfg.contains("seed") && !cfg["seed"].is_number()) {
-            SRV_WRN("%s", "hydra: CONFIGURE seed must be a number\n");
-            return false;
         }
         // antiprompt — full replacement (matches the existing semantics
         // of CLI --reverse-prompt)
-        if (cfg.contains("antiprompt") && cfg["antiprompt"].is_array()) {
+        if (cfg.contains("antiprompt")) {
             std::vector<std::string> new_antiprompt;
             for (const auto & v : cfg["antiprompt"]) {
-                if (!v.is_string()) {
-                    SRV_WRN("%s", "hydra: CONFIGURE antiprompt entries must be strings\n");
-                    return false;
-                }
                 new_antiprompt.push_back(v.get<std::string>());
             }
             params.antiprompt = std::move(new_antiprompt);
             params_applied["antiprompt"] = params.antiprompt;
-        } else if (cfg.contains("antiprompt") && !cfg["antiprompt"].is_array()) {
-            SRV_WRN("%s", "hydra: CONFIGURE antiprompt must be an array of strings\n");
-            return false;
         }
         // state_chunk_size — apply via the existing llama_hydra API (clamps
         // and echoes the post-clamp value)
-        if (cfg.contains("state_chunk_size") && cfg["state_chunk_size"].is_number_unsigned()) {
+        if (cfg.contains("state_chunk_size")) {
             const size_t bytes = cfg["state_chunk_size"].get<size_t>();
             if (ctx) {
                 llama_hydra_set_state_chunk_size(ctx, bytes);
             }
             const size_t applied = ctx ? llama_hydra_get_state_chunk_size(ctx) : llama_hydra_clamp_state_chunk_size(bytes);
             params_applied["state_chunk_size"] = (uint64_t) applied;
-        } else if (cfg.contains("state_chunk_size") && !cfg["state_chunk_size"].is_number_unsigned()) {
-            SRV_WRN("%s", "hydra: CONFIGURE state_chunk_size must be a non-negative integer\n");
-            return false;
         }
-        return true;
     }
 
-    // Apply the T3 mutators immediately. The "staging" is: the statics in
-    // llama-hydra.cpp + the T3 keys in pending_config JSON. The actual
-    // model reload happens later, in the slot-free trigger.
-    void hydra_apply_t3_mutators(llama_context * ctx, const json & cfg,
-                                 std::vector<std::string> & deferred_keys) {
+    // Apply the T3 mutators — record staged state in llama-hydra.cpp's
+    // module-level statics. The caller's classification loop is responsible
+    // for deferred_keys; this function only performs the side effects.
+    void hydra_apply_t3_mutators(llama_context * ctx, const json & cfg) {
         if (cfg.contains("n_gpu_layers") && cfg["n_gpu_layers"].is_number_integer()) {
             llama_hydra_set_pending_n_gpu_layers(cfg["n_gpu_layers"].get<int32_t>());
-            deferred_keys.push_back("n_gpu_layers");
         }
         if (cfg.contains("n_cpu_moe") && cfg["n_cpu_moe"].is_number_integer()) {
             llama_hydra_set_pending_n_cpu_moe(cfg["n_cpu_moe"].get<int32_t>());
-            deferred_keys.push_back("n_cpu_moe");
         }
         if (cfg.contains("override_tensor") && cfg["override_tensor"].is_string()) {
             llama_hydra_set_override_tensor(ctx, cfg["override_tensor"].get<std::string>().c_str());
-            deferred_keys.push_back("override_tensor");
         }
         if (cfg.contains("split_mode") && cfg["split_mode"].is_string()) {
             std::vector<float> split;
@@ -2357,21 +2395,20 @@ private:
             }
             llama_hydra_set_split_mode(ctx, cfg["split_mode"].get<std::string>().c_str(),
                                        split.empty() ? nullptr : split.data(), split.size());
-            deferred_keys.push_back("split_mode");
-            if (!split.empty()) deferred_keys.push_back("tensor_split");
-        } else if (cfg.contains("tensor_split") && cfg["tensor_split"].is_array()) {
-            // tensor_split without split_mode is meaningless; record it as
-            // deferred and let the apply step surface the missing mode.
-            deferred_keys.push_back("tensor_split");
         }
+        // Flat "model.path" key (e.g. {"model.path": "/new.gguf"}).
+        // The classification loop already pushed "model.path" into
+        // deferred_keys. Here we stage the actual value.
+        if (cfg.contains("model.path") && cfg["model.path"].is_string()) {
+            llama_hydra_set_pending_model_path(cfg["model.path"].get<std::string>().c_str());
+        }
+        // Nested "model" object or string (e.g. {"model": {"path": "/x.gguf"}}).
         if (cfg.contains("model") && cfg["model"].is_object() &&
             cfg["model"].contains("path") && cfg["model"]["path"].is_string()) {
             llama_hydra_set_pending_model_path(cfg["model"]["path"].get<std::string>().c_str());
-            deferred_keys.push_back("model.path");
         } else if (cfg.contains("model") && cfg["model"].is_string()) {
             // legacy shorthand: {"model": "/path/to.gguf"}
             llama_hydra_set_pending_model_path(cfg["model"].get<std::string>().c_str());
-            deferred_keys.push_back("model");
         }
     }
 
@@ -3153,6 +3190,7 @@ private:
                     } catch (const std::exception & e) {
                         res->success = false;
                         res->rpc_status = HYDRA_STATUS_ERROR;
+                        res->tier = "T1";
                         res->error = std::string("CONFIGURE: invalid config_json: ") + e.what();
                         SRV_WRN("hydra: CONFIGURE failed to parse config_json (slot %d): %s\n",
                                 task.hydra_action.id_slot, e.what());
@@ -3198,6 +3236,9 @@ private:
                     // is recognized by hydra_classify_config_key returning 3
                     // for the bare "model" key. If the bare "model" is set
                     // and is an object with a "path", route it as T3.
+                    // Note: the classification loop already pushed "model" or
+                    // "model.path" into deferred_keys above; the dedup guard
+                    // prevents double-push.
                     if (cfg.contains("model")) {
                         if (cfg["model"].is_object()) {
                             t2t3_subset["model"] = cfg["model"];
@@ -3224,18 +3265,24 @@ private:
                         break;
                     }
 
-                    // 2. Apply T1 keys in-place.
-                    std::map<std::string, json> params_applied;
+                    // 2. Validate T1 keys first (no mutation yet).
                     if (!t1_subset.empty()) {
-                        if (!hydra_apply_t1_config(params_base, ctx_tgt, t1_subset, params_applied)) {
+                        if (!hydra_validate_t1_config(t1_subset)) {
                             res->success = false;
                             res->rpc_status = HYDRA_STATUS_ERROR;
+                            res->tier = hydra_tier_label(highest_tier);
                             res->error = "CONFIGURE: T1 key has wrong type (see log)";
-                            SRV_WRN("hydra: CONFIGURE T1 apply failed (slot %d)\n",
+                            SRV_WRN("hydra: CONFIGURE T1 validation failed (slot %d)\n",
                                     task.hydra_action.id_slot);
                             queue_results.send(std::move(res));
                             break;
                         }
+                    }
+
+                    // 3. Apply validated T1 keys in-place.
+                    std::map<std::string, json> params_applied;
+                    if (!t1_subset.empty()) {
+                        hydra_apply_t1_config(params_base, ctx_tgt, t1_subset, params_applied);
                         // Propagate state_chunk_size_applied for the existing
                         // hydra#334 echo (Coordinator expects this key).
                         auto it = params_applied.find("state_chunk_size");
@@ -3244,10 +3291,10 @@ private:
                         }
                     }
 
-                    // 3. Apply T3 mutators (record staged state; the actual
+                    // 4. Apply T3 mutators (record staged state; the actual
                     //    model reload is deferred to the slot-free trigger).
                     if (highest_tier == 3 && ctx_tgt) {
-                        hydra_apply_t3_mutators(ctx_tgt, t2t3_subset, deferred_keys);
+                        hydra_apply_t3_mutators(ctx_tgt, t2t3_subset);
                     }
                     // T2 keys (and any T3 keys the handler didn't recognize)
                     // are stored in pending_config for the apply step to
@@ -3257,7 +3304,7 @@ private:
                             t2t3_subset.dump(), hydra_tier_label(highest_tier));
                     }
 
-                    // 4. Build the response.
+                    // 5. Build the response.
                     res->tier = hydra_tier_label(highest_tier);
                     res->params_applied = std::move(params_applied);
                     res->deferred_keys = std::move(deferred_keys);

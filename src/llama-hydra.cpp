@@ -581,5 +581,12 @@ int llama_hydra_apply_pending_config(struct llama_context * ctx) {
 
 const char * llama_hydra_get_pending_config_tier(const struct llama_context * ctx) {
     if (!ctx) return "";
-    return ctx->hydra_get_pending_config_tier().c_str();
+    // hydra_get_pending_config_tier() returns std::string by value — the
+    // temporary would be destroyed before the caller uses the returned pointer.
+    // Store in a thread_local static so the pointer remains valid until the
+    // next call on the same thread (sufficient for the single-threaded
+    // update_slots / CONFIGURE handler dispatch model).
+    thread_local static std::string s_cached_tier;
+    s_cached_tier = ctx->hydra_get_pending_config_tier();
+    return s_cached_tier.c_str();
 }
