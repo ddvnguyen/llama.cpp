@@ -4156,14 +4156,19 @@ private:
     // On failure: rebuild with the old params_base (rollback).
     //
     // Helper: parse a wire-shape cache_type string ("f16" / "q8_0" / ...)
-    // to a ggml_type. The wire spec uses llama.cpp's ggml type names.
-    // There is no public ggml_parse_type() in upstream llama.cpp, so
-    // we iterate ggml_type_traits via ggml_get_type_traits() and
-    // match on ggml_type_name().
+    // to a ggml_type. Only accepts types valid for KV cache storage;
+    // non-KV types (e.g. GGML_TYPE_I32) that happen to have a matching
+    // name are rejected to prevent cryptic GGML_ABORT deep in the KV
+    // allocator.
     static ggml_type hydra_parse_cache_type(const std::string & s) {
+        static const ggml_type valid_kv_types[] = {
+            GGML_TYPE_F32, GGML_TYPE_F16,
+            GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+            GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_1,
+        };
         if (s.empty()) return GGML_TYPE_COUNT;
-        for (int i = 0; i < GGML_TYPE_COUNT; i++) {
-            ggml_type t = (ggml_type) i;
+        for (auto t : valid_kv_types) {
             if (strcmp(ggml_type_name(t), s.c_str()) == 0) return t;
         }
         return GGML_TYPE_COUNT;
@@ -4243,11 +4248,14 @@ private:
 
         // Free the live context. KV cache is destroyed; this is the
         // T2 cost. The model is kept (T2 is context-only).
+        //
+        // IMPORTANT: do NOT free ctx_dft here — T2 rebuilds only the
+        // context, not the model. ctx_dft is tied to model_tgt and
+        // cannot be recreated without a full model reload. Keeping it
+        // alive preserves MTP/speculative decode across T2 applies.
+        // ctx_dft is only freed/recreated by load_model() (T3 path).
         llama_free(ctx_tgt);
-        if (ctx_dft) {
-            llama_free(ctx_dft.get());
-            ctx_dft.reset();
-        }
+        ctx_tgt = nullptr;
 
         // Build new cparams from the updated params_base. This is
         // the same call site load_model() uses internally.
@@ -4271,13 +4279,28 @@ private:
                 GGML_ABORT("hydra: T2 rollback failed (cannot rebuild context with old params). "
                            "Engine exiting to prevent serving with corrupted state.");
             }
+            // Rollback succeeded — update slot pointers to the new context
+            // so slots don't use-after-free on the old freed context.
+            const int32_t n_ctx_old = llama_n_ctx(ctx_tgt) / params_base.n_parallel;
+            for (auto & slot : slots) {
+                slot.ctx_tgt = ctx_tgt;
+                slot.n_ctx   = n_ctx_old;
+                slot.smpl.reset(common_sampler_init(model_tgt, params_base.sampling));
+            }
+            SRV_INF("hydra: T2 rollback succeeded — restored old context (n_ctx=%d)\n",
+                    llama_n_ctx(ctx_tgt));
             return false;
         }
 
-        // Re-init per-slot samplers. The old samplers were bound to
-        // the now-freed context; common_sampler_init() on the new
-        // model picks up the (possibly changed) sampling config.
+        // Re-init per-slot samplers and update slot context pointers.
+        // The old samplers were bound to the now-freed context;
+        // common_sampler_init() on the new model picks up the
+        // (possibly changed) sampling config. The ctx_tgt pointer
+        // must be refreshed so slots don't use-after-free.
+        const int32_t n_ctx_slot = llama_n_ctx(ctx_tgt) / params_base.n_parallel;
         for (auto & slot : slots) {
+            slot.ctx_tgt = ctx_tgt;
+            slot.n_ctx   = n_ctx_slot;
             slot.smpl.reset(common_sampler_init(model_tgt, params_base.sampling));
         }
 
@@ -4362,25 +4385,24 @@ private:
             buft_list["CPU"] = ggml_backend_cpu_buffer_type();
 
             const std::string ovr(override);
+            // Hold the pattern strings alive for the duration of
+            // load_model(). The C API requires stable C strings in
+            // tensor_buft_overrides; without this vector, each
+            // entry.pattern would point into a loop-local std::string
+            // that's freed before load_model() reads it.
+            std::vector<std::string> pattern_strings;
             size_t start = 0;
             while (start < ovr.size()) {
                 size_t comma = ovr.find(',', start);
                 std::string part = ovr.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
                 size_t eq = part.find('=');
                 if (eq != std::string::npos) {
-                    std::string pattern = part.substr(0, eq);
                     std::string buft_name = part.substr(eq + 1);
                     auto it = buft_list.find(buft_name);
                     if (it != buft_list.end()) {
-                        // The C API requires a stable C string; the
-                        // pattern lives as long as ovr (the staged
-                        // static, see llama-hydra.cpp:452). The model
-                        // load parses it synchronously within
-                        // load_model(), which is called before we clear
-                        // the staged T3 statics — so the pointer is
-                        // valid for the entire load_model() call.
+                        pattern_strings.push_back(part.substr(0, eq));
                         llama_model_tensor_buft_override entry;
-                        entry.pattern = pattern.c_str();
+                        entry.pattern = pattern_strings.back().c_str();
                         entry.buft = it->second;
                         swapped_params.tensor_buft_overrides.push_back(entry);
                     } else {
@@ -4415,6 +4437,13 @@ private:
         // NOTE: load_model() does `params_base = params` internally
         // (line 844), so after a successful load params_base reflects
         // swapped_params — no explicit reassignment needed by us.
+        //
+        // NOTE: this runs synchronously inside update_slots(), blocking
+        // the serving loop for the duration of the GGUF load + VRAM
+        // alloc. The drain-timeout guards entry but not the reload
+        // itself — the engine appears hung to the Coordinator for the
+        // entire reload. A future improvement could offload this to a
+        // background thread and gate requests until the reload completes.
         if (!load_model(swapped_params)) {
             SRV_ERR("hydra: T3 reload to '%s' failed (load_model returned false); "
                     "rolling back to old model\n",
@@ -4426,6 +4455,33 @@ private:
             }
             SRV_INF("hydra: T3 rollback succeeded — restored old model '%s'\n",
                     old_params.model.path.c_str());
+            // COMBINED reattach on rollback: the old model is loaded;
+            // re-attach COMBINED if it was active before the CONFIGURE.
+            // Without this, the engine silently stays in SOLO mode.
+            if (was_combined) {
+                SRV_INF("%s", "hydra: T3 rollback — re-attaching COMBINED on old model\n");
+                if (hydra_combined_static) {
+                    llama_hydra_set_expert_mode(ctx_tgt, 1);
+                } else if (!hydra_peer.empty() && !hydra_combined_pattern.empty()) {
+                    if (llama_hydra_peer_reachable(hydra_peer.c_str())) {
+                        ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+                        if (rpc_reg) {
+                            using add_server_fn_t = ggml_backend_reg_t (*)(const char *);
+                            auto add_server_fn = (add_server_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+                            ggml_backend_reg_t peer_reg = add_server_fn ? add_server_fn(hydra_peer.c_str()) : nullptr;
+                            ggml_backend_dev_t  peer_dev = (peer_reg && ggml_backend_reg_dev_count(peer_reg) > 0) ? ggml_backend_reg_dev_get(peer_reg, 0) : nullptr;
+                            if (peer_dev) {
+                                int32_t n_bound = llama_hydra_rebind_combined_experts(
+                                        ctx_tgt, hydra_peer.c_str(), peer_dev, hydra_combined_pattern.c_str());
+                                if (n_bound > 0) {
+                                    hydra_combined_head_attached = true;
+                                    llama_hydra_set_expert_mode(ctx_tgt, 1);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             return false;
         }
 
