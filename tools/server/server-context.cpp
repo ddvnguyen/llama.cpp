@@ -4302,6 +4302,19 @@ private:
                 slot.n_ctx   = n_ctx_old;
                 slot.smpl.reset(common_sampler_init(model_tgt, params_base.sampling));
             }
+            // Re-init speculative decoding on rollback too — the rollback
+            // created a fresh ctx_tgt, so the old spec's copies of ctx_tgt
+            // are dangling (same issue as the success path above).
+            if (spec) {
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                for (auto & slot : slots) {
+                    slot.spec = spec ? spec.get() : nullptr;
+                    slot.spec_ckpt.clear();
+                    slot.spec_draft.clear();
+                    slot.spec_i_batch.clear();
+                }
+            }
             SRV_INF("hydra: T2 rollback succeeded — restored old context (n_ctx=%d)\n",
                     llama_n_ctx(ctx_tgt));
             return false;
