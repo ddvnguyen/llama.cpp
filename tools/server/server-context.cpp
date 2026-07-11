@@ -4162,10 +4162,15 @@ private:
     // allocator.
     static ggml_type hydra_parse_cache_type(const std::string & s) {
         static const ggml_type valid_kv_types[] = {
-            GGML_TYPE_F32, GGML_TYPE_F16,
-            GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
-            GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
-            GGML_TYPE_Q8_0, GGML_TYPE_Q8_1,
+            GGML_TYPE_F32,    // "f32"
+            GGML_TYPE_F16,    // "f16"
+            GGML_TYPE_BF16,   // "bf16"
+            GGML_TYPE_Q8_0,   // "q8_0"
+            GGML_TYPE_Q4_0,   // "q4_0"
+            GGML_TYPE_Q4_1,   // "q4_1"
+            GGML_TYPE_IQ4_NL, // "iq4_nl"
+            GGML_TYPE_Q5_0,   // "q5_0"
+            GGML_TYPE_Q5_1,   // "q5_1"
         };
         if (s.empty()) return GGML_TYPE_COUNT;
         for (auto t : valid_kv_types) {
@@ -4245,6 +4250,16 @@ private:
         if (cfg.contains("yarn_orig_ctx") && cfg["yarn_orig_ctx"].is_number_integer()) {
             params_base.yarn_orig_ctx = cfg["yarn_orig_ctx"].get<int32_t>();
         }
+        if (cfg.contains("attention_type") && cfg["attention_type"].is_string()) {
+            const std::string & s = cfg["attention_type"].get_ref<const std::string &>();
+            if (s == "causal") {
+                params_base.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
+            } else if (s == "non-causal") {
+                params_base.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+            } else {
+                SRV_WRN("hydra: T2 attention_type='%s' unrecognized; ignoring\n", s.c_str());
+            }
+        }
 
         // Free the live context. KV cache is destroyed; this is the
         // T2 cost. The model is kept (T2 is context-only).
@@ -4304,6 +4319,22 @@ private:
             slot.smpl.reset(common_sampler_init(model_tgt, params_base.sampling));
         }
 
+        // Re-initialize speculative decoding. The old spec's MTP/draft
+        // impls hold copies of the now-freed ctx_tgt pointer (set at
+        // common_speculative_init time via params.draft.ctx_tgt). Update
+        // the params, recreate the spec, re-assign to every slot, and
+        // clear stale speculative state (KV cache was rebuilt from scratch).
+        if (spec) {
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+            for (auto & slot : slots) {
+                slot.spec = spec ? spec.get() : nullptr;
+                slot.spec_ckpt.clear();
+                slot.spec_draft.clear();
+                slot.spec_i_batch.clear();
+            }
+        }
+
         n_ctx = llama_n_ctx(ctx_tgt);
         SRV_INF("hydra: T2 rebuild applied (n_ctx=%d, cache=%d/%d, slots=%zu)\n",
                 n_ctx, (int) params_base.cache_type_k,
@@ -4322,6 +4353,14 @@ private:
 
         common_params old_params = params_base;
         common_params swapped_params = params_base;
+
+        // Hold pattern strings alive for the duration of load_model().
+        // Declared at function scope (not inside the override parsing
+        // block) because load_model() runs AFTER the if-block closes.
+        // reserve(16) prevents reallocation which would invalidate
+        // c_str() pointers stored in tensor_buft_overrides via SSO.
+        std::vector<std::string> pattern_strings;
+        pattern_strings.reserve(16);
 
         // Read the staged T3 statics and apply them to swapped_params.
         if (llama_hydra_get_pending_n_gpu_layers() >= 0) {
@@ -4385,12 +4424,6 @@ private:
             buft_list["CPU"] = ggml_backend_cpu_buffer_type();
 
             const std::string ovr(override);
-            // Hold the pattern strings alive for the duration of
-            // load_model(). The C API requires stable C strings in
-            // tensor_buft_overrides; without this vector, each
-            // entry.pattern would point into a loop-local std::string
-            // that's freed before load_model() reads it.
-            std::vector<std::string> pattern_strings;
             size_t start = 0;
             while (start < ovr.size()) {
                 size_t comma = ovr.find(',', start);
@@ -4412,6 +4445,9 @@ private:
                 if (comma == std::string::npos) break;
                 start = comma + 1;
             }
+            // Null-terminate the overrides list — the model loader
+            // asserts on this (model-loader.cpp:1158).
+            swapped_params.tensor_buft_overrides.push_back({nullptr, nullptr});
         }
 
         // COMBINED-mode teardown. We must remove the peer's RPC
