@@ -7,7 +7,9 @@
 #include "ggml-rpc.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <regex>
 #include <string>
 #include <unordered_map>
@@ -432,4 +434,159 @@ void llama_hydra_force_sync_if_shared(struct llama_context * ctx) {
     if (g_hydra_shared_backend_mode.load(std::memory_order_acquire)) {
         ggml_backend_sched_synchronize(ctx->get_sched());
     }
+}
+
+// ── Hydra #406: tiered CONFIGURE (T1/T2/T3) ────────────────────────────────
+//
+// The pending config is stored on the llama_context (hydra_pending_config_*).
+// The T3 mutators below ALSO record their state on the model in module-local
+// statics so the apply step (in server-context) can build a fresh
+// llama_model_params without re-parsing the JSON. The graph cache is
+// invalidated on every mutator so the next compute rebuilds against the
+// new placement.
+
+namespace {
+// Pending T3 state. Read by the apply step in server-context when all slots
+// are idle. Cleared by the apply step. If a follow-up CONFIGURE arrives
+// before the apply step runs, it OVERWRITES these (last-write-wins).
+std::string                  s_hydra_pending_override_tensor;
+std::string                  s_hydra_pending_split_mode;            // "" = unchanged
+std::vector<float>            s_hydra_pending_tensor_split;
+int32_t                      s_hydra_pending_n_gpu_layers = -1;     // -1 = unchanged
+int32_t                      s_hydra_pending_n_cpu_moe     = -1;     // -1 = unchanged
+std::string                  s_hydra_pending_model_path;            // "" = unchanged
+} // namespace
+
+int llama_hydra_set_override_tensor(struct llama_context * ctx, const char * pattern) {
+    if (!ctx || !pattern) {
+        LLAMA_LOG_WARN("hydra: set_override_tensor called with null ctx/pattern\n");
+        return -1;
+    }
+    s_hydra_pending_override_tensor = pattern;
+    // Invalidate graph cache: the next compute will see the new override
+    // and re-place tensors. (See llama-context.cpp: graph reuse key includes
+    // tensor placement; a change to override invalidates the cached graph.)
+    if (auto sched = ctx->get_sched()) {
+        ggml_backend_sched_reset(sched);
+    }
+    LLAMA_LOG_INFO("hydra: CONFIGURE override_tensor staged: '%s' (will apply on next model reload)\n", pattern);
+    return 0;
+}
+
+int llama_hydra_set_split_mode(struct llama_context * ctx, const char * mode, const float * tensor_split, size_t n_split) {
+    if (!ctx || !mode) {
+        LLAMA_LOG_WARN("hydra: set_split_mode called with null ctx/mode\n");
+        return -1;
+    }
+    // Only accept known modes — we don't want to silently mutate llama.cpp
+    // internals on a misspelled mode.
+    std::string m(mode);
+    if (m != "none" && m != "layer" && m != "row") {
+        LLAMA_LOG_WARN("hydra: set_split_mode rejected unknown mode '%s'\n", mode);
+        return -1;
+    }
+    s_hydra_pending_split_mode = m;
+    s_hydra_pending_tensor_split.clear();
+    if (tensor_split != nullptr && n_split > 0) {
+        for (size_t i = 0; i < n_split; i++) {
+            s_hydra_pending_tensor_split.push_back(tensor_split[i]);
+        }
+    }
+    // The split itself is part of llama_model_params — a model reload is
+    // required to take effect. We don't invalidate the graph cache here
+    // because the change is queued for the next load, not for the next
+    // compute.
+    LLAMA_LOG_INFO("hydra: CONFIGURE split_mode staged: mode='%s' n_split=%zu (will apply on next model reload)\n",
+            mode, n_split);
+    return 0;
+}
+
+// Accessors for the apply step in server-context.
+const char * llama_hydra_get_pending_override_tensor() { return s_hydra_pending_override_tensor.c_str(); }
+const char * llama_hydra_get_pending_split_mode()      { return s_hydra_pending_split_mode.c_str(); }
+size_t       llama_hydra_get_pending_tensor_split_count() { return s_hydra_pending_tensor_split.size(); }
+const float * llama_hydra_get_pending_tensor_split()   { return s_hydra_pending_tensor_split.data(); }
+int32_t      llama_hydra_get_pending_n_gpu_layers()   { return s_hydra_pending_n_gpu_layers; }
+int32_t      llama_hydra_get_pending_n_cpu_moe()      { return s_hydra_pending_n_cpu_moe; }
+const char * llama_hydra_get_pending_model_path()      { return s_hydra_pending_model_path.c_str(); }
+
+void llama_hydra_set_pending_n_gpu_layers(int32_t v) { s_hydra_pending_n_gpu_layers = v; }
+void llama_hydra_set_pending_n_cpu_moe(int32_t v)    { s_hydra_pending_n_cpu_moe = v; }
+void llama_hydra_set_pending_model_path(const char * p) { s_hydra_pending_model_path = p ? p : ""; }
+void llama_hydra_clear_pending_t3() {
+    s_hydra_pending_override_tensor.clear();
+    s_hydra_pending_split_mode.clear();
+    s_hydra_pending_tensor_split.clear();
+    s_hydra_pending_n_gpu_layers = -1;
+    s_hydra_pending_n_cpu_moe    = -1;
+    s_hydra_pending_model_path.clear();
+}
+
+// llama_hydra_apply_pending_config: stub that the apply step in
+// server-context calls. The real rebuild (unload+reload model/context with
+// the staged T3 params) is orchestrated by server-context itself, which
+// owns model_tgt, ctx_tgt, and the slot samplers. Here we:
+//   1. Invalidate the context's graph cache so the next compute sees
+//      fresh state.
+//   2. Clear the pending_config (caller will free model+context+rebuild).
+// The actual free+rebuild is done by the caller in server-context.cpp.
+//
+// The pending T3 state (override/split/n_gpu_layers/n_cpu_moe/model.path)
+// is NOT cleared here — the server-context apply step reads it, builds
+// fresh llama_model_params, reloads the model, and only THEN clears
+// the statics (via hydra_h_clear_pending_t3) and the context's
+// pending_config (via hydra_clear_pending_config).
+int llama_hydra_apply_pending_config(struct llama_context * ctx) {
+    if (!ctx) {
+        return -1;
+    }
+    if (!ctx->hydra_has_pending_config()) {
+        return 0;  // nothing to do
+    }
+    // Drain timeout: default 300s, override via env. Beyond this the engine
+    // gives up on the slot-free wait and the Coordinator can retry.
+    constexpr time_t k_drain_timeout_default = 300;
+    time_t now = std::time(nullptr);
+    time_t elapsed = now - ctx->hydra_get_pending_config_set_at();
+    int env_timeout = 0;
+    if (const char * e = getenv("HYDRA_COORD_PROFILE_SWITCH_DRAIN_TIMEOUT")) {
+        env_timeout = atoi(e);
+    }
+    time_t drain_timeout = env_timeout > 0 ? env_timeout : k_drain_timeout_default;
+    if (elapsed > drain_timeout) {
+        LLAMA_LOG_WARN("hydra: pending config drain timeout (elapsed=%lld, limit=%lld) — discarding, "
+                "tier='%s' payload_size=%zu\n",
+                (long long) elapsed, (long long) drain_timeout,
+                ctx->hydra_get_pending_config_tier().c_str(),
+                ctx->hydra_get_pending_config().size());
+        ctx->hydra_clear_pending_config();
+        llama_hydra_clear_pending_t3();
+        return -1;
+    }
+    // Invalidate graph cache — the next compute will rebuild against the
+    // new T2 cparams / T3 staging. (The real model+context reload, if
+    // required by the T3 keys, is done by the caller in server-context.)
+    if (auto sched = ctx->get_sched()) {
+        ggml_backend_sched_reset(sched);
+    }
+    LLAMA_LOG_INFO("hydra: applying pending config (tier='%s', age=%llds) — invalidating graph cache\n",
+            ctx->hydra_get_pending_config_tier().c_str(), (long long) elapsed);
+    // NOTE: the actual model/context rebuild is the caller's responsibility.
+    // Returning 0 here means "the cache is invalidated and the rebuild can
+    // proceed"; the caller (server-context update_slots hook) does the
+    // model/context free+rebuild using the staged T3 statics + the
+    // pending_config JSON, then calls hydra_clear_pending_config().
+    return 0;
+}
+
+const char * llama_hydra_get_pending_config_tier(const struct llama_context * ctx) {
+    if (!ctx) return "";
+    // hydra_get_pending_config_tier() returns std::string by value — the
+    // temporary would be destroyed before the caller uses the returned pointer.
+    // Store in a thread_local static so the pointer remains valid until the
+    // next call on the same thread (sufficient for the single-threaded
+    // update_slots / CONFIGURE handler dispatch model).
+    thread_local static std::string s_cached_tier;
+    s_cached_tier = ctx->hydra_get_pending_config_tier();
+    return s_cached_tier.c_str();
 }
