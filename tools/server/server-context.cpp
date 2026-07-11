@@ -3263,6 +3263,37 @@ private:
                         }
                     }
 
+                    // Filter T2/T3 subset: only keep keys that actually
+                    // differ from the current running state. The engine
+                    // owns the drain decision — Hydra Core sends the
+                    // desired config, and the engine diffs it against
+                    // params_base before staging. If all T2/T3 values
+                    // match, no drain is triggered.
+                    {
+                        json filtered_t2t3 = json::object();
+                        std::vector<std::string> filtered_deferred;
+                        for (auto it = t2t3_subset.begin(); it != t2t3_subset.end(); ++it) {
+                            const std::string & key = it.key();
+                            if (hydra_t2t3_key_changed(key, it.value(), params_base)) {
+                                filtered_t2t3[key] = it.value();
+                                filtered_deferred.push_back(key);
+                            }
+                        }
+                        if (filtered_t2t3.empty() && !t2t3_subset.empty()) {
+                            SRV_DBG("hydra: CONFIGURE all %zu T2/T3 keys match current state — "
+                                    "no drain needed\n", t2t3_subset.size());
+                        }
+                        t2t3_subset = std::move(filtered_t2t3);
+                        deferred_keys = std::move(filtered_deferred);
+                        // Recalculate highest_tier after filtering.
+                        highest_tier = 0;
+                        if (!t1_subset.empty()) highest_tier = 1;
+                        for (const auto & k : deferred_keys) {
+                            int t = hydra_classify_config_key(k);
+                            if (t > highest_tier) highest_tier = t;
+                        }
+                    }
+
                     if (highest_tier == 0) {
                         // No recognized keys at all — still emit a T1 success
                         // (the legacy {"state_chunk_size":N} case).
@@ -4155,6 +4186,93 @@ private:
     // RoPE / YaRN), recreate the context, re-init per-slot samplers.
     // On failure: rebuild with the old params_base (rollback).
     //
+    // Compare a single T2/T3 key's requested value against the current
+    // running state (params_base + pending T3 statics). Returns true if
+    // the value differs (i.e. a rebuild/reload is needed for this key).
+    static bool hydra_t2t3_key_changed(const std::string & key, const json & val,
+                                       const common_params & params) {
+        // T2: context-level keys — compare against params_base.
+        if (key == "n_ctx") {
+            return val.is_number_integer() && val.get<int32_t>() != params.n_ctx;
+        }
+        if (key == "cache_type_k") {
+            if (!val.is_string()) return false;
+            ggml_type t = hydra_parse_cache_type(val.get_ref<const std::string &>());
+            return t != GGML_TYPE_COUNT && t != params.cache_type_k;
+        }
+        if (key == "cache_type_v") {
+            if (!val.is_string()) return false;
+            ggml_type t = hydra_parse_cache_type(val.get_ref<const std::string &>());
+            return t != GGML_TYPE_COUNT && t != params.cache_type_v;
+        }
+        if (key == "rope_freq_base") {
+            return val.is_number() && val.get<float>() != params.rope_freq_base;
+        }
+        if (key == "rope_freq_scale") {
+            return val.is_number() && val.get<float>() != params.rope_freq_scale;
+        }
+        if (key == "yarn_ext_factor") {
+            return val.is_number() && val.get<float>() != params.yarn_ext_factor;
+        }
+        if (key == "yarn_attn_factor") {
+            return val.is_number() && val.get<float>() != params.yarn_attn_factor;
+        }
+        if (key == "yarn_beta_fast") {
+            return val.is_number() && val.get<float>() != params.yarn_beta_fast;
+        }
+        if (key == "yarn_beta_slow") {
+            return val.is_number() && val.get<float>() != params.yarn_beta_slow;
+        }
+        if (key == "yarn_orig_ctx") {
+            return val.is_number_integer() && val.get<int32_t>() != params.yarn_orig_ctx;
+        }
+        if (key == "attention_type") {
+            if (!val.is_string()) return false;
+            const std::string & s = val.get_ref<const std::string &>();
+            llama_attention_type requested = LLAMA_ATTENTION_TYPE_UNSPECIFIED;
+            if (s == "causal") requested = LLAMA_ATTENTION_TYPE_CAUSAL;
+            else if (s == "non-causal") requested = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+            return requested != LLAMA_ATTENTION_TYPE_UNSPECIFIED &&
+                   requested != params.attention_type;
+        }
+        // T3: model-level keys — compare against params_base + pending statics.
+        if (key == "n_gpu_layers") {
+            if (!val.is_number_integer()) return false;
+            int pending = llama_hydra_get_pending_n_gpu_layers();
+            int current = (pending >= 0) ? pending : params.n_gpu_layers;
+            return val.get<int32_t>() != current;
+        }
+        if (key == "n_cpu_moe") {
+            if (!val.is_number_integer()) return false;
+            int pending = llama_hydra_get_pending_n_cpu_moe();
+            return val.get<int32_t>() != pending;
+        }
+        if (key == "model.path" || key == "model") {
+            const char * pending = llama_hydra_get_pending_model_path();
+            std::string pending_str = pending ? pending : "";
+            if (val.is_object() && val.contains("path")) {
+                return val["path"].is_string() &&
+                       val["path"].get<std::string>() != pending_str;
+            } else if (val.is_string()) {
+                return val.get<std::string>() != pending_str;
+            }
+            return false;
+        }
+        if (key == "override_tensor") {
+            if (!val.is_string()) return false;
+            const char * pending = llama_hydra_get_pending_override_tensor();
+            std::string pending_str = pending ? pending : "";
+            return val.get<std::string>() != pending_str;
+        }
+        // split_mode, tensor_split: no current-state comparison available;
+        // always treat as changed (safe default — triggers reload).
+        if (key == "split_mode" || key == "tensor_split") {
+            return true;
+        }
+        // Unknown T2/T3 key: treat as changed to be safe.
+        return true;
+    }
+
     // Helper: parse a wire-shape cache_type string ("f16" / "q8_0" / ...)
     // to a ggml_type. Only accepts types valid for KV cache storage;
     // non-KV types (e.g. GGML_TYPE_I32) that happen to have a matching
