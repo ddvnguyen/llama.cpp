@@ -4276,25 +4276,34 @@ private:
         }
         if (key == "n_cpu_moe") {
             if (!val.is_number_integer()) return false;
-            int pending = llama_hydra_get_pending_n_cpu_moe(ctx);
-            return val.get<int32_t>() != pending;
+            // n_cpu_moe has no field in common_params (informational only).
+            // After a drain clears pending statics, pending resets to -1,
+            // causing every wire value >= 0 to appear "changed". Always
+            // return true — the apply path only logs it; no model reload
+            // is needed for this key alone.
+            return true;
         }
         if (key == "model.path" || key == "model") {
+            // Compare against pending static first; fall back to the
+            // actually-loaded model path (params.model.path) so that
+            // re-sending the current path doesn't trigger a spurious T3.
             const char * pending = llama_hydra_get_pending_model_path(ctx);
-            std::string pending_str = pending ? pending : "";
+            std::string current = (pending && *pending) ? pending : params.model.path;
             if (val.is_object() && val.contains("path")) {
                 return val["path"].is_string() &&
-                       val["path"].get<std::string>() != pending_str;
+                       val["path"].get<std::string>() != current;
             } else if (val.is_string()) {
-                return val.get<std::string>() != pending_str;
+                return val.get<std::string>() != current;
             }
             return false;
         }
         if (key == "override_tensor") {
             if (!val.is_string()) return false;
-            const char * pending = llama_hydra_get_pending_override_tensor(ctx);
-            std::string pending_str = pending ? pending : "";
-            return val.get<std::string>() != pending_str;
+            // No params equivalent. After a drain clears pending statics,
+            // pending resets to "", causing every wire value to appear
+            // "changed". Always return true — the apply path parses and
+            // applies the overrides on model reload.
+            return true;
         }
         // split_mode, tensor_split: no current-state comparison available;
         // always treat as changed (safe default — triggers reload).
