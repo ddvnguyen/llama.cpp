@@ -4189,6 +4189,29 @@ private:
         return ok;
     }
 
+    // Re-init per-slot samplers, ctx_tgt pointers, and speculative
+    // decoding after a context rebuild. Extracted because both the
+    // success and rollback paths of apply_t2_rebuild need the
+    // identical logic (was a duplication / omission bug class).
+    void refresh_slots_after_ctx_rebuild() {
+        const int32_t n_ctx_slot = llama_n_ctx(ctx_tgt) / params_base.n_parallel;
+        for (auto & slot : slots) {
+            slot.ctx_tgt = ctx_tgt;
+            slot.n_ctx   = n_ctx_slot;
+            slot.smpl.reset(common_sampler_init(model_tgt, params_base.sampling));
+        }
+        if (spec) {
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+            for (auto & slot : slots) {
+                slot.spec = spec ? spec.get() : nullptr;
+                slot.spec_ckpt.clear();
+                slot.spec_draft.clear();
+                slot.spec_i_batch.clear();
+            }
+        }
+    }
+
     // T2 rebuild: free the live llama_context, rebuild llama_context_params
     // from the updated params_base (n_ctx / cache_type_k / cache_type_v /
     // RoPE / YaRN), recreate the context, re-init per-slot samplers.
@@ -4422,57 +4445,14 @@ private:
             }
             // Rollback succeeded — update slot pointers to the new context
             // so slots don't use-after-free on the old freed context.
-            const int32_t n_ctx_old = llama_n_ctx(ctx_tgt) / params_base.n_parallel;
-            for (auto & slot : slots) {
-                slot.ctx_tgt = ctx_tgt;
-                slot.n_ctx   = n_ctx_old;
-                slot.smpl.reset(common_sampler_init(model_tgt, params_base.sampling));
-            }
-            // Re-init speculative decoding on rollback too — the rollback
-            // created a fresh ctx_tgt, so the old spec's copies of ctx_tgt
-            // are dangling (same issue as the success path above).
-            if (spec) {
-                params_base.speculative.draft.ctx_tgt = ctx_tgt;
-                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
-                for (auto & slot : slots) {
-                    slot.spec = spec ? spec.get() : nullptr;
-                    slot.spec_ckpt.clear();
-                    slot.spec_draft.clear();
-                    slot.spec_i_batch.clear();
-                }
-            }
+            refresh_slots_after_ctx_rebuild();
             SRV_INF("hydra: T2 rollback succeeded — restored old context (n_ctx=%d)\n",
                     llama_n_ctx(ctx_tgt));
             return false;
         }
 
-        // Re-init per-slot samplers and update slot context pointers.
-        // The old samplers were bound to the now-freed context;
-        // common_sampler_init() on the new model picks up the
-        // (possibly changed) sampling config. The ctx_tgt pointer
-        // must be refreshed so slots don't use-after-free.
-        const int32_t n_ctx_slot = llama_n_ctx(ctx_tgt) / params_base.n_parallel;
-        for (auto & slot : slots) {
-            slot.ctx_tgt = ctx_tgt;
-            slot.n_ctx   = n_ctx_slot;
-            slot.smpl.reset(common_sampler_init(model_tgt, params_base.sampling));
-        }
-
-        // Re-initialize speculative decoding. The old spec's MTP/draft
-        // impls hold copies of the now-freed ctx_tgt pointer (set at
-        // common_speculative_init time via params.draft.ctx_tgt). Update
-        // the params, recreate the spec, re-assign to every slot, and
-        // clear stale speculative state (KV cache was rebuilt from scratch).
-        if (spec) {
-            params_base.speculative.draft.ctx_tgt = ctx_tgt;
-            spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
-            for (auto & slot : slots) {
-                slot.spec = spec ? spec.get() : nullptr;
-                slot.spec_ckpt.clear();
-                slot.spec_draft.clear();
-                slot.spec_i_batch.clear();
-            }
-        }
+        // Re-init per-slot samplers, ctx_tgt pointers, and spec-decode.
+        refresh_slots_after_ctx_rebuild();
 
         n_ctx = llama_n_ctx(ctx_tgt);
         SRV_INF("hydra: T2 rebuild applied (n_ctx=%d, cache=%d/%d, slots=%zu)\n",
@@ -4594,16 +4574,31 @@ private:
         // model reload — otherwise the new ctx_tgt (post-reload)
         // would inherit a stale binding to the old peer's device.
         // Same pattern as SET_EXPERT_MODE (server-context.cpp:~3890).
+        //
+        // Gate: for layer-split (hydra_combined_static), the model
+        // loader needs the peer registered to place layers across
+        // devices via tensor_split — so we only zero the mode flag
+        // and leave the RPC backend in place. For expert-split, the
+        // full teardown is required because the new model load doesn't
+        // need the peer's runtime-bound expert tensors.
         const bool was_combined = hydra_combined_head_attached || hydra_combined_static;
         if (was_combined) {
             SRV_INF("hydra: T3 rebuild — tearing down COMBINED before model reload (was head_attached=%d, static=%d)\n",
                     (int) hydra_combined_head_attached, (int) hydra_combined_static);
             llama_hydra_set_expert_mode(ctx_tgt, 0);
-            if (!hydra_current_peer.empty()) {
-                ctx_tgt->hydra_remove_combined_rpc_backend(hydra_current_peer.c_str());
+            if (!hydra_combined_static) {
+                // Expert-split: full teardown — remove RPC backend and
+                // clear bindings so load_model() starts clean.
+                // Use hydra_current_peer consistently (the endpoint
+                // actually registered in the ggml backend registry).
+                if (!hydra_current_peer.empty()) {
+                    ctx_tgt->hydra_remove_combined_rpc_backend(hydra_current_peer.c_str());
+                }
+                llama_hydra_clear_combined_bindings(ctx_tgt, hydra_current_peer.c_str());
+                hydra_combined_head_attached = false;
             }
-            llama_hydra_clear_combined_bindings(ctx_tgt, hydra_peer.c_str());
-            hydra_combined_head_attached = false;
+            // Layer-split: peer stays registered — load_model() needs
+            // it to do tensor_split placement across devices.
         }
 
         // Full model reload. load_model() handles the unload of the
