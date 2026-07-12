@@ -2394,10 +2394,10 @@ private:
     // for deferred_keys; this function only performs the side effects.
     void hydra_apply_t3_mutators(llama_context * ctx, const json & cfg) {
         if (cfg.contains("n_gpu_layers") && cfg["n_gpu_layers"].is_number_integer()) {
-            llama_hydra_set_pending_n_gpu_layers(cfg["n_gpu_layers"].get<int32_t>());
+            llama_hydra_set_pending_n_gpu_layers(ctx, cfg["n_gpu_layers"].get<int32_t>());
         }
         if (cfg.contains("n_cpu_moe") && cfg["n_cpu_moe"].is_number_integer()) {
-            llama_hydra_set_pending_n_cpu_moe(cfg["n_cpu_moe"].get<int32_t>());
+            llama_hydra_set_pending_n_cpu_moe(ctx, cfg["n_cpu_moe"].get<int32_t>());
         }
         if (cfg.contains("override_tensor") && cfg["override_tensor"].is_string()) {
             llama_hydra_set_override_tensor(ctx, cfg["override_tensor"].get<std::string>().c_str());
@@ -2416,15 +2416,15 @@ private:
         // The classification loop already pushed "model.path" into
         // deferred_keys. Here we stage the actual value.
         if (cfg.contains("model.path") && cfg["model.path"].is_string()) {
-            llama_hydra_set_pending_model_path(cfg["model.path"].get<std::string>().c_str());
+            llama_hydra_set_pending_model_path(ctx, cfg["model.path"].get<std::string>().c_str());
         }
         // Nested "model" object or string (e.g. {"model": {"path": "/x.gguf"}}).
         if (cfg.contains("model") && cfg["model"].is_object() &&
             cfg["model"].contains("path") && cfg["model"]["path"].is_string()) {
-            llama_hydra_set_pending_model_path(cfg["model"]["path"].get<std::string>().c_str());
+            llama_hydra_set_pending_model_path(ctx, cfg["model"]["path"].get<std::string>().c_str());
         } else if (cfg.contains("model") && cfg["model"].is_string()) {
             // legacy shorthand: {"model": "/path/to.gguf"}
-            llama_hydra_set_pending_model_path(cfg["model"].get<std::string>().c_str());
+            llama_hydra_set_pending_model_path(ctx, cfg["model"].get<std::string>().c_str());
         }
     }
 
@@ -3282,7 +3282,7 @@ private:
                         std::vector<std::string> filtered_deferred;
                         for (auto it = t2t3_subset.begin(); it != t2t3_subset.end(); ++it) {
                             const std::string & key = it.key();
-                            if (hydra_t2t3_key_changed(key, it.value(), params_base)) {
+                            if (hydra_t2t3_key_changed(key, it.value(), params_base, ctx_tgt)) {
                                 filtered_t2t3[key] = it.value();
                                 filtered_deferred.push_back(key);
                             }
@@ -4149,7 +4149,7 @@ private:
                     ctx_tgt->hydra_get_pending_config_tier().c_str(),
                     ctx_tgt->hydra_get_pending_config().size());
             ctx_tgt->hydra_clear_pending_config();
-            llama_hydra_clear_pending_t3();
+            llama_hydra_clear_pending_t3(ctx_tgt);
             return false;
         }
 
@@ -4185,7 +4185,7 @@ private:
         //    previous state; clearing the staged state prevents the
         //    next slot-free moment from re-attempting the same rebuild.
         ctx_tgt->hydra_clear_pending_config();
-        llama_hydra_clear_pending_t3();
+        llama_hydra_clear_pending_t3(ctx_tgt);
         return ok;
     }
 
@@ -4221,7 +4221,8 @@ private:
     // running state (params_base + pending T3 statics). Returns true if
     // the value differs (i.e. a rebuild/reload is needed for this key).
     static bool hydra_t2t3_key_changed(const std::string & key, const json & val,
-                                       const common_params & params) {
+                                       const common_params & params,
+                                       const llama_context * ctx) {
         // T2: context-level keys — compare against params_base.
         if (key == "n_ctx") {
             return val.is_number_integer() && val.get<int32_t>() != params.n_ctx;
@@ -4269,17 +4270,17 @@ private:
         // T3: model-level keys — compare against params_base + pending statics.
         if (key == "n_gpu_layers") {
             if (!val.is_number_integer()) return false;
-            int pending = llama_hydra_get_pending_n_gpu_layers();
+            int pending = llama_hydra_get_pending_n_gpu_layers(ctx);
             int current = (pending >= 0) ? pending : params.n_gpu_layers;
             return val.get<int32_t>() != current;
         }
         if (key == "n_cpu_moe") {
             if (!val.is_number_integer()) return false;
-            int pending = llama_hydra_get_pending_n_cpu_moe();
+            int pending = llama_hydra_get_pending_n_cpu_moe(ctx);
             return val.get<int32_t>() != pending;
         }
         if (key == "model.path" || key == "model") {
-            const char * pending = llama_hydra_get_pending_model_path();
+            const char * pending = llama_hydra_get_pending_model_path(ctx);
             std::string pending_str = pending ? pending : "";
             if (val.is_object() && val.contains("path")) {
                 return val["path"].is_string() &&
@@ -4291,7 +4292,7 @@ private:
         }
         if (key == "override_tensor") {
             if (!val.is_string()) return false;
-            const char * pending = llama_hydra_get_pending_override_tensor();
+            const char * pending = llama_hydra_get_pending_override_tensor(ctx);
             std::string pending_str = pending ? pending : "";
             return val.get<std::string>() != pending_str;
         }
@@ -4482,23 +4483,23 @@ private:
         hydra_pattern_strings.reserve(16);
 
         // Read the staged T3 statics and apply them to swapped_params.
-        if (llama_hydra_get_pending_n_gpu_layers() >= 0) {
-            swapped_params.n_gpu_layers = llama_hydra_get_pending_n_gpu_layers();
+        if (llama_hydra_get_pending_n_gpu_layers(ctx_tgt) >= 0) {
+            swapped_params.n_gpu_layers = llama_hydra_get_pending_n_gpu_layers(ctx_tgt);
         }
         // n_cpu_moe is informational only — the actual MoE expert
         // offload is done via override_tensor (parsed below into
         // tensor_buft_overrides). The standard common_params struct
         // has no n_cpu_moe field; we just log the staged value for
         // operator visibility.
-        if (llama_hydra_get_pending_n_cpu_moe() >= 0) {
+        if (llama_hydra_get_pending_n_cpu_moe(ctx_tgt) >= 0) {
             SRV_INF("hydra: T3 rebuild: staged n_cpu_moe=%d (informational; expert routing via override_tensor)\n",
-                    llama_hydra_get_pending_n_cpu_moe());
+                    llama_hydra_get_pending_n_cpu_moe(ctx_tgt));
         }
-        const char * path = llama_hydra_get_pending_model_path();
+        const char * path = llama_hydra_get_pending_model_path(ctx_tgt);
         if (path && *path) {
             swapped_params.model.path = path;
         }
-        const char * mode = llama_hydra_get_pending_split_mode();
+        const char * mode = llama_hydra_get_pending_split_mode(ctx_tgt);
         if (mode && *mode) {
             std::string m(mode);
             if (m == "none")      swapped_params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -4506,9 +4507,9 @@ private:
             else if (m == "row")   swapped_params.split_mode = LLAMA_SPLIT_MODE_ROW;
             else SRV_WRN("hydra: T3 split_mode='%s' unknown; keeping current\n", m);
         }
-        const size_t n_split = llama_hydra_get_pending_tensor_split_count();
+        const size_t n_split = llama_hydra_get_pending_tensor_split_count(ctx_tgt);
         if (n_split > 0) {
-            const float * split = llama_hydra_get_pending_tensor_split();
+            const float * split = llama_hydra_get_pending_tensor_split(ctx_tgt);
             // common_params::tensor_split is a fixed-size array.
             const size_t cap = sizeof(swapped_params.tensor_split) /
                                 sizeof(swapped_params.tensor_split[0]);
@@ -4521,7 +4522,7 @@ private:
                 swapped_params.tensor_split[i] = 0.0f;
             }
         }
-        const char * override = llama_hydra_get_pending_override_tensor();
+        const char * override = llama_hydra_get_pending_override_tensor(ctx_tgt);
         if (override && *override) {
             // Wire-shape: comma-separated "pattern=buft" pairs (e.g.
             // "blk.*.ffn_*_exps.weight=CPU"). The C++ side stores

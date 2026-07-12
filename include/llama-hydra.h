@@ -57,27 +57,27 @@ LLAMA_API int llama_hydra_set_override_tensor(struct llama_context * ctx, const 
 LLAMA_API int llama_hydra_set_split_mode(struct llama_context * ctx, const char * mode, const float * tensor_split, size_t n_split);
 
 // Hydra #406: getters for the staged T3 mutator state. The apply step in
-// server-context reads these to build a fresh llama_model_params. Returned
-// pointers are owned by llama-hydra.cpp and remain valid until the next
-// mutator call OR hydra_h_clear_pending_t3.
-LLAMA_API const char * llama_hydra_get_pending_override_tensor();
-LLAMA_API const char * llama_hydra_get_pending_split_mode();
-LLAMA_API size_t       llama_hydra_get_pending_tensor_split_count();
-LLAMA_API const float * llama_hydra_get_pending_tensor_split();
-LLAMA_API int32_t      llama_hydra_get_pending_n_gpu_layers();
-LLAMA_API int32_t      llama_hydra_get_pending_n_cpu_moe();
-LLAMA_API const char * llama_hydra_get_pending_model_path();
+// server-context reads these to build a fresh llama_model_params. State is
+// owned by the llama_context (not global statics) so each context has its
+// own pending T3 state. Returned pointers remain valid until the next
+// mutator call OR llama_hydra_clear_pending_t3.
+LLAMA_API const char * llama_hydra_get_pending_override_tensor(const struct llama_context * ctx);
+LLAMA_API const char * llama_hydra_get_pending_split_mode(const struct llama_context * ctx);
+LLAMA_API size_t       llama_hydra_get_pending_tensor_split_count(const struct llama_context * ctx);
+LLAMA_API const float * llama_hydra_get_pending_tensor_split(const struct llama_context * ctx);
+LLAMA_API int32_t      llama_hydra_get_pending_n_gpu_layers(const struct llama_context * ctx);
+LLAMA_API int32_t      llama_hydra_get_pending_n_cpu_moe(const struct llama_context * ctx);
+LLAMA_API const char * llama_hydra_get_pending_model_path(const struct llama_context * ctx);
 
 // Hydra #406: additional T3 mutators (the JSON payload carries these keys
-// directly; the handler calls these to record them in the same statics as
-// set_override_tensor / set_split_mode).
-LLAMA_API void llama_hydra_set_pending_n_gpu_layers(int32_t v);
-LLAMA_API void llama_hydra_set_pending_n_cpu_moe(int32_t v);
-LLAMA_API void llama_hydra_set_pending_model_path(const char * p);
+// directly; the handler calls these to record them on the context).
+LLAMA_API void llama_hydra_set_pending_n_gpu_layers(struct llama_context * ctx, int32_t v);
+LLAMA_API void llama_hydra_set_pending_n_cpu_moe(struct llama_context * ctx, int32_t v);
+LLAMA_API void llama_hydra_set_pending_model_path(struct llama_context * ctx, const char * p);
 
-// Hydra #406: clear all staged T3 state. Called by the apply step after
-// the model+context rebuild succeeds, OR by the drain-timeout path.
-LLAMA_API void llama_hydra_clear_pending_t3();
+// Hydra #406: clear all staged T3 state on the context. Called by the apply
+// step after the model+context rebuild succeeds, OR by the drain-timeout path.
+LLAMA_API void llama_hydra_clear_pending_t3(struct llama_context * ctx);
 
 // Hydra: try to connect to an RPC engine peer. Returns true if reachable.
 // Used at startup for graceful degradation — if the peer is down, the engine
