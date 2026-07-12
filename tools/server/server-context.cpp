@@ -710,6 +710,14 @@ public:
     // serialized), so no separate mutex needed.
     std::string hydra_current_peer;
 
+    // T3 override_tensor pattern lifetime. The C API's
+    // llama_model_tensor_buft_override stores a raw const char* for
+    // entry.pattern. load_model() copies params (including
+    // tensor_buft_overrides) into params_base — so the raw pointers
+    // in params_base.tensor_buft_overrides must outlive apply_t3_rebuild().
+    // Member scope ensures they survive; cleared after load_model() completes.
+    std::vector<std::string> hydra_pattern_strings;
+
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
@@ -4485,13 +4493,13 @@ private:
         common_params old_params = params_base;
         common_params swapped_params = params_base;
 
-        // Hold pattern strings alive for the duration of load_model().
-        // Declared at function scope (not inside the override parsing
-        // block) because load_model() runs AFTER the if-block closes.
-        // reserve(16) prevents reallocation which would invalidate
-        // c_str() pointers stored in tensor_buft_overrides via SSO.
-        std::vector<std::string> pattern_strings;
-        pattern_strings.reserve(16);
+        // Reuse the member vector (not a local) so that the c_str()
+        // pointers stored in tensor_buft_overrides survive after
+        // load_model() copies params into params_base. A local would
+        // be destroyed at function exit, leaving dangling pointers
+        // in params_base.tensor_buft_overrides.
+        hydra_pattern_strings.clear();
+        hydra_pattern_strings.reserve(16);
 
         // Read the staged T3 statics and apply them to swapped_params.
         if (llama_hydra_get_pending_n_gpu_layers() >= 0) {
@@ -4564,9 +4572,9 @@ private:
                     std::string buft_name = part.substr(eq + 1);
                     auto it = buft_list.find(buft_name);
                     if (it != buft_list.end()) {
-                        pattern_strings.push_back(part.substr(0, eq));
+                        hydra_pattern_strings.push_back(part.substr(0, eq));
                         llama_model_tensor_buft_override entry;
-                        entry.pattern = pattern_strings.back().c_str();
+                        entry.pattern = hydra_pattern_strings.back().c_str();
                         entry.buft = it->second;
                         swapped_params.tensor_buft_overrides.push_back(entry);
                     } else {
