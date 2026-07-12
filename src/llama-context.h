@@ -429,4 +429,16 @@ private:
     std::string hydra_pending_config_json;
     std::string hydra_pending_config_tier;
     time_t      hydra_pending_config_set_at = 0;
+
+public:
+    // Hydra #406 T3 mutator state. Previously file-scope statics in
+    // llama-hydra.cpp; moved here so each context owns its own pending
+    // state (eliminates the thread-model invariant that required both
+    // CONFIGURE and update_slots to run on the same thread).
+    std::string           hydra_pending_override_tensor;
+    std::string           hydra_pending_split_mode;       // "" = unchanged
+    std::vector<float>    hydra_pending_tensor_split;
+    int32_t               hydra_pending_n_gpu_layers = -1; // -1 = unchanged
+    int32_t               hydra_pending_n_cpu_moe    = -1; // -1 = unchanged
+    std::string           hydra_pending_model_path;       // "" = unchanged
 };

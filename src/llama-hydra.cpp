@@ -446,15 +446,10 @@ void llama_hydra_force_sync_if_shared(struct llama_context * ctx) {
 // new placement.
 
 namespace {
-// Pending T3 state. Read by the apply step in server-context when all slots
-// are idle. Cleared by the apply step. If a follow-up CONFIGURE arrives
-// before the apply step runs, it OVERWRITES these (last-write-wins).
-std::string                  s_hydra_pending_override_tensor;
-std::string                  s_hydra_pending_split_mode;            // "" = unchanged
-std::vector<float>            s_hydra_pending_tensor_split;
-int32_t                      s_hydra_pending_n_gpu_layers = -1;     // -1 = unchanged
-int32_t                      s_hydra_pending_n_cpu_moe     = -1;     // -1 = unchanged
-std::string                  s_hydra_pending_model_path;            // "" = unchanged
+// The pending T3 state now lives on llama_context (hydra_pending_* fields),
+// not as file-scope statics. This eliminates the thread-model invariant
+// that previously required CONFIGURE and update_slots to run on the same
+// thread. Each context owns its own pending state.
 } // namespace
 
 int llama_hydra_set_override_tensor(struct llama_context * ctx, const char * pattern) {
@@ -462,7 +457,7 @@ int llama_hydra_set_override_tensor(struct llama_context * ctx, const char * pat
         LLAMA_LOG_WARN("hydra: set_override_tensor called with null ctx/pattern\n");
         return -1;
     }
-    s_hydra_pending_override_tensor = pattern;
+    ctx->hydra_pending_override_tensor = pattern;
     // Invalidate graph cache: the next compute will see the new override
     // and re-place tensors. (See llama-context.cpp: graph reuse key includes
     // tensor placement; a change to override invalidates the cached graph.)
@@ -485,11 +480,11 @@ int llama_hydra_set_split_mode(struct llama_context * ctx, const char * mode, co
         LLAMA_LOG_WARN("hydra: set_split_mode rejected unknown mode '%s'\n", mode);
         return -1;
     }
-    s_hydra_pending_split_mode = m;
-    s_hydra_pending_tensor_split.clear();
+    ctx->hydra_pending_split_mode = m;
+    ctx->hydra_pending_tensor_split.clear();
     if (tensor_split != nullptr && n_split > 0) {
         for (size_t i = 0; i < n_split; i++) {
-            s_hydra_pending_tensor_split.push_back(tensor_split[i]);
+            ctx->hydra_pending_tensor_split.push_back(tensor_split[i]);
         }
     }
     // The split itself is part of llama_model_params — a model reload is
@@ -501,25 +496,26 @@ int llama_hydra_set_split_mode(struct llama_context * ctx, const char * mode, co
     return 0;
 }
 
-// Accessors for the apply step in server-context.
-const char * llama_hydra_get_pending_override_tensor() { return s_hydra_pending_override_tensor.c_str(); }
-const char * llama_hydra_get_pending_split_mode()      { return s_hydra_pending_split_mode.c_str(); }
-size_t       llama_hydra_get_pending_tensor_split_count() { return s_hydra_pending_tensor_split.size(); }
-const float * llama_hydra_get_pending_tensor_split()   { return s_hydra_pending_tensor_split.data(); }
-int32_t      llama_hydra_get_pending_n_gpu_layers()   { return s_hydra_pending_n_gpu_layers; }
-int32_t      llama_hydra_get_pending_n_cpu_moe()      { return s_hydra_pending_n_cpu_moe; }
-const char * llama_hydra_get_pending_model_path()      { return s_hydra_pending_model_path.c_str(); }
+// Accessors for the apply step in server-context. All read from ctx fields.
+const char * llama_hydra_get_pending_override_tensor(const struct llama_context * ctx) { return ctx ? ctx->hydra_pending_override_tensor.c_str() : ""; }
+const char * llama_hydra_get_pending_split_mode(const struct llama_context * ctx)     { return ctx ? ctx->hydra_pending_split_mode.c_str() : ""; }
+size_t       llama_hydra_get_pending_tensor_split_count(const struct llama_context * ctx) { return ctx ? ctx->hydra_pending_tensor_split.size() : 0; }
+const float * llama_hydra_get_pending_tensor_split(const struct llama_context * ctx)  { return ctx ? ctx->hydra_pending_tensor_split.data() : nullptr; }
+int32_t      llama_hydra_get_pending_n_gpu_layers(const struct llama_context * ctx)  { return ctx ? ctx->hydra_pending_n_gpu_layers : -1; }
+int32_t      llama_hydra_get_pending_n_cpu_moe(const struct llama_context * ctx)     { return ctx ? ctx->hydra_pending_n_cpu_moe : -1; }
+const char * llama_hydra_get_pending_model_path(const struct llama_context * ctx)     { return ctx ? ctx->hydra_pending_model_path.c_str() : ""; }
 
-void llama_hydra_set_pending_n_gpu_layers(int32_t v) { s_hydra_pending_n_gpu_layers = v; }
-void llama_hydra_set_pending_n_cpu_moe(int32_t v)    { s_hydra_pending_n_cpu_moe = v; }
-void llama_hydra_set_pending_model_path(const char * p) { s_hydra_pending_model_path = p ? p : ""; }
-void llama_hydra_clear_pending_t3() {
-    s_hydra_pending_override_tensor.clear();
-    s_hydra_pending_split_mode.clear();
-    s_hydra_pending_tensor_split.clear();
-    s_hydra_pending_n_gpu_layers = -1;
-    s_hydra_pending_n_cpu_moe    = -1;
-    s_hydra_pending_model_path.clear();
+void llama_hydra_set_pending_n_gpu_layers(struct llama_context * ctx, int32_t v) { if (ctx) ctx->hydra_pending_n_gpu_layers = v; }
+void llama_hydra_set_pending_n_cpu_moe(struct llama_context * ctx, int32_t v)    { if (ctx) ctx->hydra_pending_n_cpu_moe = v; }
+void llama_hydra_set_pending_model_path(struct llama_context * ctx, const char * p) { if (ctx) ctx->hydra_pending_model_path = p ? p : ""; }
+void llama_hydra_clear_pending_t3(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->hydra_pending_override_tensor.clear();
+    ctx->hydra_pending_split_mode.clear();
+    ctx->hydra_pending_tensor_split.clear();
+    ctx->hydra_pending_n_gpu_layers = -1;
+    ctx->hydra_pending_n_cpu_moe    = -1;
+    ctx->hydra_pending_model_path.clear();
 }
 
 // llama_hydra_apply_pending_config: stub that the apply step in
@@ -560,7 +556,7 @@ int llama_hydra_apply_pending_config(struct llama_context * ctx) {
                 ctx->hydra_get_pending_config_tier().c_str(),
                 ctx->hydra_get_pending_config().size());
         ctx->hydra_clear_pending_config();
-        llama_hydra_clear_pending_t3();
+        llama_hydra_clear_pending_t3(ctx);
         return -1;
     }
     // Invalidate graph cache — the next compute will rebuild against the
