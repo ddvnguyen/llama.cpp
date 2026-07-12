@@ -24,6 +24,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cinttypes>
@@ -701,6 +702,12 @@ public:
     // "peer configured+reachable" and "dual-load succeeded" in the old INFO
     // JSON — those are now distinct (hydra_peer_reachable vs this field).
     bool hydra_combined_head_attached = false;
+
+    // Hydra P1-6: set after a successful T3 rebuild so that the next
+    // HTTP request refreshes the cached server_context_meta.  The flag
+    // is cleared by the HTTP thread that performs the refresh (via
+    // atomic exchange), so at most one thread calls update_meta().
+    mutable std::atomic<bool> needs_meta_refresh{false};
 
     // Hydra #383 T1: true when this engine was started in COMBINED static
     // (layer-split) mode. The split is fixed at model load time; the mode
@@ -3262,9 +3269,11 @@ private:
                     // T2 keys (and any T3 keys the handler didn't recognize)
                     // are stored in pending_config for the apply step to
                     // consume.
-                    if (!t2t3_subset.empty()) {
+                    if (!t2t3_subset.empty() && ctx_tgt) {
                         ctx_tgt->hydra_set_pending_config(
                             t2t3_subset.dump(), hydra_tier_label(highest_tier));
+                    } else if (!t2t3_subset.empty()) {
+                        SRV_INF("%s", "hydra: CONFIGURE staged T3 keys for first load (no context yet)\n");
                     }
 
                     // 4. Build the response.
@@ -4093,6 +4102,12 @@ private:
             if (!apply_t3_rebuild()) {
                 SRV_ERR("%s", "hydra: T3 rebuild failed; engine continues with old model\n");
                 ok = false;
+            } else {
+                // P1-6: T3 model changed — the cached server_context_meta
+                // (model_path, split_mode, tensor_split, chat_params, …)
+                // is now stale.  Signal the HTTP thread to refresh it on
+                // the next request.
+                needs_meta_refresh.store(true, std::memory_order_release);
             }
         }
 
@@ -5964,17 +5979,39 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             for (auto & res : all_results.results) {
                 auto * cmpl = dynamic_cast<server_task_result_cmpl_final*>(res.get());
                 GGML_ASSERT(cmpl != nullptr);
-                if (!hydra_metrics_result.is_null()) {
-                    cmpl->hydra_metrics = hydra_metrics_result;
+                // P1-5/P1-6: build metrics inline from the (always-current)
+                // meta rather than reading a class-level field that could
+                // leak between concurrent requests.
+                {
+                    auto split_mode_str = [](enum llama_split_mode m) -> const char * {
+                        switch (m) {
+                            case LLAMA_SPLIT_MODE_NONE:  return "none";
+                            case LLAMA_SPLIT_MODE_LAYER: return "layer";
+                            case LLAMA_SPLIT_MODE_ROW:   return "row";
+                            default: return "none";
+                        }
+                    };
+                    json metrics = json::object();
+                    metrics["model_path"]   = meta->model_path;
+                    metrics["split_mode"]   = split_mode_str(meta->split_mode);
+                    metrics["t3_reloaded"]  = false;
+                    metrics["t3_reload_ms"] = 0.0;
+                    json ts_arr = json::array();
+                    for (const auto & v : meta->tensor_split) {
+                        if (v != 0.0f) {
+                            ts_arr.push_back(v);
+                        } else {
+                            break;
+                        }
+                    }
+                    metrics["tensor_split"] = ts_arr;
+                    cmpl->hydra_metrics = metrics;
                 }
                 arr.push_back(cmpl->to_json());
             }
             GGML_ASSERT(!arr.empty() && "empty results");
             if (arr.size() == 1) {
                 // if single request, return single object instead of array
-                if (!hydra_metrics_result.is_null()) {
-                    arr[0]["hydra_metrics"] = hydra_metrics_result;
-                }
                 res->ok(arr[0]);
             } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
                 // if multiple results in OAI format, we need to re-format them
@@ -6135,6 +6172,7 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
 
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
         : params(params),
+          ctx_server_outer(ctx_server),
           ctx_server(*ctx_server.impl),
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
@@ -6626,36 +6664,16 @@ void server_routes::init_routes() {
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
 
+        // P1-6: after a T3 rebuild the cached meta is stale.  Refresh it
+        // once (the first request after the rebuild wins the exchange).
+        if (ctx_server.needs_meta_refresh.exchange(false, std::memory_order_acquire)) {
+            this->update_meta(ctx_server_outer);
+        }
+
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
             files);
-
-        {
-            auto split_mode_str = [](enum llama_split_mode m) -> const char * {
-                switch (m) {
-                    case LLAMA_SPLIT_MODE_NONE:  return "none";
-                    case LLAMA_SPLIT_MODE_LAYER: return "layer";
-                    case LLAMA_SPLIT_MODE_ROW:   return "row";
-                    default: return "none";
-                }
-            };
-            json metrics = json::object();
-            metrics["model_path"]   = meta->model_path;
-            metrics["split_mode"]   = split_mode_str(meta->split_mode);
-            metrics["t3_reloaded"]  = false;
-            metrics["t3_reload_ms"] = 0.0;
-            json ts_arr = json::array();
-            for (const auto & v : meta->tensor_split) {
-                if (v != 0.0f) {
-                    ts_arr.push_back(v);
-                } else {
-                    break;
-                }
-            }
-            metrics["tensor_split"] = ts_arr;
-            this->hydra_metrics_result = metrics;
-        }
 
         return handle_completions_impl(
             req,

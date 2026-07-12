@@ -186,11 +186,10 @@ private:
     std::unique_ptr<const server_context_meta> meta;
 
     const common_params & params;
+    const server_context & ctx_server_outer; // P1-6: outer wrapper, needed by update_meta()
     const server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
-
-    json hydra_metrics_result = json();
 };
