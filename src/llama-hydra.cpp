@@ -449,6 +449,17 @@ namespace {
 // Pending T3 state. Read by the apply step in server-context when all slots
 // are idle. Cleared by the apply step. If a follow-up CONFIGURE arrives
 // before the apply step runs, it OVERWRITES these (last-write-wins).
+//
+// THREADING INVARIANT (hard constraint): these statics are written by the
+// CONFIGURE handler (in the bounded thread pool) and read/cleared by
+// apply_pending_hydra_config() in update_slots(). Both run on the same
+// thread (the pool dispatches to hydra_handle_connection which runs the
+// CONFIGURE handler, and update_slots is called from process_single_task
+// which runs on the pool thread). This is safe because update_slots runs
+// in the same process_single_task call that received the CONFIGURE task.
+// If a future refactor moves CONFIGURE handling to a different thread,
+// these MUST be moved to the llama_context struct (which already owns
+// hydra_pending_config_json) or protected by a mutex.
 std::string                  s_hydra_pending_override_tensor;
 std::string                  s_hydra_pending_split_mode;            // "" = unchanged
 std::vector<float>            s_hydra_pending_tensor_split;
@@ -458,24 +469,26 @@ std::string                  s_hydra_pending_model_path;            // "" = unch
 } // namespace
 
 int llama_hydra_set_override_tensor(struct llama_context * ctx, const char * pattern) {
-    if (!ctx || !pattern) {
-        LLAMA_LOG_WARN("hydra: set_override_tensor called with null ctx/pattern\n");
+    if (!pattern) {
+        LLAMA_LOG_WARN("hydra: set_override_tensor called with null pattern\n");
         return -1;
     }
     s_hydra_pending_override_tensor = pattern;
     // Invalidate graph cache: the next compute will see the new override
     // and re-place tensors. (See llama-context.cpp: graph reuse key includes
     // tensor placement; a change to override invalidates the cached graph.)
-    if (auto sched = ctx->get_sched()) {
-        ggml_backend_sched_reset(sched);
+    if (ctx) {
+        if (auto sched = ctx->get_sched()) {
+            ggml_backend_sched_reset(sched);
+        }
     }
     LLAMA_LOG_INFO("hydra: CONFIGURE override_tensor staged: '%s' (will apply on next model reload)\n", pattern);
     return 0;
 }
 
 int llama_hydra_set_split_mode(struct llama_context * ctx, const char * mode, const float * tensor_split, size_t n_split) {
-    if (!ctx || !mode) {
-        LLAMA_LOG_WARN("hydra: set_split_mode called with null ctx/mode\n");
+    if (!mode) {
+        LLAMA_LOG_WARN("hydra: set_split_mode called with null mode\n");
         return -1;
     }
     // Only accept known modes — we don't want to silently mutate llama.cpp
@@ -581,12 +594,5 @@ int llama_hydra_apply_pending_config(struct llama_context * ctx) {
 
 const char * llama_hydra_get_pending_config_tier(const struct llama_context * ctx) {
     if (!ctx) return "";
-    // hydra_get_pending_config_tier() returns std::string by value — the
-    // temporary would be destroyed before the caller uses the returned pointer.
-    // Store in a thread_local static so the pointer remains valid until the
-    // next call on the same thread (sufficient for the single-threaded
-    // update_slots / CONFIGURE handler dispatch model).
-    thread_local static std::string s_cached_tier;
-    s_cached_tier = ctx->hydra_get_pending_config_tier();
-    return s_cached_tier.c_str();
+    return ctx->hydra_get_pending_config_tier().c_str();
 }

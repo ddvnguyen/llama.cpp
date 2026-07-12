@@ -870,6 +870,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         res.push_back({"timings", timings.to_json()});
     }
 
+    if (!hydra_metrics.is_null()) {
+        res["hydra_metrics"] = hydra_metrics;
+    }
+
     return res;
 }
 

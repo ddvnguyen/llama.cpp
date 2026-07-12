@@ -53,6 +53,8 @@ struct server_context_meta {
     int32_t model_n_embd_inp;
     uint64_t model_n_params;
     uint64_t model_size;
+    enum llama_split_mode split_mode;
+    std::vector<float> tensor_split;
 };
 
 struct server_context {
@@ -189,4 +191,6 @@ private:
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    json hydra_metrics_result = json();
 };

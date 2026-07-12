@@ -408,6 +408,8 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<completion_token_output> probs_output;
     std::vector<std::string>  response_fields;
 
+    json hydra_metrics;
+
     task_params generation_params;
 
     // response formatting
