@@ -3256,13 +3256,13 @@ private:
 
                     // 3. Apply T3 mutators (record staged state; the actual
                     //    model reload is deferred to the slot-free trigger).
-                    if (highest_tier == 3 && ctx_tgt) {
+                    if (highest_tier == 3) {
                         hydra_apply_t3_mutators(ctx_tgt, t2t3_subset, deferred_keys);
                     }
                     // T2 keys (and any T3 keys the handler didn't recognize)
                     // are stored in pending_config for the apply step to
                     // consume.
-                    if (!t2t3_subset.empty() && ctx_tgt) {
+                    if (!t2t3_subset.empty()) {
                         ctx_tgt->hydra_set_pending_config(
                             t2t3_subset.dump(), hydra_tier_label(highest_tier));
                     }
@@ -4316,6 +4316,11 @@ private:
             // explicitly since some backends may not register the CPU buft.
             buft_list["CPU"] = ggml_backend_cpu_buffer_type();
 
+            // Keep pattern strings alive for the lifetime of the
+            // process — entry.pattern is a const char* that must not
+            // dangle.  Matches the safe pattern in common/arg.cpp.
+            static std::list<std::string> buft_override_patterns;
+
             const std::string ovr(override);
             size_t start = 0;
             while (start < ovr.size()) {
@@ -4327,15 +4332,9 @@ private:
                     std::string buft_name = part.substr(eq + 1);
                     auto it = buft_list.find(buft_name);
                     if (it != buft_list.end()) {
-                        // The C API requires a stable C string; the
-                        // pattern lives as long as ovr (the staged
-                        // static, see llama-hydra.cpp:452). The model
-                        // load parses it synchronously within
-                        // load_model(), which is called before we clear
-                        // the staged T3 statics — so the pointer is
-                        // valid for the entire load_model() call.
+                        buft_override_patterns.push_back(pattern);
                         llama_model_tensor_buft_override entry;
-                        entry.pattern = pattern.c_str();
+                        entry.pattern = buft_override_patterns.back().c_str();
                         entry.buft = it->second;
                         swapped_params.tensor_buft_overrides.push_back(entry);
                     } else {
@@ -6626,68 +6625,6 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
-
-        bool t3_reloaded = false;
-        double t3_reload_ms = 0.0;
-
-        if (!meta && body.contains("hydra_config") && body["hydra_config"].is_object()) {
-            const json & hc = body["hydra_config"];
-            if (hc.contains("model_path") && hc["model_path"].is_string()) {
-                SRV_INF("hydra: first model load from hydra_config: %s\n",
-                        hc["model_path"].get<std::string>().c_str());
-                llama_hydra_set_pending_model_path(hc["model_path"].get<std::string>().c_str());
-                if (hc.contains("split_mode") && hc["split_mode"].is_string()) {
-                    std::string mode = hc["split_mode"].get<std::string>();
-                    const float * split_ptr = nullptr;
-                    size_t split_count = 0;
-                    std::vector<float> split_vec;
-                    if (hc.contains("tensor_split") && hc["tensor_split"].is_array()) {
-                        for (const auto & v : hc["tensor_split"]) {
-                            if (v.is_number()) {
-                                split_vec.push_back(v.get<float>());
-                            }
-                        }
-                        split_ptr = split_vec.data();
-                        split_count = split_vec.size();
-                    }
-                    llama_hydra_set_split_mode(nullptr, mode.c_str(), split_ptr, split_count);
-                }
-                if (hc.contains("n_gpu_layers") && hc["n_gpu_layers"].is_number_integer()) {
-                    llama_hydra_set_pending_n_gpu_layers(hc["n_gpu_layers"].get<int32_t>());
-                }
-                if (hc.contains("override_tensor") && hc["override_tensor"].is_string()) {
-                    llama_hydra_set_override_tensor(nullptr, hc["override_tensor"].get<std::string>().c_str());
-                }
-                auto & impl_ref = const_cast<server_context_impl &>(ctx_server);
-                if (hc.contains("n_ctx") && hc["n_ctx"].is_number_integer()) {
-                    impl_ref.params_base.n_ctx = hc["n_ctx"].get<int32_t>();
-                }
-                if (hc.contains("ubatch_size") && hc["ubatch_size"].is_number_integer()) {
-                    impl_ref.params_base.n_ubatch = hc["ubatch_size"].get<int32_t>();
-                }
-                auto t_start = std::chrono::steady_clock::now();
-                bool ok = const_cast<server_context_impl &>(ctx_server).apply_t3_rebuild();
-                auto t_end = std::chrono::steady_clock::now();
-                t3_reload_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-                t3_reloaded = ok;
-                if (ok) {
-                    SRV_INF("%s", "hydra: first model load succeeded\n");
-                } else {
-                    SRV_WRN("%s", "hydra: first model load failed\n");
-                }
-                json metrics = json::object();
-                metrics["model_path"]   = meta ? meta->model_path : hc["model_path"].get<std::string>();
-                metrics["t3_reloaded"]  = t3_reloaded;
-                metrics["t3_reload_ms"] = t3_reload_ms;
-                this->hydra_metrics_result = metrics;
-                json result = json::object();
-                result["t3_reloaded"]  = t3_reloaded;
-                result["t3_reload_ms"] = t3_reload_ms;
-                result["model_path"]   = meta ? meta->model_path : "";
-                res->ok(result);
-                return res;
-            }
-        }
 
         json body_parsed = oaicompat_chat_params_parse(
             body,
