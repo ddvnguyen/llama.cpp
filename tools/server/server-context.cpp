@@ -703,11 +703,11 @@ public:
     // JSON — those are now distinct (hydra_peer_reachable vs this field).
     bool hydra_combined_head_attached = false;
 
-    // Hydra P1-6: set after a successful T3 rebuild so that the next
-    // HTTP request refreshes the cached server_context_meta.  The flag
-    // is cleared by the HTTP thread that performs the refresh (via
-    // atomic exchange), so at most one thread calls update_meta().
-    mutable std::atomic<bool> needs_meta_refresh{false};
+    // Hydra P1-6: back-pointer to server_routes, set after construction
+    // in server.cpp.  Used by apply_pending_hydra_config() to refresh
+    // the cached server_context_meta on the task-queue thread (safe —
+    // runs during the drain window when no slots are processing).
+    server_routes * routes_ptr = nullptr;
 
     // Hydra #383 T1: true when this engine was started in COMBINED static
     // (layer-split) mode. The split is fixed at model load time; the mode
@@ -3276,6 +3276,20 @@ private:
                         SRV_INF("%s", "hydra: CONFIGURE staged T3 keys for first load (no context yet)\n");
                     }
 
+                    // First load: ctx_tgt is null, so apply_pending_hydra_config()
+                    // and update_slots() can't trigger (both gate on ctx_tgt).
+                    // Call apply_t3_rebuild() directly — safe because this runs on
+                    // the task-queue thread and there are no slots to drain.
+                    if (!t2t3_subset.empty() && !ctx_tgt) {
+                        SRV_INF("%s", "hydra: CONFIGURE first load — calling apply_t3_rebuild directly\n");
+                        bool ok = apply_t3_rebuild();
+                        if (ok) {
+                            SRV_INF("%s", "hydra: CONFIGURE first load succeeded\n");
+                        } else {
+                            SRV_ERR("%s", "hydra: CONFIGURE first load failed\n");
+                        }
+                    }
+
                     // 4. Build the response.
                     res->tier = hydra_tier_label(highest_tier);
                     res->params_applied = std::move(params_applied);
@@ -4105,9 +4119,12 @@ private:
             } else {
                 // P1-6: T3 model changed — the cached server_context_meta
                 // (model_path, split_mode, tensor_split, chat_params, …)
-                // is now stale.  Signal the HTTP thread to refresh it on
-                // the next request.
-                needs_meta_refresh.store(true, std::memory_order_release);
+                // is now stale.  Refresh it on the task-queue thread
+                // (safe — runs during the drain window when no slots are
+                // processing and no new requests are being dispatched).
+                if (routes_ptr) {
+                    routes_ptr->refresh_meta();
+                }
             }
         }
 
@@ -6663,12 +6680,6 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
-
-        // P1-6: after a T3 rebuild the cached meta is stale.  Refresh it
-        // once (the first request after the rebuild wins the exchange).
-        if (ctx_server.needs_meta_refresh.exchange(false, std::memory_order_acquire)) {
-            this->update_meta(ctx_server_outer);
-        }
 
         json body_parsed = oaicompat_chat_params_parse(
             body,

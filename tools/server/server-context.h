@@ -136,6 +136,13 @@ struct server_routes {
         this->meta = std::make_unique<server_context_meta>(ctx_server.get_meta());
     }
 
+    // Hydra P1-6: refresh meta from the stored ctx_server_outer reference.
+    // Called from the task-queue thread (apply_pending_hydra_config) during
+    // the drain window — no concurrent readers at this point.
+    void refresh_meta() {
+        this->update_meta(ctx_server_outer);
+    }
+
     // handlers using lambda function, so that they can capture `this` without `std::bind`
     // they won't be called until ctx_http.is_ready is set to true
     server_http_context::handler_t get_health;
