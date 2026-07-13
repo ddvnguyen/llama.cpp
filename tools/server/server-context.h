@@ -94,6 +94,13 @@ struct server_context {
     // after the first load. Must be called before start_loop().
     void set_routes_ptr(struct server_routes * routes);
 
+    // P0-1 (#49): stage capability flags for deferred first-load.
+    // apply_pending_hydra_config() will call set_hydra_capabilities() and
+    // set_hydra_combined_static() after the first load succeeds.
+    void set_bootstrap_capabilities(bool rpc_active, const std::string & peer,
+            bool peer_reachable, const std::string & pattern,
+            const std::string & split_mode, bool combined_static);
+
     // Hydra RPC: start a binary TCP listener for KV state transfer.
     // Ops: STATE_GET (0x30), STATE_PUT (0x31), STATE_META (0x32).
     // port = 0 is a no-op (disabled). Must be called after load_model().

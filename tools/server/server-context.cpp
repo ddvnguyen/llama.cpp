@@ -23,6 +23,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "../llama-engine/hydra_rpc/hydra_rpc.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -712,7 +714,16 @@ public:
     // Set by the CONFIGURE HTTP handler when ctx_tgt is null and T3 keys
     // are staged. Cleared by apply_pending_hydra_config() on the
     // task-queue thread when it runs apply_t3_rebuild() for first load.
-    bool first_load_pending = false;
+    bool        first_load_pending = false;
+    // P0-1 (#49): staged capabilities for deferred first-load.
+    // Populated by set_bootstrap_capabilities() before start_loop();
+    // applied by apply_pending_hydra_config() after the first load.
+    bool        bootstrap_rpc_active = false;
+    std::string bootstrap_peer;
+    bool        bootstrap_peer_reachable = false;
+    std::string bootstrap_pattern;
+    std::string bootstrap_split_mode = "none";
+    bool        bootstrap_combined_static = false;
 
     // Hydra #383 T1: true when this engine was started in COMBINED static
     // (layer-split) mode. The split is fixed at model load time; the mode
@@ -4142,6 +4153,39 @@ private:
                 if (routes_ptr) {
                     routes_ptr->refresh_meta();
                 }
+                // P0-1 (#49): after deferred first-load, apply staged capabilities
+                // so ENGINE_INFO(0x41) and COMBINED-mode logic work correctly.
+                if (is_first_load) {
+                    hydra_rpc_backend_active = bootstrap_rpc_active;
+                    hydra_peer               = bootstrap_peer;
+                    hydra_peer_reachable     = bootstrap_peer_reachable;
+                    hydra_combined_pattern   = bootstrap_pattern;
+                    hydra_split_mode         = bootstrap_split_mode;
+                    if (bootstrap_combined_static) {
+                        hydra_combined_static = true;
+                        SRV_INF("%s", "P0-1: deferred first-load — combined_static mode activated\n");
+                    }
+                    // Register local tensors and enable shared-backend compute
+                    // lock so the model can serve inbound RPC requests.
+                    if (model_tgt && ctx_tgt) {
+                        llama_hydra_register_local_tensors_for_rpc(ctx_tgt);
+                        llama_hydra_enable_shared_backend_compute_lock();
+                    }
+                    // Update the RPC server's compute backends now that the
+                    // model is loaded. The RPC server was started with empty
+                    // backends (head-bootstrap mode); now populate it.
+                    if (ctx_tgt) {
+                        std::vector<ggml_backend_t> backends(8);
+                        size_t n = llama_hydra_get_compute_backends(ctx_tgt, backends.data(), backends.size());
+                        if (n > backends.size()) {
+                            backends.resize(n);
+                            n = llama_hydra_get_compute_backends(ctx_tgt, backends.data(), backends.size());
+                        }
+                        backends.resize(n);
+                        hydra_rpc::update_backends(backends);
+                        SRV_INF("P0-1: updated RPC backends to %zu compute device(s)\n", backends.size());
+                    }
+                }
             }
         }
 
@@ -5876,6 +5920,17 @@ void server_context::set_routes_ptr(server_routes * routes) {
     impl->routes_ptr = routes;
 }
 
+void server_context::set_bootstrap_capabilities(bool rpc_active, const std::string & peer,
+        bool peer_reachable, const std::string & pattern,
+        const std::string & split_mode, bool combined_static) {
+    impl->bootstrap_rpc_active = rpc_active;
+    impl->bootstrap_peer = peer;
+    impl->bootstrap_peer_reachable = peer_reachable;
+    impl->bootstrap_pattern = pattern;
+    impl->bootstrap_split_mode = split_mode;
+    impl->bootstrap_combined_static = combined_static;
+}
+
 // compute the number of tokens before the last user message in the prompt
 static int32_t prompt_get_n_before_user(
         const json & message_spans,
@@ -5937,6 +5992,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     std::shared_lock meta_lock(meta_mutex);
+
+    // P0-1 (#49): null-meta guard — meta is null until update_meta() is
+    // called after model load. Return 503 instead of crashing.
+    if (!meta) {
+        auto res = create_response();
+        res->error(format_error_response("model not loaded — waiting for CONFIGURE",
+                                         ERROR_TYPE_NOT_SUPPORTED));
+        return res;
+    }
 
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
@@ -6607,6 +6671,15 @@ void server_routes::init_routes() {
 
     this->post_infill = [this](const server_http_req & req) {
         auto res = create_response();
+        // P0-1 (#49): null-meta guard
+        {
+            std::shared_lock meta_lock(meta_mutex);
+            if (!meta) {
+                res->error(format_error_response("model not loaded — waiting for CONFIGURE",
+                                                 ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+        }
 
         // Validate input and compute infill prompt — these read meta->slot_n_ctx.
         // Scope the shared_lock so it releases before handle_completions_impl
@@ -6719,6 +6792,16 @@ void server_routes::init_routes() {
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
+        // P0-1 (#49): null-meta guard — meta is null until update_meta() is
+        // called after model load. Return 503 instead of crashing.
+        {
+            std::shared_lock meta_lock(meta_mutex);
+            if (!meta) {
+                res->error(format_error_response("model not loaded — waiting for CONFIGURE",
+                                                 ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+        }
         json body_parsed;
         std::vector<raw_buffer> files;
         {

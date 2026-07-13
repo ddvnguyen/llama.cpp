@@ -254,4 +254,9 @@ int bound_port() {
     return state().port;
 }
 
+void update_backends(const std::vector<ggml_backend_t> & backends) {
+    state().backends = backends;
+    LOG_INF("hydra_rpc: updated backends to %zu compute device(s)\n", backends.size());
+}
+
 }  // namespace hydra_rpc

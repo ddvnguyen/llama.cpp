@@ -782,9 +782,12 @@ int llama_engine(int argc, char ** argv) {
                 llama_backend_free();
                 return 1;
             }
-            // Don't set is_ready yet — will be set after CONFIGURE T3 loads model
-            // and routes.update_meta() is called. In the meantime, /health works
-            // but inference routes will return errors (correct for bootstrap state).
+            // is_ready means "HTTP server is up", not "model is loaded".
+            // Individual routes handle the no-model-yet case themselves
+            // (returns 503 with a clear message). Setting this early
+            // ensures /health works for orchestration liveness checks
+            // from the moment the process starts.
+            ctx_http.is_ready.store(true);
         }
 
         // Start the unified RPC server with Hydra protocol enabled.
@@ -792,6 +795,18 @@ int llama_engine(int argc, char ** argv) {
         // the model via apply_pending_hydra_config(). CONFIGURE itself is a
         // Hydra opcode, not ggml-RPC, so it doesn't need compute backends.
         ctx_server.start_rpc_server(rpc_port, {});
+
+        // Stage capabilities for deferred first-load — apply_pending_hydra_config()
+        // will call set_hydra_capabilities() / set_hydra_combined_static() after
+        // the model is loaded, so ENGINE_INFO(0x41) and COMBINED-mode work correctly.
+        ctx_server.set_bootstrap_capabilities(
+            rpc_port > 0,                    // rpc_active
+            flags.rpc_engine_peer,           // peer
+            !flags.rpc_engine_peer.empty() && peer_reg != nullptr,  // peer_reachable
+            flags.tensor_split_str,          // pattern
+            peer_reg != nullptr ? "layer" : "none",  // split_mode
+            peer_reg != nullptr              // combined_static
+        );
 
         shutdown_handler = [&](int) {
             ctx_server.terminate();

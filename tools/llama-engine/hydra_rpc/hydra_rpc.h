@@ -71,4 +71,10 @@ bool is_running();
 // returns 0.
 int bound_port();
 
+// P0-1 (#49): update the compute backends exposed to inbound ggml-RPC.
+// Called after deferred first-load to populate the RPC server with the
+// model's actual compute backends (the server was started with empty
+// backends for CONFIGURE to arrive before the model was loaded).
+void update_backends(const std::vector<ggml_backend_t> & backends);
+
 }  // namespace hydra_rpc
