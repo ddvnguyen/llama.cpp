@@ -131,6 +131,12 @@ int llama_server(int argc, char ** argv) {
 
     // register API routes
     server_routes routes(params, ctx_server);
+
+    // Hydra P1-6: wire up the back-pointer so that apply_pending_hydra_config()
+    // (task-queue thread) can refresh meta after a T3 rebuild without going
+    // through the HTTP thread pool.
+    ctx_server.impl->routes_ptr = &routes;
+
     server_tools tools;
 
     std::optional<server_models_routes> models_routes{};

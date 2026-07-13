@@ -24,6 +24,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cinttypes>
@@ -701,6 +702,17 @@ public:
     // "peer configured+reachable" and "dual-load succeeded" in the old INFO
     // JSON — those are now distinct (hydra_peer_reachable vs this field).
     bool hydra_combined_head_attached = false;
+
+    // Hydra P1-6: back-pointer to server_routes, set after construction
+    // in server.cpp.  Used by apply_pending_hydra_config() to refresh
+    // the cached server_context_meta on the task-queue thread (safe —
+    // runs during the drain window when no slots are processing).
+    server_routes * routes_ptr = nullptr;
+
+    // Set by the CONFIGURE HTTP handler when ctx_tgt is null and T3 keys
+    // are staged. Cleared by apply_pending_hydra_config() on the
+    // task-queue thread when it runs apply_t3_rebuild() for first load.
+    bool first_load_pending = false;
 
     // Hydra #383 T1: true when this engine was started in COMBINED static
     // (layer-split) mode. The split is fixed at model load time; the mode
@@ -3256,7 +3268,7 @@ private:
 
                     // 3. Apply T3 mutators (record staged state; the actual
                     //    model reload is deferred to the slot-free trigger).
-                    if (highest_tier == 3 && ctx_tgt) {
+                    if (highest_tier == 3) {
                         hydra_apply_t3_mutators(ctx_tgt, t2t3_subset, deferred_keys);
                     }
                     // T2 keys (and any T3 keys the handler didn't recognize)
@@ -3265,6 +3277,17 @@ private:
                     if (!t2t3_subset.empty() && ctx_tgt) {
                         ctx_tgt->hydra_set_pending_config(
                             t2t3_subset.dump(), hydra_tier_label(highest_tier));
+                    } else if (!t2t3_subset.empty()) {
+                        SRV_INF("%s", "hydra: CONFIGURE staged T3 keys for first load (no context yet)\n");
+                    }
+
+                    // First load: ctx_tgt is null, so apply_pending_hydra_config()
+                    // and update_slots() can't trigger (both gate on ctx_tgt).
+                    // Set the flag so the task-queue thread runs apply_t3_rebuild()
+                    // at the next slot-free moment (safe — no slots to drain).
+                    if (!t2t3_subset.empty() && !ctx_tgt) {
+                        first_load_pending = true;
+                        SRV_INF("%s", "hydra: CONFIGURE first load staged — task-queue will apply\n");
                     }
 
                     // 4. Build the response.
@@ -4045,34 +4068,51 @@ private:
     // catastrophic case where the rollback itself fails — the engine
     // would be unable to serve in any state and must exit.
     bool apply_pending_hydra_config() {
-        if (!ctx_tgt || !ctx_tgt->hydra_has_pending_config()) {
+        const bool is_first_load = !ctx_tgt;
+        if (is_first_load) {
+            if (!first_load_pending) {
+                return false;
+            }
+            // Don't check hydra_has_pending_config — ctx_tgt doesn't exist yet.
+            // The T3 statics were staged by hydra_apply_t3_mutators() in the
+            // CONFIGURE handler. Set a default tier for the rebuild path.
+        } else if (!ctx_tgt->hydra_has_pending_config()) {
             return false;
         }
 
-        // 1. Drain timeout
-        constexpr time_t k_drain_timeout_default = 300;
-        time_t now = std::time(nullptr);
-        time_t elapsed = now - ctx_tgt->hydra_get_pending_config_set_at();
-        int env_timeout = 0;
-        if (const char * e = getenv("HYDRA_COORD_PROFILE_SWITCH_DRAIN_TIMEOUT")) {
-            env_timeout = atoi(e);
-        }
-        time_t drain_timeout = env_timeout > 0 ? env_timeout : k_drain_timeout_default;
-        if (elapsed > drain_timeout) {
-            SRV_WRN("hydra: pending config drain timeout (elapsed=%lld, limit=%lld) — discarding, "
-                    "tier='%s' payload_size=%zu\n",
-                    (long long) elapsed, (long long) drain_timeout,
-                    ctx_tgt->hydra_get_pending_config_tier().c_str(),
-                    ctx_tgt->hydra_get_pending_config().size());
-            ctx_tgt->hydra_clear_pending_config();
-            llama_hydra_clear_pending_t3();
-            return false;
-        }
+        // 1. Drain timeout — skipped for first load (no ctx_tgt timestamp).
+        std::string tier;
+        std::string pending_json;
 
-        const std::string tier = ctx_tgt->hydra_get_pending_config_tier();
-        const std::string pending_json = ctx_tgt->hydra_get_pending_config();
-        SRV_INF("hydra: applying pending config (tier='%s', age=%llds, payload_size=%zu)\n",
-                tier.c_str(), (long long) elapsed, pending_json.size());
+        if (is_first_load) {
+            tier = "T3";
+            // pending_json stays empty — T3 statics are staged in global
+            // overrides, not in pending_config (ctx_tgt doesn't exist yet).
+        } else {
+            constexpr time_t k_drain_timeout_default = 300;
+            time_t now = std::time(nullptr);
+            time_t elapsed = now - ctx_tgt->hydra_get_pending_config_set_at();
+            int env_timeout = 0;
+            if (const char * e = getenv("HYDRA_COORD_PROFILE_SWITCH_DRAIN_TIMEOUT")) {
+                env_timeout = atoi(e);
+            }
+            time_t drain_timeout = env_timeout > 0 ? env_timeout : k_drain_timeout_default;
+            if (elapsed > drain_timeout) {
+                SRV_WRN("hydra: pending config drain timeout (elapsed=%lld, limit=%lld) — discarding, "
+                        "tier='%s' payload_size=%zu\n",
+                        (long long) elapsed, (long long) drain_timeout,
+                        ctx_tgt->hydra_get_pending_config_tier().c_str(),
+                        ctx_tgt->hydra_get_pending_config().size());
+                ctx_tgt->hydra_clear_pending_config();
+                llama_hydra_clear_pending_t3();
+                return false;
+            }
+
+            tier = ctx_tgt->hydra_get_pending_config_tier();
+            pending_json = ctx_tgt->hydra_get_pending_config();
+            SRV_INF("hydra: applying pending config (tier='%s', age=%llds, payload_size=%zu)\n",
+                    tier.c_str(), (long long) elapsed, pending_json.size());
+        }
 
         bool ok = true;
 
@@ -4093,6 +4133,15 @@ private:
             if (!apply_t3_rebuild()) {
                 SRV_ERR("%s", "hydra: T3 rebuild failed; engine continues with old model\n");
                 ok = false;
+            } else {
+                // P1-6: T3 model changed — the cached server_context_meta
+                // (model_path, split_mode, tensor_split, chat_params, …)
+                // is now stale.  Refresh it on the task-queue thread
+                // (safe — runs during the drain window when no slots are
+                // processing and no new requests are being dispatched).
+                if (routes_ptr) {
+                    routes_ptr->refresh_meta();
+                }
             }
         }
 
@@ -4100,7 +4149,11 @@ private:
         //    the rollback in apply_t{2,3}_rebuild has restored the
         //    previous state; clearing the staged state prevents the
         //    next slot-free moment from re-attempting the same rebuild.
-        ctx_tgt->hydra_clear_pending_config();
+        if (is_first_load) {
+            first_load_pending = false;
+        } else {
+            ctx_tgt->hydra_clear_pending_config();
+        }
         llama_hydra_clear_pending_t3();
         return ok;
     }
@@ -4316,6 +4369,11 @@ private:
             // explicitly since some backends may not register the CPU buft.
             buft_list["CPU"] = ggml_backend_cpu_buffer_type();
 
+            // Keep pattern strings alive for the lifetime of the
+            // process — entry.pattern is a const char* that must not
+            // dangle.  Matches the safe pattern in common/arg.cpp.
+            static std::list<std::string> buft_override_patterns;
+
             const std::string ovr(override);
             size_t start = 0;
             while (start < ovr.size()) {
@@ -4327,15 +4385,9 @@ private:
                     std::string buft_name = part.substr(eq + 1);
                     auto it = buft_list.find(buft_name);
                     if (it != buft_list.end()) {
-                        // The C API requires a stable C string; the
-                        // pattern lives as long as ovr (the staged
-                        // static, see llama-hydra.cpp:452). The model
-                        // load parses it synchronously within
-                        // load_model(), which is called before we clear
-                        // the staged T3 statics — so the pointer is
-                        // valid for the entire load_model() call.
+                        buft_override_patterns.push_back(pattern);
                         llama_model_tensor_buft_override entry;
-                        entry.pattern = pattern.c_str();
+                        entry.pattern = buft_override_patterns.back().c_str();
                         entry.buft = it->second;
                         swapped_params.tensor_buft_overrides.push_back(entry);
                     } else {
@@ -4466,6 +4518,9 @@ private:
                 if (ctx_tgt && ctx_tgt->hydra_has_pending_config()) {
                     SRV_INF("hydra: slot-free moment — applying pending CONFIGURE (tier=%s)\n",
                             ctx_tgt->hydra_get_pending_config_tier().c_str());
+                    apply_pending_hydra_config();
+                } else if (!ctx_tgt && first_load_pending) {
+                    SRV_INF("%s", "hydra: slot-free moment — first load (no context yet)\n");
                     apply_pending_hydra_config();
                 }
 
@@ -5877,6 +5932,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task_response_type res_type) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
+    std::shared_lock meta_lock(meta_mutex);
+
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
@@ -5965,17 +6022,39 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             for (auto & res : all_results.results) {
                 auto * cmpl = dynamic_cast<server_task_result_cmpl_final*>(res.get());
                 GGML_ASSERT(cmpl != nullptr);
-                if (!hydra_metrics_result.is_null()) {
-                    cmpl->hydra_metrics = hydra_metrics_result;
+                // P1-5/P1-6: build metrics inline from the (always-current)
+                // meta rather than reading a class-level field that could
+                // leak between concurrent requests.
+                {
+                    auto split_mode_str = [](enum llama_split_mode m) -> const char * {
+                        switch (m) {
+                            case LLAMA_SPLIT_MODE_NONE:  return "none";
+                            case LLAMA_SPLIT_MODE_LAYER: return "layer";
+                            case LLAMA_SPLIT_MODE_ROW:   return "row";
+                            default: return "none";
+                        }
+                    };
+                    json metrics = json::object();
+                    metrics["model_path"]   = meta->model_path;
+                    metrics["split_mode"]   = split_mode_str(meta->split_mode);
+                    metrics["t3_reloaded"]  = false;
+                    metrics["t3_reload_ms"] = 0.0;
+                    json ts_arr = json::array();
+                    for (const auto & v : meta->tensor_split) {
+                        if (v != 0.0f) {
+                            ts_arr.push_back(v);
+                        } else {
+                            break;
+                        }
+                    }
+                    metrics["tensor_split"] = ts_arr;
+                    cmpl->hydra_metrics = metrics;
                 }
                 arr.push_back(cmpl->to_json());
             }
             GGML_ASSERT(!arr.empty() && "empty results");
             if (arr.size() == 1) {
                 // if single request, return single object instead of array
-                if (!hydra_metrics_result.is_null()) {
-                    arr[0]["hydra_metrics"] = hydra_metrics_result;
-                }
                 res->ok(arr[0]);
             } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
                 // if multiple results in OAI format, we need to re-format them
@@ -6136,6 +6215,7 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
 
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
         : params(params),
+          ctx_server_outer(ctx_server),
           ctx_server(*ctx_server.impl),
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
@@ -6456,6 +6536,7 @@ void server_routes::init_routes() {
 
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
+        std::shared_lock meta_lock(meta_mutex);
 
         // this endpoint can be accessed during sleeping
         // the next LOC is to avoid someone accidentally use ctx_server
@@ -6522,74 +6603,84 @@ void server_routes::init_routes() {
 
     this->post_infill = [this](const server_http_req & req) {
         auto res = create_response();
-        // check model compatibility
-        std::string err;
-        if (llama_vocab_fim_pre(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
-            err += "prefix token is missing. ";
-        }
-        if (llama_vocab_fim_suf(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
-            err += "suffix token is missing. ";
-        }
-        if (llama_vocab_fim_mid(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
-            err += "middle token is missing. ";
-        }
-        if (!err.empty()) {
-            res->error(format_error_response(string_format("Infill is not supported by this model: %s", err.c_str()), ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
 
-        // validate input
-        json data = json::parse(req.body);
-        if (data.contains("prompt") && !data.at("prompt").is_string()) {
-            // prompt is optional
-            res->error(format_error_response("\"prompt\" must be a string", ERROR_TYPE_INVALID_REQUEST));
-        }
+        // Validate input and compute infill prompt — these read meta->slot_n_ctx.
+        // Scope the shared_lock so it releases before handle_completions_impl
+        // takes its own lock (recursive shared_lock is UB on std::shared_mutex).
+        json data;
+        std::vector<raw_buffer> files;
+        {
+            std::shared_lock meta_lock(meta_mutex);
 
-        if (!data.contains("input_prefix")) {
-            res->error(format_error_response("\"input_prefix\" is required", ERROR_TYPE_INVALID_REQUEST));
-        }
-
-        if (!data.contains("input_suffix")) {
-            res->error(format_error_response("\"input_suffix\" is required", ERROR_TYPE_INVALID_REQUEST));
-        }
-
-        if (data.contains("input_extra") && !data.at("input_extra").is_array()) {
-            // input_extra is optional
-            res->error(format_error_response("\"input_extra\" must be an array of {\"filename\": string, \"text\": string}", ERROR_TYPE_INVALID_REQUEST));
-            return res;
-        }
-
-        json input_extra = json_value(data, "input_extra", json::array());
-        for (const auto & chunk : input_extra) {
-            // { "text": string, "filename": string }
-            if (!chunk.contains("text") || !chunk.at("text").is_string()) {
-                res->error(format_error_response("extra_context chunk must contain a \"text\" field with a string value", ERROR_TYPE_INVALID_REQUEST));
+            // check model compatibility
+            std::string err;
+            if (llama_vocab_fim_pre(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+                err += "prefix token is missing. ";
+            }
+            if (llama_vocab_fim_suf(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+                err += "suffix token is missing. ";
+            }
+            if (llama_vocab_fim_mid(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+                err += "middle token is missing. ";
+            }
+            if (!err.empty()) {
+                res->error(format_error_response(string_format("Infill is not supported by this model: %s", err.c_str()), ERROR_TYPE_NOT_SUPPORTED));
                 return res;
             }
-            // filename is optional
-            if (chunk.contains("filename") && !chunk.at("filename").is_string()) {
-                res->error(format_error_response("extra_context chunk's \"filename\" field must be a string", ERROR_TYPE_INVALID_REQUEST));
+
+            // validate input
+            data = json::parse(req.body);
+            if (data.contains("prompt") && !data.at("prompt").is_string()) {
+                // prompt is optional
+                res->error(format_error_response("\"prompt\" must be a string", ERROR_TYPE_INVALID_REQUEST));
+            }
+
+            if (!data.contains("input_prefix")) {
+                res->error(format_error_response("\"input_prefix\" is required", ERROR_TYPE_INVALID_REQUEST));
+            }
+
+            if (!data.contains("input_suffix")) {
+                res->error(format_error_response("\"input_suffix\" is required", ERROR_TYPE_INVALID_REQUEST));
+            }
+
+            if (data.contains("input_extra") && !data.at("input_extra").is_array()) {
+                // input_extra is optional
+                res->error(format_error_response("\"input_extra\" must be an array of {\"filename\": string, \"text\": string}", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
+
+            json input_extra = json_value(data, "input_extra", json::array());
+            for (const auto & chunk : input_extra) {
+                // { "text": string, "filename": string }
+                if (!chunk.contains("text") || !chunk.at("text").is_string()) {
+                    res->error(format_error_response("extra_context chunk must contain a \"text\" field with a string value", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                // filename is optional
+                if (chunk.contains("filename") && !chunk.at("filename").is_string()) {
+                    res->error(format_error_response("extra_context chunk's \"filename\" field must be a string", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+            }
+            data["input_extra"] = input_extra; // default to empty array if it's not exist
+
+            std::string prompt = json_value(data, "prompt", std::string());
+            std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true);
+            SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
+            data["prompt"] = format_prompt_infill(
+                ctx_server.vocab,
+                data.at("input_prefix"),
+                data.at("input_suffix"),
+                data.at("input_extra"),
+                params.n_batch,
+                params.n_predict,
+                meta->slot_n_ctx,
+                params.spm_infill,
+                tokenized_prompts[0].get_tokens() // TODO: this could maybe be multimodal.
+            );
         }
-        data["input_extra"] = input_extra; // default to empty array if it's not exist
+        // meta_lock released here
 
-        std::string prompt = json_value(data, "prompt", std::string());
-        std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true);
-        SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
-        data["prompt"] = format_prompt_infill(
-            ctx_server.vocab,
-            data.at("input_prefix"),
-            data.at("input_suffix"),
-            data.at("input_extra"),
-            params.n_batch,
-            params.n_predict,
-            meta->slot_n_ctx,
-            params.spm_infill,
-            tokenized_prompts[0].get_tokens() // TODO: this could maybe be multimodal.
-        );
-
-        std::vector<raw_buffer> files; // dummy
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_INFILL,
@@ -6624,101 +6715,14 @@ void server_routes::init_routes() {
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
+        json body_parsed;
         std::vector<raw_buffer> files;
-        json body = json::parse(req.body);
-
-        bool t3_reloaded = false;
-        double t3_reload_ms = 0.0;
-
-        if (!meta && body.contains("hydra_config") && body["hydra_config"].is_object()) {
-            const json & hc = body["hydra_config"];
-            if (hc.contains("model_path") && hc["model_path"].is_string()) {
-                SRV_INF("hydra: first model load from hydra_config: %s\n",
-                        hc["model_path"].get<std::string>().c_str());
-                llama_hydra_set_pending_model_path(hc["model_path"].get<std::string>().c_str());
-                if (hc.contains("split_mode") && hc["split_mode"].is_string()) {
-                    std::string mode = hc["split_mode"].get<std::string>();
-                    const float * split_ptr = nullptr;
-                    size_t split_count = 0;
-                    std::vector<float> split_vec;
-                    if (hc.contains("tensor_split") && hc["tensor_split"].is_array()) {
-                        for (const auto & v : hc["tensor_split"]) {
-                            if (v.is_number()) {
-                                split_vec.push_back(v.get<float>());
-                            }
-                        }
-                        split_ptr = split_vec.data();
-                        split_count = split_vec.size();
-                    }
-                    llama_hydra_set_split_mode(nullptr, mode.c_str(), split_ptr, split_count);
-                }
-                if (hc.contains("n_gpu_layers") && hc["n_gpu_layers"].is_number_integer()) {
-                    llama_hydra_set_pending_n_gpu_layers(hc["n_gpu_layers"].get<int32_t>());
-                }
-                if (hc.contains("override_tensor") && hc["override_tensor"].is_string()) {
-                    llama_hydra_set_override_tensor(nullptr, hc["override_tensor"].get<std::string>().c_str());
-                }
-                auto & impl_ref = const_cast<server_context_impl &>(ctx_server);
-                if (hc.contains("n_ctx") && hc["n_ctx"].is_number_integer()) {
-                    impl_ref.params_base.n_ctx = hc["n_ctx"].get<int32_t>();
-                }
-                if (hc.contains("ubatch_size") && hc["ubatch_size"].is_number_integer()) {
-                    impl_ref.params_base.n_ubatch = hc["ubatch_size"].get<int32_t>();
-                }
-                auto t_start = std::chrono::steady_clock::now();
-                bool ok = const_cast<server_context_impl &>(ctx_server).apply_t3_rebuild();
-                auto t_end = std::chrono::steady_clock::now();
-                t3_reload_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-                t3_reloaded = ok;
-                if (ok) {
-                    SRV_INF("%s", "hydra: first model load succeeded\n");
-                } else {
-                    SRV_WRN("%s", "hydra: first model load failed\n");
-                }
-                json metrics = json::object();
-                metrics["model_path"]   = meta ? meta->model_path : hc["model_path"].get<std::string>();
-                metrics["t3_reloaded"]  = t3_reloaded;
-                metrics["t3_reload_ms"] = t3_reload_ms;
-                this->hydra_metrics_result = metrics;
-                json result = json::object();
-                result["t3_reloaded"]  = t3_reloaded;
-                result["t3_reload_ms"] = t3_reload_ms;
-                result["model_path"]   = meta ? meta->model_path : "";
-                res->ok(result);
-                return res;
-            }
-        }
-
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
-
         {
-            auto split_mode_str = [](enum llama_split_mode m) -> const char * {
-                switch (m) {
-                    case LLAMA_SPLIT_MODE_NONE:  return "none";
-                    case LLAMA_SPLIT_MODE_LAYER: return "layer";
-                    case LLAMA_SPLIT_MODE_ROW:   return "row";
-                    default: return "none";
-                }
-            };
-            json metrics = json::object();
-            metrics["model_path"]   = meta->model_path;
-            metrics["split_mode"]   = split_mode_str(meta->split_mode);
-            metrics["t3_reloaded"]  = false;
-            metrics["t3_reload_ms"] = 0.0;
-            json ts_arr = json::array();
-            for (const auto & v : meta->tensor_split) {
-                if (v != 0.0f) {
-                    ts_arr.push_back(v);
-                } else {
-                    break;
-                }
-            }
-            metrics["tensor_split"] = ts_arr;
-            this->hydra_metrics_result = metrics;
+            std::shared_lock meta_lock(meta_mutex);
+            json body = json::parse(req.body);
+            body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
         }
+        // meta_lock released before handle_completions_impl (which takes its own)
 
         return handle_completions_impl(
             req,
@@ -6767,14 +6771,17 @@ void server_routes::init_routes() {
 
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
+        json body_parsed;
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        {
+            std::shared_lock meta_lock(meta_mutex);
+            json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
+            SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
+            SRV_DBG("converted request: %s\n", body.dump().c_str());
+            body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
+        }
+        // meta_lock released before handle_completions_impl
+
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -6785,24 +6792,27 @@ void server_routes::init_routes() {
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
         auto res = create_response();
-
-        if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
-            res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
-
+        json body_parsed;
         std::vector<raw_buffer> files;
-        json body = convert_transcriptions_to_chatcmpl(
-            json::parse(req.body),
-            meta->chat_params.tmpls.get(),
-            req.files,
-            files);
-        SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        {
+            std::shared_lock meta_lock(meta_mutex);
+
+            if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
+                res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+
+            json body = convert_transcriptions_to_chatcmpl(
+                json::parse(req.body),
+                meta->chat_params.tmpls.get(),
+                req.files,
+                files);
+            SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
+            SRV_DBG("converted request: %s\n", body.dump().c_str());
+            body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
+        }
+        // meta_lock released before handle_completions_impl
+
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -6813,14 +6823,17 @@ void server_routes::init_routes() {
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
+        json body_parsed;
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        {
+            std::shared_lock meta_lock(meta_mutex);
+            json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+            SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
+            SRV_DBG("converted request: %s\n", body.dump().c_str());
+            body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
+        }
+        // meta_lock released before handle_completions_impl
+
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -6831,6 +6844,7 @@ void server_routes::init_routes() {
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
         std::vector<raw_buffer> files;
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
@@ -6849,6 +6863,7 @@ void server_routes::init_routes() {
     // same with handle_chat_completions, but without inference part
     this->post_apply_template = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
         std::vector<raw_buffer> files; // dummy, unused
         json body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(
@@ -6861,6 +6876,7 @@ void server_routes::init_routes() {
 
     this->get_models = [this](const server_http_req &) {
         auto res = create_response(true);
+        std::shared_lock meta_lock(meta_mutex);
 
         // this endpoint can be accessed during sleeping
         // the next LOC is to avoid someone accidentally use ctx_server
@@ -6965,6 +6981,7 @@ void server_routes::init_routes() {
 
     this->post_rerank = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
         if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
             res->error(format_error_response("This server does not support reranking. Start it with `--reranking`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -7107,6 +7124,8 @@ void server_routes::init_routes() {
 }
 
 json server_routes::get_model_info() const {
+    std::shared_lock meta_lock(meta_mutex);
+
     return json {
         {"id",       meta->model_name},
         {"aliases",  meta->model_aliases},
@@ -7227,6 +7246,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {
+    std::shared_lock meta_lock(meta_mutex);
+
     auto res = create_response();
     if (!params.embedding) {
         res->error(format_error_response("This server does not support embeddings. Start it with `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));

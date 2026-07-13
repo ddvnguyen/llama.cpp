@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <memory>
 #include <set>
+#include <shared_mutex>
 #include <vector>
 
 struct ggml_backend;
@@ -131,9 +132,22 @@ struct server_routes {
 
     void init_routes();
 
+    // Guards meta against concurrent read/write: update_meta takes exclusive,
+    // HTTP handlers take shared.  refresh_meta() calls update_meta() so it
+    // already holds the exclusive lock — do NOT add a shared lock there.
+    mutable std::shared_mutex meta_mutex;
+
     // note: this is not thread-safe and can only when ctx_http.is_ready is false
     void update_meta(const server_context & ctx_server) {
+        std::unique_lock lock(meta_mutex);
         this->meta = std::make_unique<server_context_meta>(ctx_server.get_meta());
+    }
+
+    // Hydra P1-6: refresh meta from the stored ctx_server_outer reference.
+    // Called from the task-queue thread (apply_pending_hydra_config) during
+    // the drain window — no concurrent readers at this point.
+    void refresh_meta() {
+        this->update_meta(ctx_server_outer);
     }
 
     // handlers using lambda function, so that they can capture `this` without `std::bind`
@@ -186,11 +200,10 @@ private:
     std::unique_ptr<const server_context_meta> meta;
 
     const common_params & params;
+    const server_context & ctx_server_outer; // P1-6: outer wrapper, needed by update_meta()
     const server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
-
-    json hydra_metrics_result = json();
 };
