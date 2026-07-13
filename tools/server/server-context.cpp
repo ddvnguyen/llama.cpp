@@ -5872,6 +5872,10 @@ void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
     impl->queue_tasks.on_sleeping_state(std::move(callback));
 }
 
+void server_context::set_routes_ptr(server_routes * routes) {
+    impl->routes_ptr = routes;
+}
+
 // compute the number of tokens before the last user message in the prompt
 static int32_t prompt_get_n_before_user(
         const json & message_spans,

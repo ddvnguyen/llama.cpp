@@ -89,6 +89,11 @@ struct server_context {
     // must be set before load_model() is called
     void on_sleeping_changed(std::function<void(bool)> callback);
 
+    // P0-1 (#49): set the back-pointer to server_routes so
+    // apply_pending_hydra_config() can call routes_ptr->refresh_meta()
+    // after the first load. Must be called before start_loop().
+    void set_routes_ptr(struct server_routes * routes);
+
     // Hydra RPC: start a binary TCP listener for KV state transfer.
     // Ops: STATE_GET (0x30), STATE_PUT (0x31), STATE_META (0x32).
     // port = 0 is a no-op (disabled). Must be called after load_model().
