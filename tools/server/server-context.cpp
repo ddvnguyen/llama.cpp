@@ -5932,6 +5932,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task_response_type res_type) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
+    std::shared_lock meta_lock(meta_mutex);
+
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
@@ -6534,6 +6536,7 @@ void server_routes::init_routes() {
 
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
+        std::shared_lock meta_lock(meta_mutex);
 
         // this endpoint can be accessed during sleeping
         // the next LOC is to avoid someone accidentally use ctx_server
@@ -6600,6 +6603,7 @@ void server_routes::init_routes() {
 
     this->post_infill = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
         // check model compatibility
         std::string err;
         if (llama_vocab_fim_pre(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
@@ -6702,6 +6706,7 @@ void server_routes::init_routes() {
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
 
@@ -6757,6 +6762,7 @@ void server_routes::init_routes() {
 
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
         std::vector<raw_buffer> files;
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
@@ -6775,6 +6781,7 @@ void server_routes::init_routes() {
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
 
         if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
             res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
@@ -6803,6 +6810,7 @@ void server_routes::init_routes() {
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
         std::vector<raw_buffer> files;
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
@@ -6821,6 +6829,7 @@ void server_routes::init_routes() {
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
         std::vector<raw_buffer> files;
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
@@ -6839,6 +6848,7 @@ void server_routes::init_routes() {
     // same with handle_chat_completions, but without inference part
     this->post_apply_template = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
         std::vector<raw_buffer> files; // dummy, unused
         json body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(
@@ -6851,6 +6861,7 @@ void server_routes::init_routes() {
 
     this->get_models = [this](const server_http_req &) {
         auto res = create_response(true);
+        std::shared_lock meta_lock(meta_mutex);
 
         // this endpoint can be accessed during sleeping
         // the next LOC is to avoid someone accidentally use ctx_server
@@ -6955,6 +6966,7 @@ void server_routes::init_routes() {
 
     this->post_rerank = [this](const server_http_req & req) {
         auto res = create_response();
+        std::shared_lock meta_lock(meta_mutex);
         if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
             res->error(format_error_response("This server does not support reranking. Start it with `--reranking`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -7097,6 +7109,8 @@ void server_routes::init_routes() {
 }
 
 json server_routes::get_model_info() const {
+    std::shared_lock meta_lock(meta_mutex);
+
     return json {
         {"id",       meta->model_name},
         {"aliases",  meta->model_aliases},
@@ -7217,6 +7231,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {
+    std::shared_lock meta_lock(meta_mutex);
+
     auto res = create_response();
     if (!params.embedding) {
         res->error(format_error_response("This server does not support embeddings. Start it with `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
