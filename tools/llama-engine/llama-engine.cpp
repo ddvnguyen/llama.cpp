@@ -599,65 +599,161 @@ int llama_engine(int argc, char ** argv) {
         return 0;
     }
 
-    // ── No-model path: compute-only backend ──
-    {
-        // Start the unified RPC server, serving globally registered non-CPU
-        // devices via ggml-RPC. No Hydra protocol — no server_context exists.
-        // No tensor registration either: without a model there are no local
-        // tensors to register for zero-copy COMBINE (RPC_CMD_RESOLVE_TENSOR
-        // will find nothing — expert-split requires the peer to have a model).
-        // Layer-split COMBINE works fine: the head owns the model and uses
-        // the peer's ggml-RPC buffers for compute only.
-        auto backends = enumerate_non_cpu_devices();
-        if (backends.empty()) {
-            LOG_ERR("eng  %12.*s: no non-CPU backends found\n", 12, __func__);
+    // ── No-model path ──
+    if (!has_model) {
+        // P0-1 (#49): Distinguish two different reasons has_model is false:
+        // 1. Compute-only peer (has_peer=false): bare ggml-RPC backend for
+        //    another head's layer-split, no Hydra protocol, no server_context.
+        // 2. Head bootstrap (has_peer=true): will become a full head via
+        //    CONFIGURE T3 — needs server_context + Hydra RPC + full HTTP routes.
+        if (!has_peer) {
+            // ── Compute-only peer mode ──
+            // Start the unified RPC server, serving globally registered non-CPU
+            // devices via ggml-RPC. No Hydra protocol — no server_context exists.
+            // No tensor registration either: without a model there are no local
+            // tensors to register for zero-copy COMBINE (RPC_CMD_RESOLVE_TENSOR
+            // will find nothing — expert-split requires the peer to have a model).
+            // Layer-split COMBINE works fine: the head owns the model and uses
+            // the peer's ggml-RPC buffers for compute only.
+            auto backends = enumerate_non_cpu_devices();
+            if (backends.empty()) {
+                LOG_ERR("eng  %12.*s: no non-CPU backends found\n", 12, __func__);
+                llama_backend_free();
+                return 1;
+            }
+
+            // The unified RPC server is started as a standalone (no server_context),
+            // so only ggml-RPC protocol is accepted — Hydra connections are rejected.
+            // Use the new fork-isolated `hydra_rpc` module (the same module the
+            // model-loaded path uses via `server_context::start_rpc_server`).
+            {
+                hydra_rpc::settings s;
+                s.port     = rpc_port;
+                s.backends = backends;
+                // No Hydra protocol here — `hydra_ctx == nullptr` means the
+                // dispatch falls through to `ggml_backend_rpc_handle_client` only.
+                // Peer in compute-only mode receives many concurrent ggml-RPC requests
+                // from the head's compute graph (one per layer op for the layers hosted
+                // on the peer). pool_size=2 throttles this — the head serializes most
+                // ops and prefill drops to ~1/3 of the upstream rpc-server baseline.
+                // 8 workers (matching a typical GPU's stream concurrency) is enough to
+                // keep the head's compute graph fed without backpressure.
+                s.hydra_ctx = nullptr;
+                s.pool_size = 8;
+                s.max_queue = 256;
+                s.host      = "0.0.0.0";
+                // Skip the bounded thread pool entirely — the peer is a trusted
+                // internal client (the head) and per-conn `std::thread::detach()` is
+                // the simpler path. The bounded pool's accept+MSG_PEEK+enqueue+worker
+                // pipeline adds ~100us of dispatch overhead per request, which throttles
+                // the head's compute graph (the head sends thousands of ops per prefill,
+                // each blocked on the pool). Without the pool, dispatch overhead
+                // disappears and the peer matches upstream rpc-server throughput.
+                s.peer_mode = true;
+                if (!hydra_rpc::start(s)) {
+                    LOG_ERR("eng  %12.*s: hydra_rpc::start failed on port %d\n",
+                            12, __func__, rpc_port);
+                    llama_backend_free();
+                    return 1;
+                }
+                LOG_INF("eng  %12.*s: compute-only peer RPC on 0.0.0.0:%d (%zu GPU backend(s))\n",
+                        12, __func__, rpc_port, backends.size());
+            }
+
+            // ── Minimal HTTP server (health + version only) ──
+            server_http_context ctx_http;
+            if (params.port > 0) {
+                if (!ctx_http.init(params)) {
+                    LOG_ERR("eng  %12.*s: failed to init HTTP server\n", 12, __func__);
+                    llama_backend_free();
+                    return 1;
+                }
+
+                ctx_http.get("/health", [](const server_http_req &) {
+                    auto res = std::make_unique<server_http_res>();
+                    res->status = 200;
+                    res->data = "{\"status\":\"ok\"}";
+                    return res;
+                });
+
+                ctx_http.get("/version", [](const server_http_req &) {
+                    auto res = std::make_unique<server_http_res>();
+                    res->status = 200;
+                    res->data = "{\"version\":\"E1\",\"engine\":\"llama-engine\",\"mode\":\"peer\"}";
+                    return res;
+                });
+
+                ctx_http.get("/slots", [](const server_http_req &) {
+                    auto res = std::make_unique<server_http_res>();
+                    res->status = 200;
+                    res->data = "[]";
+                    return res;
+                });
+
+                if (!ctx_http.start()) {
+                    LOG_ERR("eng  %12.*s: failed to start HTTP server\n", 12, __func__);
+                    llama_backend_free();
+                    return 1;
+                }
+                ctx_http.is_ready.store(true);
+            }
+
+            LOG_INF("eng  %12.*s: compute-only peer ready — RPC on :%d, HTTP on :%d\n",
+                    12, __func__, rpc_port, params.port);
+
+            // Block until signal.
+            {
+                struct sigaction sa;
+                sa.sa_handler = +[](int) {};
+                sigemptyset(&sa.sa_mask);
+                sa.sa_flags = 0;
+                sigaction(SIGINT, &sa, NULL);
+                sigaction(SIGTERM, &sa, NULL);
+            }
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+
+            if (params.port > 0) {
+                ctx_http.stop();
+                if (ctx_http.thread.joinable()) {
+                    ctx_http.thread.join();
+                }
+            }
+            llama_backend_free();
+            return 0;
+        }
+
+        // ── P0-1: Head-bootstrap mode (no model yet, will load via CONFIGURE T3) ──
+        // The --rpc-engine flag indicates this engine is a head (not a peer).
+        // Build server_context + server_routes + Hydra RPC so CONFIGURE(0x40)
+        // can arrive and trigger a deferred model load via apply_t3_rebuild().
+        // Mirrors the empty-start mechanism in server.cpp for llama-server
+        // (PR #48/#53), reimplemented for llama-engine's binary.
+        LOG_INF("eng  %12.*s: head-bootstrap mode — no model, waiting for CONFIGURE T3\n", 12, __func__);
+
+        server_context ctx_server;
+
+        // Wire up queue callbacks + metrics without a model.
+        if (!ctx_server.bootstrap_init()) {
+            LOG_ERR("eng  %12.*s: bootstrap_init failed\n", 12, __func__);
             llama_backend_free();
             return 1;
         }
 
-        // The unified RPC server is started as a standalone (no server_context),
-        // so only ggml-RPC protocol is accepted — Hydra connections are rejected.
-        // Use the new fork-isolated `hydra_rpc` module (the same module the
-        // model-loaded path uses via `server_context::start_rpc_server`).
-        {
-            hydra_rpc::settings s;
-            s.port     = rpc_port;
-            s.backends = backends;
-            // No Hydra protocol here — `hydra_ctx == nullptr` means the
-            // dispatch falls through to `ggml_backend_rpc_handle_client` only.
-            // Peer in compute-only mode receives many concurrent ggml-RPC requests
-            // from the head's compute graph (one per layer op for the layers hosted
-            // on the peer). pool_size=2 throttles this — the head serializes most
-            // ops and prefill drops to ~1/3 of the upstream rpc-server baseline.
-            // 8 workers (matching a typical GPU's stream concurrency) is enough to
-            // keep the head's compute graph fed without backpressure.
-            s.hydra_ctx = nullptr;
-            s.pool_size = 8;
-            s.max_queue = 256;
-            s.host      = "0.0.0.0";
-            // Skip the bounded thread pool entirely — the peer is a trusted
-            // internal client (the head) and per-conn `std::thread::detach()` is
-            // the simpler path. The bounded pool's accept+MSG_PEEK+enqueue+worker
-            // pipeline adds ~100us of dispatch overhead per request, which throttles
-            // the head's compute graph (the head sends thousands of ops per prefill,
-            // each blocked on the pool). Without the pool, dispatch overhead
-            // disappears and the peer matches upstream rpc-server throughput.
-            s.peer_mode = true;
-            if (!hydra_rpc::start(s)) {
-                LOG_ERR("eng  %12.*s: hydra_rpc::start failed on port %d\n",
-                        12, __func__, rpc_port);
-                llama_backend_free();
-                return 1;
-            }
-            LOG_INF("eng  %12.*s: no-model RPC server on 0.0.0.0:%d (%zu GPU backend(s))\n",
-                    12, __func__, rpc_port, backends.size());
-        }
+        // ── HTTP server with full inference routes ──
+        // Create server_routes first (it captures a reference to ctx_server's impl).
+        // Routes will be functional after CONFIGURE T3 loads a model via apply_t3_rebuild().
+        server_routes routes(params, ctx_server);
 
-        // ── Minimal HTTP server (health + version only) ──
+        // Set routes_ptr so apply_pending_hydra_config() can call
+        // routes_ptr->refresh_meta() after the first load.
+        ctx_server.set_routes_ptr(&routes);
+
         server_http_context ctx_http;
         if (params.port > 0) {
             if (!ctx_http.init(params)) {
-                LOG_ERR("eng  %12.*s: failed to init HTTP server\n", 12, __func__);
+                LOG_ERR("eng  %12.*s: failed to initialize HTTP server\n", 12, __func__);
                 llama_backend_free();
                 return 1;
             }
@@ -665,14 +761,14 @@ int llama_engine(int argc, char ** argv) {
             ctx_http.get("/health", [](const server_http_req &) {
                 auto res = std::make_unique<server_http_res>();
                 res->status = 200;
-                res->data = "{\"status\":\"ok\"}";
+                res->data = "{\"status\":\"ok\",\"mode\":\"bootstrap\"}";
                 return res;
             });
 
             ctx_http.get("/version", [](const server_http_req &) {
                 auto res = std::make_unique<server_http_res>();
                 res->status = 200;
-                res->data = "{\"version\":\"E1\",\"engine\":\"llama-engine\",\"mode\":\"peer\"}";
+                res->data = "{\"version\":\"E1\",\"engine\":\"llama-engine\",\"mode\":\"bootstrap\"}";
                 return res;
             });
 
@@ -683,29 +779,61 @@ int llama_engine(int argc, char ** argv) {
                 return res;
             });
 
+            // Full inference routes — will be functional after CONFIGURE T3 loads model.
+            ctx_http.post("/v1/chat/completions", ex_wrapper(routes.post_chat_completions));
+            ctx_http.post("/chat/completions",    ex_wrapper(routes.post_chat_completions));
+            ctx_http.post("/v1/completions",      ex_wrapper(routes.post_completions_oai));
+
             if (!ctx_http.start()) {
                 LOG_ERR("eng  %12.*s: failed to start HTTP server\n", 12, __func__);
                 llama_backend_free();
                 return 1;
             }
+            // is_ready means "HTTP server is up", not "model is loaded".
+            // Individual routes handle the no-model-yet case themselves
+            // (returns 503 with a clear message). Setting this early
+            // ensures /health works for orchestration liveness checks
+            // from the moment the process starts.
             ctx_http.is_ready.store(true);
         }
 
-        LOG_INF("eng  %12.*s: no-model engine ready — RPC on :%d, HTTP on :%d\n",
-                12, __func__, rpc_port, params.port);
+        // Start the unified RPC server with Hydra protocol enabled.
+        // Empty backends for now — will be populated after CONFIGURE T3 loads
+        // the model via apply_pending_hydra_config(). CONFIGURE itself is a
+        // Hydra opcode, not ggml-RPC, so it doesn't need compute backends.
+        ctx_server.start_rpc_server(rpc_port, {});
 
-        // Block until signal.
-        {
-            struct sigaction sa;
-            sa.sa_handler = +[](int) {};
-            sigemptyset(&sa.sa_mask);
-            sa.sa_flags = 0;
-            sigaction(SIGINT, &sa, NULL);
-            sigaction(SIGTERM, &sa, NULL);
-        }
-        for (;;) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
+        // Stage capabilities for deferred first-load — apply_pending_hydra_config()
+        // will call set_hydra_capabilities() / set_hydra_combined_static() after
+        // the model is loaded, so ENGINE_INFO(0x41) and COMBINED-mode work correctly.
+        ctx_server.set_bootstrap_capabilities(
+            rpc_port > 0,                    // rpc_active
+            flags.rpc_engine_peer,           // peer
+            !flags.rpc_engine_peer.empty() && peer_reg != nullptr,  // peer_reachable
+            flags.tensor_split_str,          // pattern
+            peer_reg != nullptr ? "layer" : "none",  // split_mode
+            peer_reg != nullptr              // combined_static
+        );
+
+        shutdown_handler = [&](int) {
+            ctx_server.terminate();
+        };
+
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+        struct sigaction sigint_action;
+        sigint_action.sa_handler = signal_handler;
+        sigemptyset(&sigint_action.sa_mask);
+        sigint_action.sa_flags = 0;
+        sigaction(SIGINT, &sigint_action, NULL);
+        sigaction(SIGTERM, &sigint_action, NULL);
+#elif defined(_WIN32)
+        auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
+            return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
+        };
+        SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
+#endif
+
+        ctx_server.start_loop();
 
         if (params.port > 0) {
             ctx_http.stop();
@@ -713,7 +841,10 @@ int llama_engine(int argc, char ** argv) {
                 ctx_http.thread.join();
             }
         }
+
+        ctx_server.terminate();
         llama_backend_free();
+
         return 0;
     }
 }
