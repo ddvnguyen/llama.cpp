@@ -6603,75 +6603,84 @@ void server_routes::init_routes() {
 
     this->post_infill = [this](const server_http_req & req) {
         auto res = create_response();
-        std::shared_lock meta_lock(meta_mutex);
-        // check model compatibility
-        std::string err;
-        if (llama_vocab_fim_pre(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
-            err += "prefix token is missing. ";
-        }
-        if (llama_vocab_fim_suf(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
-            err += "suffix token is missing. ";
-        }
-        if (llama_vocab_fim_mid(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
-            err += "middle token is missing. ";
-        }
-        if (!err.empty()) {
-            res->error(format_error_response(string_format("Infill is not supported by this model: %s", err.c_str()), ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
 
-        // validate input
-        json data = json::parse(req.body);
-        if (data.contains("prompt") && !data.at("prompt").is_string()) {
-            // prompt is optional
-            res->error(format_error_response("\"prompt\" must be a string", ERROR_TYPE_INVALID_REQUEST));
-        }
+        // Validate input and compute infill prompt — these read meta->slot_n_ctx.
+        // Scope the shared_lock so it releases before handle_completions_impl
+        // takes its own lock (recursive shared_lock is UB on std::shared_mutex).
+        json data;
+        std::vector<raw_buffer> files;
+        {
+            std::shared_lock meta_lock(meta_mutex);
 
-        if (!data.contains("input_prefix")) {
-            res->error(format_error_response("\"input_prefix\" is required", ERROR_TYPE_INVALID_REQUEST));
-        }
-
-        if (!data.contains("input_suffix")) {
-            res->error(format_error_response("\"input_suffix\" is required", ERROR_TYPE_INVALID_REQUEST));
-        }
-
-        if (data.contains("input_extra") && !data.at("input_extra").is_array()) {
-            // input_extra is optional
-            res->error(format_error_response("\"input_extra\" must be an array of {\"filename\": string, \"text\": string}", ERROR_TYPE_INVALID_REQUEST));
-            return res;
-        }
-
-        json input_extra = json_value(data, "input_extra", json::array());
-        for (const auto & chunk : input_extra) {
-            // { "text": string, "filename": string }
-            if (!chunk.contains("text") || !chunk.at("text").is_string()) {
-                res->error(format_error_response("extra_context chunk must contain a \"text\" field with a string value", ERROR_TYPE_INVALID_REQUEST));
+            // check model compatibility
+            std::string err;
+            if (llama_vocab_fim_pre(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+                err += "prefix token is missing. ";
+            }
+            if (llama_vocab_fim_suf(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+                err += "suffix token is missing. ";
+            }
+            if (llama_vocab_fim_mid(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+                err += "middle token is missing. ";
+            }
+            if (!err.empty()) {
+                res->error(format_error_response(string_format("Infill is not supported by this model: %s", err.c_str()), ERROR_TYPE_NOT_SUPPORTED));
                 return res;
             }
-            // filename is optional
-            if (chunk.contains("filename") && !chunk.at("filename").is_string()) {
-                res->error(format_error_response("extra_context chunk's \"filename\" field must be a string", ERROR_TYPE_INVALID_REQUEST));
+
+            // validate input
+            data = json::parse(req.body);
+            if (data.contains("prompt") && !data.at("prompt").is_string()) {
+                // prompt is optional
+                res->error(format_error_response("\"prompt\" must be a string", ERROR_TYPE_INVALID_REQUEST));
+            }
+
+            if (!data.contains("input_prefix")) {
+                res->error(format_error_response("\"input_prefix\" is required", ERROR_TYPE_INVALID_REQUEST));
+            }
+
+            if (!data.contains("input_suffix")) {
+                res->error(format_error_response("\"input_suffix\" is required", ERROR_TYPE_INVALID_REQUEST));
+            }
+
+            if (data.contains("input_extra") && !data.at("input_extra").is_array()) {
+                // input_extra is optional
+                res->error(format_error_response("\"input_extra\" must be an array of {\"filename\": string, \"text\": string}", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
+
+            json input_extra = json_value(data, "input_extra", json::array());
+            for (const auto & chunk : input_extra) {
+                // { "text": string, "filename": string }
+                if (!chunk.contains("text") || !chunk.at("text").is_string()) {
+                    res->error(format_error_response("extra_context chunk must contain a \"text\" field with a string value", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                // filename is optional
+                if (chunk.contains("filename") && !chunk.at("filename").is_string()) {
+                    res->error(format_error_response("extra_context chunk's \"filename\" field must be a string", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+            }
+            data["input_extra"] = input_extra; // default to empty array if it's not exist
+
+            std::string prompt = json_value(data, "prompt", std::string());
+            std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true);
+            SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
+            data["prompt"] = format_prompt_infill(
+                ctx_server.vocab,
+                data.at("input_prefix"),
+                data.at("input_suffix"),
+                data.at("input_extra"),
+                params.n_batch,
+                params.n_predict,
+                meta->slot_n_ctx,
+                params.spm_infill,
+                tokenized_prompts[0].get_tokens() // TODO: this could maybe be multimodal.
+            );
         }
-        data["input_extra"] = input_extra; // default to empty array if it's not exist
+        // meta_lock released here
 
-        std::string prompt = json_value(data, "prompt", std::string());
-        std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true);
-        SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
-        data["prompt"] = format_prompt_infill(
-            ctx_server.vocab,
-            data.at("input_prefix"),
-            data.at("input_suffix"),
-            data.at("input_extra"),
-            params.n_batch,
-            params.n_predict,
-            meta->slot_n_ctx,
-            params.spm_infill,
-            tokenized_prompts[0].get_tokens() // TODO: this could maybe be multimodal.
-        );
-
-        std::vector<raw_buffer> files; // dummy
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_INFILL,
@@ -6706,14 +6715,14 @@ void server_routes::init_routes() {
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
-        std::shared_lock meta_lock(meta_mutex);
+        json body_parsed;
         std::vector<raw_buffer> files;
-        json body = json::parse(req.body);
-
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        {
+            std::shared_lock meta_lock(meta_mutex);
+            json body = json::parse(req.body);
+            body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
+        }
+        // meta_lock released before handle_completions_impl (which takes its own)
 
         return handle_completions_impl(
             req,
@@ -6762,15 +6771,17 @@ void server_routes::init_routes() {
 
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
-        std::shared_lock meta_lock(meta_mutex);
+        json body_parsed;
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        {
+            std::shared_lock meta_lock(meta_mutex);
+            json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
+            SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
+            SRV_DBG("converted request: %s\n", body.dump().c_str());
+            body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
+        }
+        // meta_lock released before handle_completions_impl
+
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -6781,25 +6792,27 @@ void server_routes::init_routes() {
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
         auto res = create_response();
-        std::shared_lock meta_lock(meta_mutex);
-
-        if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
-            res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
-
+        json body_parsed;
         std::vector<raw_buffer> files;
-        json body = convert_transcriptions_to_chatcmpl(
-            json::parse(req.body),
-            meta->chat_params.tmpls.get(),
-            req.files,
-            files);
-        SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        {
+            std::shared_lock meta_lock(meta_mutex);
+
+            if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
+                res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+
+            json body = convert_transcriptions_to_chatcmpl(
+                json::parse(req.body),
+                meta->chat_params.tmpls.get(),
+                req.files,
+                files);
+            SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
+            SRV_DBG("converted request: %s\n", body.dump().c_str());
+            body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
+        }
+        // meta_lock released before handle_completions_impl
+
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -6810,15 +6823,17 @@ void server_routes::init_routes() {
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
-        std::shared_lock meta_lock(meta_mutex);
+        json body_parsed;
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        {
+            std::shared_lock meta_lock(meta_mutex);
+            json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+            SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
+            SRV_DBG("converted request: %s\n", body.dump().c_str());
+            body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
+        }
+        // meta_lock released before handle_completions_impl
+
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
