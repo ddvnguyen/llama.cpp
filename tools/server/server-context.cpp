@@ -709,6 +709,11 @@ public:
     // runs during the drain window when no slots are processing).
     server_routes * routes_ptr = nullptr;
 
+    // Set by the CONFIGURE HTTP handler when ctx_tgt is null and T3 keys
+    // are staged. Cleared by apply_pending_hydra_config() on the
+    // task-queue thread when it runs apply_t3_rebuild() for first load.
+    bool first_load_pending = false;
+
     // Hydra #383 T1: true when this engine was started in COMBINED static
     // (layer-split) mode. The split is fixed at model load time; the mode
     // cannot be changed at runtime — SET_EXPERT_MODE("solo") is rejected.
@@ -3278,16 +3283,11 @@ private:
 
                     // First load: ctx_tgt is null, so apply_pending_hydra_config()
                     // and update_slots() can't trigger (both gate on ctx_tgt).
-                    // Call apply_t3_rebuild() directly — safe because this runs on
-                    // the task-queue thread and there are no slots to drain.
+                    // Set the flag so the task-queue thread runs apply_t3_rebuild()
+                    // at the next slot-free moment (safe — no slots to drain).
                     if (!t2t3_subset.empty() && !ctx_tgt) {
-                        SRV_INF("%s", "hydra: CONFIGURE first load — calling apply_t3_rebuild directly\n");
-                        bool ok = apply_t3_rebuild();
-                        if (ok) {
-                            SRV_INF("%s", "hydra: CONFIGURE first load succeeded\n");
-                        } else {
-                            SRV_ERR("%s", "hydra: CONFIGURE first load failed\n");
-                        }
+                        first_load_pending = true;
+                        SRV_INF("%s", "hydra: CONFIGURE first load staged — task-queue will apply\n");
                     }
 
                     // 4. Build the response.
@@ -4068,34 +4068,51 @@ private:
     // catastrophic case where the rollback itself fails — the engine
     // would be unable to serve in any state and must exit.
     bool apply_pending_hydra_config() {
-        if (!ctx_tgt || !ctx_tgt->hydra_has_pending_config()) {
+        const bool is_first_load = !ctx_tgt;
+        if (is_first_load) {
+            if (!first_load_pending) {
+                return false;
+            }
+            // Don't check hydra_has_pending_config — ctx_tgt doesn't exist yet.
+            // The T3 statics were staged by hydra_apply_t3_mutators() in the
+            // CONFIGURE handler. Set a default tier for the rebuild path.
+        } else if (!ctx_tgt->hydra_has_pending_config()) {
             return false;
         }
 
-        // 1. Drain timeout
-        constexpr time_t k_drain_timeout_default = 300;
-        time_t now = std::time(nullptr);
-        time_t elapsed = now - ctx_tgt->hydra_get_pending_config_set_at();
-        int env_timeout = 0;
-        if (const char * e = getenv("HYDRA_COORD_PROFILE_SWITCH_DRAIN_TIMEOUT")) {
-            env_timeout = atoi(e);
-        }
-        time_t drain_timeout = env_timeout > 0 ? env_timeout : k_drain_timeout_default;
-        if (elapsed > drain_timeout) {
-            SRV_WRN("hydra: pending config drain timeout (elapsed=%lld, limit=%lld) — discarding, "
-                    "tier='%s' payload_size=%zu\n",
-                    (long long) elapsed, (long long) drain_timeout,
-                    ctx_tgt->hydra_get_pending_config_tier().c_str(),
-                    ctx_tgt->hydra_get_pending_config().size());
-            ctx_tgt->hydra_clear_pending_config();
-            llama_hydra_clear_pending_t3();
-            return false;
-        }
+        // 1. Drain timeout — skipped for first load (no ctx_tgt timestamp).
+        std::string tier;
+        std::string pending_json;
 
-        const std::string tier = ctx_tgt->hydra_get_pending_config_tier();
-        const std::string pending_json = ctx_tgt->hydra_get_pending_config();
-        SRV_INF("hydra: applying pending config (tier='%s', age=%llds, payload_size=%zu)\n",
-                tier.c_str(), (long long) elapsed, pending_json.size());
+        if (is_first_load) {
+            tier = "T3";
+            // pending_json stays empty — T3 statics are staged in global
+            // overrides, not in pending_config (ctx_tgt doesn't exist yet).
+        } else {
+            constexpr time_t k_drain_timeout_default = 300;
+            time_t now = std::time(nullptr);
+            time_t elapsed = now - ctx_tgt->hydra_get_pending_config_set_at();
+            int env_timeout = 0;
+            if (const char * e = getenv("HYDRA_COORD_PROFILE_SWITCH_DRAIN_TIMEOUT")) {
+                env_timeout = atoi(e);
+            }
+            time_t drain_timeout = env_timeout > 0 ? env_timeout : k_drain_timeout_default;
+            if (elapsed > drain_timeout) {
+                SRV_WRN("hydra: pending config drain timeout (elapsed=%lld, limit=%lld) — discarding, "
+                        "tier='%s' payload_size=%zu\n",
+                        (long long) elapsed, (long long) drain_timeout,
+                        ctx_tgt->hydra_get_pending_config_tier().c_str(),
+                        ctx_tgt->hydra_get_pending_config().size());
+                ctx_tgt->hydra_clear_pending_config();
+                llama_hydra_clear_pending_t3();
+                return false;
+            }
+
+            tier = ctx_tgt->hydra_get_pending_config_tier();
+            pending_json = ctx_tgt->hydra_get_pending_config();
+            SRV_INF("hydra: applying pending config (tier='%s', age=%llds, payload_size=%zu)\n",
+                    tier.c_str(), (long long) elapsed, pending_json.size());
+        }
 
         bool ok = true;
 
@@ -4132,7 +4149,11 @@ private:
         //    the rollback in apply_t{2,3}_rebuild has restored the
         //    previous state; clearing the staged state prevents the
         //    next slot-free moment from re-attempting the same rebuild.
-        ctx_tgt->hydra_clear_pending_config();
+        if (is_first_load) {
+            first_load_pending = false;
+        } else {
+            ctx_tgt->hydra_clear_pending_config();
+        }
         llama_hydra_clear_pending_t3();
         return ok;
     }
@@ -4497,6 +4518,9 @@ private:
                 if (ctx_tgt && ctx_tgt->hydra_has_pending_config()) {
                     SRV_INF("hydra: slot-free moment — applying pending CONFIGURE (tier=%s)\n",
                             ctx_tgt->hydra_get_pending_config_tier().c_str());
+                    apply_pending_hydra_config();
+                } else if (!ctx_tgt && first_load_pending) {
+                    SRV_INF("%s", "hydra: slot-free moment — first load (no context yet)\n");
                     apply_pending_hydra_config();
                 }
 
