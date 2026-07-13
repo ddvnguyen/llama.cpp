@@ -1314,6 +1314,27 @@ private:
     }
 
     // unlike load_model(), this is only called once during initialization
+    // P0-1 (#49): bootstrap_init wires up queue callbacks and metrics without
+    // requiring a model to be loaded. Used by llama-engine's head-bootstrap
+    // mode (no model at startup, model loaded later via CONFIGURE T3).
+    // Must be called before start_loop().
+    bool bootstrap_init() {
+        SRV_INF("%s", "P0-1: bootstrap_init — wiring up queues without model\n");
+
+        queue_tasks.on_new_task([this](server_task && task) {
+            process_single_task(std::move(task));
+        });
+        queue_tasks.on_update_slots([this]() {
+            update_slots();
+        });
+        queue_tasks.on_sleeping_state([this](bool sleeping) {
+            handle_sleeping_state(sleeping);
+        });
+
+        metrics.init();
+        return true;
+    }
+
     bool init() {
         GGML_ASSERT(ctx_tgt   != nullptr);
         GGML_ASSERT(model_tgt != nullptr);
@@ -5918,6 +5939,10 @@ void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
 
 void server_context::set_routes_ptr(server_routes * routes) {
     impl->routes_ptr = routes;
+}
+
+bool server_context::bootstrap_init() {
+    return impl->bootstrap_init();
 }
 
 void server_context::set_bootstrap_capabilities(bool rpc_active, const std::string & peer,

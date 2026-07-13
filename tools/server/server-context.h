@@ -89,6 +89,12 @@ struct server_context {
     // must be set before load_model() is called
     void on_sleeping_changed(std::function<void(bool)> callback);
 
+    // P0-1 (#49): bootstrap_init wires up queue callbacks and metrics without
+    // requiring a model to be loaded. Used by llama-engine's head-bootstrap
+    // mode (no model at startup, model loaded later via CONFIGURE T3).
+    // Must be called before start_loop().
+    bool bootstrap_init();
+
     // P0-1 (#49): set the back-pointer to server_routes so
     // apply_pending_hydra_config() can call routes_ptr->refresh_meta()
     // after the first load. Must be called before start_loop().

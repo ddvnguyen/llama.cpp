@@ -734,6 +734,13 @@ int llama_engine(int argc, char ** argv) {
 
         server_context ctx_server;
 
+        // Wire up queue callbacks + metrics without a model.
+        if (!ctx_server.bootstrap_init()) {
+            LOG_ERR("eng  %12.*s: bootstrap_init failed\n", 12, __func__);
+            llama_backend_free();
+            return 1;
+        }
+
         // ── HTTP server with full inference routes ──
         // Create server_routes first (it captures a reference to ctx_server's impl).
         // Routes will be functional after CONFIGURE T3 loads a model via apply_t3_rebuild().
