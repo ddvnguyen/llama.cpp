@@ -2943,7 +2943,7 @@ private:
                     if (!task.hydra_action.config_json.empty()) {
                         try {
                             const json cfg = json::parse(task.hydra_action.config_json);
-                            if (ctx_tgt && cfg.contains("state_chunk_size")) {
+                            if (cfg.contains("state_chunk_size")) {
                                 const size_t bytes = cfg.at("state_chunk_size").get<size_t>();
                                 llama_hydra_set_state_chunk_size(ctx_tgt, bytes);
                                 // Echo the post-clamp value back so the Coordinator can
