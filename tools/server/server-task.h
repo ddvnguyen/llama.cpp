@@ -671,6 +671,13 @@ struct server_task_result_hydra_state : server_task_result {
     std::string model_hash;                 // 64-char hex SHA-256 of the GGUF
     std::string model_path;                 // absolute path to the GGUF
 
+    // #451: progress fields for slot progress visibility
+    std::string operation;                  // "prefill" | "decode" | "save" | "restore" | "idle"
+    float       progress = 0.0;             // 0.0 - 1.0
+    int32_t     tokens_processed = 0;
+    int32_t     tokens_total = 0;
+    int64_t     elapsed_ms = 0;
+
     std::string error; // human-readable, non-empty on failure
 
     // is_stop() inherits true (single result, not a stream)

@@ -3177,6 +3177,40 @@ private:
                         const char * hash = llama_model_hash(model_tgt);
                         if (hash && hash[0]) res->model_hash = hash;
                     }
+                    // #451: populate progress fields based on slot state
+                    switch (slot->state) {
+                        case SLOT_STATE_PROCESSING_PROMPT:
+                            res->operation = "prefill";
+                            res->tokens_processed = slot->n_prompt_tokens_processed;
+                            res->tokens_total = (int)slot->prompt.tokens.size();
+                            if (res->tokens_total > 0) {
+                                res->progress = (float)res->tokens_processed / (float)res->tokens_total;
+                            }
+                            res->elapsed_ms = (slot->t_start_process_prompt > 0) 
+                                ? (ggml_time_ms() - slot->t_start_process_prompt) : 0;
+                            break;
+                        case SLOT_STATE_GENERATING:
+                            res->operation = "decode";
+                            res->tokens_processed = slot->n_decoded;
+                            res->tokens_total = slot->n_decoded + slot->n_remaining;
+                            if (res->tokens_total > 0) {
+                                res->progress = (float)res->tokens_processed / (float)res->tokens_total;
+                            }
+                            res->elapsed_ms = (slot->t_start_generation > 0) 
+                                ? (ggml_time_ms() - slot->t_start_generation) : 0;
+                            break;
+                        case SLOT_STATE_IDLE:
+                            res->operation = "idle";
+                            res->progress = 1.0f;
+                            break;
+                        default:
+                            res->operation = "unknown";
+                            break;
+                    }
+                    // Handle save/restore operations via hydra_transferring flag
+                    if (slot->hydra_transferring->load()) {
+                        res->operation = "save"; // or restore, but we can't distinguish here
+                    }
                     res->rpc_status    = HYDRA_STATUS_OK;
                     queue_results.send(std::move(res));
                 } break;
@@ -6623,6 +6657,11 @@ void server_routes::init_routes() {
             {"state_size",     (uint64_t)hr->state_size},
             {"is_processing",  hr->is_processing},
             {"is_transferring", hr->is_transferring},
+            {"operation",      hr->operation},
+            {"progress",       hr->progress},
+            {"tokens_processed", hr->tokens_processed},
+            {"tokens_total",   hr->tokens_total},
+            {"elapsed_ms",     hr->elapsed_ms},
         });
         return res;
     };

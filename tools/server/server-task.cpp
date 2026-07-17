@@ -2011,6 +2011,12 @@ json server_task_result_hydra_state::to_json() {
         j["state_size"]      = state_size;
         j["is_processing"]   = is_processing;
         j["is_transferring"] = is_transferring; // true while M1/M2 async GET is active
+        // #451: progress fields
+        j["operation"]       = operation;
+        j["progress"]        = progress;
+        j["tokens_processed"] = tokens_processed;
+        j["tokens_total"]    = tokens_total;
+        j["elapsed_ms"]      = elapsed_ms;
     }
     // M-Perf.9 #289: model identity is returned for every op (it answers
     // "what model built the KV in this slot?"). Empty strings mean the
