@@ -3182,7 +3182,9 @@ private:
                         case SLOT_STATE_PROCESSING_PROMPT:
                             res->operation = "prefill";
                             res->tokens_processed = slot->n_prompt_tokens_processed;
-                            res->tokens_total = (int)slot->prompt.tokens.size();
+                            // task->n_tokens() is the total tokens to process (fixed);
+                            // prompt.tokens.size() grows during prefill and is WRONG for total.
+                            res->tokens_total = slot->task ? slot->task->n_tokens() : 0;
                             if (res->tokens_total > 0) {
                                 res->progress = (float)res->tokens_processed / (float)res->tokens_total;
                             }
