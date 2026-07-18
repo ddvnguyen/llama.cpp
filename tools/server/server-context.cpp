@@ -5721,13 +5721,59 @@ static void hydra_handle_state_put(int fd, server_slot & slot, uint64_t payload_
 }
 
 // STATE_META (0x32): slot metadata only — cheap, no KV serialization.
+// Pick 1d (860101b31) ported to this lineage: slot progress/status for #451.
+// The M1 task-queue parts of 860101b31 were skipped (no M1 base here by design,
+// see pick 1b option B); this keeps the self-contained progress reporting,
+// adapted to server_slot fields of this tree (n_remaining() is a method,
+// timing comes from slot.stats, no hydra_transferring flag exists here).
 static void hydra_handle_state_meta(int fd, server_slot & slot) {
     const int32_t n_past = slot.n_prompt_tokens_cache + slot.n_decoded;
+    std::string operation = "unknown";
+    float progress = 0.0f;
+    int32_t tokens_processed = 0;
+    int32_t tokens_total = 0;
+    int64_t elapsed_ms = 0;
+    if (slot.stats.t_start > 0) {
+        elapsed_ms = (ggml_time_us() - slot.stats.t_start) / 1000;
+    }
+    switch (slot.state) {
+        case SLOT_STATE_PROCESSING_PROMPT:
+            operation = "prefill";
+            tokens_processed = (int32_t) slot.stats.n_prompt_processed;
+            // task->n_tokens() is the fixed total; prompt.tokens.size() grows
+            // during prefill and is wrong for the total.
+            tokens_total = slot.task ? slot.task->n_tokens() : 0;
+            if (tokens_total > 0) {
+                progress = (float) tokens_processed / (float) tokens_total;
+            }
+            break;
+        case SLOT_STATE_GENERATING:
+            operation = "decode";
+            tokens_processed = slot.n_decoded;
+            // n_remaining() == -1 is the unlimited-generation sentinel; only
+            // compute progress when a finite remainder is known.
+            if (slot.n_remaining() > 0) {
+                tokens_total = slot.n_decoded + slot.n_remaining();
+                progress = (float) tokens_processed / (float) tokens_total;
+            }
+            break;
+        case SLOT_STATE_IDLE:
+            operation = "idle";
+            progress = 1.0f;
+            break;
+        default:
+            break;
+    }
     const json meta_j = {
-        {"slot_id",       slot.id},
-        {"n_past",        n_past},
-        {"state_size",    (uint64_t)llama_state_seq_get_size(slot.ctx_tgt, slot.id)},
-        {"is_processing", slot.is_processing()},
+        {"slot_id",          slot.id},
+        {"n_past",           n_past},
+        {"state_size",       (uint64_t)llama_state_seq_get_size(slot.ctx_tgt, slot.id)},
+        {"is_processing",    slot.is_processing()},
+        {"operation",        operation},
+        {"progress",         progress},
+        {"tokens_processed", tokens_processed},
+        {"tokens_total",     tokens_total},
+        {"elapsed_ms",       elapsed_ms},
     };
     const std::string meta_str = meta_j.dump();
     hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
