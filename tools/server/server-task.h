@@ -719,7 +719,7 @@ struct server_task_result_hydra_engine : server_task_result {
     double      tokens_per_second = 0.0;    // throughput during prefill
     int32_t     cache_tokens = 0;           // tokens from cache
     uint64_t    kv_size = 0;                // KV state size in bytes
-    uint64_t    logits_size = 0;            // logits size in bytes
+    // NOTE: logits_size is already declared above (line 700) — reused here for PREFILL response
 
     // DECODE: generated tokens (IDs)
     std::vector<llama_token> tokens;
