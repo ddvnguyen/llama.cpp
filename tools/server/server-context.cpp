@@ -3434,6 +3434,9 @@ private:
                     res->id = task.id;
                     res->op = HYDRA_OP_PREFILL;
 
+                    // #451: track timing for PREFILL metrics
+                    const int64_t prefill_start_ms = ggml_time_ms();
+
                     // Set by the model-resolution block below when a real
                     // `load_model` swap happens. Used at the response site to
                     // decide whether the post-prefill model identity is the
@@ -3496,12 +3499,15 @@ private:
                             // correctly in load_model() (model_name is set from
                             // model_alias.first when non-empty).
                             swapped_params.model_alias  = { requested_model };
+                            const int64_t model_load_start_ms = ggml_time_ms();
                             if (!load_model(swapped_params)) {
                                 res->rpc_status = HYDRA_STATUS_ERROR;
                                 res->error = "model swap to '" + requested_model + "' failed";
                                 queue_results.send(std::move(res));
                                 break;
                             }
+                            res->model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
+                            model_was_swapped = true;
                             // After load_model, `this` state is reset (new
                             // slots, new context). Re-look up the slot by id.
                             slot = get_slot_by_id(id_slot);
@@ -3708,6 +3714,14 @@ private:
                     res->state_data  = std::move(v2_blob);
                     res->state_size  = state_size;
                     res->logits_size = logits_size;
+                    // #451: populate PREFILL metrics
+                    res->prefill_ms = (double)(ggml_time_ms() - prefill_start_ms);
+                    res->prompt_tokens = n_tokens;
+                    res->kv_size = state_size;
+                    if (res->prefill_ms > 0 && n_tokens > 0) {
+                        res->tokens_per_second = (double)n_tokens / (res->prefill_ms / 1000.0);
+                    }
+                    res->cache_tokens = slot->n_prompt_tokens_cache;
                     queue_results.send(std::move(res));
                 } break;
 

@@ -712,6 +712,15 @@ struct server_task_result_hydra_engine : server_task_result {
     std::string model_path;
     bool        model_fallback = false;
 
+    // PREFILL metrics for Hydra Core statistics
+    double      prefill_ms = 0.0;           // actual prefill time in ms
+    double      model_load_ms = 0.0;        // model load time if swap happened (ms)
+    int32_t     prompt_tokens = 0;          // total tokens processed
+    double      tokens_per_second = 0.0;    // throughput during prefill
+    int32_t     cache_tokens = 0;           // tokens from cache
+    uint64_t    kv_size = 0;                // KV state size in bytes
+    uint64_t    logits_size = 0;            // logits size in bytes
+
     // DECODE: generated tokens (IDs)
     std::vector<llama_token> tokens;
     std::vector<float>       logprobs;

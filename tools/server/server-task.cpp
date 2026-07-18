@@ -2049,6 +2049,14 @@ json server_task_result_hydra_engine::to_json() {
         if (!model_hash.empty())  j["model_hash"]  = model_hash;
         if (!model_path.empty())  j["model_path"]  = model_path;
         j["model_fallback"] = model_fallback;
+        // #451: PREFILL metrics for Hydra Core statistics
+        if (prefill_ms > 0)         j["prefill_ms"] = prefill_ms;
+        if (model_load_ms > 0)      j["model_load_ms"] = model_load_ms;
+        if (prompt_tokens > 0)      j["prompt_tokens"] = prompt_tokens;
+        if (tokens_per_second > 0)  j["tokens_per_second"] = tokens_per_second;
+        if (cache_tokens > 0)       j["cache_tokens"] = cache_tokens;
+        if (kv_size > 0)            j["kv_size"] = kv_size;
+        if (logits_size > 0)        j["logits_size"] = logits_size;
     }
     if (op == 0x43) { // DECODE
         j["tokens"]   = tokens;
