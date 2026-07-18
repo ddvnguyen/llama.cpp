@@ -3211,9 +3211,15 @@ private:
                             res->operation = "unknown";
                             break;
                     }
-                    // Handle save/restore operations via hydra_transferring flag
+                    // Handle save/restore operations via hydra_transferring flag.
+                    // Clear any stale progress from the prior state since we're
+                    // now in a transferring context, not the previous operation.
                     if (slot->hydra_transferring->load()) {
-                        res->operation = "save"; // or restore, but we can't distinguish here
+                        res->operation = "save";
+                        res->progress = 0.0f;
+                        res->tokens_processed = 0;
+                        res->tokens_total = 0;
+                        res->elapsed_ms = 0;
                     }
                     res->rpc_status    = HYDRA_STATUS_OK;
                     queue_results.send(std::move(res));
