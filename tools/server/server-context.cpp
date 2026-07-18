@@ -3177,6 +3177,50 @@ private:
                         const char * hash = llama_model_hash(model_tgt);
                         if (hash && hash[0]) res->model_hash = hash;
                     }
+                    // #451: populate progress fields based on slot state
+                    switch (slot->state) {
+                        case SLOT_STATE_PROCESSING_PROMPT:
+                            res->operation = "prefill";
+                            res->tokens_processed = slot->n_prompt_tokens_processed;
+                            // task->n_tokens() is the total tokens to process (fixed);
+                            // prompt.tokens.size() grows during prefill and is WRONG for total.
+                            res->tokens_total = slot->task ? slot->task->n_tokens() : 0;
+                            if (res->tokens_total > 0) {
+                                res->progress = (float)res->tokens_processed / (float)res->tokens_total;
+                            }
+                            res->elapsed_ms = (slot->t_start_process_prompt > 0) 
+                                ? (ggml_time_ms() - slot->t_start_process_prompt) : 0;
+                            break;
+                        case SLOT_STATE_GENERATING:
+                            res->operation = "decode";
+                            res->tokens_processed = slot->n_decoded;
+                            // n_remaining == -1 is the "unlimited generation" sentinel
+                            // (no finite n_predict). Don't compute progress in that case.
+                            if (slot->n_remaining > 0) {
+                                res->tokens_total = slot->n_decoded + slot->n_remaining;
+                                res->progress = (float)res->tokens_processed / (float)res->tokens_total;
+                            }
+                            res->elapsed_ms = (slot->t_start_generation > 0) 
+                                ? (ggml_time_ms() - slot->t_start_generation) : 0;
+                            break;
+                        case SLOT_STATE_IDLE:
+                            res->operation = "idle";
+                            res->progress = 1.0f;
+                            break;
+                        default:
+                            res->operation = "unknown";
+                            break;
+                    }
+                    // Handle save/restore operations via hydra_transferring flag.
+                    // Clear any stale progress from the prior state since we're
+                    // now in a transferring context, not the previous operation.
+                    if (slot->hydra_transferring->load()) {
+                        res->operation = "save";
+                        res->progress = 0.0f;
+                        res->tokens_processed = 0;
+                        res->tokens_total = 0;
+                        res->elapsed_ms = 0;
+                    }
                     res->rpc_status    = HYDRA_STATUS_OK;
                     queue_results.send(std::move(res));
                 } break;
@@ -3398,6 +3442,9 @@ private:
                     res->id = task.id;
                     res->op = HYDRA_OP_PREFILL;
 
+                    // #451: track timing for PREFILL metrics
+                    const int64_t prefill_start_ms = ggml_time_ms();
+
                     // Set by the model-resolution block below when a real
                     // `load_model` swap happens. Used at the response site to
                     // decide whether the post-prefill model identity is the
@@ -3460,12 +3507,15 @@ private:
                             // correctly in load_model() (model_name is set from
                             // model_alias.first when non-empty).
                             swapped_params.model_alias  = { requested_model };
+                            const int64_t model_load_start_ms = ggml_time_ms();
                             if (!load_model(swapped_params)) {
                                 res->rpc_status = HYDRA_STATUS_ERROR;
                                 res->error = "model swap to '" + requested_model + "' failed";
                                 queue_results.send(std::move(res));
                                 break;
                             }
+                            res->model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
+                            model_was_swapped = true;
                             // After load_model, `this` state is reset (new
                             // slots, new context). Re-look up the slot by id.
                             slot = get_slot_by_id(id_slot);
@@ -3672,6 +3722,14 @@ private:
                     res->state_data  = std::move(v2_blob);
                     res->state_size  = state_size;
                     res->logits_size = logits_size;
+                    // #451: populate PREFILL metrics
+                    res->prefill_ms = (double)(ggml_time_ms() - prefill_start_ms);
+                    res->prompt_tokens = n_tokens;
+                    res->kv_size = state_size;
+                    if (res->prefill_ms > 0 && n_tokens > 0) {
+                        res->tokens_per_second = (double)n_tokens / (res->prefill_ms / 1000.0);
+                    }
+                    res->cache_tokens = slot->n_prompt_tokens_cache;
                     queue_results.send(std::move(res));
                 } break;
 
@@ -6623,6 +6681,11 @@ void server_routes::init_routes() {
             {"state_size",     (uint64_t)hr->state_size},
             {"is_processing",  hr->is_processing},
             {"is_transferring", hr->is_transferring},
+            {"operation",      hr->operation},
+            {"progress",       hr->progress},
+            {"tokens_processed", hr->tokens_processed},
+            {"tokens_total",   hr->tokens_total},
+            {"elapsed_ms",     hr->elapsed_ms},
         });
         return res;
     };
