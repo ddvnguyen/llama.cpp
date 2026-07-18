@@ -3194,8 +3194,10 @@ private:
                         case SLOT_STATE_GENERATING:
                             res->operation = "decode";
                             res->tokens_processed = slot->n_decoded;
-                            res->tokens_total = slot->n_decoded + slot->n_remaining;
-                            if (res->tokens_total > 0) {
+                            // n_remaining == -1 is the "unlimited generation" sentinel
+                            // (no finite n_predict). Don't compute progress in that case.
+                            if (slot->n_remaining > 0) {
+                                res->tokens_total = slot->n_decoded + slot->n_remaining;
                                 res->progress = (float)res->tokens_processed / (float)res->tokens_total;
                             }
                             res->elapsed_ms = (slot->t_start_generation > 0) 
