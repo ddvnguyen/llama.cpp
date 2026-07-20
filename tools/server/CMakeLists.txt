@@ -4,6 +4,13 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
 set(TARGET server-context)
 
+# hydra_rpc: only compile when the source exists (llama-engine build has it;
+# llama-server build skips gracefully).
+set(HYDRA_RPC_SRC "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../llama-engine/hydra_rpc/hydra_rpc.cpp")
+    set(HYDRA_RPC_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../llama-engine/hydra_rpc/hydra_rpc.cpp")
+endif()
+
 add_library(${TARGET} STATIC
     server-chat.cpp
     server-chat.h
@@ -23,6 +30,7 @@ add_library(${TARGET} STATIC
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    ${HYDRA_RPC_SRC} # hydra 1e: empty unless tools/llama-engine/hydra_rpc exists (guard above)
 )
 
 if (BUILD_SHARED_LIBS)
@@ -31,6 +39,7 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE ../llama-engine) # hydra 1e: for hydra_rpc headers when present
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
 # llama-server-impl: server logic, reusable by app
