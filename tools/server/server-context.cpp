@@ -2898,6 +2898,9 @@ private:
                                 json meta_j;
                                 meta_j["n_past"]     = res->n_past;
                                 meta_j["state_size"] = (uint64_t)state_size;
+                                if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+                                if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
+                                if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
                                 const std::string meta_str = meta_j.dump();
 
                                 const uint32_t meta_len  = (uint32_t)meta_str.size();
@@ -3015,6 +3018,17 @@ private:
                         res->rpc_status = HYDRA_STATUS_BUSY;
                         queue_results.send(std::move(res));
                         break;
+                    }
+
+                    // M-Perf.9 #289: populate model identity from resident model.
+                    // model_match = true always (infrastructure only; actual KV
+                    // validation comes when model identity is embedded in the KV header).
+                    res->model_alias  = model_name;
+                    res->model_path   = params_base.model.path;
+                    res->model_match  = true;
+                    if (model_tgt) {
+                        const char * hash = llama_model_hash(model_tgt);
+                        if (hash && hash[0]) res->model_hash = hash;
                     }
 
                     // Erase existing checkpoints to avoid collision with restored session state
@@ -7883,6 +7897,9 @@ static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ct
         json meta_j;
         meta_j["n_past"]     = res->n_past;
         meta_j["state_size"] = payload;
+        if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+        if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
+        if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
         const std::string meta_str = meta_j.dump();
         hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), payload);
         hydra_send_all(fd, meta_str.data(), meta_str.size());
@@ -7948,8 +7965,12 @@ static void hydra_handle_state_put(int fd, int slot_id, uint64_t payload_len, co
     uint8_t rpc_status = res->rpc_status;
     if (rpc_status == HYDRA_STATUS_OK) {
         json meta_j;
-        meta_j["restored"] = true;
-        meta_j["bytes"]    = res->bytes;
+        meta_j["restored"]    = true;
+        meta_j["bytes"]       = res->bytes;
+        meta_j["model_match"] = res->model_match;
+        if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+        if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
+        if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
         const std::string meta_str = meta_j.dump();
         hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
         hydra_send_all(fd, meta_str.data(), meta_str.size());
@@ -7998,6 +8019,9 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
         meta_j["state_size"]      = res->state_size;
         meta_j["is_processing"]   = res->is_processing;
         meta_j["is_transferring"] = res->is_transferring;
+        if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+        if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
+        if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
         const std::string meta_str = meta_j.dump();
         hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
         hydra_send_all(fd, meta_str.data(), meta_str.size());
