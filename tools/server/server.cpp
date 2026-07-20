@@ -135,7 +135,7 @@ int llama_server(int argc, char ** argv) {
     // Hydra P1-6: wire up the back-pointer so that apply_pending_hydra_config()
     // (task-queue thread) can refresh meta after a T3 rebuild without going
     // through the HTTP thread pool.
-    ctx_server.impl->routes_ptr = &routes;
+    ctx_server.set_routes_ptr(&routes);
 
     server_tools tools;
 

@@ -3588,11 +3588,30 @@ private:
                         token_offset = 1;
                     }
 
-                    // Decode prompt in batches
+                    // Decode prompt in batches. Hydra #469 fix: upstream's own
+                    // invariant (see create_checkpoint call in update_slots,
+                    // "we create the checkpoint before calling llama_decode(),
+                    // so the current batch is not yet processed and therefore
+                    // it is not part of the checkpoint") requires the
+                    // checkpoint to be created BEFORE the final token is
+                    // decoded. The previous version of this handler decoded
+                    // the whole prompt first and only afterward claimed (via
+                    // create_checkpoint's pos_max arg, below) that the last
+                    // token was still unprocessed. For hybrid/recurrent (SSM)
+                    // models, whose memory can't be partially rolled back via
+                    // seq_rm, that lie meant a cross-node restore would
+                    // re-decode a token that was already baked into the
+                    // recurrent state — double-applying it and corrupting the
+                    // hidden state. Splitting the loop so the checkpoint is
+                    // captured after n_tokens-1 tokens (matching what
+                    // create_checkpoint's pos_max already claimed) makes the
+                    // claim honest, same as the standard update_slots() path.
+                    const int total_tokens = n_tokens + token_offset;
                     const int n_ubatch = llama_n_ubatch(ctx_tgt);
+                    const int n_before_last = total_tokens > 1 ? total_tokens - 1 : total_tokens;
                     bool decode_ok = true;
-                    for (int i = 0; i < n_tokens + token_offset; i += n_ubatch) {
-                        const int n_tokens_batch = std::min(n_ubatch, n_tokens + token_offset - i);
+                    for (int i = 0; i < n_before_last && decode_ok; i += n_ubatch) {
+                        const int n_tokens_batch = std::min(n_ubatch, n_before_last - i);
                         common_batch_clear(batch);
                         for (int j = 0; j < n_tokens_batch; j++) {
                             const int tok_idx = i + j;
@@ -3602,13 +3621,13 @@ private:
                             } else {
                                 id = tokens[tok_idx - token_offset];
                             }
-                            const bool need_logits = (tok_idx == n_tokens + token_offset - 1);
-                            common_batch_add(batch, id, tok_idx, {slot->id}, need_logits);
+                            // No token in this phase is the final prompt
+                            // token, so logits are never needed here.
+                            common_batch_add(batch, id, tok_idx, {slot->id}, false);
                         }
                         if (llama_decode(ctx_tgt, batch) != 0) {
                             SRV_ERR("hydra: PREFILL slot=%d llama_decode failed at batch %d\n", id_slot, i);
                             decode_ok = false;
-                            break;
                         }
                     }
 
@@ -3619,14 +3638,37 @@ private:
                         break;
                     }
 
+                    // Register checkpoint BEFORE decoding the final token, so
+                    // its pos_max claim (n_tokens - 1) is honest. Moved up
+                    // from after the full-prompt decode (see #469 above).
+                    if (n_tokens > 0) {
+                        create_checkpoint(*slot, 0, 0, (llama_pos)(n_tokens - 1));
+                    }
+
+                    // Decode the held-back final token (if any) now that the
+                    // checkpoint has captured the state before it.
+                    if (total_tokens > n_before_last) {
+                        common_batch_clear(batch);
+                        const int tok_idx = total_tokens - 1;
+                        llama_token id = (token_offset > 0 && tok_idx == 0)
+                            ? bos
+                            : tokens[tok_idx - token_offset];
+                        common_batch_add(batch, id, tok_idx, {slot->id}, true);
+                        if (llama_decode(ctx_tgt, batch) != 0) {
+                            SRV_ERR("hydra: PREFILL slot=%d llama_decode failed on final token\n", id_slot);
+                            res->rpc_status = HYDRA_STATUS_ERROR;
+                            res->error = "llama_decode failed during prefill (final token)";
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                    }
+
                     // Update slot tracking
                     slot->n_prompt_tokens_processed = n_tokens;
                     slot->n_prompt_tokens_cache = n_tokens;
 
-                    // Register checkpoint BEFORE getting state so v2 header includes it
-                    if (n_tokens > 0) {
-                        create_checkpoint(*slot, 0, 0, (llama_pos)(n_tokens - 1));
-                    }
+                    // Checkpoint already registered above, before the final
+                    // token was decoded (#469 fix).
 
                     // Build v2 blob: [1B version=0x02][4B n_past][4B n_tok][n_tok*4B tokens][1B flags][?ckpt?][raw KV state]
                     const uint32_t hdr_n_past = (uint32_t)n_tokens;
