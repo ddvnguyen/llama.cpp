@@ -2012,6 +2012,26 @@ private:
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
 
+        // #469 trace: log final response for hallucination detection
+        {
+            const std::string & content = res->content;
+            const size_t content_len = content.size();
+            const int n_decoded = res->n_decoded;
+            const int n_cache = res->n_prompt_tokens_cache;
+            const int n_prompt = res->n_prompt_tokens;
+            // Log first 200 chars of content for quick inspection
+            const std::string preview = content_len > 200 ? content.substr(0, 200) : content;
+            SRV_DBG("hydra: FINAL_RESPONSE slot=%d n_prompt=%d n_cache=%d n_decoded=%d content_len=%zu preview='%s'\n",
+                    slot.id, n_prompt, n_cache, n_decoded, content_len, preview.c_str());
+            // Log if content looks suspicious (empty, very short, or starts with thinking tags)
+            if (content_len == 0 && n_decoded > 0) {
+                SRV_WRN("hydra: FINAL_RESPONSE slot=%d WARNING: empty content but n_decoded=%d — possible hallucination!\n", slot.id, n_decoded);
+            }
+            if (content_len > 0 && content_len < 10 && n_decoded > 50) {
+                SRV_WRN("hydra: FINAL_RESPONSE slot=%d WARNING: very short content (%zu chars) but n_decoded=%d — possible truncation!\n", slot.id, content_len, n_decoded);
+            }
+        }
+
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.n_decoded;
         res->n_prompt_tokens       = slot.task->n_tokens();
@@ -3111,6 +3131,18 @@ private:
                         res->rpc_status = HYDRA_STATUS_OK;
                         res->restored   = true;
                         res->bytes      = (uint64_t)n_read;
+                        // #469 trace: log restored state for cross-flow comparison
+                        SRV_DBG("hydra: STATE_PUT slot=%d RESTORED n_past=%d n_prompt_tok=%d state_bytes=%zu just_restored=true\n",
+                                id_slot, hdr_n_tok, hdr_n_tok, n_read);
+                        {
+                            std::string tok_ids;
+                            for (size_t i = 0; i < std::min<size_t>(16, slot->prompt.tokens.size()); ++i) {
+                                if (i > 0) tok_ids += ",";
+                                tok_ids += std::to_string(slot->prompt.tokens[i]);
+                            }
+                            SRV_DBG("hydra: STATE_PUT slot=%d first16_tokens=[%s] total=%zu\n",
+                                    id_slot, tok_ids.c_str(), slot->prompt.tokens.size());
+                        }
                         if (hdr_n_tok > 0) {
                             slot->n_prompt_tokens_cache = hdr_n_tok;
                             slot->n_decoded = 0;
@@ -3561,6 +3593,16 @@ private:
                     }
 
                     SRV_INF("hydra: PREFILL slot=%d tokens=%zu\n", id_slot, prompt_tokens.size());
+                    // #469 trace: log first 16 token IDs for cross-flow comparison
+                    {
+                        std::string tok_ids;
+                        for (size_t i = 0; i < std::min<size_t>(16, prompt_tokens.size()); ++i) {
+                            if (i > 0) tok_ids += ",";
+                            tok_ids += std::to_string(prompt_tokens[i]);
+                        }
+                        SRV_DBG("hydra: PREFILL slot=%d first16_tokens=[%s] total=%zu\n",
+                                id_slot, tok_ids.c_str(), prompt_tokens.size());
+                    }
 
                     // Clear existing slot state
                     slot->prompt_clear(false);
@@ -3772,6 +3814,9 @@ private:
                         res->tokens_per_second = (double)n_tokens / (res->prefill_ms / 1000.0);
                     }
                     res->cache_tokens = slot->n_prompt_tokens_cache;
+                    // #469 trace: log PREFILL completion with token IDs for cross-flow comparison
+                    SRV_DBG("hydra: PREFILL_DONE slot=%d n_past=%d state_size=%zu logits_size=%zu blob_size=%zu prefill_ms=%.1f\n",
+                            id_slot, n_tokens, state_size, logits_size, v2_blob.size(), res->prefill_ms);
                     queue_results.send(std::move(res));
                 } break;
 
@@ -3984,6 +4029,13 @@ private:
                     }
 
                     SRV_INF("hydra: DECODE slot=%d completed %d tokens\n", id_slot, n_decoded);
+
+                    // #469 trace: log generated text for hallucination detection
+                    {
+                        const std::string preview = accumulated.size() > 200 ? accumulated.substr(0, 200) : accumulated;
+                        SRV_DBG("hydra: DECODE_DONE slot=%d n_decoded=%d n_cached=%d generated_len=%zu preview='%s'\n",
+                                id_slot, n_decoded, slot->n_prompt_tokens_cache, accumulated.size(), preview.c_str());
+                    }
 
                     // Store generated text for RPC handler to send as payload
                     res->generated_text = std::move(accumulated);
@@ -4925,6 +4977,18 @@ private:
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
 
+                    // #469 trace: log input tokens for cross-flow comparison
+                    {
+                        std::string tok_ids;
+                        for (size_t i = 0; i < std::min<size_t>(16, input_tokens.size()); ++i) {
+                            if (i > 0) tok_ids += ",";
+                            tok_ids += std::to_string(input_tokens[i]);
+                        }
+                        SLT_DBG(slot, "#PD-TRACE HTTP_COMPLETION slot=%d input_tokens_first16=[%s] input_total=%zu cached=%d just_restored=%d\n",
+                                slot.id, tok_ids.c_str(), input_tokens.size(),
+                                slot.n_prompt_tokens_cache, slot.just_restored);
+                    }
+
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.n_tokens;
 
@@ -5008,6 +5072,51 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+                                // #469 trace: log common prefix for cross-flow comparison
+                                SLT_DBG(slot, "#PD-TRACE COMMON_PREFIX slot=%d n_past=%d cached=%d input_total=%zu just_restored=%d\n",
+                                        slot.id, n_past, slot.n_prompt_tokens_cache, input_tokens.size(), slot.just_restored);
+                                {
+                                    // Log cached tokens if any
+                                    if (slot.n_prompt_tokens_cache > 0) {
+                                        std::string cached_ids;
+                                        for (int i = 0; i < std::min<int>(16, slot.n_prompt_tokens_cache); ++i) {
+                                            if (i > 0) cached_ids += ",";
+                                            cached_ids += std::to_string(slot.prompt.tokens[i]);
+                                        }
+                                        SLT_DBG(slot, "#PD-TRACE CACHED_TOKENS slot=%d first16=[%s] total=%d\n",
+                                                slot.id, cached_ids.c_str(), slot.n_prompt_tokens_cache);
+                                    }
+                                    // Log first mismatch point when common prefix < input size
+                                    if (n_past < (int)input_tokens.size()) {
+                                        if (n_past < (int)slot.prompt.tokens.size()) {
+                                            SLT_WRN(slot, "#PD-TRACE MISMATCH slot=%d n_past=%d cached=%d input_total=%zu stored_tok[%d]=%d input_tok[%d]=%d\n",
+                                                    slot.id, n_past, slot.n_prompt_tokens_cache, input_tokens.size(),
+                                                    n_past, slot.prompt.tokens[n_past],
+                                                    n_past, input_tokens[n_past]);
+                                        } else {
+                                            SLT_WRN(slot, "#PD-TRACE MISMATCH slot=%d n_past=%d cached=%d input_total=%zu stored_size=%zu input exceeds stored\n",
+                                                    slot.id, n_past, slot.n_prompt_tokens_cache, input_tokens.size(),
+                                                    slot.prompt.tokens.size());
+                                        }
+                                        // Log first 16 of both token lists for comparison
+                                        {
+                                            std::string stored_ids, input_ids;
+                                            for (int i = 0; i < std::min<int>(16, (int)slot.prompt.tokens.size()); ++i) {
+                                                if (i > 0) stored_ids += ",";
+                                                stored_ids += std::to_string(slot.prompt.tokens[i]);
+                                            }
+                                            for (size_t i = 0; i < std::min<size_t>(16, input_tokens.size()); ++i) {
+                                                if (i > 0) input_ids += ",";
+                                                input_ids += std::to_string(input_tokens[i]);
+                                            }
+                                            SLT_WRN(slot, "#PD-TRACE MISMATCH_STORED slot=%d first16=[%s] total=%zu\n",
+                                                    slot.id, stored_ids.c_str(), slot.prompt.tokens.size());
+                                            SLT_WRN(slot, "#PD-TRACE MISMATCH_INPUT slot=%d first16=[%s] total=%zu\n",
+                                                    slot.id, input_ids.c_str(), input_tokens.size());
+                                        }
+                                    }
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -5163,6 +5272,10 @@ private:
                                     );
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+
+                                    // #469 trace: log checkpoint search result and just_restored decision
+                                    SLT_DBG(slot, "#PD-TRACE CHECKPOINT_SEARCH slot=%d do_reset=%d just_restored=%d n_past=%d checkpoints=%zu pos_next=%d\n",
+                                            slot.id, do_reset, slot.just_restored, n_past, slot.prompt.checkpoints.size(), pos_next);
 
                                     // For slots restored via STATE_PUT (full context state),
                                     // skip the checkpoint search entirely. The restored state
