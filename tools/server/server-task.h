@@ -670,6 +670,7 @@ struct server_task_result_hydra_state : server_task_result {
     std::string model_alias;                // e.g. "balanced"
     std::string model_hash;                 // 64-char hex SHA-256 of the GGUF
     std::string model_path;                 // absolute path to the GGUF
+    bool model_match = false;               // STATE_PUT: true if KV matches resident model
 
     // #451: progress fields for slot progress visibility
     std::string operation;                  // "prefill" | "decode" | "save" | "restore" | "idle"

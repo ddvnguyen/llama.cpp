@@ -866,6 +866,31 @@ private:
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
+        // #486: If a model is already resident (swap, not first load), release it
+        // BEFORE loading the new model. Without this, both old and new models
+        // are simultaneously in VRAM during common_init_from_params() — the old
+        // model's buffers aren't freed until the assignment completes, so the new
+        // model's cudaMallocs run against the old model's still-resident VRAM,
+        // causing OOM or degraded memory fit. destroy() is safe on first load
+        // (all resets are no-ops on already-null/empty state).
+        if (llama_init) {
+            SRV_INF("releasing previous model before swap (model_path='%s')\n",
+                    params_base.model.path.c_str());
+            destroy();
+            // Log available VRAM after release so operators can see the freed space
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                auto dev = ggml_backend_dev_get(i);
+                size_t free_mem = 0, total_mem = 0;
+                ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+                if (total_mem > 0) {
+                    SRV_INF("VRAM after release: device '%s' free=%.1f MiB / total=%.1f MiB\n",
+                            ggml_backend_dev_name(dev),
+                            free_mem / (1024.0 * 1024.0),
+                            total_mem / (1024.0 * 1024.0));
+                }
+            }
+        }
+
         params_base = params;
         // Hydra #406: resolve n_parallel = -1 (auto) to 1 before the
         // conversion to uint32_t n_seq_max in common_context_params_to_llama.
@@ -2898,6 +2923,9 @@ private:
                                 json meta_j;
                                 meta_j["n_past"]     = res->n_past;
                                 meta_j["state_size"] = (uint64_t)state_size;
+                                if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+                                if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
+                                if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
                                 const std::string meta_str = meta_j.dump();
 
                                 const uint32_t meta_len  = (uint32_t)meta_str.size();
@@ -3015,6 +3043,17 @@ private:
                         res->rpc_status = HYDRA_STATUS_BUSY;
                         queue_results.send(std::move(res));
                         break;
+                    }
+
+                    // M-Perf.9 #289: populate model identity from resident model.
+                    // model_match = true always (infrastructure only; actual KV
+                    // validation comes when model identity is embedded in the KV header).
+                    res->model_alias  = model_name;
+                    res->model_path   = params_base.model.path;
+                    res->model_match  = true;
+                    if (model_tgt) {
+                        const char * hash = llama_model_hash(model_tgt);
+                        if (hash && hash[0]) res->model_hash = hash;
                     }
 
                     // Erase existing checkpoints to avoid collision with restored session state
@@ -3548,6 +3587,10 @@ private:
                             }
                             res->model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
                             model_was_swapped = true;
+                            SRV_INF("hydra: PREFILL swap confirmed model_alias='%s' model_hash='%s' model_load_ms=%.1f\n",
+                                    swapped_params.model_alias.empty() ? "?" : swapped_params.model_alias.begin()->c_str(),
+                                    llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "",
+                                    res->model_load_ms);
                             // After load_model, `this` state is reset (new
                             // slots, new context). Re-look up the slot by id.
                             slot = get_slot_by_id(id_slot);
@@ -4043,6 +4086,12 @@ private:
                     // Update slot tracking
                     slot->n_decoded = n_decoded;
                     res->n_past = slot->n_prompt_tokens_cache + slot->n_decoded;
+
+                    // M-Perf.9 #289: model identity for the slot that decoded.
+                    // Populated the same way as PREFILL — from resident model state.
+                    res->model_alias = model_name;
+                    res->model_hash  = llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "";
+                    res->model_path  = params_base.model.path;
 
                     res->rpc_status = HYDRA_STATUS_OK;
                     queue_results.send(std::move(res));
@@ -4656,6 +4705,12 @@ private:
                     old_params.model.path.c_str());
             return false;
         }
+
+        // T3 reload confirmed. Log model identity for traceability.
+        SRV_INF("hydra: T3 reload confirmed model_alias='%s' model_hash='%s' model_path='%s'\n",
+                swapped_params.model_alias.empty() ? "?" : swapped_params.model_alias.begin()->c_str(),
+                llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "",
+                swapped_params.model.path.c_str());
 
         // COMBINED-mode reattach (if was combined). The new model
         // is loaded; the layer-split allocator has already placed
@@ -7883,6 +7938,9 @@ static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ct
         json meta_j;
         meta_j["n_past"]     = res->n_past;
         meta_j["state_size"] = payload;
+        if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+        if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
+        if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
         const std::string meta_str = meta_j.dump();
         hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), payload);
         hydra_send_all(fd, meta_str.data(), meta_str.size());
@@ -7948,8 +8006,12 @@ static void hydra_handle_state_put(int fd, int slot_id, uint64_t payload_len, co
     uint8_t rpc_status = res->rpc_status;
     if (rpc_status == HYDRA_STATUS_OK) {
         json meta_j;
-        meta_j["restored"] = true;
-        meta_j["bytes"]    = res->bytes;
+        meta_j["restored"]    = true;
+        meta_j["bytes"]       = res->bytes;
+        meta_j["model_match"] = res->model_match;
+        if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+        if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
+        if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
         const std::string meta_str = meta_j.dump();
         hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
         hydra_send_all(fd, meta_str.data(), meta_str.size());
@@ -7998,6 +8060,9 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
         meta_j["state_size"]      = res->state_size;
         meta_j["is_processing"]   = res->is_processing;
         meta_j["is_transferring"] = res->is_transferring;
+        if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+        if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
+        if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
         const std::string meta_str = meta_j.dump();
         hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
         hydra_send_all(fd, meta_str.data(), meta_str.size());
@@ -8145,13 +8210,21 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
         return;
     }
 
-    // Return n_past + sizes in meta; full blob (v2 header + KV + logits) as payload.
+    // Return n_past + sizes + model identity in meta; full blob (v2 header + KV + logits) as payload.
     // logits_size > 0 signals the decode GPU to inject them into ctx->logits via STATE_PUT.
+    // M-Perf.9 #289: model identity fields (already populated on res by the PREFILL handler)
+    // are included so the Coordinator can record which model built the KV.
     json meta_j = {
         {"n_past",      res->n_past},
         {"state_size",  res->state_size},
         {"logits_size", res->logits_size}
     };
+    if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+    if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
+    if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+    meta_j["model_fallback"] = res->model_fallback;
+    if (res->prefill_ms > 0)     meta_j["prefill_ms"]     = res->prefill_ms;
+    if (res->model_load_ms > 0)  meta_j["model_load_ms"]  = res->model_load_ms;
     const std::string meta_str = meta_j.dump();
     const uint64_t total_payload = (uint64_t)res->state_data.size();
     hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), total_payload);
@@ -8229,6 +8302,13 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
 
     SRV_INF("hydra: DECODE slot=%d generated %d tokens (streamed)\n",
             slot_id, (int)res->tokens.size());
+    // M-Perf.9 #289: model identity traceability for DECODE (#469/#470).
+    // DECODE sends response header before task completes (streaming), so it
+    // cannot carry model identity in RPC response meta — log instead.
+    SRV_INF("hydra: DECODE slot=%d model_alias='%s' model_hash='%s'\n",
+            slot_id,
+            res->model_alias.c_str(),
+            res->model_hash.c_str());
 }
 
 // SET_EXPERT_MODE (0x37): Read mode string, post task, return success.

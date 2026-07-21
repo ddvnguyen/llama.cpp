@@ -2005,6 +2005,7 @@ json server_task_result_hydra_state::to_json() {
     if (op == 0x31) {
         j["restored"] = restored;
         j["bytes"]    = bytes;
+        j["model_match"] = model_match;
     }
     if (op == 0x32) {
         j["n_past"]          = n_past;
