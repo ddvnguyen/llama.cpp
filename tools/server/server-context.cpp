@@ -3588,7 +3588,7 @@ private:
                             res->model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
                             model_was_swapped = true;
                             SRV_INF("hydra: PREFILL swap confirmed model_alias='%s' model_hash='%s' model_load_ms=%.1f\n",
-                                    swapped_params.model_alias.empty() ? "?" : swapped_params.model_alias.front().c_str(),
+                                    swapped_params.model_alias.empty() ? "?" : swapped_params.model_alias.begin()->c_str(),
                                     llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "",
                                     res->model_load_ms);
                             // After load_model, `this` state is reset (new
@@ -4086,6 +4086,12 @@ private:
                     // Update slot tracking
                     slot->n_decoded = n_decoded;
                     res->n_past = slot->n_prompt_tokens_cache + slot->n_decoded;
+
+                    // M-Perf.9 #289: model identity for the slot that decoded.
+                    // Populated the same way as PREFILL — from resident model state.
+                    res->model_alias = model_name;
+                    res->model_hash  = llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "";
+                    res->model_path  = params_base.model.path;
 
                     res->rpc_status = HYDRA_STATUS_OK;
                     queue_results.send(std::move(res));
@@ -4702,7 +4708,7 @@ private:
 
         // T3 reload confirmed. Log model identity for traceability.
         SRV_INF("hydra: T3 reload confirmed model_alias='%s' model_hash='%s' model_path='%s'\n",
-                swapped_params.model_alias.empty() ? "?" : swapped_params.model_alias.front().c_str(),
+                swapped_params.model_alias.empty() ? "?" : swapped_params.model_alias.begin()->c_str(),
                 llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "",
                 swapped_params.model.path.c_str());
 
@@ -8263,14 +8269,6 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
         return;
     }
 
-    // Log resident model identity for DECODE traceability (#469/#470).
-    // DECODE sends response header before task completes (streaming), so it
-    // cannot carry model identity in RPC response meta — log instead.
-    SRV_INF("hydra: DECODE slot=%d resident model_alias='%s' model_hash='%s'\n",
-            slot_id,
-            model_name.c_str(),
-            llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "");
-
     server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
@@ -8304,6 +8302,13 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
 
     SRV_INF("hydra: DECODE slot=%d generated %d tokens (streamed)\n",
             slot_id, (int)res->tokens.size());
+    // M-Perf.9 #289: model identity traceability for DECODE (#469/#470).
+    // DECODE sends response header before task completes (streaming), so it
+    // cannot carry model identity in RPC response meta — log instead.
+    SRV_INF("hydra: DECODE slot=%d model_alias='%s' model_hash='%s'\n",
+            slot_id,
+            res->model_alias.c_str(),
+            res->model_hash.c_str());
 }
 
 // SET_EXPERT_MODE (0x37): Read mode string, post task, return success.
