@@ -4043,6 +4043,10 @@ private:
 
             case SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE:
                 {
+                    // Validation-only task: identity check + KV restore.
+                    // Generation is driven by a subsequent SERVER_TASK_TYPE_COMPLETION
+                    // task posted after this returns (via update_slots(), not a
+                    // blocking loop — same mechanism as today's STATE_PUT+HTTP-decode).
                     const int id_slot = task.hydra_action.id_slot;
                     const int32_t decode_request_id = task.hydra_action.decode_request_id;
                     auto res = std::make_unique<server_task_result_hydra_engine>();
@@ -4050,8 +4054,6 @@ private:
                     res->op = HYDRA_OP_DECODE;
                     res->decode_request_id = decode_request_id;
                     res->id_slot = id_slot;
-
-                    const int64_t decode_init_start_ms = ggml_time_ms();
 
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -4081,7 +4083,6 @@ private:
 
                     // ── Model identity validation ────────────────────────────
                     const json & kv_meta = decode_req["kv_metadata"];
-                    const json & prompt = decode_req["prompt"];
 
                     // Read resident model identity (thread-safe GGUF getters)
                     const std::string resident_tokenizer   = llama_model_get_tokenizer_model(model_tgt);
@@ -4137,19 +4138,15 @@ private:
                     }
 
                     // Log notes for soft mismatches
-                    std::vector<std::string> notes;
                     if (!model_quant_match) {
-                        notes.push_back("model_quant differs (" + req_model_quant + " → " + resident_model_quant + ") — P/D mix-quant allowed");
-                    }
-                    if (!model_capabilities_match && !(capabilities_xor & 0x3)) {
-                        notes.push_back("model_capabilities differ — non-critical bits ignored");
+                        SRV_INF("hydra: DECODE slot=%d model_quant differs (%s → %s) — mix-quant allowed\n",
+                                id_slot, req_model_quant.c_str(), resident_model_quant.c_str());
                     }
 
                     // ── KV restore (reuse STATE_PUT logic) ──────────────────
                     const int64_t restore_start_ms = ggml_time_ms();
 
                     if (!task.hydra_action.kv_data.empty()) {
-                        // Restore KV from blob (same path as SERVER_TASK_TYPE_HYDRA_STATE_PUT)
                         slot->prompt_clear(false);
                         slot->n_prompt_tokens_cache = 0;
                         slot->n_prompt_tokens_processed = 0;
@@ -4168,7 +4165,6 @@ private:
                             break;
                         }
 
-                        // Update slot n_past from restored state
                         const int n_past = kv_meta.value("n_past", 0);
                         if (n_past > 0) {
                             slot->n_prompt_tokens_cache = n_past;
@@ -4182,133 +4178,57 @@ private:
                     SRV_INF("hydra: DECODE slot=%d identity OK, restore=%.1fms n_past=%d\n",
                             id_slot, res->restore_slot_ms, res->n_past);
 
-                    // ── Parse prompt and run generation ──────────────────────
-                    int32_t n_predict = prompt.value("n_predict", 256);
-                    std::string completion_id_str = gen_chatcmplid();
-
-                    // Parse sampling params from prompt
-                    common_params_sampling sparams;
-                    if (prompt.contains("sampling")) {
-                        const json & samp = prompt["sampling"];
-                        sparams.temp = samp.value("temperature", 0.0f);
-                        sparams.top_p = samp.value("top_p", 0.95f);
-                        sparams.top_k = samp.value("top_k", 40);
-                        if (samp.contains("seed")) {
-                            sparams.seed = samp.value("seed", 0);
-                        }
-                    } else {
-                        sparams.top_k = 1;
-                        sparams.temp = 0.0f;
-                    }
-
-                    // Set up sampler
-                    slot->smpl.reset(common_sampler_init(model_tgt, sparams));
-
-                    // Skip checkpoint loading for cross-GPU decode
-                    if (!slot->prompt.checkpoints.empty()) {
-                        slot->prompt.checkpoints.clear();
-                    }
-
-                    // Generation loop
-                    int n_decoded = 0;
-                    int n_tokens_cached = slot->n_prompt_tokens_cache;
-                    std::string accumulated;
-                    std::vector<llama_token> generated_tokens;
-
-                    while (n_decoded < n_predict) {
-                        llama_token id = common_sampler_sample(slot->smpl.get(), ctx_tgt, -1);
-
-                        if (llama_vocab_is_eog(vocab, id)) {
-                            break;
-                        }
-
-                        std::string token_str = common_token_to_piece(ctx_tgt, id);
-                        generated_tokens.push_back(id);
-                        accumulated += token_str;
-
-                        const int next_pos = n_tokens_cached + n_decoded;
-                        common_batch_clear(batch);
-                        common_batch_add(batch, id, next_pos, {slot->id}, true);
-
-                        if (llama_decode(ctx_tgt, batch) != 0) {
-                            SRV_ERR("hydra: DECODE slot=%d llama_decode failed at step %d\n", id_slot, n_decoded);
-                            break;
-                        }
-
-                        common_sampler_accept(slot->smpl.get(), id, true);
-                        n_decoded++;
-                    }
-
-                    slot->n_decoded = n_decoded;
-                    res->n_past = slot->n_prompt_tokens_cache + slot->n_decoded;
-                    res->generated_text = std::move(accumulated);
-                    res->tokens = std::move(generated_tokens);
-
-                    // Model identity for the slot that decoded
-                    res->model_alias = model_name;
-                    res->tokenizer   = resident_tokenizer;
-                    res->model_name  = resident_model_name;
-                    res->model_quant = resident_model_quant;
-                    res->model_capabilities = resident_capabilities;
-                    res->model_path  = params_base.model.path;
-
-                    res->decode_init_ms = (double)(ggml_time_ms() - decode_init_start_ms);
                     res->rpc_status = HYDRA_STATUS_OK;
-
-                    SRV_INF("hydra: DECODE slot=%d completed %d tokens (decode_init=%.1fms)\n",
-                            id_slot, n_decoded, res->decode_init_ms);
-
-                    // ── Store result in decode_results buffer for HTTP retrieval ──
-                    {
-                        std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
-                        server_routes::decode_result_entry entry;
-                        entry.id_slot = id_slot;
-                        entry.completion_id = completion_id_str;
-                        entry.oaicompat_model = model_name;
-                        entry.generation_params = json{{"n_predict", n_predict}};
-                        entry.content = res->generated_text;
-                        entry.n_decoded = n_decoded;
-                        entry.n_prompt_tokens = slot->n_prompt_tokens_cache;
-                        entry.n_prompt_tokens_cache = slot->n_prompt_tokens_cache;
-                        entry.timings = result_timings();
-                        entry.stop = STOP_TYPE_NONE; // TODO: track stop reason
-                        entry.include_usage = true;
-                        entry.match_json = res->match_json;
-                        entry.created_at = std::time(nullptr);
-                        entry.ttl_s = routes_ptr->decode_result_ttl_s;
-
-                        // Build hydra_metrics 9-field sidecar
-                        auto split_mode_str = [](enum llama_split_mode m) -> const char * {
-                            switch (m) {
-                                case LLAMA_SPLIT_MODE_NONE:  return "none";
-                                case LLAMA_SPLIT_MODE_LAYER: return "layer";
-                                case LLAMA_SPLIT_MODE_ROW:   return "row";
-                                default: return "none";
-                            }
-                        };
-                        json metrics = json::object();
-                        metrics["decode_request_id"] = decode_request_id;
-                        metrics["id_slot"] = id_slot;
-                        metrics["n_past"] = res->n_past;
-                        metrics["kv_bytes"] = task.hydra_action.kv_data.size();
-                        metrics["decode_ms"] = res->decode_init_ms;
-                        metrics["prompt_ms"] = 0.0;
-                        metrics["model_identity"] = {
-                            {"tokenizer", resident_tokenizer},
-                            {"model_name", resident_model_name},
-                            {"model_quant", resident_model_quant},
-                            {"model_capabilities", resident_capabilities}
-                        };
-                        metrics["match"] = res->match_json;
-                        metrics["t3_reloaded"] = false;   // TODO: wire real T3 reload state
-                        metrics["t3_reload_ms"] = 0.0;   // TODO: wire real T3 reload timing
-                        entry.hydra_metrics = metrics;
-
-                        routes_ptr->decode_results[decode_request_id] = std::move(entry);
-                        routes_ptr->evict_decode_results_locked();
-                    }
-
                     queue_results.send(std::move(res));
+
+                    // ── Phase 2: post COMPLETION task for generation ────────
+                    // Build a SERVER_TASK_TYPE_COMPLETION task the same way
+                    // handle_completions_impl does. This runs on the inference
+                    // thread, so we have full access to vocab, model, params, etc.
+                    // The task is posted to the queue and update_slots() drives it.
+                    {
+                        json prompt = decode_req["prompt"];
+                        json cmpl_data;
+                        cmpl_data["stream"] = prompt.value("stream", false);
+                        cmpl_data["n_predict"] = prompt.value("n_predict", 256);
+                        cmpl_data["id_slot"] = id_slot;
+                        if (prompt.contains("sampling")) {
+                            const json & samp = prompt["sampling"];
+                            if (samp.contains("temperature")) cmpl_data["temperature"] = samp["temperature"];
+                            if (samp.contains("top_p"))       cmpl_data["top_p"] = samp["top_p"];
+                            if (samp.contains("top_k"))       cmpl_data["top_k"] = samp["top_k"];
+                            if (samp.contains("seed"))        cmpl_data["seed"] = samp["seed"];
+                        }
+                        if (prompt.contains("stop")) cmpl_data["stop"] = prompt["stop"];
+
+                        std::string prompt_str;
+                        if (prompt.contains("messages") && !prompt["messages"].is_null()) {
+                            prompt_str = prompt["messages"].dump();
+                        } else {
+                            prompt_str = prompt.value("prompt", std::string());
+                        }
+                        cmpl_data["prompt"] = prompt_str;
+
+                        auto inputs = tokenize_input_prompts(vocab, mctx, prompt_str, true, true);
+                        if (!inputs.empty()) {
+                            server_task cmpl_task(SERVER_TASK_TYPE_COMPLETION);
+                            cmpl_task.id = decode_request_id;
+                            cmpl_task.id_slot = id_slot;
+                            cmpl_task.tokens = std::move(inputs[0]);
+                            cmpl_task.params = server_task::params_from_json_cmpl(
+                                vocab, params_base, get_slot_n_ctx(), params_base.sampling.logit_bias_eog, cmpl_data);
+                            cmpl_task.params.res_type = TASK_RESPONSE_TYPE_OAI_CHAT;
+                            cmpl_task.params.oaicompat_cmpl_id = gen_chatcmplid();
+                            cmpl_task.params.oaicompat_model = model_name;
+
+                            queue_results.add_waiting_task_id(decode_request_id);
+                            queue_tasks.post(std::move(cmpl_task));
+                            SRV_INF("hydra: DECODE slot=%d posted COMPLETION task (request_id=%d)\n",
+                                    id_slot, decode_request_id);
+                        } else {
+                            SRV_WRN("hydra: DECODE slot=%d tokenization failed, no generation\n", id_slot);
+                        }
+                    }
                 } break;
 
             case SERVER_TASK_TYPE_HYDRA_ENGINE_SET_EXPERT_MODE:
@@ -8719,10 +8639,12 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
 }
 
 // DECODE (0x43) — Merged P/D: framed request with async HTTP retrieval.
-// New wire format: [4B json_len LE][json_len bytes JSON][raw KV bytes]
-// The RPC handler reads the full request, posts the decode task asynchronously,
-// and returns immediately with a decode_request_id — NOT the generated text.
-// The actual result is retrieved via GET /v1/decode/{decode_request_id}.
+// Wire format: [4B json_len LE][json_len bytes JSON][raw KV bytes]
+// Two-phase flow:
+//   Phase 1 (sync): identity validation + KV restore — waits for inference thread
+//   Phase 2 (async): background thread posts SERVER_TASK_TYPE_COMPLETION,
+//           update_slots() drives generation, result stored in decode_results buffer.
+// Actual result retrieved via GET /v1/decode/{decode_request_id}.
 static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
     if (payload_len < sizeof(uint32_t)) {
         hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
@@ -8750,13 +8672,12 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
         return;
     }
 
-    // Read remaining KV bytes (payload_len includes the 4-byte length prefix + JSON + KV)
+    // Read remaining KV bytes
     const uint64_t kv_len = payload_len - sizeof(uint32_t) - json_len;
     if (kv_len > HYDRA_MAX_STATE_BYTES) {
         SRV_WRN("hydra rpc: DECODE KV blob %" PRIu64 " B exceeds cap %" PRIu64 " B\n",
                 kv_len, HYDRA_MAX_STATE_BYTES);
         hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
-        // Drain KV bytes to keep connection alive
         std::vector<uint8_t> drain(65536);
         for (uint64_t rem = kv_len; rem > 0; ) {
             size_t chunk = (size_t)std::min(rem, (uint64_t)drain.size());
@@ -8776,7 +8697,6 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
         return;
     }
 
-    // Validate required fields
     if (!req.contains("kv_metadata") || !req.contains("prompt")) {
         SRV_WRN("%s", "hydra rpc: DECODE missing kv_metadata or prompt\n");
         hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
@@ -8790,32 +8710,60 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
         return;
     }
 
-    // Assign decode_request_id (= task id, monotonically increasing)
+    // ── Phase 1: sync validate + restore ──────────────────────────────────
     const int32_t decode_request_id = ctx.queue_tasks->get_new_id();
 
-    // Post async decode task — does NOT block for generation
-    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE);
-    task.id = decode_request_id;
-    task.hydra_action.id_slot = slot_id;
-    task.hydra_action.decode_json = std::move(json_str);
-    task.hydra_action.kv_data = std::move(kv_data);
-    task.hydra_action.decode_request_id = decode_request_id;
+    server_task val_task(SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE);
+    val_task.id = decode_request_id;
+    val_task.hydra_action.id_slot = slot_id;
+    val_task.hydra_action.decode_json = std::move(json_str);
+    val_task.hydra_action.kv_data = std::move(kv_data);
+    val_task.hydra_action.decode_request_id = decode_request_id;
     ctx.queue_results->add_waiting_task_id(decode_request_id);
-    ctx.queue_tasks->post(std::move(task));
+    ctx.queue_tasks->post(std::move(val_task));
 
-    // Return immediate response: decode_request_id + basic status
-    // (full match info is in the HTTP result buffer, retrievable via GET)
+    // Wait for validation+restore to complete (30s timeout for large KV blobs)
+    std::unordered_set<int> val_ids = {decode_request_id};
+    auto val_res_ptr = ctx.queue_results->recv_with_timeout(val_ids, 30);
+    ctx.queue_results->remove_waiting_task_id(decode_request_id);
+
+    if (!val_res_ptr) {
+        SRV_WRN("hydra rpc: DECODE validation timeout for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * val_res = dynamic_cast<server_task_result_hydra_engine*>(val_res_ptr.get());
+    if (!val_res || val_res->rpc_status != HYDRA_STATUS_OK) {
+        json err_j = {
+            {"valid", false},
+            {"decode_request_id", decode_request_id},
+        };
+        if (val_res) {
+            if (!val_res->match_json.is_null()) err_j["match"] = val_res->match_json;
+            if (!val_res->error.empty()) err_j["reason"] = val_res->error;
+            err_j["error_code"] = "CAP_MISMATCH";
+        }
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
+        return;
+    }
+
+    // Validation passed — build real success response
     json meta_j = {
         {"valid", true},
+        {"match", val_res->match_json},
         {"decode_request_id", decode_request_id},
-        {"n_past_after_restore", req["kv_metadata"].value("n_past", 0)}
+        {"n_past_after_restore", val_res->n_past},
+        {"restore_slot_ms", val_res->restore_slot_ms},
     };
     const std::string meta_str = meta_j.dump();
     hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
     hydra_send_all(fd, meta_str.data(), meta_str.size());
 
-    SRV_INF("hydra: DECODE slot=%d accepted, request_id=%d, kv=%" PRIu64 "B\n",
-            slot_id, decode_request_id, kv_len);
+    SRV_INF("hydra: DECODE slot=%d accepted, request_id=%d, restore=%.1fms\n",
+            slot_id, decode_request_id, val_res->restore_slot_ms);
 }
 
 // SET_EXPERT_MODE (0x37): Read mode string, post task, return success.
