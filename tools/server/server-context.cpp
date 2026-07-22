@@ -4225,6 +4225,73 @@ private:
                             queue_tasks.post(std::move(cmpl_task));
                             SRV_INF("hydra: DECODE slot=%d posted COMPLETION task (request_id=%d)\n",
                                     id_slot, decode_request_id);
+
+                            // ── Background consumer: drain queue_results for the
+                            // completion task and populate decode_results so
+                            // GET /v1/decode/{id} has something to return. Mirrors
+                            // the STATE_GET background-thread pattern (see the
+                            // std::thread(...).detach() block earlier in this file).
+                            if (routes_ptr) {
+                                std::thread([this, decode_request_id, id_slot,
+                                             match_j, resident_tokenizer, resident_model_name,
+                                             resident_model_quant, resident_capabilities,
+                                             oaicompat_model_name = model_name,
+                                             &results = queue_results]() mutable {
+                                    std::unordered_set<int> ids = {(int)decode_request_id};
+                                    auto res_ptr = results.recv_with_timeout(ids, 120);
+                                    results.remove_waiting_task_id(decode_request_id);
+                                    if (!res_ptr) {
+                                        SRV_WRN("hydra: DECODE slot=%d generation timeout (request_id=%d)\n",
+                                                id_slot, decode_request_id);
+                                        return;
+                                    }
+                                    auto * cres = dynamic_cast<server_task_result_cmpl_final*>(res_ptr.get());
+                                    if (!cres) {
+                                        SRV_WRN("hydra: DECODE slot=%d unexpected result type (request_id=%d)\n",
+                                                id_slot, decode_request_id);
+                                        return;
+                                    }
+
+                                    server_routes::decode_result_entry entry;
+                                    entry.id_slot               = id_slot;
+                                    entry.completion_id         = cres->oaicompat_cmpl_id;
+                                    entry.oaicompat_model       = oaicompat_model_name;
+                                    entry.content                = cres->content;
+                                    entry.n_decoded              = cres->n_decoded;
+                                    entry.n_prompt_tokens        = cres->n_prompt_tokens;
+                                    entry.n_prompt_tokens_cache  = cres->n_prompt_tokens_cache;
+                                    entry.timings                = cres->timings;
+                                    entry.stop                   = cres->stop;
+                                    entry.include_usage          = cres->include_usage;
+                                    entry.match_json             = match_j;
+                                    entry.created_at             = std::time(nullptr);
+                                    entry.ttl_s                  = routes_ptr->decode_result_ttl_s;
+
+                                    json metrics = json::object();
+                                    metrics["decode_request_id"] = decode_request_id;
+                                    metrics["id_slot"]           = id_slot;
+                                    metrics["n_past"]            = cres->n_prompt_tokens_cache + cres->n_decoded;
+                                    metrics["decode_ms"]         = cres->timings.predicted_ms;
+                                    metrics["prompt_ms"]         = cres->timings.prompt_ms;
+                                    metrics["model_identity"]    = {
+                                        {"tokenizer", resident_tokenizer},
+                                        {"model_name", resident_model_name},
+                                        {"model_quant", resident_model_quant},
+                                        {"model_capabilities", resident_capabilities}
+                                    };
+                                    metrics["match"]        = match_j;
+                                    metrics["t3_reloaded"]  = false;  // TODO: wire real T3 reload state
+                                    metrics["t3_reload_ms"] = 0.0;    // TODO: wire real T3 reload timing
+                                    entry.hydra_metrics = metrics;
+
+                                    std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                                    routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                                    routes_ptr->evict_decode_results_locked();
+
+                                    SRV_INF("hydra: DECODE slot=%d generation complete, buffered (request_id=%d, n_decoded=%d)\n",
+                                            id_slot, decode_request_id, cres->n_decoded);
+                                }).detach();
+                            }
                         } else {
                             SRV_WRN("hydra: DECODE slot=%d tokenization failed, no generation\n", id_slot);
                         }
