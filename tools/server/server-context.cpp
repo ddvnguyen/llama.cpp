@@ -57,6 +57,11 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Pending RPC servers staged by hydra_apply_t3_mutators() and consumed
+// by apply_t3_rebuild() before load_model(). File-scope static so both
+// functions (methods of server_context_impl) can access it.
+static std::vector<std::string> g_pending_rpc_servers;
+
 // Forward-declared so the background thread lambda in process_single_task can use it
 // before the full RPC helper definitions appear later in this file.
 #if !defined(_WIN32)
@@ -2321,6 +2326,8 @@ private:
             key == "override_tensor" ||
             key == "split_mode"      ||
             key == "tensor_split"    ||
+            key == "model_path"      ||  // hydra_config: absolute GGUF path
+            key == "rpc_servers"     ||  // hydra_config: RPC peer endpoints to register
             key == "model.path"      ||
             key == "model") {        // legacy alias for { "model": { "path": ... } }
             return 3;
@@ -2472,6 +2479,162 @@ private:
             llama_hydra_set_pending_model_path(cfg["model"].get<std::string>().c_str());
             deferred_keys.push_back("model");
         }
+        // hydra_config flat key: {"model_path": "/path/to.gguf"}
+        if (cfg.contains("model_path") && cfg["model_path"].is_string()) {
+            llama_hydra_set_pending_model_path(cfg["model_path"].get<std::string>().c_str());
+            deferred_keys.push_back("model_path");
+        }
+        // hydra_config: {"rpc_servers": ["host1:port1", "host2:port2"]}
+        // Stored in a static for apply_t3_rebuild() to consume before
+        // load_model(). The actual ggml backend registration happens in
+        // hydra_register_rpc_servers() called from apply_t3_rebuild().
+        if (cfg.contains("rpc_servers") && cfg["rpc_servers"].is_array()) {
+            g_pending_rpc_servers.clear();
+            for (const auto & v : cfg["rpc_servers"]) {
+                if (v.is_string()) {
+                    g_pending_rpc_servers.push_back(v.get<std::string>());
+                }
+            }
+            deferred_keys.push_back("rpc_servers");
+        }
+    }
+
+    // Shared helper: classify config keys, apply T1 immediately, and either
+    // stage (sync=false) or synchronously apply (sync=true) T2/T3.
+    //
+    // sync=false (CONFIGURE path): T2/T3 are staged via hydra_set_pending_config()
+    // + hydra_apply_t3_mutators() for later application at the slot-free moment.
+    //
+    // sync=true (PREFILL / HTTP decode path): T2/T3 are applied immediately
+    // via apply_t2_rebuild() / apply_t3_rebuild(). The caller already owns
+    // the task-queue thread context, so synchronous application is safe.
+    //
+    // Returns a structured result so callers can build CONFIGURE responses
+    // or handle errors uniformly.
+    struct hydra_config_result {
+        int highest_tier = 0;
+        std::map<std::string, json> params_applied;
+        std::vector<std::string> deferred_keys;
+        json t2t3_subset = json::object();
+        bool ok = true;
+        std::string error;
+        uint64_t state_chunk_size_applied = 0;
+    };
+
+    hydra_config_result hydra_apply_config(const json & cfg, bool sync) {
+        hydra_config_result result;
+
+        // 1. Classify every top-level key. T1 → apply now; T2/T3 →
+        //    defer (stage) or apply synchronously depending on `sync`.
+        json t1_subset = json::object();
+        for (auto it = cfg.begin(); it != cfg.end(); ++it) {
+            const std::string key = it.key();
+            int tier = hydra_classify_config_key(key);
+            if (tier == 0) {
+                SRV_DBG("hydra: config unknown key '%s' — ignored\n", key.c_str());
+                continue;
+            }
+            if (tier == 1) {
+                t1_subset[key] = it.value();
+            } else {
+                result.t2t3_subset[key] = it.value();
+                result.deferred_keys.push_back(key);
+            }
+            if (tier > result.highest_tier) result.highest_tier = tier;
+        }
+        // The "sampling" object may contain unlisted nested keys
+        // (e.g. penalty_last_n, mirostat) — route the whole object
+        // through T1 when present.
+        if (cfg.contains("sampling") && cfg["sampling"].is_object()) {
+            t1_subset["sampling"] = cfg["sampling"];
+            if (result.highest_tier < 1) result.highest_tier = 1;
+        }
+        // model.path is nested — the legacy {"model": {...}} form
+        // is recognized by hydra_classify_config_key returning 3
+        // for the bare "model" key. If the bare "model" is set
+        // and is an object with a "path", route it as T3.
+        if (cfg.contains("model")) {
+            if (cfg["model"].is_object()) {
+                result.t2t3_subset["model"] = cfg["model"];
+                if (std::find(result.deferred_keys.begin(), result.deferred_keys.end(), "model")
+                    == result.deferred_keys.end()) {
+                    result.deferred_keys.push_back("model");
+                }
+                if (result.highest_tier < 3) result.highest_tier = 3;
+            } else if (cfg["model"].is_string()) {
+                result.t2t3_subset["model"] = cfg["model"];
+                if (std::find(result.deferred_keys.begin(), result.deferred_keys.end(), "model")
+                    == result.deferred_keys.end()) {
+                    result.deferred_keys.push_back("model");
+                }
+                if (result.highest_tier < 3) result.highest_tier = 3;
+            }
+        }
+
+        if (result.highest_tier == 0) {
+            // No recognized keys — caller decides whether to treat as
+            // a no-op or surface an error.
+            return result;
+        }
+
+        // 2. Apply T1 keys in-place.
+        if (!t1_subset.empty()) {
+            if (!hydra_apply_t1_config(params_base, ctx_tgt, t1_subset, result.params_applied)) {
+                result.ok = false;
+                result.error = "T1 key has wrong type (see log)";
+                return result;
+            }
+            // Capture state_chunk_size for callers that need it (CONFIGURE).
+            auto it = result.params_applied.find("state_chunk_size");
+            if (it != result.params_applied.end() && it->second.is_number_unsigned()) {
+                result.state_chunk_size_applied = it->second.get<uint64_t>();
+            }
+        }
+
+        // 3. T2/T3 handling — diverges based on sync flag.
+        if (!result.t2t3_subset.empty()) {
+            if (sync) {
+                // Synchronous mode (PREFILL / HTTP decode): apply T2/T3 now
+                // on the task-queue thread. The caller owns this thread context
+                // so blocking is safe.
+                if (result.highest_tier == 3) {
+                    hydra_apply_t3_mutators(ctx_tgt, result.t2t3_subset, result.deferred_keys);
+                    if (!apply_t3_rebuild()) {
+                        result.ok = false;
+                        result.error = "T3 rebuild failed";
+                        return result;
+                    }
+                } else if (result.highest_tier == 2) {
+                    if (!apply_t2_rebuild(result.t2t3_subset.dump())) {
+                        result.ok = false;
+                        result.error = "T2 rebuild failed";
+                        return result;
+                    }
+                }
+                // Clear T3 staged statics — they were consumed by the
+                // sync apply and must not leak into a later deferred path.
+                llama_hydra_clear_pending_t3();
+            } else {
+                // Stage mode (CONFIGURE): record the mutators and store
+                // pending_config for application at the next slot-free moment.
+                if (result.highest_tier == 3) {
+                    hydra_apply_t3_mutators(ctx_tgt, result.t2t3_subset, result.deferred_keys);
+                }
+                if (ctx_tgt) {
+                    ctx_tgt->hydra_set_pending_config(
+                        result.t2t3_subset.dump(), hydra_tier_label(result.highest_tier));
+                } else {
+                    // First load: ctx_tgt is null, so apply_pending_hydra_config()
+                    // and update_slots() can't trigger. Set the flag so the
+                    // task-queue thread runs apply_t3_rebuild() at the next
+                    // slot-free moment.
+                    first_load_pending = true;
+                    SRV_INF("%s", "hydra: config staged for first load (no context yet)\n");
+                }
+            }
+        }
+
+        return result;
     }
 
     void process_single_task(server_task && task) {
@@ -2486,6 +2649,31 @@ private:
                     if (task.cli) {
                         if (!tokenize_cli_input(task)) {
                             break;
+                        }
+                    }
+
+                    // Hydra config from HTTP decode path: apply synchronously
+                    // on the task-queue thread before any slot scheduling or
+                    // generation work. This is safe because we own this thread;
+                    // the previous attempt applied on the httplib worker thread
+                    // and raced the main queue (reverted in ebbbe1116).
+                    if (!task.hydra_config_json.empty()) {
+                        json hydra_cfg;
+                        try {
+                            hydra_cfg = json::parse(task.hydra_config_json);
+                        } catch (const std::exception & e) {
+                            SRV_WRN("hydra: COMPLETION hydra_config parse failed: %s\n", e.what());
+                        }
+                        if (!hydra_cfg.is_null() && hydra_cfg.is_object()) {
+                            SRV_INF("hydra: COMPLETION applying hydra_config (%zu keys)\n",
+                                    hydra_cfg.size());
+                            hydra_config_result cfg_result = hydra_apply_config(hydra_cfg, /*sync=*/true);
+                            if (!cfg_result.ok) {
+                                SRV_WRN("hydra: COMPLETION hydra_config apply failed: %s\n",
+                                        cfg_result.error.c_str());
+                            }
+                            // After T3 rebuild, model/slots are reset.
+                            // The slot lookup below will pick up the new state.
                         }
                     }
 
@@ -3329,62 +3517,12 @@ private:
                         break;
                     }
 
-                    // 1. Classify every top-level key. T1 → apply now; T2/T3 →
-                    //    defer to the next slot-free moment.
-                    int  highest_tier  = 0;
-                    json t1_subset     = json::object();
-                    json t2t3_subset   = json::object();
-                    std::vector<std::string> deferred_keys;
-                    for (auto it = cfg.begin(); it != cfg.end(); ++it) {
-                        const std::string key = it.key();
-                        int tier = hydra_classify_config_key(key);
-                        if (tier == 0) {
-                            // Unknown key — record as a T1 no-op so the
-                            // Coordinator can see we acknowledged it (mirrors
-                            // the legacy behavior of silently ignoring
-                            // unrecognized keys).
-                            SRV_DBG("hydra: CONFIGURE unknown key '%s' — ignored\n", key.c_str());
-                            continue;
-                        }
-                        if (tier == 1) {
-                            t1_subset[key] = it.value();
-                        } else {
-                            t2t3_subset[key] = it.value();
-                            deferred_keys.push_back(key);
-                        }
-                        if (tier > highest_tier) highest_tier = tier;
-                    }
-                    // The "sampling" object may contain unlisted nested keys
-                    // (e.g. penalty_last_n, mirostat) — those are still T1 by
-                    // the rule "sampling.* applies immediately", so route
-                    // the whole object through T1 when present.
-                    if (cfg.contains("sampling") && cfg["sampling"].is_object()) {
-                        t1_subset["sampling"] = cfg["sampling"];
-                        // Promote any unknown T1 subset keys to applied silently.
-                        if (highest_tier < 1) highest_tier = 1;
-                    }
-                    // model.path is nested — the legacy {"model": {...}} form
-                    // is recognized by hydra_classify_config_key returning 3
-                    // for the bare "model" key. If the bare "model" is set
-                    // and is an object with a "path", route it as T3.
-                    if (cfg.contains("model")) {
-                        if (cfg["model"].is_object()) {
-                            t2t3_subset["model"] = cfg["model"];
-                            if (std::find(deferred_keys.begin(), deferred_keys.end(), "model") == deferred_keys.end()) {
-                                deferred_keys.push_back("model");
-                            }
-                            if (highest_tier < 3) highest_tier = 3;
-                        } else if (cfg["model"].is_string()) {
-                            t2t3_subset["model"] = cfg["model"];
-                            if (std::find(deferred_keys.begin(), deferred_keys.end(), "model") == deferred_keys.end()) {
-                                deferred_keys.push_back("model");
-                            }
-                            if (highest_tier < 3) highest_tier = 3;
-                        }
-                    }
+                    // Route through the shared classify → apply helper.
+                    // sync=false: T2/T3 are staged for the slot-free moment.
+                    hydra_config_result cfg_result = hydra_apply_config(cfg, /*sync=*/false);
 
-                    if (highest_tier == 0) {
-                        // No recognized keys at all — still emit a T1 success
+                    if (cfg_result.highest_tier == 0) {
+                        // No recognized keys — still emit a T1 success
                         // (the legacy {"state_chunk_size":N} case).
                         res->tier = "T1";
                         SRV_INF("hydra: CONFIGURE (no recognized keys, slot %d) — T1 no-op\n",
@@ -3393,54 +3531,21 @@ private:
                         break;
                     }
 
-                    // 2. Apply T1 keys in-place.
-                    std::map<std::string, json> params_applied;
-                    if (!t1_subset.empty()) {
-                        if (!hydra_apply_t1_config(params_base, ctx_tgt, t1_subset, params_applied)) {
-                            res->success = false;
-                            res->rpc_status = HYDRA_STATUS_ERROR;
-                            res->error = "CONFIGURE: T1 key has wrong type (see log)";
-                            SRV_WRN("hydra: CONFIGURE T1 apply failed (slot %d)\n",
-                                    task.hydra_action.id_slot);
-                            queue_results.send(std::move(res));
-                            break;
-                        }
-                        // Propagate state_chunk_size_applied for the existing
-                        // hydra#334 echo (Coordinator expects this key).
-                        auto it = params_applied.find("state_chunk_size");
-                        if (it != params_applied.end() && it->second.is_number_unsigned()) {
-                            res->state_chunk_size_applied = it->second.get<uint64_t>();
-                        }
+                    if (!cfg_result.ok) {
+                        res->success = false;
+                        res->rpc_status = HYDRA_STATUS_ERROR;
+                        res->error = "CONFIGURE: " + cfg_result.error;
+                        SRV_WRN("hydra: CONFIGURE apply failed (slot %d): %s\n",
+                                task.hydra_action.id_slot, cfg_result.error.c_str());
+                        queue_results.send(std::move(res));
+                        break;
                     }
 
-                    // 3. Apply T3 mutators (record staged state; the actual
-                    //    model reload is deferred to the slot-free trigger).
-                    if (highest_tier == 3) {
-                        hydra_apply_t3_mutators(ctx_tgt, t2t3_subset, deferred_keys);
-                    }
-                    // T2 keys (and any T3 keys the handler didn't recognize)
-                    // are stored in pending_config for the apply step to
-                    // consume.
-                    if (!t2t3_subset.empty() && ctx_tgt) {
-                        ctx_tgt->hydra_set_pending_config(
-                            t2t3_subset.dump(), hydra_tier_label(highest_tier));
-                    } else if (!t2t3_subset.empty()) {
-                        SRV_INF("%s", "hydra: CONFIGURE staged T3 keys for first load (no context yet)\n");
-                    }
-
-                    // First load: ctx_tgt is null, so apply_pending_hydra_config()
-                    // and update_slots() can't trigger (both gate on ctx_tgt).
-                    // Set the flag so the task-queue thread runs apply_t3_rebuild()
-                    // at the next slot-free moment (safe — no slots to drain).
-                    if (!t2t3_subset.empty() && !ctx_tgt) {
-                        first_load_pending = true;
-                        SRV_INF("%s", "hydra: CONFIGURE first load staged — task-queue will apply\n");
-                    }
-
-                    // 4. Build the response.
-                    res->tier = hydra_tier_label(highest_tier);
-                    res->params_applied = std::move(params_applied);
-                    res->deferred_keys = std::move(deferred_keys);
+                    // Build the response from the shared helper's result.
+                    res->tier = hydra_tier_label(cfg_result.highest_tier);
+                    res->params_applied = std::move(cfg_result.params_applied);
+                    res->deferred_keys = std::move(cfg_result.deferred_keys);
+                    res->state_chunk_size_applied = cfg_result.state_chunk_size_applied;
 
                     SRV_INF("hydra: CONFIGURE tier=%s applied=%zu deferred=%zu (slot %d)\n",
                             res->tier.c_str(),
@@ -3546,12 +3651,23 @@ private:
                     // alias is unknown or no preset is configured.
                     json parsed_body;
                     std::string requested_model;
+                    json hydra_cfg; // optional hydra_config object
+                    bool has_hydra_config = false;
                     if (!task.hydra_action.request_json.empty()) {
                         try {
                             parsed_body = json::parse(task.hydra_action.request_json);
                             if (parsed_body.is_object() && parsed_body.contains("model")
                                 && parsed_body["model"].is_string()) {
                                 requested_model = parsed_body["model"].get<std::string>();
+                            }
+                            // hydra_config: optional config object from Hydra.Core
+                            // containing topology/sampling overrides. When present
+                            // with model_path, it drives the model swap directly
+                            // (bypassing the preset alias lookup).
+                            if (parsed_body.is_object() && parsed_body.contains("hydra_config")
+                                && parsed_body["hydra_config"].is_object()) {
+                                hydra_cfg = parsed_body["hydra_config"];
+                                has_hydra_config = true;
                             }
                         } catch (const std::exception & e) {
                             res->rpc_status = HYDRA_STATUS_BAD_REQUEST;
@@ -3561,6 +3677,48 @@ private:
                         }
                     }
 
+                    // Apply hydra_config synchronously when present.
+                    // T1 keys (sampling, n_predict, etc.) are applied in-place.
+                    // T2/T3 keys (n_ctx, cache_type, model_path, split_mode, etc.)
+                    // trigger immediate rebuilds on this task-queue thread.
+                    if (has_hydra_config) {
+                        SRV_INF("hydra: PREFILL slot=%d applying hydra_config (%zu keys)\n",
+                                id_slot, hydra_cfg.size());
+                        hydra_config_result cfg_result = hydra_apply_config(hydra_cfg, /*sync=*/true);
+                        if (!cfg_result.ok) {
+                            res->rpc_status = HYDRA_STATUS_ERROR;
+                            res->error = "hydra_config apply failed: " + cfg_result.error;
+                            SRV_WRN("hydra: PREFILL hydra_config apply failed (slot %d): %s\n",
+                                    id_slot, cfg_result.error.c_str());
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                        // If T3 rebuild happened (model swap via model_path),
+                        // track it and re-look-up the slot.
+                        if (cfg_result.highest_tier == 3) {
+                            model_was_swapped = true;
+                            res->model_load_ms = (double)(ggml_time_ms() - prefill_start_ms);
+                            SRV_INF("hydra: PREFILL hydra_config T3 applied model_alias='%s' model_hash='%s'\n",
+                                    model_name.empty() ? "?" : model_name.c_str(),
+                                    llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "");
+                            slot = get_slot_by_id(id_slot);
+                            if (slot == nullptr) {
+                                res->rpc_status = HYDRA_STATUS_NOT_FOUND;
+                                res->error = "slot disappeared after hydra_config T3 rebuild";
+                                queue_results.send(std::move(res));
+                                break;
+                            }
+                        }
+                        // When hydra_config carries model_path, the model swap is
+                        // handled by apply_t3_rebuild() above — skip the bare
+                        // model alias lookup below.
+                        if (hydra_cfg.contains("model_path")) {
+                            requested_model.clear();
+                        }
+                    }
+
+                    // Fallback: bare model alias lookup when hydra_config didn't
+                    // handle the model swap (no hydra_config, or no model_path).
                     if (!requested_model.empty()) {
                         auto it = preset_alias_to_path.find(requested_model);
                         if (it == preset_alias_to_path.end()) {
@@ -4562,6 +4720,57 @@ private:
         return true;
     }
 
+    // Register new RPC peer devices into the global ggml backend registry.
+    // Called from apply_t3_rebuild() before load_model() so the new peer's
+    // device exists when common_init_from_params() tries to place tensors
+    // per tensor_split/split_mode.
+    //
+    // Repeated registration is NOT safe/idempotent in the underlying API,
+    // so we track already-registered endpoints in a static set and only
+    // register genuinely new ones.
+    static void hydra_register_rpc_servers(const json & servers_arr) {
+        static std::set<std::string> registered;
+
+        if (!servers_arr.is_array() || servers_arr.empty()) {
+            return;
+        }
+
+        ggml_backend_load_all();
+        ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+        if (!rpc_reg) {
+            SRV_WRN("%s", "hydra: rpc_servers: RPC backend not available\n");
+            return;
+        }
+
+        typedef ggml_backend_reg_t (*ggml_backend_rpc_add_server_t)(const char * endpoint);
+        auto add_server_fn = (ggml_backend_rpc_add_server_t)
+            ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+        if (!add_server_fn) {
+            SRV_WRN("%s", "hydra: rpc_servers: ggml_backend_rpc_add_server not found\n");
+            return;
+        }
+
+        for (const auto & v : servers_arr) {
+            if (!v.is_string()) continue;
+            const std::string endpoint = v.get<std::string>();
+            if (endpoint.empty()) continue;
+            if (registered.count(endpoint)) {
+                SRV_DBG("hydra: rpc_servers: endpoint '%s' already registered, skipping\n",
+                        endpoint.c_str());
+                continue;
+            }
+            ggml_backend_reg_t reg = add_server_fn(endpoint.c_str());
+            if (reg) {
+                ggml_backend_register(reg);
+                registered.insert(endpoint);
+                SRV_INF("hydra: rpc_servers: registered endpoint '%s'\n", endpoint.c_str());
+            } else {
+                SRV_WRN("hydra: rpc_servers: failed to register endpoint '%s'\n",
+                        endpoint.c_str());
+            }
+        }
+    }
+
     // T3 rebuild: full model reload. Uses the staged T3 statics
     // (override_tensor, split_mode, tensor_split, n_gpu_layers,
     // n_cpu_moe, model.path) populated by hydra_apply_t3_mutators().
@@ -4680,6 +4889,21 @@ private:
             }
             llama_hydra_clear_combined_bindings(ctx_tgt, hydra_peer.c_str());
             hydra_combined_head_attached = false;
+        }
+
+        // Register any new RPC peer devices before load_model() so the
+        // peer's device exists in the global ggml backend registry when
+        // common_init_from_params() tries to place tensors per
+        // tensor_split/split_mode. Only genuinely new endpoints are
+        // registered (hydra_register_rpc_servers tracks already-registered
+        // endpoints to avoid unsafe repeated registration).
+        if (!g_pending_rpc_servers.empty()) {
+            json rpc_arr = json::array();
+            for (const auto & s : g_pending_rpc_servers) {
+                rpc_arr.push_back(s);
+            }
+            hydra_register_rpc_servers(rpc_arr);
+            g_pending_rpc_servers.clear();
         }
 
         // Full model reload. load_model() handles the unload of the
@@ -6281,7 +6505,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type) {
+            task_response_type res_type,
+            const std::string & hydra_config_json) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     std::shared_lock meta_lock(meta_mutex);
@@ -6350,6 +6575,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+
+            // Attach hydra_config (if any) so the task-queue thread can
+            // apply it synchronously before processing the completion.
+            if (!hydra_config_json.empty()) {
+                task.hydra_config_json = hydra_config_json;
+            }
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
@@ -7107,6 +7338,18 @@ void server_routes::init_routes() {
                 return res;
             }
         }
+        // Extract optional hydra_config from the raw body before it's
+        // consumed by oaicompat_chat_params_parse(). The config is applied
+        // on the task-queue thread (not here on the httplib worker thread)
+        // to avoid racing the main inference loop.
+        std::string hydra_config_str;
+        {
+            json raw_body = json::parse(req.body);
+            if (raw_body.is_object() && raw_body.contains("hydra_config")
+                && raw_body["hydra_config"].is_object()) {
+                hydra_config_str = raw_body["hydra_config"].dump();
+            }
+        }
         json body_parsed;
         std::vector<raw_buffer> files;
         {
@@ -7121,7 +7364,8 @@ void server_routes::init_routes() {
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_OAI_CHAT);
+            TASK_RESPONSE_TYPE_OAI_CHAT,
+            hydra_config_str);
     };
 
     this->post_control = [this](const server_http_req & req) {
