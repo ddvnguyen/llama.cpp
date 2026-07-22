@@ -199,6 +199,36 @@ struct server_routes {
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
 
+    // Merged DECODE result retrieval
+    server_http_context::handler_t get_decode_result;   // GET  /v1/decode/:decode_request_id
+    server_http_context::handler_t delete_decode_result; // DELETE /v1/decode/:decode_request_id
+
+    // Merged DECODE result buffer: keyed by decode_request_id
+    struct decode_result_entry {
+        int32_t         id_slot = -1;
+        std::string     completion_id;
+        std::string     oaicompat_model;
+        json            generation_params;
+        std::string     content;           // full generated text
+        int32_t         n_decoded = 0;
+        int32_t         n_prompt_tokens = 0;
+        int32_t         n_prompt_tokens_cache = 0;
+        result_timings  timings;
+        stop_type       stop = STOP_TYPE_NONE;
+        bool            include_usage = false;
+        json            hydra_metrics;
+        json            match_json;        // match result from inference thread
+        int64_t         created_at = 0;    // std::time(nullptr) at creation
+        int             ttl_s = 300;       // TTL in seconds
+    };
+    mutable std::mutex decode_results_mutex;
+    std::map<int32_t, decode_result_entry> decode_results;
+    int decode_result_max = 1024;
+    int decode_result_ttl_s = 300;
+
+    // Evict expired entries from decode_results (call with decode_results_mutex held)
+    void evict_decode_results_locked();
+
     // to be used in router mode
     json get_model_info() const;
 

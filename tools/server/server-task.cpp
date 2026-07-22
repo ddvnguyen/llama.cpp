@@ -2064,8 +2064,12 @@ json server_task_result_hydra_engine::to_json() {
         if (logits_size > 0)        j["logits_size"] = logits_size;
     }
     if (op == 0x43) { // DECODE
-        j["tokens"]   = tokens;
-        j["logprobs"] = logprobs;
+        j["decode_request_id"] = decode_request_id;
+        j["valid"] = match_valid;
+        if (!match_json.is_null()) j["match"] = match_json;
+        if (restore_slot_ms > 0) j["restore_slot_ms"] = restore_slot_ms;
+        if (decode_init_ms > 0)  j["decode_init_ms"]  = decode_init_ms;
+        j["id_slot"] = id_slot;
     }
     if (op == 0x40 || op == 0x44 || op == 0x45 || op == 0x46) { // CONFIGURE/SET_EXPERT_MODE/SWAP_QUANT/PIPELINE_ATTACH
         j["success"] = success;
