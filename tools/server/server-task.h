@@ -175,6 +175,12 @@ struct server_task {
     std::string             cli_prompt;
     std::vector<raw_buffer> cli_files;
 
+    // Hydra config from HTTP decode path: optional JSON config object
+    // injected by Hydra.Core on /v1/chat/completions. Applied on the
+    // task-queue thread at the start of COMPLETION processing (not on
+    // the httplib worker thread — avoids racing the main queue).
+    std::string             hydra_config_json;
+
     server_task_type type;
 
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
