@@ -666,17 +666,19 @@ struct server_task_result_hydra_state : server_task_result {
     bool     is_transferring = false;       // true while M1/M2 background send is active
     uint64_t state_size      = 0;
 
-    // M-Perf.9 #289: model identity for the slot. Populated from impl->model_name
-    // (the alias the model is loaded under; "?" / first alias / filename) and
-    // impl->params_base.model.path (the GGUF file the model was loaded from).
-    // model_hash is the 64-char hex SHA-256 of that GGUF file, computed once
-    // at model-load time and exposed via llama_model_hash(). The Coordinator
-    // uses this for cross-model KV safety: a restore is rejected if the
-    // stored KV's model_hash does not match the slot's model_hash.
+    // M-Perf.9 #289 / #470: model identity for the slot. Populated from
+    // impl->model_name (the alias) and impl->params_base.model.path.
+    // model_hash has been replaced by GGUF-derived semantic identity fields
+    // (tokenizer, model_name, model_quant, model_capabilities) which give
+    // capability information and are stable across rebuilds.
     std::string model_alias;                // e.g. "balanced"
-    std::string model_hash;                 // 64-char hex SHA-256 of the GGUF
     std::string model_path;                 // absolute path to the GGUF
     bool model_match = false;               // STATE_PUT: true if KV matches resident model
+    // #470: GGUF-derived semantic identity
+    std::string tokenizer;                  // e.g. "gpt2", "llama"
+    std::string model_name;                 // display name (base_model.0.name or general.name)
+    std::string model_quant;                // e.g. "Q5_K_M"
+    uint32_t    model_capabilities = 0;     // capability bitfield (0x01=MTP, etc.)
 
     // #451: progress fields for slot progress visibility
     std::string operation;                  // "prefill" | "decode" | "save" | "restore" | "idle"
@@ -706,18 +708,22 @@ struct server_task_result_hydra_engine : server_task_result {
     uint64_t             state_size  = 0; // raw KV bytes only (from llama_state_seq_get_size)
     uint64_t             logits_size = 0; // appended logits bytes (n_vocab * sizeof(float))
 
-    // M-Perf.9 #289: model identity for the slot the prefill was built on.
+    // M-Perf.9 #289 / #470: model identity for the slot the prefill was built on.
     // model_alias: the alias (or filename if no aliases) the engine reports.
-    // model_hash:  64-char hex SHA-256 of the GGUF (or "" if not available).
     // model_path:  absolute path to the GGUF.
     // model_fallback: true when the request asked for a `model` the engine
     //   could not resolve (no preset match / no preset configured) and the
     //   engine used the resident model. The Coordinator surfaces this in
     //   Loki and Prometheus but does not error.
+    // model_hash removed (#470) — replaced by GGUF-derived fields below.
     std::string model_alias;
-    std::string model_hash;
     std::string model_path;
     bool        model_fallback = false;
+    // #470: GGUF-derived semantic identity
+    std::string tokenizer;                  // e.g. "gpt2", "llama"
+    std::string model_name;                 // display name (base_model.0.name or general.name)
+    std::string model_quant;                // e.g. "Q5_K_M"
+    uint32_t    model_capabilities = 0;     // capability bitfield (0x01=MTP, etc.)
 
     // PREFILL metrics for Hydra Core statistics
     double      prefill_ms = 0.0;           // actual prefill time in ms

@@ -3023,8 +3023,10 @@ private:
                     res->model_alias = model_name;
                     res->model_path  = params_base.model.path;
                     if (model_tgt) {
-                        const char * hash = llama_model_hash(model_tgt);
-                        if (hash && hash[0]) res->model_hash = hash;
+                        res->tokenizer   = llama_model_get_tokenizer_model(model_tgt);
+                        res->model_name  = llama_model_get_display_name(model_tgt);
+                        res->model_quant = llama_model_get_quant_label(model_tgt);
+                        res->model_capabilities = llama_model_get_capabilities_bitfield(model_tgt);
                     }
                     SRV_INF("hydra: STATE_GET slot=%d n_past=%d state=%.1f MiB — async\n",
                             id_slot, res->n_past, state_size / (1024.0 * 1024.0));
@@ -3112,8 +3114,11 @@ private:
                                 meta_j["n_past"]     = res->n_past;
                                 meta_j["state_size"] = (uint64_t)state_size;
                                 if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
-                                if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
                                 if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+                                if (!res->tokenizer.empty())   meta_j["tokenizer"]   = res->tokenizer;
+                                if (!res->model_name.empty())  meta_j["model_name"]  = res->model_name;
+                                if (!res->model_quant.empty()) meta_j["model_quant"] = res->model_quant;
+                                if (res->model_capabilities)   meta_j["model_capabilities"] = res->model_capabilities;
                                 const std::string meta_str = meta_j.dump();
 
                                 const uint32_t meta_len  = (uint32_t)meta_str.size();
@@ -3236,12 +3241,14 @@ private:
                     // M-Perf.9 #289: populate model identity from resident model.
                     // model_match = true always (infrastructure only; actual KV
                     // validation comes when model identity is embedded in the KV header).
-                    res->model_alias  = model_name;
+                    res->model_alias = model_name;
                     res->model_path   = params_base.model.path;
                     res->model_match  = true;
                     if (model_tgt) {
-                        const char * hash = llama_model_hash(model_tgt);
-                        if (hash && hash[0]) res->model_hash = hash;
+                        res->tokenizer   = llama_model_get_tokenizer_model(model_tgt);
+                        res->model_name  = llama_model_get_display_name(model_tgt);
+                        res->model_quant = llama_model_get_quant_label(model_tgt);
+                        res->model_capabilities = llama_model_get_capabilities_bitfield(model_tgt);
                     }
 
                     // Erase existing checkpoints to avoid collision with restored session state
@@ -3433,8 +3440,10 @@ private:
                     res->model_alias = model_name;
                     res->model_path  = params_base.model.path;
                     if (model_tgt) {
-                        const char * hash = llama_model_hash(model_tgt);
-                        if (hash && hash[0]) res->model_hash = hash;
+                        res->tokenizer   = llama_model_get_tokenizer_model(model_tgt);
+                        res->model_name  = llama_model_get_display_name(model_tgt);
+                        res->model_quant = llama_model_get_quant_label(model_tgt);
+                        res->model_capabilities = llama_model_get_capabilities_bitfield(model_tgt);
                     }
                     // #451: populate progress fields based on slot state
                     switch (slot->state) {
@@ -3563,7 +3572,8 @@ private:
                     res->rpc_status = HYDRA_STATUS_OK;
                     // M-Perf.9 #289: advertise the model identity features so
                     // the Coordinator knows it can send `model` in PREFILL and
-                    // expect model_alias/model_hash/model_path in META responses.
+                    // expect model_alias/model_path/tokenizer/model_name/model_quant/model_capabilities
+                    // in META responses.
                     // `preset_aliases` lists every alias loaded from
                     // --models-preset (empty when no preset is configured).
                     json preset_aliases_j = json::array();
@@ -3584,7 +3594,8 @@ private:
                     // (hydra_combined_head_attached) or via layer-split (hydra_combined_static).
                     json capabilities_j = {"prefill", "decode", "state_transfer",
                                            "expert_mode", "quant_swap",
-                                           "preset", "model_hash"};
+                                           "preset", "tokenizer", "model_name",
+                                           "model_quant", "model_capabilities"};
                     if (hydra_combined_head_attached || hydra_combined_static) {
                         capabilities_j.push_back("combined");
                     }
@@ -3698,9 +3709,12 @@ private:
                         if (cfg_result.highest_tier == 3) {
                             model_was_swapped = true;
                             res->model_load_ms = (double)(ggml_time_ms() - prefill_start_ms);
-                            SRV_INF("hydra: PREFILL hydra_config T3 applied model_alias='%s' model_hash='%s'\n",
+                            SRV_INF("hydra: PREFILL hydra_config T3 applied model_alias='%s' tokenizer='%s' model_name='%s' quant='%s' caps=0x%x\n",
                                     model_name.empty() ? "?" : model_name.c_str(),
-                                    llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "");
+                                    model_tgt ? llama_model_get_tokenizer_model(model_tgt) : "",
+                                    model_tgt ? llama_model_get_display_name(model_tgt) : "",
+                                    model_tgt ? llama_model_get_quant_label(model_tgt) : "",
+                                    model_tgt ? llama_model_get_capabilities_bitfield(model_tgt) : 0);
                             slot = get_slot_by_id(id_slot);
                             if (slot == nullptr) {
                                 res->rpc_status = HYDRA_STATUS_NOT_FOUND;
@@ -3745,9 +3759,12 @@ private:
                             }
                             res->model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
                             model_was_swapped = true;
-                            SRV_INF("hydra: PREFILL swap confirmed model_alias='%s' model_hash='%s' model_load_ms=%.1f\n",
+                            SRV_INF("hydra: PREFILL swap confirmed model_alias='%s' tokenizer='%s' model_name='%s' quant='%s' caps=0x%x model_load_ms=%.1f\n",
                                     swapped_params.model_alias.empty() ? "?" : swapped_params.model_alias.begin()->c_str(),
-                                    llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "",
+                                    model_tgt ? llama_model_get_tokenizer_model(model_tgt) : "",
+                                    model_tgt ? llama_model_get_display_name(model_tgt) : "",
+                                    model_tgt ? llama_model_get_quant_label(model_tgt) : "",
+                                    model_tgt ? llama_model_get_capabilities_bitfield(model_tgt) : 0,
                                     res->model_load_ms);
                             // After load_model, `this` state is reset (new
                             // slots, new context). Re-look up the slot by id.
@@ -3998,8 +4015,10 @@ private:
                         // nothing to do — leave as-is
                     }
                     if (model_tgt) {
-                        const char * hash = llama_model_hash(model_tgt);
-                        if (hash && hash[0]) res->model_hash = hash;
+                        res->tokenizer   = llama_model_get_tokenizer_model(model_tgt);
+                        res->model_name  = llama_model_get_display_name(model_tgt);
+                        res->model_quant = llama_model_get_quant_label(model_tgt);
+                        res->model_capabilities = llama_model_get_capabilities_bitfield(model_tgt);
                     }
 
                     res->rpc_status  = HYDRA_STATUS_OK;
@@ -4245,10 +4264,13 @@ private:
                     slot->n_decoded = n_decoded;
                     res->n_past = slot->n_prompt_tokens_cache + slot->n_decoded;
 
-                    // M-Perf.9 #289: model identity for the slot that decoded.
+                    // M-Perf.9 #289 / #470: model identity for the slot that decoded.
                     // Populated the same way as PREFILL — from resident model state.
                     res->model_alias = model_name;
-                    res->model_hash  = llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "";
+                    res->tokenizer   = llama_model_get_tokenizer_model(model_tgt);
+                    res->model_name  = llama_model_get_display_name(model_tgt);
+                    res->model_quant = llama_model_get_quant_label(model_tgt);
+                    res->model_capabilities = llama_model_get_capabilities_bitfield(model_tgt);
                     res->model_path  = params_base.model.path;
 
                     res->rpc_status = HYDRA_STATUS_OK;
@@ -4931,9 +4953,12 @@ private:
         }
 
         // T3 reload confirmed. Log model identity for traceability.
-        SRV_INF("hydra: T3 reload confirmed model_alias='%s' model_hash='%s' model_path='%s'\n",
+        SRV_INF("hydra: T3 reload confirmed model_alias='%s' tokenizer='%s' model_name='%s' quant='%s' caps=0x%x model_path='%s'\n",
                 swapped_params.model_alias.empty() ? "?" : swapped_params.model_alias.begin()->c_str(),
-                llama_model_hash(model_tgt) ? llama_model_hash(model_tgt) : "",
+                model_tgt ? llama_model_get_tokenizer_model(model_tgt) : "",
+                model_tgt ? llama_model_get_display_name(model_tgt) : "",
+                model_tgt ? llama_model_get_quant_label(model_tgt) : "",
+                model_tgt ? llama_model_get_capabilities_bitfield(model_tgt) : 0,
                 swapped_params.model.path.c_str());
 
         // COMBINED-mode reattach (if was combined). The new model
@@ -8183,8 +8208,11 @@ static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ct
         meta_j["n_past"]     = res->n_past;
         meta_j["state_size"] = payload;
         if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
-        if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
         if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+        if (!res->tokenizer.empty())   meta_j["tokenizer"]   = res->tokenizer;
+        if (!res->model_name.empty())  meta_j["model_name"]  = res->model_name;
+        if (!res->model_quant.empty()) meta_j["model_quant"] = res->model_quant;
+        if (res->model_capabilities)   meta_j["model_capabilities"] = res->model_capabilities;
         const std::string meta_str = meta_j.dump();
         hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), payload);
         hydra_send_all(fd, meta_str.data(), meta_str.size());
@@ -8254,8 +8282,11 @@ static void hydra_handle_state_put(int fd, int slot_id, uint64_t payload_len, co
         meta_j["bytes"]       = res->bytes;
         meta_j["model_match"] = res->model_match;
         if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
-        if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
         if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+        if (!res->tokenizer.empty())   meta_j["tokenizer"]   = res->tokenizer;
+        if (!res->model_name.empty())  meta_j["model_name"]  = res->model_name;
+        if (!res->model_quant.empty()) meta_j["model_quant"] = res->model_quant;
+        if (res->model_capabilities)   meta_j["model_capabilities"] = res->model_capabilities;
         const std::string meta_str = meta_j.dump();
         hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
         hydra_send_all(fd, meta_str.data(), meta_str.size());
@@ -8305,8 +8336,11 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
         meta_j["is_processing"]   = res->is_processing;
         meta_j["is_transferring"] = res->is_transferring;
         if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
-        if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
         if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+        if (!res->tokenizer.empty())   meta_j["tokenizer"]   = res->tokenizer;
+        if (!res->model_name.empty())  meta_j["model_name"]  = res->model_name;
+        if (!res->model_quant.empty()) meta_j["model_quant"] = res->model_quant;
+        if (res->model_capabilities)   meta_j["model_capabilities"] = res->model_capabilities;
         const std::string meta_str = meta_j.dump();
         hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
         hydra_send_all(fd, meta_str.data(), meta_str.size());
@@ -8464,8 +8498,11 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
         {"logits_size", res->logits_size}
     };
     if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
-    if (!res->model_hash.empty())  meta_j["model_hash"]  = res->model_hash;
     if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+    if (!res->tokenizer.empty())   meta_j["tokenizer"]   = res->tokenizer;
+    if (!res->model_name.empty())  meta_j["model_name"]  = res->model_name;
+    if (!res->model_quant.empty()) meta_j["model_quant"] = res->model_quant;
+    if (res->model_capabilities)   meta_j["model_capabilities"] = res->model_capabilities;
     meta_j["model_fallback"] = res->model_fallback;
     if (res->prefill_ms > 0)     meta_j["prefill_ms"]     = res->prefill_ms;
     if (res->model_load_ms > 0)  meta_j["model_load_ms"]  = res->model_load_ms;
@@ -8549,10 +8586,13 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     // M-Perf.9 #289: model identity traceability for DECODE (#469/#470).
     // DECODE sends response header before task completes (streaming), so it
     // cannot carry model identity in RPC response meta — log instead.
-    SRV_INF("hydra: DECODE slot=%d model_alias='%s' model_hash='%s'\n",
+    SRV_INF("hydra: DECODE slot=%d model_alias='%s' tokenizer='%s' model_name='%s' quant='%s' caps=0x%x\n",
             slot_id,
             res->model_alias.c_str(),
-            res->model_hash.c_str());
+            res->tokenizer.c_str(),
+            res->model_name.c_str(),
+            res->model_quant.c_str(),
+            res->model_capabilities);
 }
 
 // SET_EXPERT_MODE (0x37): Read mode string, post task, return success.

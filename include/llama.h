@@ -620,6 +620,34 @@ extern "C" {
     // when the hash was never computed.
     LLAMA_API const char * llama_model_hash(const struct llama_model * model);
 
+    // GGUF-derived semantic identity getters (#470).
+    // These replace model_hash for cross-model KV safety: the hash changes on
+    // rebuild even when model content is unchanged, and gives no information
+    // about model capabilities (MTP, vision, reasoning, etc.).
+
+    // Returns the tokenizer model type string from GGUF key "tokenizer.ggml.model"
+    // (e.g. "gpt2", "llama", "bert"). Returns an empty string if the key is absent.
+    LLAMA_API const char * llama_model_get_tokenizer_model(const struct llama_model * model);
+
+    // Returns a human-readable display name for the model. Reads
+    // "general.base_model.0.name" first; if absent or empty, falls back to
+    // "general.name". Returns an empty string if both are absent/empty.
+    LLAMA_API const char * llama_model_get_display_name(const struct llama_model * model);
+
+    // Returns a human-readable quantization label derived from "general.file_type"
+    // (a UINT32 GGUF key mapped through the llama_ftype enum). Returns an empty
+    // string if the key is absent or unrecognized.
+    LLAMA_API const char * llama_model_get_quant_label(const struct llama_model * model);
+
+    // Returns a capabilities bitfield derived from GGUF metadata:
+    //   bit 0 (0x01) MTP        — multi-token prediction / speculative draft
+    //   bit 1 (0x02) VISION     — multimodal vision encoder (currently unused)
+    //   bit 2 (0x04) REASONING  — chain-of-thought / thinking mode
+    //   bit 3 (0x08) TOOL_USE   — function-calling / tool-use (heuristic)
+    //   bit 4 (0x10) CODE       — code-specialist model (heuristic)
+    //   bits 5-31 reserved, must be 0
+    LLAMA_API uint32_t llama_model_get_capabilities_bitfield(const struct llama_model * model);
+
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
 
