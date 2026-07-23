@@ -4203,7 +4203,13 @@ private:
 
                         std::string prompt_str;
                         if (prompt.contains("messages") && !prompt["messages"].is_null()) {
-                            prompt_str = prompt["messages"].dump();
+                            // DECODE endpoint does not support chat messages — callers must
+                            // provide a pre-formatted prompt string. Sending messages here
+                            // would be tokenized as raw JSON, not through the chat template.
+                            res->rpc_status = HYDRA_STATUS_BAD_REQUEST;
+                            res->error = "DECODE endpoint does not support 'messages' field — use 'prompt' instead";
+                            queue_results.send(std::move(res));
+                            break;
                         } else {
                             prompt_str = prompt.value("prompt", std::string());
                         }
@@ -4211,8 +4217,12 @@ private:
 
                         auto inputs = tokenize_input_prompts(vocab, mctx, prompt_str, true, true);
                         if (!inputs.empty()) {
+                            // Use a distinct task id for the completion task to avoid racing
+                            // on waiting_task_ids with the validation task's decode_request_id.
+                            const int32_t completion_id = queue_tasks.get_new_id();
+
                             server_task cmpl_task(SERVER_TASK_TYPE_COMPLETION);
-                            cmpl_task.id = decode_request_id;
+                            cmpl_task.id = completion_id;
                             cmpl_task.id_slot = id_slot;
                             cmpl_task.tokens = std::move(inputs[0]);
                             cmpl_task.params = server_task::params_from_json_cmpl(
@@ -4221,10 +4231,10 @@ private:
                             cmpl_task.params.oaicompat_cmpl_id = gen_chatcmplid();
                             cmpl_task.params.oaicompat_model = model_name;
 
-                            queue_results.add_waiting_task_id(decode_request_id);
+                            queue_results.add_waiting_task_id(completion_id);
                             queue_tasks.post(std::move(cmpl_task));
-                            SRV_INF("hydra: DECODE slot=%d posted COMPLETION task (request_id=%d)\n",
-                                    id_slot, decode_request_id);
+                            SRV_INF("hydra: DECODE slot=%d posted COMPLETION task (completion_id=%d, request_id=%d)\n",
+                                    id_slot, completion_id, decode_request_id);
 
                             // ── Background consumer: drain queue_results for the
                             // completion task and populate decode_results so
@@ -4232,23 +4242,23 @@ private:
                             // the STATE_GET background-thread pattern (see the
                             // std::thread(...).detach() block earlier in this file).
                             if (routes_ptr) {
-                                std::thread([this, decode_request_id, id_slot,
+                                std::thread([this, completion_id, decode_request_id, id_slot,
                                              match_j, resident_tokenizer, resident_model_name,
                                              resident_model_quant, resident_capabilities,
                                              oaicompat_model_name = model_name,
                                              &results = queue_results]() mutable {
-                                    std::unordered_set<int> ids = {(int)decode_request_id};
+                                    std::unordered_set<int> ids = {(int)completion_id};
                                     auto res_ptr = results.recv_with_timeout(ids, 120);
-                                    results.remove_waiting_task_id(decode_request_id);
+                                    results.remove_waiting_task_id(completion_id);
                                     if (!res_ptr) {
-                                        SRV_WRN("hydra: DECODE slot=%d generation timeout (request_id=%d)\n",
-                                                id_slot, decode_request_id);
+                                        SRV_WRN("hydra: DECODE slot=%d generation timeout (request_id=%d, completion_id=%d)\n",
+                                                id_slot, decode_request_id, completion_id);
                                         return;
                                     }
                                     auto * cres = dynamic_cast<server_task_result_cmpl_final*>(res_ptr.get());
                                     if (!cres) {
-                                        SRV_WRN("hydra: DECODE slot=%d unexpected result type (request_id=%d)\n",
-                                                id_slot, decode_request_id);
+                                        SRV_WRN("hydra: DECODE slot=%d unexpected result type (request_id=%d, completion_id=%d)\n",
+                                                id_slot, decode_request_id, completion_id);
                                         return;
                                     }
 
@@ -8795,8 +8805,15 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     ctx.queue_results->remove_waiting_task_id(decode_request_id);
 
     if (!val_res_ptr) {
-        SRV_WRN("hydra rpc: DECODE validation timeout for slot %d\n", slot_id);
-        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        SRV_WRN("hydra rpc: DECODE validation timeout for slot %d (request_id=%d)\n",
+                slot_id, decode_request_id);
+        json err_j = {
+            {"error", "validation timeout"},
+            {"decode_request_id", decode_request_id},
+        };
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
         return;
     }
 
