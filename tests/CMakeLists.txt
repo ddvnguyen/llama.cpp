@@ -308,6 +308,12 @@ if (TARGET cpp-httplib)
         target_link_libraries(test-gguf-model-data PRIVATE gguf-model-data llama-common)
         llama_test(test-gguf-model-data LABEL "model")
 
+        # test-model-identity: exercises the GGUF-derived identity getter logic
+        # (tag → capability bitfield derivation) in isolation. Standalone — no
+        # llama library link required, just standard C++.
+        add_executable(test-model-identity test-model-identity.cpp)
+        llama_test(test-model-identity LABEL "model")
+
         # test-quant-type-selection requires gguf-model-data for remote model metadata
         llama_build_and_test(test-quant-type-selection.cpp LABEL "model")
         target_link_libraries(test-quant-type-selection PRIVATE gguf-model-data)

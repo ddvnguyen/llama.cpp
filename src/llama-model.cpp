@@ -33,6 +33,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -2673,31 +2674,73 @@ uint32_t llama_model_get_capabilities_bitfield(const llama_model * model) {
     // These bits are heuristic, not authoritative. MTP (bit 0) is derived from
     // a real GGUF signal (<arch>.nextn_predict_layers); TOOL_USE and CODE are
     // best-effort guesses from metadata strings that may not be present.
-    const std::string display_name = model->gguf_kv.count("general.base_model.0.name")
-        ? model->gguf_kv.at("general.base_model.0.name")
-        : (model->gguf_kv.count("general.name") ? model->gguf_kv.at("general.name") : "");
+    //
+    // We use explicit tag sets (not substring find) to avoid false positives:
+    // "code" is a substring of "encode"/"decode"/"encoder"/"decoder"/"autoencoder",
+    // all common GGUF tags for non-code models.
+    static const std::unordered_set<std::string> kCodeTags = {
+        "code", "coding", "coder", "codes",
+    };
+    static const std::unordered_set<std::string> kToolTags = {
+        "tool", "tools", "tool-use", "function-calling", "function_calling",
+    };
+
+    // Display name: prefer general.base_model.0.name, fall back to general.name.
+    // Matches llama_model_get_display_name() logic — skip empty values.
+    const std::string display_name = [&]() {
+        const auto & base_it = model->gguf_kv.find("general.base_model.0.name");
+        if (base_it != model->gguf_kv.end() && !base_it->second.empty()) {
+            return base_it->second;
+        }
+        const auto & name_it = model->gguf_kv.find("general.name");
+        if (name_it != model->gguf_kv.end() && !name_it->second.empty()) {
+            return name_it->second;
+        }
+        return std::string();
+    }();
+
     for (const auto & tag : model->gguf_tags) {
         std::string lower = tag;
         for (auto & c : lower) c = (char)tolower((unsigned char)c);
-        if (lower.find("tool") != std::string::npos ||
-            lower.find("function") != std::string::npos) {
+        if (kToolTags.count(lower)) {
             caps |= 0x08; // TOOL_USE
         }
-        if (lower.find("code") != std::string::npos ||
-            lower.find("coder") != std::string::npos) {
+        if (kCodeTags.count(lower)) {
             caps |= 0x10; // CODE
         }
     }
-    // Also check display name for code/tool hints
+    // Also check display name for code/tool hints.
+    // Display names are multi-word (e.g. "Qwopus Coder", "CodeLlama-7B"), so
+    // we check if any word in the name matches a known keyword — not exact
+    // full-string match. Uses word-boundary check on the ORIGINAL (pre-lowercase)
+    // name to preserve CamelCase boundaries ("CodeLlama" → "code" at boundary).
     {
         std::string lower_name = display_name;
         for (auto & c : lower_name) c = (char)tolower((unsigned char)c);
-        if (lower_name.find("code") != std::string::npos ||
-            lower_name.find("coder") != std::string::npos) {
+        auto has_word = [&display_name, &lower_name](const std::unordered_set<std::string> & keywords) -> bool {
+            for (const auto & kw : keywords) {
+                size_t pos = 0;
+                while ((pos = lower_name.find(kw, pos)) != std::string::npos) {
+                    // Word boundary: keyword must be preceded/followed by a
+                    // non-alphanumeric char, OR preceded by an uppercase letter
+                    // in the ORIGINAL name (CamelCase boundary), OR at string
+                    // start/end.
+                    bool word_start = (pos == 0)
+                        || !isalnum((unsigned char)lower_name[pos - 1])
+                        || isupper((unsigned char)display_name[pos - 1]);
+                    bool word_end   = (pos + kw.size() >= lower_name.size())
+                        || !isalnum((unsigned char)lower_name[pos + kw.size()])
+                        || isupper((unsigned char)display_name[pos + kw.size()]);
+                    if (word_start && word_end) return true;
+                    pos++;
+                }
+            }
+            return false;
+        };
+        if (has_word(kCodeTags)) {
             caps |= 0x10; // CODE
         }
-        if (lower_name.find("tool") != std::string::npos ||
-            lower_name.find("function") != std::string::npos) {
+        if (has_word(kToolTags)) {
             caps |= 0x08; // TOOL_USE
         }
     }
