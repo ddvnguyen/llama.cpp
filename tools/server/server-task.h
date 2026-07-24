@@ -223,6 +223,12 @@ struct server_task {
         std::string          quant_key;
         // SWAP_QUANT: tensor name pattern (regex)
         std::string          tensor_pattern;
+        // Merged DECODE (0x43): full JSON header (kv_metadata + prompt)
+        std::string          decode_json;
+        // Merged DECODE (0x43): raw KV bytes to restore
+        std::vector<uint8_t> kv_data;
+        // Merged DECODE (0x43): request ID for result retrieval
+        int32_t              decode_request_id = -1;
     };
     hydra_action hydra_action;
 
@@ -777,6 +783,14 @@ struct server_task_result_hydra_engine : server_task_result {
     std::vector<std::string> deferred_keys;
 
     std::string error; // human-readable, non-empty on failure
+
+    // Merged DECODE (0x43): match result and timing
+    int32_t  decode_request_id   = -1;
+    bool     match_valid         = false;
+    json     match_json;                        // match object (tokenizer_match, etc.)
+    double   restore_slot_ms     = 0.0;
+    double   decode_init_ms      = 0.0;
+    int32_t  id_slot             = -1;          // slot used for decode (dup of base, for convenience)
 
     virtual json to_json() override;
 };

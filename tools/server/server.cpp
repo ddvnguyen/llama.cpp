@@ -227,6 +227,10 @@ int llama_server(int argc, char ** argv) {
     ctx_http.put ("/slots/:id_slot/state",      ex_wrapper(routes.put_state));
     ctx_http.get ("/slots/:id_slot/state/meta", ex_wrapper(routes.get_state_meta));
 
+    // Merged DECODE result retrieval
+    ctx_http.get ("/v1/decode/:decode_request_id",      ex_wrapper(routes.get_decode_result));
+    ctx_http.del ("/v1/decode/:decode_request_id",      ex_wrapper(routes.delete_decode_result));
+
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
 

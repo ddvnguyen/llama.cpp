@@ -43,6 +43,11 @@ static constexpr uint8_t  HYDRA_STATUS_BAD_REQUEST      = 0x05;
 // ── Safety cap (4 GB) ─────────────────────────────────────────────────────────
 static constexpr uint64_t HYDRA_MAX_STATE_BYTES  = 4ULL * 1024 * 1024 * 1024;
 
+// ── Merged DECODE (0x43) framing constants ─────────────────────────────────────
+static constexpr uint32_t HYDRA_MAX_JSON_HEADER  = 32U * 1024; // 32 KiB cap on JSON header
+static constexpr int      HYDRA_DECODE_RESULT_TTL_S_DEFAULT = 300;
+static constexpr int      HYDRA_DECODE_RESULT_MAX_DEFAULT   = 1024;
+
 // ── Unified RPC server (Phase 1, #36) ────────────────────────────────────────
 // The protocol-detecting accept loop lives in
 // `tools/llama-engine/hydra_rpc/` (fork-isolated). Both `server_context`
