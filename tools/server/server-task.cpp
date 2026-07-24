@@ -2019,13 +2019,14 @@ json server_task_result_hydra_state::to_json() {
         j["tokens_total"]    = tokens_total;
         j["elapsed_ms"]      = elapsed_ms;
     }
-    // M-Perf.9 #289: model identity is returned for every op (it answers
-    // "what model built the KV in this slot?"). Empty strings mean the
-    // server did not populate them (pre-feature build / single-model
-    // server without aliases / hash not yet computed).
+    // M-Perf.9 #289 / #470: model identity is returned for every op.
+    // model_hash replaced by GGUF-derived semantic identity fields.
     if (!model_alias.empty()) j["model_alias"] = model_alias;
-    if (!model_hash.empty())  j["model_hash"]  = model_hash;
     if (!model_path.empty())  j["model_path"]  = model_path;
+    if (!tokenizer.empty())   j["tokenizer"]   = tokenizer;
+    if (!model_name.empty())  j["model_name"]  = model_name;
+    if (!model_quant.empty()) j["model_quant"] = model_quant;
+    if (model_capabilities)   j["model_capabilities"] = model_capabilities;
     return j;
 }
 
@@ -2047,8 +2048,11 @@ json server_task_result_hydra_engine::to_json() {
         // Coordinator uses this to populate item.KvModelAlias/Hash and to
         // gate RestoreKvAsync against cross-model restores.
         if (!model_alias.empty()) j["model_alias"] = model_alias;
-        if (!model_hash.empty())  j["model_hash"]  = model_hash;
         if (!model_path.empty())  j["model_path"]  = model_path;
+        if (!tokenizer.empty())   j["tokenizer"]   = tokenizer;
+        if (!model_name.empty())  j["model_name"]  = model_name;
+        if (!model_quant.empty()) j["model_quant"] = model_quant;
+        if (model_capabilities)   j["model_capabilities"] = model_capabilities;
         j["model_fallback"] = model_fallback;
         // #451: PREFILL metrics for Hydra Core statistics
         if (prefill_ms > 0)         j["prefill_ms"] = prefill_ms;

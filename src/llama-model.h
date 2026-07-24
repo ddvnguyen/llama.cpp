@@ -584,8 +584,12 @@ struct llama_model {
     struct ggml_tensor * dense_2_out_layers_b = nullptr;
     struct ggml_tensor * dense_3_out_layers   = nullptr;
 
-    // gguf metadata
+    // gguf metadata (non-array values only)
     std::unordered_map<std::string, std::string> gguf_kv;
+
+    // GGUF-derived semantic identity (#470): tags array stored separately
+    // because gguf_kv skips GGUF_TYPE_ARRAY values.
+    std::vector<std::string> gguf_tags;
 
     // list of devices used in this model
     std::vector<llama_device> devices;

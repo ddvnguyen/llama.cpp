@@ -33,6 +33,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1018,6 +1019,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const char * name = gguf_get_key(ctx, i);
         const std::string value = gguf_kv_to_str(ctx, i);
         gguf_kv.emplace(name, value);
+    }
+
+    // #470: read general.tags array separately (skipped by gguf_kv loop above)
+    {
+        const int idx = gguf_find_key(ctx, "general.tags");
+        if (idx >= 0 && gguf_get_kv_type(ctx, idx) == GGUF_TYPE_ARRAY) {
+            const int n = gguf_get_arr_n(ctx, idx);
+            gguf_tags.reserve(n);
+            for (int j = 0; j < n; j++) {
+                gguf_tags.push_back(gguf_get_arr_str(ctx, idx, j));
+            }
+        }
     }
 
     // get general kv
@@ -2537,6 +2550,202 @@ uint64_t llama_model_n_params(const llama_model * model) {
 const char * llama_model_hash(const llama_model * model) {
     if (!model) return "";
     return model->hash_hex.c_str();
+}
+
+// ── #470 GGUF-derived semantic identity getters ──────────────────────────────
+
+const char * llama_model_get_tokenizer_model(const llama_model * model) {
+    if (!model) return "";
+    const auto & it = model->gguf_kv.find("tokenizer.ggml.model");
+    if (it == model->gguf_kv.end()) return "";
+    return it->second.c_str();
+}
+
+const char * llama_model_get_display_name(const llama_model * model) {
+    if (!model) return "";
+    // Primary: general.base_model.0.name (the real model identity).
+    // On production GGUFs, general.name is "Safetensors" — a conversion-tool
+    // artifact — while base_model.0.name is the actual model name (e.g.
+    // "Qwen3.6 35B A3B").
+    const auto & base_it = model->gguf_kv.find("general.base_model.0.name");
+    if (base_it != model->gguf_kv.end() && !base_it->second.empty()) {
+        return base_it->second.c_str();
+    }
+    // Fallback: general.name (may be a conversion artifact like "Safetensors",
+    // but some models like the 27B-Coder have a useful name here).
+    const auto & name_it = model->gguf_kv.find("general.name");
+    if (name_it != model->gguf_kv.end() && !name_it->second.empty()) {
+        return name_it->second.c_str();
+    }
+    return "";
+}
+
+const char * llama_model_get_quant_label(const llama_model * model) {
+    if (!model) return "";
+    const auto & it = model->gguf_kv.find("general.file_type");
+    if (it == model->gguf_kv.end()) return "";
+    // general.file_type is stored as a UINT32 in GGUF, serialized to string
+    // by gguf_kv_to_str. Parse it back and map to the llama_ftype name.
+    try {
+        const uint32_t fval = std::stoul(it->second);
+        const llama_ftype ftype = static_cast<llama_ftype>(fval);
+        switch (ftype) {
+            case LLAMA_FTYPE_ALL_F32:         return "F32";
+            case LLAMA_FTYPE_MOSTLY_F16:      return "F16";
+            case LLAMA_FTYPE_MOSTLY_BF16:     return "BF16";
+            case LLAMA_FTYPE_MOSTLY_Q4_0:     return "Q4_0";
+            case LLAMA_FTYPE_MOSTLY_Q4_1:     return "Q4_1";
+            case LLAMA_FTYPE_MOSTLY_Q5_0:     return "Q5_0";
+            case LLAMA_FTYPE_MOSTLY_Q5_1:     return "Q5_1";
+            case LLAMA_FTYPE_MOSTLY_Q8_0:     return "Q8_0";
+            case LLAMA_FTYPE_MOSTLY_Q2_K:     return "Q2_K";
+            case LLAMA_FTYPE_MOSTLY_Q2_K_S:   return "Q2_K_S";
+            case LLAMA_FTYPE_MOSTLY_Q3_K_S:   return "Q3_K_S";
+            case LLAMA_FTYPE_MOSTLY_Q3_K_M:   return "Q3_K_M";
+            case LLAMA_FTYPE_MOSTLY_Q3_K_L:   return "Q3_K_L";
+            case LLAMA_FTYPE_MOSTLY_Q4_K_S:   return "Q4_K_S";
+            case LLAMA_FTYPE_MOSTLY_Q4_K_M:   return "Q4_K_M";
+            case LLAMA_FTYPE_MOSTLY_Q5_K_S:   return "Q5_K_S";
+            case LLAMA_FTYPE_MOSTLY_Q5_K_M:   return "Q5_K_M";
+            case LLAMA_FTYPE_MOSTLY_Q6_K:     return "Q6_K";
+            case LLAMA_FTYPE_MOSTLY_IQ2_XXS:  return "IQ2_XXS";
+            case LLAMA_FTYPE_MOSTLY_IQ2_XS:   return "IQ2_XS";
+            case LLAMA_FTYPE_MOSTLY_IQ2_S:    return "IQ2_S";
+            case LLAMA_FTYPE_MOSTLY_IQ2_M:    return "IQ2_M";
+            case LLAMA_FTYPE_MOSTLY_IQ3_XS:   return "IQ3_XS";
+            case LLAMA_FTYPE_MOSTLY_IQ3_XXS:  return "IQ3_XXS";
+            case LLAMA_FTYPE_MOSTLY_IQ1_S:    return "IQ1_S";
+            case LLAMA_FTYPE_MOSTLY_IQ1_M:    return "IQ1_M";
+            case LLAMA_FTYPE_MOSTLY_IQ4_NL:   return "IQ4_NL";
+            case LLAMA_FTYPE_MOSTLY_IQ4_XS:   return "IQ4_XS";
+            case LLAMA_FTYPE_MOSTLY_IQ3_S:    return "IQ3_S";
+            case LLAMA_FTYPE_MOSTLY_IQ3_M:    return "IQ3_M";
+            case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return "MXFP4";
+            case LLAMA_FTYPE_MOSTLY_NVFP4:    return "NVFP4";
+            case LLAMA_FTYPE_MOSTLY_Q1_0:     return "Q1_0";
+            case LLAMA_FTYPE_MOSTLY_TQ1_0:    return "TQ1_0";
+            case LLAMA_FTYPE_MOSTLY_TQ2_0:    return "TQ2_0";
+            default: return "";
+        }
+    } catch (...) {
+        return "";
+    }
+}
+
+uint32_t llama_model_get_capabilities_bitfield(const llama_model * model) {
+    if (!model) return 0;
+    uint32_t caps = 0;
+
+    // ── MTP (bit 0): multi-token prediction / speculative draft ──
+    // Look up architecture-prefixed key <arch>.nextn_predict_layers.
+    // The LLM_KV helper builds the key as "<arch_name>.nextn_predict_layers"
+    // using the model's arch string from general.architecture.
+    if (model->arch != LLM_ARCH_UNKNOWN) {
+        const std::string mtp_key = LLM_KV(model->arch)(LLM_KV_NEXTN_PREDICT_LAYERS);
+        const auto & it = model->gguf_kv.find(mtp_key);
+        if (it != model->gguf_kv.end()) {
+            try {
+                if (std::stoul(it->second) > 0) {
+                    caps |= 0x01; // MTP
+                }
+            } catch (...) {}
+        }
+    }
+
+    // ── VISION (bit 1): currently unset ──
+    // llama-server loads vision projectors as a separate --mmproj GGUF file,
+    // not embedded in the main model. A single-model getter has no reliable
+    // signal for vision capability. Do NOT add a heuristic here — leave this
+    // for a future mmproj-aware getter.
+    // caps |= 0x02; // VISION — intentionally absent
+
+    // ── REASONING (bit 2): check general.tags for "reasoning" ──
+    for (const auto & tag : model->gguf_tags) {
+        // Case-insensitive substring check
+        std::string lower = tag;
+        for (auto & c : lower) c = (char)tolower((unsigned char)c);
+        if (lower.find("reasoning") != std::string::npos) {
+            caps |= 0x04; // REASONING
+            break;
+        }
+    }
+
+    // ── TOOL_USE (bit 3) and CODE (bit 4): heuristic — check tags + display name ──
+    // These bits are heuristic, not authoritative. MTP (bit 0) is derived from
+    // a real GGUF signal (<arch>.nextn_predict_layers); TOOL_USE and CODE are
+    // best-effort guesses from metadata strings that may not be present.
+    //
+    // We use explicit tag sets (not substring find) to avoid false positives:
+    // "code" is a substring of "encode"/"decode"/"encoder"/"decoder"/"autoencoder",
+    // all common GGUF tags for non-code models.
+    static const std::unordered_set<std::string> kCodeTags = {
+        "code", "coding", "coder", "codes",
+    };
+    static const std::unordered_set<std::string> kToolTags = {
+        "tool", "tools", "tool-use", "function-calling", "function_calling",
+    };
+
+    // Display name: prefer general.base_model.0.name, fall back to general.name.
+    // Matches llama_model_get_display_name() logic — skip empty values.
+    const std::string display_name = [&]() {
+        const auto & base_it = model->gguf_kv.find("general.base_model.0.name");
+        if (base_it != model->gguf_kv.end() && !base_it->second.empty()) {
+            return base_it->second;
+        }
+        const auto & name_it = model->gguf_kv.find("general.name");
+        if (name_it != model->gguf_kv.end() && !name_it->second.empty()) {
+            return name_it->second;
+        }
+        return std::string();
+    }();
+
+    for (const auto & tag : model->gguf_tags) {
+        std::string lower = tag;
+        for (auto & c : lower) c = (char)tolower((unsigned char)c);
+        if (kToolTags.count(lower)) {
+            caps |= 0x08; // TOOL_USE
+        }
+        if (kCodeTags.count(lower)) {
+            caps |= 0x10; // CODE
+        }
+    }
+    // Also check display name for code/tool hints.
+    // Display names are multi-word (e.g. "Qwopus Coder", "CodeLlama-7B"), so
+    // we check if any word in the name matches a known keyword — not exact
+    // full-string match. Uses word-boundary check on the ORIGINAL (pre-lowercase)
+    // name to preserve CamelCase boundaries ("CodeLlama" → "code" at boundary).
+    {
+        std::string lower_name = display_name;
+        for (auto & c : lower_name) c = (char)tolower((unsigned char)c);
+        auto has_word = [&display_name, &lower_name](const std::unordered_set<std::string> & keywords) -> bool {
+            for (const auto & kw : keywords) {
+                size_t pos = 0;
+                while ((pos = lower_name.find(kw, pos)) != std::string::npos) {
+                    // Word boundary: keyword must be preceded/followed by a
+                    // non-alphanumeric char, OR preceded by an uppercase letter
+                    // in the ORIGINAL name (CamelCase boundary), OR at string
+                    // start/end.
+                    bool word_start = (pos == 0)
+                        || !isalnum((unsigned char)lower_name[pos - 1])
+                        || isupper((unsigned char)display_name[pos - 1]);
+                    bool word_end   = (pos + kw.size() >= lower_name.size())
+                        || !isalnum((unsigned char)lower_name[pos + kw.size()])
+                        || isupper((unsigned char)display_name[pos + kw.size()]);
+                    if (word_start && word_end) return true;
+                    pos++;
+                }
+            }
+            return false;
+        };
+        if (has_word(kCodeTags)) {
+            caps |= 0x10; // CODE
+        }
+        if (has_word(kToolTags)) {
+            caps |= 0x08; // TOOL_USE
+        }
+    }
+
+    return caps;
 }
 
 bool llama_model_has_encoder(const llama_model * model) {
