@@ -4206,9 +4206,28 @@ private:
                             // DECODE endpoint does not support chat messages — callers must
                             // provide a pre-formatted prompt string. Sending messages here
                             // would be tokenized as raw JSON, not through the chat template.
-                            res->rpc_status = HYDRA_STATUS_BAD_REQUEST;
-                            res->error = "DECODE endpoint does not support 'messages' field — use 'prompt' instead";
-                            queue_results.send(std::move(res));
+                            //
+                            // NOTE: `res` was already moved into queue_results.send() above
+                            // (the HYDRA_STATUS_OK validation-success response) — the RPC
+                            // request/response cycle for this decode_request_id is over and
+                            // the caller is now polling GET /v1/decode/{id}. There is no
+                            // second response channel back to the original RPC caller, so
+                            // surface this rejection through the same decode_results buffer
+                            // that a successful completion would populate instead.
+                            SRV_WRN("hydra: DECODE slot=%d rejected: 'messages' field not supported (request_id=%d)\n",
+                                    id_slot, decode_request_id);
+                            if (routes_ptr) {
+                                server_routes::decode_result_entry entry;
+                                entry.id_slot    = id_slot;
+                                entry.error      = "DECODE endpoint does not support 'messages' field — use 'prompt' instead";
+                                entry.match_json = match_j;
+                                entry.created_at = std::time(nullptr);
+                                entry.ttl_s      = routes_ptr->decode_result_ttl_s;
+
+                                std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                                routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                                routes_ptr->evict_decode_results_locked();
+                            }
                             break;
                         } else {
                             prompt_str = prompt.value("prompt", std::string());
@@ -7905,6 +7924,16 @@ void server_routes::init_routes() {
             return res;
         }
         const auto & entry = it->second;
+        if (!entry.error.empty()) {
+            // Request was rejected/failed before or during generation (e.g. the
+            // 'messages' field is unsupported on DECODE) — no completion body
+            // was ever produced. Surface the error and drop the entry.
+            const std::string err_msg = entry.error;
+            decode_results.erase(it);
+            lock.unlock();
+            res->error(format_error_response(err_msg, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         // Read fields we need before unlocking
         const int32_t id_slot = entry.id_slot;
         const std::string completion_id = entry.completion_id;

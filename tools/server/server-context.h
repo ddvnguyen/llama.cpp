@@ -220,6 +220,9 @@ struct server_routes {
         json            match_json;        // match result from inference thread
         int64_t         created_at = 0;    // std::time(nullptr) at creation
         int             ttl_s = 300;       // TTL in seconds
+        std::string     error;             // non-empty => request rejected/failed;
+                                            // GET /v1/decode/:id returns this instead
+                                            // of a completion body (content is unset)
     };
     mutable std::mutex decode_results_mutex;
     std::map<int32_t, decode_result_entry> decode_results;
