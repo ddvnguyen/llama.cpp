@@ -4081,6 +4081,57 @@ private:
                         break;
                     }
 
+                    // ── Model swap (if requested model != resident) ─────────
+                    // The optional "model" field in the DECODE JSON header
+                    // triggers a model load/swap before KV restore, matching
+                    // the PREFILL handler's model-swap pattern. This enables
+                    // the Coordinator to request a specific model for decode
+                    // without a separate HTTP /models/load round-trip.
+                    const std::string requested_model = decode_req.value("model", std::string());
+                    if (!requested_model.empty()) {
+                        auto it = preset_alias_to_path.find(requested_model);
+                        if (it == preset_alias_to_path.end()) {
+                            SRV_WRN("hydra: DECODE model='%s' unknown (preset has %zu alias(es)) — falling back to resident '%s'\n",
+                                    requested_model.c_str(), preset_alias_to_path.size(),
+                                    model_name.c_str());
+                            res->model_fallback = true;
+                        } else if (it->second != params_base.model.path) {
+                            SRV_INF("hydra: DECODE model='%s' swapping %s -> %s\n",
+                                    requested_model.c_str(), params_base.model.path.c_str(),
+                                    it->second.c_str());
+                            common_params swapped_params = params_base;
+                            swapped_params.model.path   = it->second;
+                            swapped_params.model_alias  = { requested_model };
+                            const int64_t model_load_start_ms = ggml_time_ms();
+                            if (!load_model(swapped_params)) {
+                                res->rpc_status = HYDRA_STATUS_ERROR;
+                                res->error = "model swap to '" + requested_model + "' failed";
+                                queue_results.send(std::move(res));
+                                break;
+                            }
+                            res->model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
+                            SRV_INF("hydra: DECODE swap confirmed model_alias='%s' tokenizer='%s' model_name='%s' quant='%s' caps=0x%x model_load_ms=%.1f\n",
+                                    requested_model.c_str(),
+                                    model_tgt ? llama_model_get_tokenizer_model(model_tgt) : "",
+                                    model_tgt ? llama_model_get_display_name(model_tgt) : "",
+                                    model_tgt ? llama_model_get_quant_label(model_tgt) : "",
+                                    model_tgt ? llama_model_get_capabilities_bitfield(model_tgt) : 0,
+                                    res->model_load_ms);
+                            // After load_model, `this` state is reset (new
+                            // slots, new context). Re-look up the slot by id.
+                            slot = get_slot_by_id(id_slot);
+                            if (slot == nullptr) {
+                                res->rpc_status = HYDRA_STATUS_NOT_FOUND;
+                                res->error = "slot disappeared after model swap";
+                                queue_results.send(std::move(res));
+                                break;
+                            }
+                        } else {
+                            SRV_DBG("hydra: DECODE model='%s' already resident, no swap\n",
+                                    requested_model.c_str());
+                        }
+                    }
+
                     // ── Model identity validation ────────────────────────────
                     const json & kv_meta = decode_req["kv_metadata"];
 
