@@ -6284,21 +6284,23 @@ private:
                     continue; // sample using speculative decoding
                 }
 
-                // D4: Inject per-slot restored logits into context buffer before first sample.
-                // The sampler reads from llama_get_logits(ctx_tgt), so we copy from the
-                // per-slot buffer that was populated during KV restore.
+                const int tok_idx = slot.i_batch - i;
+
+                // D4: Inject per-slot restored logits into the correct batch row before
+                // first sample. The sampler reads via llama_get_logits_ith(ctx, tok_idx),
+                // so we must write to that exact row — not row 0.
                 if (slot.logits_valid && !slot.restored_logits.empty() && slot.n_decoded == 0) {
-                    float * ctx_logits = llama_get_logits(slot.ctx_tgt);
-                    if (ctx_logits) {
+                    float * row_logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
+                    if (row_logits) {
                         const size_t n_floats = slot.restored_logits.size();
-                        memcpy(ctx_logits, slot.restored_logits.data(), n_floats * sizeof(float));
-                        SLT_INF(slot, "consumed %zu restored logits from per-slot buffer\n", n_floats);
+                        memcpy(row_logits, slot.restored_logits.data(), n_floats * sizeof(float));
+                        SLT_INF(slot, "consumed %zu restored logits into row %d (tok_idx)\n", n_floats, tok_idx);
+                    } else {
+                        SLT_WRN(slot, "restored logits skipped: llama_get_logits_ith returned null for row %d\n", tok_idx);
                     }
                     slot.restored_logits.clear();
                     slot.logits_valid = false;
                 }
-
-                const int tok_idx = slot.i_batch - i;
 
                 llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
 
