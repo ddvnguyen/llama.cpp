@@ -176,6 +176,12 @@ struct server_slot {
     // not be assigned to this slot until the reservation is released.
     int32_t reserved_for_decode_id = -1;
 
+    // Hydra n_common observability: set during update_slots() prompt
+    // processing decision, read by background consumer for hydra_metrics.
+    int32_t n_common           = 0; // length of common prefix with new tokens
+    int32_t n_prompt_processed = 0; // tokens actually sent to batch (0 = zero-prompt decode)
+    bool    logits_reused      = false; // true when sampled directly from restored logits
+
     server_prompt prompt;
 
     void prompt_save(server_prompt_cache & prompt_cache) const {
@@ -4480,10 +4486,20 @@ private:
                                 if (dit != routes_ptr->decode_results.end()) {
                                     dit->second.state = server_routes::DECODE_STATE_GENERATING;
                                     dit->second.completion_id = std::to_string(completion_id);
+                                    dit->second.stream->completion_task_id = completion_id;
+                                    // Capture n_common observability from the slot
+                                    dit->second.n_common           = slot->n_common;
+                                    dit->second.n_prompt_processed = slot->n_prompt_processed;
+                                    dit->second.logits_reused      = slot->logits_reused;
                                 }
                             }
 
                             // ── Background consumer ─────────────────────────
+                            // Sole listener on the completion task.  Relays
+                            // partial results into the decode_result_entry's
+                            // streaming_queue so GET /v1/decode can stream
+                            // them to the client.  Stores the final result
+                            // when generation completes.
                             if (routes_ptr) {
                                 // Read match_json from the decode_result_entry (set by sync DECODE)
                                 json match_j_bg;
@@ -4501,60 +4517,109 @@ private:
                                              model_load_ms, restore_slot_ms, n_past,
                                              &results = queue_results]() mutable {
                                     std::unordered_set<int> ids = {(int)completion_id};
-                                    auto res_ptr = results.recv_with_timeout(ids, 120);
+                                    bool got_final = false;
+
+                                    // Loop: receive partials and relay, wait for final
+                                    while (!got_final) {
+                                        auto res_ptr = results.recv_with_timeout(ids, 120);
+                                        if (!res_ptr) {
+                                            SRV_WRN("hydra: DECODE_APPLY slot=%d generation timeout (request_id=%d, completion_id=%d)\n",
+                                                    id_slot, decode_request_id, completion_id);
+                                            // Mark stream as finished so GET handler unblocks
+                                            {
+                                                std::lock_guard<std::mutex> lk(routes_ptr->decode_results_mutex);
+                                                auto dit = routes_ptr->decode_results.find(decode_request_id);
+                                                if (dit != routes_ptr->decode_results.end() && dit->second.stream) {
+                                                    std::lock_guard<std::mutex> slk(dit->second.stream->streaming_mutex);
+                                                    dit->second.stream->stream_finished = true;
+                                                    dit->second.stream->streaming_cv.notify_all();
+                                                }
+                                            }
+                                            return;
+                                        }
+
+                                        // Check if this is a partial or final result
+                                        auto * partial = dynamic_cast<server_task_result_cmpl_partial*>(res_ptr.get());
+                                        auto * final_r = dynamic_cast<server_task_result_cmpl_final*>(res_ptr.get());
+
+                                        if (partial && !partial->is_begin) {
+                                            // Relay partial to streaming queue
+                                            std::lock_guard<std::mutex> lk(routes_ptr->decode_results_mutex);
+                                            auto dit = routes_ptr->decode_results.find(decode_request_id);
+                                            if (dit != routes_ptr->decode_results.end() && dit->second.stream) {
+                                                std::lock_guard<std::mutex> slk(dit->second.stream->streaming_mutex);
+                                                dit->second.stream->streaming_queue.push_back(std::move(res_ptr));
+                                                dit->second.stream->streaming_cv.notify_all();
+                                            }
+                                        } else if (final_r) {
+                                            // Store final result and mark DONE
+                                            got_final = true;
+
+                                            server_routes::decode_result_entry entry;
+                                            entry.id_slot               = id_slot;
+                                            entry.completion_id         = final_r->oaicompat_cmpl_id;
+                                            entry.oaicompat_model       = oaicompat_model_name;
+                                            entry.content               = final_r->content;
+                                            entry.n_decoded             = final_r->n_decoded;
+                                            entry.n_prompt_tokens       = final_r->n_prompt_tokens;
+                                            entry.n_prompt_tokens_cache = final_r->n_prompt_tokens_cache;
+                                            entry.timings               = final_r->timings;
+                                            entry.stop                  = final_r->stop;
+                                            entry.include_usage         = final_r->include_usage;
+                                            entry.match_json            = match_j;
+                                            entry.created_at            = std::time(nullptr);
+                                            entry.ttl_s                 = routes_ptr->decode_result_ttl_s;
+
+                                            json metrics = json::object();
+                                            metrics["decode_request_id"] = decode_request_id;
+                                            metrics["id_slot"]           = id_slot;
+                                            metrics["n_past"]            = final_r->n_prompt_tokens_cache + final_r->n_decoded;
+                                            metrics["decode_ms"]         = final_r->timings.predicted_ms;
+                                            metrics["prompt_ms"]         = final_r->timings.prompt_ms;
+                                            metrics["model_load_ms"]     = model_load_ms;
+                                            metrics["restore_slot_ms"]   = restore_slot_ms;
+                                            metrics["model_identity"]    = {
+                                                {"tokenizer", resident_tokenizer},
+                                                {"model_name", resident_model_name},
+                                                {"model_quant", resident_model_quant},
+                                                {"model_capabilities", resident_capabilities}
+                                            };
+                                            metrics["match"]        = match_j;
+                                            metrics["model_fallback"] = false;
+                                            // Hydra n_common observability
+                                            metrics["n_common"]           = entry.n_common;
+                                            metrics["n_prompt_processed"] = entry.n_prompt_processed;
+                                            metrics["logits_reused"]      = entry.logits_reused;
+                                            entry.hydra_metrics = metrics;
+                                            entry.state = server_routes::DECODE_STATE_DONE;
+
+                                            // Signal stream finished before storing entry
+                                            {
+                                                std::lock_guard<std::mutex> lk(routes_ptr->decode_results_mutex);
+                                                auto dit = routes_ptr->decode_results.find(decode_request_id);
+                                                if (dit != routes_ptr->decode_results.end() && dit->second.stream) {
+                                                    // Transfer streaming state to the new entry
+                                                    entry.stream = std::move(dit->second.stream);
+                                                    {
+                                                        std::lock_guard<std::mutex> slk(entry.stream->streaming_mutex);
+                                                        entry.stream->stream_finished = true;
+                                                    }
+                                                    entry.stream->streaming_cv.notify_all();
+                                                }
+                                            }
+
+                                            std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                                            routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                                            routes_ptr->evict_decode_results_locked();
+
+                                            SRV_INF("hydra: DECODE_APPLY slot=%d generation complete (request_id=%d, n_decoded=%d)\n",
+                                                    id_slot, decode_request_id, final_r->n_decoded);
+                                        } else {
+                                            // is_begin partial — just consume it
+                                        }
+                                    }
+
                                     results.remove_waiting_task_id(completion_id);
-                                    if (!res_ptr) {
-                                        SRV_WRN("hydra: DECODE_APPLY slot=%d generation timeout (request_id=%d, completion_id=%d)\n",
-                                                id_slot, decode_request_id, completion_id);
-                                        return;
-                                    }
-                                    auto * cres = dynamic_cast<server_task_result_cmpl_final*>(res_ptr.get());
-                                    if (!cres) {
-                                        SRV_WRN("hydra: DECODE_APPLY slot=%d unexpected result type (request_id=%d, completion_id=%d)\n",
-                                                id_slot, decode_request_id, completion_id);
-                                        return;
-                                    }
-
-                                    server_routes::decode_result_entry entry;
-                                    entry.id_slot               = id_slot;
-                                    entry.completion_id         = cres->oaicompat_cmpl_id;
-                                    entry.oaicompat_model       = oaicompat_model_name;
-                                    entry.content                = cres->content;
-                                    entry.n_decoded              = cres->n_decoded;
-                                    entry.n_prompt_tokens        = cres->n_prompt_tokens;
-                                    entry.n_prompt_tokens_cache  = cres->n_prompt_tokens_cache;
-                                    entry.timings                = cres->timings;
-                                    entry.stop                   = cres->stop;
-                                    entry.include_usage          = cres->include_usage;
-                                    entry.match_json             = match_j;
-                                    entry.created_at             = std::time(nullptr);
-                                    entry.ttl_s                  = routes_ptr->decode_result_ttl_s;
-
-                                    json metrics = json::object();
-                                    metrics["decode_request_id"] = decode_request_id;
-                                    metrics["id_slot"]           = id_slot;
-                                    metrics["n_past"]            = cres->n_prompt_tokens_cache + cres->n_decoded;
-                                    metrics["decode_ms"]         = cres->timings.predicted_ms;
-                                    metrics["prompt_ms"]         = cres->timings.prompt_ms;
-                                    metrics["model_load_ms"]     = model_load_ms;
-                                    metrics["restore_slot_ms"]   = restore_slot_ms;
-                                    metrics["model_identity"]    = {
-                                        {"tokenizer", resident_tokenizer},
-                                        {"model_name", resident_model_name},
-                                        {"model_quant", resident_model_quant},
-                                        {"model_capabilities", resident_capabilities}
-                                    };
-                                    metrics["match"]        = match_j;
-                                    metrics["model_fallback"] = false;
-                                    entry.hydra_metrics = metrics;
-                                    entry.state = server_routes::DECODE_STATE_DONE;
-
-                                    std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
-                                    routes_ptr->decode_results[decode_request_id] = std::move(entry);
-                                    routes_ptr->evict_decode_results_locked();
-
-                                    SRV_INF("hydra: DECODE_APPLY slot=%d generation complete (request_id=%d, n_decoded=%d)\n",
-                                            id_slot, decode_request_id, cres->n_decoded);
                                 }).detach();
                             }
                         } else {
@@ -5712,6 +5777,51 @@ private:
                                     }
                                 }
 
+                                // ── Hydra n_common decision rule ──────────────
+                                // n_slot = tokens resident in KV (blob, prior turn, or prefill).
+                                // n_new  = tokens in the incoming prompt.
+                                // n_common = length of common prefix (== n_past before alora).
+                                {
+                                    const int n_slot = (int) slot.prompt.tokens.size();
+                                    const int n_new  = (int) input_tokens.size();
+                                    const int n_common_val = n_past; // before alora adjustment
+                                    const bool logits_valid = slot.logits_valid;
+
+                                    slot.n_common           = n_common_val;
+                                    slot.logits_reused      = false;
+                                    slot.n_prompt_processed = 0;
+
+                                    SLT_DBG(slot, "#PD-TRACE N_COMMON slot=%d n_slot=%d n_new=%d n_common=%d logits_valid=%d just_restored=%d\n",
+                                            slot.id, n_slot, n_new, n_common_val, (int) logits_valid, (int) slot.just_restored);
+
+                                    if (n_common_val == n_new && logits_valid) {
+                                        // Full prompt matches resident KV and restored logits are
+                                        // valid.  Sample directly — zero prompt tokens processed.
+                                        n_past = n_new;
+                                        slot.logits_reused = true;
+                                        slot.n_prompt_processed = 0;
+                                        SLT_INF(slot, "#PD-TRACE N_COMMON zero-prompt decode n_common=%d logits_reused=true\n", n_common_val);
+                                    } else if (n_common_val == n_new && !logits_valid) {
+                                        // Full prompt matches but restored logits are stale or
+                                        // absent.  Re-decode the final token to regenerate logits
+                                        // (the "1-token trick").  DEFAULT for warm/COMBINED.
+                                        n_past = n_common_val - 1;
+                                        slot.n_prompt_processed = 1;
+                                        SLT_INF(slot, "#PD-TRACE N_COMMON 1-token re-decode n_common=%d logits_reused=false\n", n_common_val);
+                                    } else if (n_common_val < n_slot) {
+                                        // Partial match — trim KV from divergence point.
+                                        // Discard restored logits FIRST (any seq_rm invalidates them).
+                                        slot.logits_valid = false;
+                                        slot.logits_reused = false;
+                                        n_past = n_common_val;
+                                        SLT_INF(slot, "#PD-TRACE N_COMMON trim n_common=%d < n_slot=%d, logits discarded\n", n_common_val, n_slot);
+                                    } else {
+                                        // Normal: n_common < n_new.  Process [n_common, n_new).
+                                        n_past = n_common_val;
+                                        slot.logits_reused = false;
+                                    }
+                                }
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
@@ -5923,7 +6033,9 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
+                        // When logits_reused is true (zero-prompt decode from restored
+                        // logits), skip this guard — the entire prompt is cached.
+                        if (!slot.logits_reused && n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
@@ -6113,6 +6225,11 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
+
+                    // Track total prompt tokens processed for n_common observability
+                    if (!slot.logits_reused) {
+                        slot.n_prompt_processed += n_tokens_cur;
+                    }
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
@@ -8197,7 +8314,6 @@ void server_routes::init_routes() {
         const json match_json    = it->second.match_json;
         const double model_load_ms = it->second.model_load_ms;
         const double restore_slot_ms = it->second.restore_slot_ms;
-        const int32_t n_past     = it->second.n_past;
         const json model_identity = it->second.model_identity;
         lock.unlock();
 
@@ -8235,19 +8351,69 @@ void server_routes::init_routes() {
             return res;
         }
 
-        // ── GENERATING + SSE → 202 with state info (client polls until DONE) ─
-        if (entry_state == server_routes::DECODE_STATE_GENERATING && stream && !completion_id.empty()) {
-            json state_j = {
-                {"state", "generating"},
-                {"decode_request_id", decode_request_id},
-                {"id_slot", id_slot},
-                {"model_load_ms", model_load_ms},
-                {"restore_slot_ms", restore_slot_ms},
-                {"n_past", n_past},
-                {"match", match_json},
+        // ── GENERATING + SSE → stream partials from relay queue ─────────
+        if (entry_state == server_routes::DECODE_STATE_GENERATING && stream) {
+            // Set up SSE response; partials arrive via the streaming_queue
+            // populated by the background consumer thread.
+            res->status = 200;
+            res->content_type = "text/event-stream";
+            res->data = ""; // no initial chunk — send headers immediately
+
+            res->next = [this, res_this = res.get(), decode_request_id, &req](std::string & output) -> bool {
+                try {
+                    if (req.should_stop()) {
+                        return false;
+                    }
+
+                    std::unique_lock lock(decode_results_mutex);
+                    auto it = decode_results.find(decode_request_id);
+                    if (it == decode_results.end()) {
+                        output = "data: [DONE]\n\n";
+                        return false;
+                    }
+                    auto & entry = it->second;
+
+                    // Drain streaming queue
+                    if (entry.stream) {
+                        std::lock_guard<std::mutex> slk(entry.stream->streaming_mutex);
+                        if (!entry.stream->streaming_queue.empty()) {
+                            auto result = std::move(entry.stream->streaming_queue.front());
+                            entry.stream->streaming_queue.pop_front();
+                            lock.unlock();
+
+                            if (result->is_error()) {
+                                json err_j = format_error_response("generation error", ERROR_TYPE_SERVER);
+                                output = format_oai_sse(json{{"error", err_j}});
+                                return false;
+                            }
+                            json j = result->to_json();
+                            if (j.is_null()) {
+                                // is_begin partial — skip
+                                return true;
+                            }
+                            output = format_oai_sse(j);
+                            return true;
+                        }
+                    }
+
+                    // Queue empty — check if stream is finished
+                    if (entry.stream && entry.stream->stream_finished) {
+                        output = "data: [DONE]\n\n";
+                        return false;
+                    }
+
+                    // Wait for next partial with ping interval
+                    if (entry.stream) {
+                        entry.stream->streaming_cv.wait_for(lock, std::chrono::seconds(30));
+                    }
+                    return true; // loop again
+
+                } catch (const std::exception & e) {
+                    json err_j = format_error_response(e.what(), ERROR_TYPE_SERVER);
+                    output = format_oai_sse(json{{"error", err_j}});
+                    return false;
+                }
             };
-            res->status = 202;
-            res->data = safe_json_to_str(state_j);
             return res;
         }
 
@@ -8338,28 +8504,43 @@ void server_routes::init_routes() {
             return res;
         }
 
-        std::unique_lock lock(decode_results_mutex);
-        auto it = decode_results.find(decode_request_id);
-        if (it == decode_results.end()) {
-            lock.unlock();
-            res->error(format_error_response("decode_request_id not found or expired", ERROR_TYPE_NOT_FOUND));
-            return res;
-        }
-        int32_t id_slot = it->second.id_slot;
-        const auto entry_state = it->second.state;
-        decode_results.erase(it);
-        lock.unlock();
+        int32_t id_slot = -1;
+        int32_t task_id_to_cancel = -1;
+        {
+            std::unique_lock lock(decode_results_mutex);
+            auto it = decode_results.find(decode_request_id);
+            if (it == decode_results.end()) {
+                lock.unlock();
+                res->error(format_error_response("decode_request_id not found or expired", ERROR_TYPE_NOT_FOUND));
+                return res;
+            }
+            id_slot = it->second.id_slot;
+            task_id_to_cancel = it->second.stream ? it->second.stream->completion_task_id.load() : -1;
 
-        // Release slot reservation if still in progress
-        if (entry_state != server_routes::DECODE_STATE_DONE &&
-            entry_state != server_routes::DECODE_STATE_ERROR) {
-            // Best-effort: find and release the slot reservation
-            // (slot lookup requires the inference thread, so we just log)
-            SRV_INF("hydra: DECODE_CANCEL id=%d slot=%d (state=%d, reservation released on next slot cycle)\n",
-                    decode_request_id, id_slot, (int)entry_state);
-        } else {
-            SRV_INF("hydra: DECODE_CANCEL id=%d slot=%d\n", decode_request_id, id_slot);
+            // Signal streaming queue to finish so any waiting GET handler unblocks
+            if (it->second.stream) {
+                std::lock_guard<std::mutex> slk(it->second.stream->streaming_mutex);
+                it->second.stream->stream_finished = true;
+                it->second.stream->streaming_cv.notify_all();
+            }
+
+            decode_results.erase(it);
         }
+
+        // Deterministically cancel the running completion task via the task queue.
+        // SERVER_TASK_TYPE_CANCEL causes the inference thread to release the slot.
+        if (task_id_to_cancel > 0) {
+            server_task cancel_task(SERVER_TASK_TYPE_CANCEL);
+            cancel_task.id = queue_tasks.get_new_id();
+            cancel_task.id_target = task_id_to_cancel;
+            queue_tasks.post(std::move(cancel_task), true);
+            SRV_INF("hydra: DECODE_CANCEL id=%d slot=%d completion_task=%d (cancel posted)\n",
+                    decode_request_id, id_slot, task_id_to_cancel);
+        } else {
+            SRV_INF("hydra: DECODE_CANCEL id=%d slot=%d (no active completion)\n",
+                    decode_request_id, id_slot);
+        }
+
         res->ok(json{{"cancelled", true}, {"decode_request_id", decode_request_id}});
         return res;
     };

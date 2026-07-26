@@ -6,7 +6,10 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <memory>
 #include <set>
 #include <shared_mutex>
@@ -237,6 +240,24 @@ struct server_routes {
         int32_t         n_past = 0;
         json            model_identity;
         json            model_metadata;
+
+        // Streaming relay: background consumer posts partials here;
+        // GET handler drains via streaming_cv.
+        // Wrapped in unique_ptr because std::mutex/std::condition_variable
+        // are non-movable, and decode_result_entry is move-assigned.
+        struct streaming_state {
+            std::mutex              streaming_mutex;
+            std::condition_variable streaming_cv;
+            std::deque<server_task_result_ptr> streaming_queue;
+            bool                    stream_finished = false;
+            std::atomic<int32_t>    completion_task_id{-1};
+        };
+        std::unique_ptr<streaming_state> stream = std::make_unique<streaming_state>();
+
+        // Hydra n_common observability (set at GENERATING, read by background consumer)
+        int32_t         n_common           = 0;
+        int32_t         n_prompt_processed = 0;
+        bool            logits_reused      = false;
     };
     mutable std::mutex decode_results_mutex;
     std::map<int32_t, decode_result_entry> decode_results;
