@@ -25,6 +25,10 @@
 
 #include "../llama-engine/hydra_rpc/hydra_rpc.h"
 
+// xxhash for DECODE segment hash verification (xxh3-64)
+#define XXH_STATIC_LINKING_ONLY
+#include "../../vendor/xxhash/xxhash.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -8893,76 +8897,238 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
 }
 
 // DECODE (0x43) — Merged P/D: framed request with async HTTP retrieval.
-// Wire format: [4B json_len LE][json_len bytes JSON][raw KV bytes]
+// Wire format v3 (segmented):
+//   [4B hdr_len LE]       <= 32768
+//   [8B  hdr_hash LE]     xxh3-64 of the hdr JSON bytes that follow
+//   [hdr_len bytes]       control header JSON
+//   [prompt_len bytes]    prompt JSON segment (may be zero-length)
+//   [kv_len bytes]        raw KV blob (may be zero-length)
+//
+// Control header:
+//   { "v": 3, "model": "...", "kv_metadata": {...}, "model_metadata": {...},
+//     "generation": {...}, "segments": [...] }
+//
 // Two-phase flow:
 //   Phase 1 (sync): identity validation + KV restore — waits for inference thread
 //   Phase 2 (async): background thread posts SERVER_TASK_TYPE_COMPLETION,
 //           update_slots() drives generation, result stored in decode_results buffer.
 // Actual result retrieved via GET /v1/decode/{decode_request_id}.
 static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
-    if (payload_len < sizeof(uint32_t)) {
+    // ── Read frame header: [4B hdr_len][8B hdr_hash] ──────────────────────
+    if (payload_len < sizeof(uint32_t) + sizeof(uint64_t)) {
+        SRV_WRN("%s", "hydra rpc: DECODE payload too small for frame header\n");
         hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
         return;
     }
 
-    // Read 4-byte JSON length prefix
-    uint32_t json_len = 0;
-    if (!hydra_recv_all(fd, &json_len, sizeof(json_len))) {
+    uint32_t hdr_len = 0;
+    if (!hydra_recv_all(fd, &hdr_len, sizeof(hdr_len))) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
 
-    if (json_len > HYDRA_MAX_JSON_HEADER) {
-        SRV_WRN("hydra rpc: DECODE JSON header %u B exceeds cap %u B\n",
-                json_len, HYDRA_MAX_JSON_HEADER);
+    if (hdr_len > HYDRA_MAX_JSON_HEADER) {
+        SRV_WRN("hydra rpc: DECODE hdr_len %u B exceeds cap %u B\n",
+                hdr_len, HYDRA_MAX_JSON_HEADER);
         hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
         return;
     }
 
-    // Read JSON header
-    std::string json_str(json_len, '\0');
-    if (json_len > 0 && !hydra_recv_all(fd, json_str.data(), json_len)) {
+    uint64_t hdr_hash = 0;
+    if (!hydra_recv_all(fd, &hdr_hash, sizeof(hdr_hash))) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
 
-    // Read remaining KV bytes
-    const uint64_t kv_len = payload_len - sizeof(uint32_t) - json_len;
-    if (kv_len > HYDRA_MAX_STATE_BYTES) {
-        SRV_WRN("hydra rpc: DECODE KV blob %" PRIu64 " B exceeds cap %" PRIu64 " B\n",
-                kv_len, HYDRA_MAX_STATE_BYTES);
-        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
-        std::vector<uint8_t> drain(65536);
-        for (uint64_t rem = kv_len; rem > 0; ) {
-            size_t chunk = (size_t)std::min(rem, (uint64_t)drain.size());
-            if (!hydra_recv_all(fd, drain.data(), chunk)) break;
-            rem -= chunk;
+    // ── Read control header JSON ──────────────────────────────────────────
+    std::string hdr_json_str(hdr_len, '\0');
+    if (hdr_len > 0 && !hydra_recv_all(fd, hdr_json_str.data(), hdr_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // Verify hdr_hash (xxh3-64 of the JSON bytes)
+    {
+        const uint64_t computed = XXH3_64bits(hdr_json_str.data(), hdr_json_str.size());
+        if (computed != hdr_hash) {
+            SRV_WRN("hydra rpc: DECODE HDR_HASH_MISMATCH expected=%016" PRIx64 " got=%016" PRIx64 "\n",
+                    hdr_hash, computed);
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
         }
-        return;
     }
 
-    // Parse JSON header
+    // Parse control header
     json req;
     try {
-        req = json::parse(json_str);
+        req = json::parse(hdr_json_str);
     } catch (const std::exception & e) {
-        SRV_WRN("hydra rpc: DECODE invalid JSON: %s\n", e.what());
+        SRV_WRN("hydra rpc: DECODE invalid JSON in control header: %s\n", e.what());
         hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
         return;
     }
 
-    if (!req.contains("kv_metadata") || !req.contains("prompt")) {
-        SRV_WRN("%s", "hydra rpc: DECODE missing kv_metadata or prompt\n");
+    // Validate version
+    const int hdr_version = req.value("v", 0);
+    if (hdr_version < 3) {
+        SRV_WRN("hydra rpc: DECODE unsupported version %d (need >= 3)\n", hdr_version);
         hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
         return;
     }
 
-    // Read KV bytes
+    // Validate required fields
+    if (!req.contains("kv_metadata")) {
+        SRV_WRN("%s", "hydra rpc: DECODE missing kv_metadata in control header\n");
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+    if (!req.contains("segments") || !req["segments"].is_array()) {
+        SRV_WRN("%s", "hydra rpc: DECODE missing or invalid segments array\n");
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    // ── Parse and validate segment table ──────────────────────────────────
+    const json & segments = req["segments"];
+    const size_t n_segments = segments.size();
+    if (n_segments > 3) {
+        SRV_WRN("hydra rpc: DECODE SEGMENT_TABLE_INVALID: too many segments (%zu)\n", n_segments);
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    // Each segment: {"id":"prompt"|"kv", "offset":N, "len":N, "hash":"xxh3:HEX"}
+    uint64_t prompt_len = 0;
+    uint64_t kv_len = 0;
+    std::string prompt_hash_str;
+    std::string kv_hash_str;
+    uint64_t expected_offset = 0;
+    for (size_t i = 0; i < n_segments; i++) {
+        const json & seg = segments[i];
+        if (!seg.contains("id") || !seg.contains("offset") || !seg.contains("len") || !seg.contains("hash")) {
+            SRV_WRN("hydra rpc: DECODE SEGMENT_TABLE_INVALID: segment %zu missing required fields\n", i);
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+        const std::string id = seg["id"].get<std::string>();
+        const uint64_t offset = seg["offset"].get<uint64_t>();
+        const uint64_t len = seg["len"].get<uint64_t>();
+        const std::string hash = seg["hash"].get<std::string>();
+
+        if (offset != expected_offset) {
+            SRV_WRN("hydra rpc: DECODE SEGMENT_TABLE_INVALID: segment %zu offset=%" PRIu64 " expected=%" PRIu64 "\n",
+                    i, offset, expected_offset);
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+        expected_offset = offset + len;
+
+        if (id == "prompt") {
+            prompt_len = len;
+            prompt_hash_str = hash;
+        } else if (id == "kv") {
+            kv_len = len;
+            kv_hash_str = hash;
+        } else {
+            SRV_WRN("hydra rpc: DECODE SEGMENT_TABLE_INVALID: unknown segment id '%s'\n", id.c_str());
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+    }
+
+    // Verify total segment size matches remaining payload
+    const uint64_t segments_total = prompt_len + kv_len;
+    const uint64_t remaining_after_hdr = payload_len - sizeof(uint32_t) - sizeof(uint64_t) - hdr_len;
+    if (segments_total != remaining_after_hdr) {
+        SRV_WRN("hydra rpc: DECODE SEGMENT_TABLE_INVALID: segments total %" PRIu64 " != remaining %" PRIu64 "\n",
+                segments_total, remaining_after_hdr);
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    // Caps
+    if (prompt_len > HYDRA_MAX_PROMPT_BYTES) {
+        SRV_WRN("hydra rpc: DECODE PROMPT_TOO_LARGE %" PRIu64 " > %" PRIu64 "\n",
+                prompt_len, HYDRA_MAX_PROMPT_BYTES);
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+    if (kv_len > HYDRA_MAX_STATE_BYTES) {
+        SRV_WRN("hydra rpc: DECODE KV_TOO_LARGE %" PRIu64 " > %" PRIu64 "\n",
+                kv_len, HYDRA_MAX_STATE_BYTES);
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    // ── Read prompt segment ───────────────────────────────────────────────
+    std::vector<uint8_t> prompt_data((size_t)prompt_len);
+    if (prompt_len > 0 && !hydra_recv_all(fd, prompt_data.data(), (size_t)prompt_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // ── Read KV segment (may be zero-length) ──────────────────────────────
     std::vector<uint8_t> kv_data((size_t)kv_len);
     if (kv_len > 0 && !hydra_recv_all(fd, kv_data.data(), (size_t)kv_len)) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
+
+    // Verify KV segment hash BEFORE passing to llama_state_seq_set_data
+    if (kv_len > 0 && !kv_hash_str.empty()) {
+        // Parse "xxh3:HEX" format
+        if (kv_hash_str.rfind("xxh3:", 0) == 0) {
+            const std::string hex_str = kv_hash_str.substr(5);
+            uint64_t expected_kv_hash = 0;
+            try {
+                expected_kv_hash = std::stoull(hex_str, nullptr, 16);
+            } catch (const std::exception &) {
+                SRV_WRN("hydra rpc: DECODE invalid KV hash format: %s\n", kv_hash_str.c_str());
+                hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                return;
+            }
+            const uint64_t computed_kv = XXH3_64bits(kv_data.data(), kv_data.size());
+            if (computed_kv != expected_kv_hash) {
+                SRV_WRN("hydra rpc: DECODE SEGMENT_HASH_MISMATCH kv expected=%016" PRIx64 " got=%016" PRIx64 "\n",
+                        expected_kv_hash, computed_kv);
+                hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                return;
+            }
+            SRV_INF("hydra rpc: DECODE KV hash verified (%" PRIu64 " B)\n", kv_len);
+        } else {
+            SRV_WRN("hydra rpc: DECODE unsupported KV hash prefix: %s\n", kv_hash_str.c_str());
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+    }
+
+    // ── Build decode_json from control header + prompt segment ─────────────
+    // The prompt JSON segment may contain { "prompt": "..." } or { "messages": [...] }
+    // Merge it into the control header as decode_req["prompt"].
+    // Also merge generation params from control header's "generation" key.
+    json decode_req = req; // control header already has kv_metadata, model, etc.
+    json prompt_obj;
+    if (prompt_len > 0) {
+        try {
+            prompt_obj = json::parse(std::string(prompt_data.begin(), prompt_data.end()));
+        } catch (const std::exception & e) {
+            SRV_WRN("hydra rpc: DECODE invalid prompt segment JSON: %s\n", e.what());
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+    }
+    // Merge generation params from control header into prompt object
+    if (req.contains("generation") && req["generation"].is_object()) {
+        const json & gen = req["generation"];
+        for (auto it = gen.begin(); it != gen.end(); ++it) {
+            if (!prompt_obj.contains(it.key())) {
+                prompt_obj[it.key()] = it.value();
+            }
+        }
+    }
+    decode_req["prompt"] = std::move(prompt_obj);
+
+    const std::string decode_json_str = decode_req.dump();
 
     // ── Phase 1: sync validate + restore ──────────────────────────────────
     const int32_t decode_request_id = ctx.queue_tasks->get_new_id();
@@ -8970,7 +9136,7 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     server_task val_task(SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE);
     val_task.id = decode_request_id;
     val_task.hydra_action.id_slot = slot_id;
-    val_task.hydra_action.decode_json = std::move(json_str);
+    val_task.hydra_action.decode_json = std::move(decode_json_str);
     val_task.hydra_action.kv_data = std::move(kv_data);
     val_task.hydra_action.decode_request_id = decode_request_id;
     ctx.queue_results->add_waiting_task_id(decode_request_id);
