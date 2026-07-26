@@ -204,8 +204,16 @@ struct server_routes {
     server_http_context::handler_t delete_decode_result; // DELETE /v1/decode/:decode_request_id
 
     // Merged DECODE result buffer: keyed by decode_request_id
+    enum decode_state {
+        DECODE_STATE_LOADING,    // sync DECODE passed, awaiting DECODE_APPLY
+        DECODE_STATE_RESTORING,  // DECODE_APPLY running (model swap / KV restore)
+        DECODE_STATE_GENERATING, // COMPLETION task posted, generation in progress
+        DECODE_STATE_DONE,       // generation complete, final result buffered
+        DECODE_STATE_ERROR,      // terminal error
+    };
     struct decode_result_entry {
         int32_t         id_slot = -1;
+        decode_state    state = DECODE_STATE_LOADING;
         std::string     completion_id;
         std::string     oaicompat_model;
         json            generation_params;
@@ -223,6 +231,12 @@ struct server_routes {
         std::string     error;             // non-empty => request rejected/failed;
                                             // GET /v1/decode/:id returns this instead
                                             // of a completion body (content is unset)
+        double          model_load_ms = 0.0;
+        double          restore_slot_ms = 0.0;
+        double          decode_init_ms = 0.0;
+        int32_t         n_past = 0;
+        json            model_identity;
+        json            model_metadata;
     };
     mutable std::mutex decode_results_mutex;
     std::map<int32_t, decode_result_entry> decode_results;

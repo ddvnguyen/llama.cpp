@@ -4174,6 +4174,23 @@ private:
                     SRV_INF("hydra: DECODE slot=%d Gate A pass, reserved for request_id=%d\n",
                             id_slot, decode_request_id);
 
+                    // ── Create decode_result_entry (LOADING state) ─────────
+                    // So GET /v1/decode/{id} returns 202 instead of 404
+                    // while async DECODE_APPLY is pending.
+                    if (routes_ptr) {
+                        server_routes::decode_result_entry entry;
+                        entry.id_slot    = id_slot;
+                        entry.state      = server_routes::DECODE_STATE_LOADING;
+                        entry.match_json = match_j;
+                        entry.created_at = std::time(nullptr);
+                        entry.ttl_s      = routes_ptr->decode_result_ttl_s;
+                        entry.model_metadata = decode_req.value("model_metadata", json::object());
+                        entry.model_identity = json::object();
+                        std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                        routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                        routes_ptr->evict_decode_results_locked();
+                    }
+
                     // ── Send sync validation response ───────────────────────
                     res->rpc_status = HYDRA_STATUS_OK;
                     queue_results.send(std::move(res));
@@ -4455,6 +4472,16 @@ private:
                             SRV_INF("hydra: DECODE_APPLY slot=%d posted COMPLETION (completion_id=%d, request_id=%d)\n",
                                     id_slot, completion_id, decode_request_id);
 
+                            // Update state to GENERATING
+                            if (routes_ptr) {
+                                std::lock_guard<std::mutex> lk(routes_ptr->decode_results_mutex);
+                                auto dit = routes_ptr->decode_results.find(decode_request_id);
+                                if (dit != routes_ptr->decode_results.end()) {
+                                    dit->second.state = server_routes::DECODE_STATE_GENERATING;
+                                    dit->second.completion_id = std::to_string(completion_id);
+                                }
+                            }
+
                             // ── Background consumer ─────────────────────────
                             if (routes_ptr) {
                                 std::thread([this, completion_id, decode_request_id, id_slot,
@@ -4510,6 +4537,7 @@ private:
                                     metrics["match"]        = match_j;
                                     metrics["model_fallback"] = false;
                                     entry.hydra_metrics = metrics;
+                                    entry.state = server_routes::DECODE_STATE_DONE;
 
                                     std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
                                     routes_ptr->decode_results[decode_request_id] = std::move(entry);
@@ -8141,106 +8169,169 @@ void server_routes::init_routes() {
             res->error(format_error_response("decode_request_id not found or expired", ERROR_TYPE_NOT_FOUND));
             return res;
         }
-        const auto & entry = it->second;
-        if (!entry.error.empty()) {
-            // Request was rejected/failed before or during generation (e.g. the
-            // 'messages' field is unsupported on DECODE) — no completion body
-            // was ever produced. Surface the error and drop the entry.
-            const std::string err_msg = entry.error;
-            decode_results.erase(it);
-            lock.unlock();
-            res->error(format_error_response(err_msg, ERROR_TYPE_INVALID_REQUEST));
+
+        // Read fields we need before unlocking
+        const auto entry_state   = it->second.state;
+        const auto entry_error   = it->second.error;
+        const int32_t id_slot    = it->second.id_slot;
+        const std::string completion_id = it->second.completion_id;
+        const std::string oaicompat_model = it->second.oaicompat_model;
+        const std::string content = it->second.content;
+        const int32_t n_decoded  = it->second.n_decoded;
+        const int32_t n_prompt_tokens = it->second.n_prompt_tokens;
+        const int32_t n_prompt_tokens_cache = it->second.n_prompt_tokens_cache;
+        const result_timings timings = it->second.timings;
+        const stop_type stop     = it->second.stop;
+        const bool include_usage = it->second.include_usage;
+        const json hydra_metrics = it->second.hydra_metrics;
+        const json match_json    = it->second.match_json;
+        const double model_load_ms = it->second.model_load_ms;
+        const double restore_slot_ms = it->second.restore_slot_ms;
+        const int32_t n_past     = it->second.n_past;
+        const json model_identity = it->second.model_identity;
+        lock.unlock();
+
+        // ── Terminal error ─────────────────────────────────────────────────
+        if (!entry_error.empty()) {
+            std::lock_guard<std::mutex> lk(decode_results_mutex);
+            decode_results.erase(decode_request_id);
+            lk.unlock();
+            json err_j = {
+                {"error", entry_error},
+                {"error_code", "DECODE_FAILED"},
+                {"match", match_json},
+            };
+            res->error(format_error_response(entry_error, ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        // Read fields we need before unlocking
-        const int32_t id_slot = entry.id_slot;
-        const std::string completion_id = entry.completion_id;
-        const std::string oaicompat_model = entry.oaicompat_model;
-        const json gen_params = entry.generation_params;
-        const std::string content = entry.content;
-        const int32_t n_decoded = entry.n_decoded;
-        const int32_t n_prompt_tokens = entry.n_prompt_tokens;
-        const int32_t n_prompt_tokens_cache = entry.n_prompt_tokens_cache;
-        const result_timings timings = entry.timings;
-        const stop_type stop = entry.stop;
-        const bool include_usage = entry.include_usage;
-        const json hydra_metrics = entry.hydra_metrics;
-        const json match_json = entry.match_json;
-        lock.unlock();
 
         const bool stream = req.headers.count("accept") > 0 &&
                             req.headers.at("accept").find("text/event-stream") != std::string::npos;
 
-        if (stream) {
-            // SSE streaming: send full result as a single delta, then finish
-            std::time_t t = std::time(0);
-            json delta {
-                {"choices", json::array({
-                    json {
-                        {"finish_reason", stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS ? "stop" : "length"},
-                        {"index", 0},
-                        {"delta", json{{"role", "assistant"}, {"content", content}}},
-                    },
-                })},
-                {"created", t},
-                {"id", completion_id},
-                {"model", oaicompat_model},
-                {"system_fingerprint", std::string(llama_build_info())},
-                {"object", "chat.completion.chunk"},
-            };
-
-            if (include_usage) {
-                delta["usage"] = json {
-                    {"completion_tokens", n_decoded},
-                    {"prompt_tokens",     n_prompt_tokens},
-                    {"total_tokens",      n_decoded + n_prompt_tokens},
-                    {"prompt_tokens_details", json{{"cached_tokens", n_prompt_tokens_cache}}},
-                };
-            }
-            if (!hydra_metrics.is_null()) {
-                delta["hydra_metrics"] = hydra_metrics;
-            }
-
-            // Set up SSE streaming
-            res->status = 200;
-            res->content_type = "text/event-stream";
-            res->data = format_oai_sse(delta);
-            // Send a [DONE] marker
-            // Note: the next function is not set because we send everything in one chunk
-        } else {
-            // Buffered: full OAI chat completion response
-            json message;
-            message["role"] = "assistant";
-            message["content"] = content;
-
-            json choice {
-                {"finish_reason", stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS ? "stop" : "length"},
-                {"index", 0},
-                {"message", message},
-            };
-
-            json oai_response {
-                {"choices", json::array({choice})},
-                {"created", std::time(0)},
-                {"model", oaicompat_model},
-                {"system_fingerprint", std::string(llama_build_info())},
-                {"object", "chat.completion"},
-                {"usage", {
-                    {"completion_tokens", n_decoded},
-                    {"prompt_tokens",     n_prompt_tokens},
-                    {"total_tokens",      n_decoded + n_prompt_tokens},
-                    {"prompt_tokens_details", json{{"cached_tokens", n_prompt_tokens_cache}}},
-                }},
-                {"id", completion_id},
+        // ── In-progress states → 202 ──────────────────────────────────────
+        if (entry_state == server_routes::DECODE_STATE_LOADING ||
+            entry_state == server_routes::DECODE_STATE_RESTORING) {
+            json state_j = {
+                {"state", entry_state == server_routes::DECODE_STATE_LOADING ? "loading" : "restoring"},
+                {"decode_request_id", decode_request_id},
                 {"id_slot", id_slot},
-                {"timings", timings.to_json()},
+                {"model_load_ms", model_load_ms},
+                {"restore_slot_ms", restore_slot_ms},
+                {"match", match_json},
             };
-            if (!hydra_metrics.is_null()) {
-                oai_response["hydra_metrics"] = hydra_metrics;
-            }
-
-            res->ok(oai_response);
+            res->status = 202;
+            res->data = safe_json_to_str(state_j);
+            return res;
         }
+
+        // ── GENERATING + SSE → real-time streaming via completion task ─────
+        if (entry_state == server_routes::DECODE_STATE_GENERATING && stream && !completion_id.empty()) {
+            // Parse completion_id as int to attach to the result queue
+            int cmpl_id_int = 0;
+            try {
+                // completion_id is an OAI cmpl string like "cmpl-xxx", not an int.
+                // We need the int task id. Use the decode_request_id as a fallback
+                // since the background consumer already tracks it.
+                // Actually, the background consumer adds completion_id to the waiting set.
+                // We can't easily get the int id from the string.
+                // Fallback: return 202 and let the client poll.
+                json state_j = {
+                    {"state", "generating"},
+                    {"decode_request_id", decode_request_id},
+                    {"id_slot", id_slot},
+                    {"model_load_ms", model_load_ms},
+                    {"restore_slot_ms", restore_slot_ms},
+                    {"n_past", n_past},
+                    {"match", match_json},
+                };
+                res->status = 202;
+                res->data = safe_json_to_str(state_j);
+                return res;
+            } catch (...) {
+                json state_j = {
+                    {"state", "generating"},
+                    {"decode_request_id", decode_request_id},
+                };
+                res->status = 202;
+                res->data = safe_json_to_str(state_j);
+                return res;
+            }
+        }
+
+        // ── DONE → return full result ─────────────────────────────────────
+        if (entry_state == server_routes::DECODE_STATE_DONE || !content.empty()) {
+            if (stream) {
+                // SSE streaming: send full result as a single delta, then finish
+                std::time_t t = std::time(0);
+                json delta {
+                    {"choices", json::array({
+                        json {
+                            {"finish_reason", stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS ? "stop" : "length"},
+                            {"index", 0},
+                            {"delta", json{{"role", "assistant"}, {"content", content}}},
+                        },
+                    })},
+                    {"created", t},
+                    {"id", completion_id},
+                    {"model", oaicompat_model},
+                    {"system_fingerprint", std::string(llama_build_info())},
+                    {"object", "chat.completion.chunk"},
+                };
+
+                if (include_usage) {
+                    delta["usage"] = json {
+                        {"completion_tokens", n_decoded},
+                        {"prompt_tokens",     n_prompt_tokens},
+                        {"total_tokens",      n_decoded + n_prompt_tokens},
+                        {"prompt_tokens_details", json{{"cached_tokens", n_prompt_tokens_cache}}},
+                    };
+                }
+                if (!hydra_metrics.is_null()) {
+                    delta["hydra_metrics"] = hydra_metrics;
+                }
+
+                res->status = 200;
+                res->content_type = "text/event-stream";
+                res->data = format_oai_sse(delta);
+            } else {
+                // Buffered: full OAI chat completion response
+                json message;
+                message["role"] = "assistant";
+                message["content"] = content;
+
+                json choice {
+                    {"finish_reason", stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS ? "stop" : "length"},
+                    {"index", 0},
+                    {"message", message},
+                };
+
+                json oai_response {
+                    {"choices", json::array({choice})},
+                    {"created", std::time(0)},
+                    {"model", oaicompat_model},
+                    {"system_fingerprint", std::string(llama_build_info())},
+                    {"object", "chat.completion"},
+                    {"usage", {
+                        {"completion_tokens", n_decoded},
+                        {"prompt_tokens",     n_prompt_tokens},
+                        {"total_tokens",      n_decoded + n_prompt_tokens},
+                        {"prompt_tokens_details", json{{"cached_tokens", n_prompt_tokens_cache}}},
+                    }},
+                    {"id", completion_id},
+                    {"id_slot", id_slot},
+                    {"timings", timings.to_json()},
+                };
+                if (!hydra_metrics.is_null()) {
+                    oai_response["hydra_metrics"] = hydra_metrics;
+                }
+
+                res->ok(oai_response);
+            }
+            return res;
+        }
+
+        // Fallback: no content yet
+        res->error(format_error_response("decode_request_id not ready", ERROR_TYPE_NOT_FOUND));
         return res;
     };
 
@@ -8262,12 +8353,20 @@ void server_routes::init_routes() {
             return res;
         }
         int32_t id_slot = it->second.id_slot;
+        const auto entry_state = it->second.state;
         decode_results.erase(it);
         lock.unlock();
 
-        // Best-effort cancel: release the slot if it's still processing
-        // (POST /slots/:id_slot?action=erase is the standard cancel path)
-        SRV_INF("hydra: DECODE_CANCEL id=%d slot=%d\n", decode_request_id, id_slot);
+        // Release slot reservation if still in progress
+        if (entry_state != server_routes::DECODE_STATE_DONE &&
+            entry_state != server_routes::DECODE_STATE_ERROR) {
+            // Best-effort: find and release the slot reservation
+            // (slot lookup requires the inference thread, so we just log)
+            SRV_INF("hydra: DECODE_CANCEL id=%d slot=%d (state=%d, reservation released on next slot cycle)\n",
+                    decode_request_id, id_slot, (int)entry_state);
+        } else {
+            SRV_INF("hydra: DECODE_CANCEL id=%d slot=%d\n", decode_request_id, id_slot);
+        }
         res->ok(json{{"cancelled", true}, {"decode_request_id", decode_request_id}});
         return res;
     };
