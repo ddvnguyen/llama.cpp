@@ -27,6 +27,7 @@
 
 // xxhash for DECODE segment hash verification (xxh3-64)
 #define XXH_STATIC_LINKING_ONLY
+#define XXH_IMPLEMENTATION
 #include "../../vendor/xxhash/xxhash.h"
 
 #include <algorithm>
@@ -4484,8 +4485,17 @@ private:
 
                             // ── Background consumer ─────────────────────────
                             if (routes_ptr) {
+                                // Read match_json from the decode_result_entry (set by sync DECODE)
+                                json match_j_bg;
+                                {
+                                    std::lock_guard<std::mutex> lk(routes_ptr->decode_results_mutex);
+                                    auto dit = routes_ptr->decode_results.find(decode_request_id);
+                                    if (dit != routes_ptr->decode_results.end()) {
+                                        match_j_bg = dit->second.match_json;
+                                    }
+                                }
                                 std::thread([this, completion_id, decode_request_id, id_slot,
-                                             match_j, resident_tokenizer, resident_model_name,
+                                             match_j = std::move(match_j_bg), resident_tokenizer, resident_model_name,
                                              resident_model_quant, resident_capabilities,
                                              oaicompat_model_name = model_name,
                                              model_load_ms, restore_slot_ms, n_past,
@@ -8193,9 +8203,10 @@ void server_routes::init_routes() {
 
         // ── Terminal error ─────────────────────────────────────────────────
         if (!entry_error.empty()) {
-            std::lock_guard<std::mutex> lk(decode_results_mutex);
-            decode_results.erase(decode_request_id);
-            lk.unlock();
+            {
+                std::lock_guard<std::mutex> lk(decode_results_mutex);
+                decode_results.erase(decode_request_id);
+            }
             json err_j = {
                 {"error", entry_error},
                 {"error_code", "DECODE_FAILED"},
@@ -8224,38 +8235,20 @@ void server_routes::init_routes() {
             return res;
         }
 
-        // ── GENERATING + SSE → real-time streaming via completion task ─────
+        // ── GENERATING + SSE → 202 with state info (client polls until DONE) ─
         if (entry_state == server_routes::DECODE_STATE_GENERATING && stream && !completion_id.empty()) {
-            // Parse completion_id as int to attach to the result queue
-            int cmpl_id_int = 0;
-            try {
-                // completion_id is an OAI cmpl string like "cmpl-xxx", not an int.
-                // We need the int task id. Use the decode_request_id as a fallback
-                // since the background consumer already tracks it.
-                // Actually, the background consumer adds completion_id to the waiting set.
-                // We can't easily get the int id from the string.
-                // Fallback: return 202 and let the client poll.
-                json state_j = {
-                    {"state", "generating"},
-                    {"decode_request_id", decode_request_id},
-                    {"id_slot", id_slot},
-                    {"model_load_ms", model_load_ms},
-                    {"restore_slot_ms", restore_slot_ms},
-                    {"n_past", n_past},
-                    {"match", match_json},
-                };
-                res->status = 202;
-                res->data = safe_json_to_str(state_j);
-                return res;
-            } catch (...) {
-                json state_j = {
-                    {"state", "generating"},
-                    {"decode_request_id", decode_request_id},
-                };
-                res->status = 202;
-                res->data = safe_json_to_str(state_j);
-                return res;
-            }
+            json state_j = {
+                {"state", "generating"},
+                {"decode_request_id", decode_request_id},
+                {"id_slot", id_slot},
+                {"model_load_ms", model_load_ms},
+                {"restore_slot_ms", restore_slot_ms},
+                {"n_past", n_past},
+                {"match", match_json},
+            };
+            res->status = 202;
+            res->data = safe_json_to_str(state_j);
+            return res;
         }
 
         // ── DONE → return full result ─────────────────────────────────────
