@@ -4270,32 +4270,93 @@ private:
 
                         std::string prompt_str;
                         if (prompt.contains("messages") && !prompt["messages"].is_null()) {
-                            // DECODE endpoint does not support chat messages — callers must
-                            // provide a pre-formatted prompt string. Sending messages here
-                            // would be tokenized as raw JSON, not through the chat template.
-                            //
-                            // NOTE: `res` was already moved into queue_results.send() above
-                            // (the HYDRA_STATUS_OK validation-success response) — the RPC
-                            // request/response cycle for this decode_request_id is over and
-                            // the caller is now polling GET /v1/decode/{id}. There is no
-                            // second response channel back to the original RPC caller, so
-                            // surface this rejection through the same decode_results buffer
-                            // that a successful completion would populate instead.
-                            SRV_WRN("hydra: DECODE slot=%d rejected: 'messages' field not supported (request_id=%d)\n",
-                                    id_slot, decode_request_id);
-                            if (routes_ptr) {
-                                server_routes::decode_result_entry entry;
-                                entry.id_slot    = id_slot;
-                                entry.error      = "DECODE endpoint does not support 'messages' field — use 'prompt' instead";
-                                entry.match_json = match_j;
-                                entry.created_at = std::time(nullptr);
-                                entry.ttl_s      = routes_ptr->decode_result_ttl_s;
+                            // Apply chat template to messages — same path as
+                            // handle_completions_impl / OAII chat completions.
+                            // Build a minimal body for oaicompat_chat_params_parse.
+                            json chat_body;
+                            chat_body["messages"] = prompt["messages"];
+                            if (prompt.contains("tools"))        chat_body["tools"]        = prompt["tools"];
+                            if (prompt.contains("tool_choice"))  chat_body["tool_choice"]  = prompt["tool_choice"];
+                            if (prompt.contains("response_format")) chat_body["response_format"] = prompt["response_format"];
+                            if (prompt.contains("add_generation_prompt")) chat_body["add_generation_prompt"] = prompt["add_generation_prompt"];
+                            if (prompt.contains("continue_final_message")) chat_body["continue_final_message"] = prompt["continue_final_message"];
+                            if (prompt.contains("reasoning_format")) chat_body["reasoning_format"] = prompt["reasoning_format"];
+                            if (prompt.contains("enable_thinking")) chat_body["enable_thinking"] = prompt["enable_thinking"];
+                            if (prompt.contains("chat_template_kwargs")) chat_body["chat_template_kwargs"] = prompt["chat_template_kwargs"];
 
-                                std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
-                                routes_ptr->decode_results[decode_request_id] = std::move(entry);
-                                routes_ptr->evict_decode_results_locked();
+                            try {
+                                std::vector<raw_buffer> dummy_files;
+                                json chat_result = oaicompat_chat_params_parse(chat_body, chat_params, dummy_files);
+                                prompt_str = chat_result.value("prompt", std::string());
+
+                                // Merge chat-template-derived fields into cmpl_data so
+                                // params_from_json_cmpl picks up grammar, stops, etc.
+                                if (chat_result.contains("grammar") && !chat_result["grammar"].is_null()) {
+                                    cmpl_data["grammar"] = chat_result["grammar"];
+                                }
+                                if (chat_result.contains("grammar_type")) {
+                                    cmpl_data["grammar_type"] = chat_result["grammar_type"];
+                                }
+                                if (chat_result.contains("grammar_lazy")) {
+                                    cmpl_data["grammar_lazy"] = chat_result["grammar_lazy"];
+                                }
+                                if (chat_result.contains("grammar_triggers")) {
+                                    cmpl_data["grammar_triggers"] = chat_result["grammar_triggers"];
+                                }
+                                if (chat_result.contains("chat_format")) {
+                                    cmpl_data["chat_format"] = chat_result["chat_format"];
+                                }
+                                if (chat_result.contains("chat_parser")) {
+                                    cmpl_data["chat_parser"] = chat_result["chat_parser"];
+                                }
+                                if (chat_result.contains("parse_tool_calls")) {
+                                    cmpl_data["parse_tool_calls"] = chat_result["parse_tool_calls"];
+                                }
+                                if (chat_result.contains("preserved_tokens")) {
+                                    cmpl_data["preserved_tokens"] = chat_result["preserved_tokens"];
+                                }
+                                if (chat_result.contains("reasoning_budget_tokens")) {
+                                    cmpl_data["reasoning_budget_tokens"] = chat_result["reasoning_budget_tokens"];
+                                }
+                                if (chat_result.contains("reasoning_budget_start_tag")) {
+                                    cmpl_data["reasoning_budget_start_tag"] = chat_result["reasoning_budget_start_tag"];
+                                }
+                                if (chat_result.contains("reasoning_budget_end_tag")) {
+                                    cmpl_data["reasoning_budget_end_tag"] = chat_result["reasoning_budget_end_tag"];
+                                }
+                                if (chat_result.contains("reasoning_budget_message")) {
+                                    cmpl_data["reasoning_budget_message"] = chat_result["reasoning_budget_message"];
+                                }
+                                if (chat_result.contains("reasoning_control")) {
+                                    cmpl_data["reasoning_control"] = chat_result["reasoning_control"];
+                                }
+                                // Merge additional stop sequences from chat template
+                                if (chat_result.contains("stop") && chat_result["stop"].is_array()) {
+                                    json existing_stops = cmpl_data.value("stop", json::array());
+                                    for (const auto & s : chat_result["stop"]) {
+                                        existing_stops.push_back(s);
+                                    }
+                                    cmpl_data["stop"] = existing_stops;
+                                }
+                                SRV_INF("hydra: DECODE slot=%d applied chat template to messages (request_id=%d, prompt_len=%zu)\n",
+                                        id_slot, decode_request_id, prompt_str.size());
+                            } catch (const std::exception & e) {
+                                SRV_WRN("hydra: DECODE slot=%d chat template failed: %s (request_id=%d)\n",
+                                        id_slot, e.what(), decode_request_id);
+                                if (routes_ptr) {
+                                    server_routes::decode_result_entry entry;
+                                    entry.id_slot    = id_slot;
+                                    entry.error      = std::string("chat template error: ") + e.what();
+                                    entry.match_json = match_j;
+                                    entry.created_at = std::time(nullptr);
+                                    entry.ttl_s      = routes_ptr->decode_result_ttl_s;
+
+                                    std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                                    routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                                    routes_ptr->evict_decode_results_locked();
+                                }
+                                break;
                             }
-                            break;
                         } else {
                             prompt_str = prompt.value("prompt", std::string());
                         }
