@@ -159,6 +159,13 @@ struct server_slot {
     std::shared_ptr<std::atomic<bool>> hydra_transferring{std::make_shared<std::atomic<bool>>(false)};
     bool just_restored  = false; // set on STATE_PUT; one-shot, gates restored-slot KV reuse
 
+    // D4: per-slot restored logits buffer — avoids the shared-context race where
+    // another slot's decode clobbers restored logits between STATE_PUT and first
+    // sample. Populated during KV restore; consumed on first sample; cleared on
+    // seq_rm and after consumption.
+    std::vector<float> restored_logits;
+    bool logits_valid = false;
+
     server_prompt prompt;
 
     void prompt_save(server_prompt_cache & prompt_cache) const {
@@ -205,6 +212,10 @@ struct server_slot {
         }
 
         prompt.tokens.clear();
+
+        // D4: seq_rm invalidates any restored logits — clear them
+        restored_logits.clear();
+        logits_valid = false;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -266,6 +277,10 @@ struct server_slot {
 
         // clear alora start
         alora_invocation_start = -1;
+
+        // D4: clear per-slot restored logits on slot reset
+        restored_logits.clear();
+        logits_valid = false;
     }
 
     void init_sampler() const {
@@ -3348,18 +3363,19 @@ private:
                         slot->n_prompt_tokens_cache = 0;
                         llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot->id, -1, -1);
                     } else {
-                        // Inject trailing logits if present — activation handoff from PREFILL.
-                        // PREFILL appends n_vocab floats after the KV state so the decode GPU
-                        // can call common_sampler_sample immediately without a re-prefill pass.
+                        // D4: Inject trailing logits into per-slot buffer instead of the
+                        // shared context-wide llama_get_logits(). This avoids the race where
+                        // another slot's decode clobbers restored logits between STATE_PUT
+                        // and the first sample.
                         const size_t remaining = state_len - n_read;
                         const size_t expected_logits = (size_t)llama_vocab_n_tokens(vocab) * sizeof(float);
                         if (remaining == expected_logits) {
-                            float * ctx_logits = llama_get_logits(ctx_tgt);
-                            if (ctx_logits) {
-                                memcpy(ctx_logits, state_ptr + n_read, expected_logits);
-                                SRV_INF("hydra: STATE_PUT slot=%d injected %zu B logits\n",
-                                        id_slot, expected_logits);
-                            }
+                            const float * src = (const float *)(state_ptr + n_read);
+                            const size_t n_floats = llama_vocab_n_tokens(vocab);
+                            slot->restored_logits.assign(src, src + n_floats);
+                            slot->logits_valid = true;
+                            SRV_INF("hydra: STATE_PUT slot=%d restored %zu logits to per-slot buffer\n",
+                                    id_slot, n_floats);
                         }
 
                         res->rpc_status = HYDRA_STATUS_OK;
@@ -5199,6 +5215,10 @@ private:
                 common_context_seq_rm (ctx_tgt, slot.id, n_keep            , n_keep + n_discard);
                 common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
+                // D4: seq_rm invalidates restored logits
+                slot.logits_valid = false;
+                slot.restored_logits.clear();
+
                 if (ctx_dft) {
                     common_context_seq_rm (ctx_dft.get(), slot.id, n_keep            , n_keep + n_discard);
                     common_context_seq_add(ctx_dft.get(), slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
@@ -6262,6 +6282,20 @@ private:
 
                 if (slot.can_speculate() && !slot.spec_draft.empty()) {
                     continue; // sample using speculative decoding
+                }
+
+                // D4: Inject per-slot restored logits into context buffer before first sample.
+                // The sampler reads from llama_get_logits(ctx_tgt), so we copy from the
+                // per-slot buffer that was populated during KV restore.
+                if (slot.logits_valid && !slot.restored_logits.empty() && slot.n_decoded == 0) {
+                    float * ctx_logits = llama_get_logits(slot.ctx_tgt);
+                    if (ctx_logits) {
+                        const size_t n_floats = slot.restored_logits.size();
+                        memcpy(ctx_logits, slot.restored_logits.data(), n_floats * sizeof(float));
+                        SLT_INF(slot, "consumed %zu restored logits from per-slot buffer\n", n_floats);
+                    }
+                    slot.restored_logits.clear();
+                    slot.logits_valid = false;
                 }
 
                 const int tok_idx = slot.i_batch - i;
