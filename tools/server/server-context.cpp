@@ -170,6 +170,11 @@ struct server_slot {
     std::vector<float> restored_logits;
     bool logits_valid = false;
 
+    // DECODE slot reservation: when a sync handler reserves this slot for an
+    // async DECODE_APPLY, this holds the decode_request_id.  Other tasks must
+    // not be assigned to this slot until the reservation is released.
+    int32_t reserved_for_decode_id = -1;
+
     server_prompt prompt;
 
     void prompt_save(server_prompt_cache & prompt_cache) const {
@@ -441,6 +446,9 @@ struct server_slot {
             if (task->is_child()) {
                 prompt_clear(false);
             }
+
+            // Release decode reservation if any
+            reserved_for_decode_id = -1;
 
             reset();
 
@@ -2220,7 +2228,8 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && !slot.hydra_transferring->load() && slot.id != exclude_id_slot) {
+            if (!slot.is_processing() && !slot.hydra_transferring->load()
+                && slot.reserved_for_decode_id == -1 && slot.id != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
             if (free_slots.size() >= n_slots_needed) {
@@ -4063,10 +4072,9 @@ private:
 
             case SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE:
                 {
-                    // Validation-only task: identity check + KV restore.
-                    // Generation is driven by a subsequent SERVER_TASK_TYPE_COMPLETION
-                    // task posted after this returns (via update_slots(), not a
-                    // blocking loop — same mechanism as today's STATE_PUT+HTTP-decode).
+                    // ── Sync phase: Gate A (header-only, no GGUF reads, ~1 ms) ──
+                    // Identity validation, slot reservation, post DECODE_APPLY.
+                    // No model I/O, no KV touched.
                     const int id_slot = task.hydra_action.id_slot;
                     const int32_t decode_request_id = task.hydra_action.decode_request_id;
                     auto res = std::make_unique<server_task_result_hydra_engine>();
@@ -4090,6 +4098,14 @@ private:
                         break;
                     }
 
+                    // Reject if slot is reserved for another decode
+                    if (slot->reserved_for_decode_id != -1 && slot->reserved_for_decode_id != decode_request_id) {
+                        res->rpc_status = HYDRA_STATUS_BUSY;
+                        res->error = "slot reserved for another decode";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
                     // Parse the merged DECODE JSON header
                     json decode_req;
                     try {
@@ -4101,80 +4117,25 @@ private:
                         break;
                     }
 
-                    // ── Model swap (if requested model != resident) ─────────
-                    // The optional "model" field in the DECODE JSON header
-                    // triggers a model load/swap before KV restore, matching
-                    // the PREFILL handler's model-swap pattern. This enables
-                    // the Coordinator to request a specific model for decode
-                    // without a separate HTTP /models/load round-trip.
-                    const std::string requested_model = decode_req.value("model", std::string());
-                    if (!requested_model.empty()) {
-                        auto it = preset_alias_to_path.find(requested_model);
-                        if (it == preset_alias_to_path.end()) {
-                            SRV_WRN("hydra: DECODE model='%s' unknown (preset has %zu alias(es)) — falling back to resident '%s'\n",
-                                    requested_model.c_str(), preset_alias_to_path.size(),
-                                    model_name.c_str());
-                            res->model_fallback = true;
-                        } else if (it->second != params_base.model.path) {
-                            SRV_INF("hydra: DECODE model='%s' swapping %s -> %s\n",
-                                    requested_model.c_str(), params_base.model.path.c_str(),
-                                    it->second.c_str());
-                            common_params swapped_params = params_base;
-                            swapped_params.model.path   = it->second;
-                            swapped_params.model_alias  = { requested_model };
-                            const int64_t model_load_start_ms = ggml_time_ms();
-                            if (!load_model(swapped_params)) {
-                                res->rpc_status = HYDRA_STATUS_ERROR;
-                                res->error = "model swap to '" + requested_model + "' failed";
-                                queue_results.send(std::move(res));
-                                break;
-                            }
-                            res->model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
-                            SRV_INF("hydra: DECODE swap confirmed model_alias='%s' tokenizer='%s' model_name='%s' quant='%s' caps=0x%x model_load_ms=%.1f\n",
-                                    requested_model.c_str(),
-                                    model_tgt ? llama_model_get_tokenizer_model(model_tgt) : "",
-                                    model_tgt ? llama_model_get_display_name(model_tgt) : "",
-                                    model_tgt ? llama_model_get_quant_label(model_tgt) : "",
-                                    model_tgt ? llama_model_get_capabilities_bitfield(model_tgt) : 0,
-                                    res->model_load_ms);
-                            // After load_model, `this` state is reset (new
-                            // slots, new context). Re-look up the slot by id.
-                            slot = get_slot_by_id(id_slot);
-                            if (slot == nullptr) {
-                                res->rpc_status = HYDRA_STATUS_NOT_FOUND;
-                                res->error = "slot disappeared after model swap";
-                                queue_results.send(std::move(res));
-                                break;
-                            }
-                        } else {
-                            SRV_DBG("hydra: DECODE model='%s' already resident, no swap\n",
-                                    requested_model.c_str());
-                        }
-                    }
+                    // ── Gate A: header-only metadata comparison ─────────────
+                    // Compare kv_metadata vs model_metadata from the control
+                    // header. No GGUF reads, no KV touched.
+                    const json & kv_meta    = decode_req["kv_metadata"];
+                    const json & model_meta = decode_req.value("model_metadata", json::object());
 
-                    // ── Model identity validation ────────────────────────────
-                    const json & kv_meta = decode_req["kv_metadata"];
-
-                    // Read resident model identity (thread-safe GGUF getters)
-                    const std::string resident_tokenizer   = llama_model_get_tokenizer_model(model_tgt);
-                    const std::string resident_model_name  = llama_model_get_display_name(model_tgt);
-                    const std::string resident_model_quant = llama_model_get_quant_label(model_tgt);
-                    const uint32_t    resident_capabilities = llama_model_get_capabilities_bitfield(model_tgt);
-
-                    // Read request identity
+                    // Read request identities from header
                     const std::string req_tokenizer   = kv_meta.value("tokenizer", "");
                     const std::string req_model_name  = kv_meta.value("model_name", "");
-                    const std::string req_model_quant = kv_meta.value("model_quant", "");
                     const uint32_t    req_capabilities = kv_meta.value("model_capabilities", 0u);
 
-                    // Compute match
-                    const bool tokenizer_match   = (req_tokenizer == resident_tokenizer);
-                    const bool model_name_match  = (req_model_name == resident_model_name);
-                    const bool model_quant_match = (req_model_quant == resident_model_quant);
-                    const bool model_capabilities_match = (req_capabilities == resident_capabilities);
-                    const uint32_t capabilities_xor = req_capabilities ^ resident_capabilities;
+                    // Read target identities from header
+                    const std::string tgt_tokenizer   = model_meta.value("tokenizer", "");
+                    const std::string tgt_model_name  = model_meta.value("model_name", "");
 
-                    // Bit names for diff (Phase 1 bit assignments: bit0=MTP, bit1=VISION, bit2=REASONING, bit3=TOOL_USE, bit4=CODE)
+                    const bool tokenizer_match  = (req_tokenizer == tgt_tokenizer);
+                    const bool model_name_match = (req_model_name == tgt_model_name);
+                    const uint32_t capabilities_xor = req_capabilities ^ model_meta.value("model_capabilities", 0u);
+
                     static const char * kCapBitNames[] = {"MTP", "VISION", "REASONING", "TOOL_USE", "CODE"};
                     std::vector<std::string> capabilities_diff_bits;
                     for (int b = 0; b < 5; b++) {
@@ -4183,38 +4144,182 @@ private:
                         }
                     }
 
+                    // MTP(bit0) + VISION(bit1) mismatch → hard reject
                     const bool valid = tokenizer_match && model_name_match
-                                       && !(capabilities_xor & 0x3); // MTP(bit0) + VISION(bit1) → hard abort
+                                       && !(capabilities_xor & 0x3);
 
                     json match_j = {
                         {"tokenizer_match",        tokenizer_match},
                         {"model_name_match",       model_name_match},
-                        {"model_capabilities_match", model_capabilities_match},
                         {"capabilities_xor",       capabilities_xor},
                         {"capabilities_diff_bits", capabilities_diff_bits},
-                        {"model_quant_match",      model_quant_match},
-                        {"model_alias_match",      true}, // alias is not part of kv_metadata yet
+                        {"model_quant_match",      kv_meta.value("model_quant", "") == model_meta.value("model_quant", "")},
+                        {"model_alias_match",      true},
                     };
                     res->match_json = match_j;
                     res->match_valid = valid;
 
                     if (!valid) {
-                        // Hard abort: do NOT restore KV into slot
                         res->rpc_status = HYDRA_STATUS_ERROR;
                         res->error = "model_capabilities_mismatch";
-                        SRV_WRN("hydra: DECODE slot=%d identity mismatch — tokenizer=%d name=%d caps_xor=0x%x\n",
+                        SRV_WRN("hydra: DECODE slot=%d Gate A reject — tokenizer=%d name=%d caps_xor=0x%x\n",
                                 id_slot, tokenizer_match, model_name_match, capabilities_xor);
                         queue_results.send(std::move(res));
                         break;
                     }
 
-                    // Log notes for soft mismatches
-                    if (!model_quant_match) {
-                        SRV_INF("hydra: DECODE slot=%d model_quant differs (%s → %s) — mix-quant allowed\n",
-                                id_slot, req_model_quant.c_str(), resident_model_quant.c_str());
+                    // ── Reserve slot ────────────────────────────────────────
+                    slot->reserved_for_decode_id = decode_request_id;
+
+                    SRV_INF("hydra: DECODE slot=%d Gate A pass, reserved for request_id=%d\n",
+                            id_slot, decode_request_id);
+
+                    // ── Send sync validation response ───────────────────────
+                    res->rpc_status = HYDRA_STATUS_OK;
+                    queue_results.send(std::move(res));
+
+                    // ── Post DECODE_APPLY async task ────────────────────────
+                    {
+                        server_task apply_task(SERVER_TASK_TYPE_HYDRA_DECODE_APPLY);
+                        apply_task.id = queue_tasks.get_new_id();
+                        apply_task.hydra_action.id_slot = id_slot;
+                        apply_task.hydra_action.decode_json = std::move(task.hydra_action.decode_json);
+                        apply_task.hydra_action.kv_data = std::move(task.hydra_action.kv_data);
+                        apply_task.hydra_action.decode_request_id = decode_request_id;
+                        queue_tasks.post(std::move(apply_task));
+                        SRV_INF("hydra: DECODE slot=%d posted DECODE_APPLY (request_id=%d)\n",
+                                id_slot, decode_request_id);
+                    }
+                } break;
+
+            case SERVER_TASK_TYPE_HYDRA_DECODE_APPLY:
+                {
+                    // ── Async phase: model swap + Gate B + KV restore + completion ──
+                    const int id_slot = task.hydra_action.id_slot;
+                    const int32_t decode_request_id = task.hydra_action.decode_request_id;
+
+                    // Parse the DECODE JSON header (re-parsed for async context)
+                    json decode_req;
+                    try {
+                        decode_req = json::parse(task.hydra_action.decode_json);
+                    } catch (const std::exception & e) {
+                        SRV_WRN("hydra: DECODE_APPLY slot=%d invalid JSON: %s\n", id_slot, e.what());
+                        // Release reservation on error
+                        server_slot * s = get_slot_by_id(id_slot);
+                        if (s) s->reserved_for_decode_id = -1;
+                        if (routes_ptr) {
+                            server_routes::decode_result_entry entry;
+                            entry.id_slot = id_slot;
+                            entry.error = std::string("DECODE_APPLY JSON parse error: ") + e.what();
+                            entry.created_at = std::time(nullptr);
+                            entry.ttl_s = routes_ptr->decode_result_ttl_s;
+                            std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                            routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                            routes_ptr->evict_decode_results_locked();
+                        }
+                        break;
                     }
 
-                    // ── KV restore (reuse STATE_PUT logic) ──────────────────
+                    const json & kv_meta    = decode_req["kv_metadata"];
+                    const json & model_meta = decode_req.value("model_metadata", json::object());
+
+                    // ── Model swap (if requested model != resident) ─────────
+                    const std::string requested_model = decode_req.value("model", std::string());
+                    double model_load_ms = 0.0;
+                    bool model_fallback = false;
+
+                    if (!requested_model.empty()) {
+                        auto it = preset_alias_to_path.find(requested_model);
+                        if (it == preset_alias_to_path.end()) {
+                            SRV_WRN("hydra: DECODE_APPLY slot=%d model='%s' unknown — falling back to resident '%s'\n",
+                                    id_slot, requested_model.c_str(), model_name.c_str());
+                            model_fallback = true;
+                        } else if (it->second != params_base.model.path) {
+                            SRV_INF("hydra: DECODE_APPLY slot=%d model='%s' swapping %s -> %s\n",
+                                    id_slot, requested_model.c_str(), params_base.model.path.c_str(),
+                                    it->second.c_str());
+                            common_params swapped_params = params_base;
+                            swapped_params.model.path  = it->second;
+                            swapped_params.model_alias = { requested_model };
+                            const int64_t model_load_start_ms = ggml_time_ms();
+                            if (!load_model(swapped_params)) {
+                                SRV_WRN("hydra: DECODE_APPLY slot=%d model swap to '%s' failed\n",
+                                        id_slot, requested_model.c_str());
+                                server_slot * s = get_slot_by_id(id_slot);
+                                if (s) s->reserved_for_decode_id = -1;
+                                if (routes_ptr) {
+                                    server_routes::decode_result_entry entry;
+                                    entry.id_slot = id_slot;
+                                    entry.error = "model swap to '" + requested_model + "' failed";
+                                    entry.created_at = std::time(nullptr);
+                                    entry.ttl_s = routes_ptr->decode_result_ttl_s;
+                                    std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                                    routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                                    routes_ptr->evict_decode_results_locked();
+                                }
+                                break;
+                            }
+                            model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
+                            SRV_INF("hydra: DECODE_APPLY slot=%d swap confirmed model_load_ms=%.1f\n",
+                                    id_slot, model_load_ms);
+                        }
+                    }
+
+                    // ── Gate B: post-load identity check ────────────────────
+                    // Compare model_metadata from header vs ACTUAL resident GGUF identity.
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        SRV_WRN("hydra: DECODE_APPLY slot=%d disappeared after model swap\n", id_slot);
+                        if (routes_ptr) {
+                            server_routes::decode_result_entry entry;
+                            entry.id_slot = id_slot;
+                            entry.error = "slot disappeared after model swap";
+                            entry.created_at = std::time(nullptr);
+                            entry.ttl_s = routes_ptr->decode_result_ttl_s;
+                            std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                            routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                            routes_ptr->evict_decode_results_locked();
+                        }
+                        break;
+                    }
+
+                    const std::string resident_tokenizer   = llama_model_get_tokenizer_model(model_tgt);
+                    const std::string resident_model_name  = llama_model_get_display_name(model_tgt);
+                    const std::string resident_model_quant = llama_model_get_quant_label(model_tgt);
+                    const uint32_t    resident_capabilities = llama_model_get_capabilities_bitfield(model_tgt);
+
+                    const std::string hdr_model_name  = model_meta.value("model_name", "");
+                    const std::string hdr_model_quant = model_meta.value("model_quant", "");
+                    const uint32_t    hdr_capabilities = model_meta.value("model_capabilities", 0u);
+
+                    const bool gate_b_tokenizer   = (resident_tokenizer  == model_meta.value("tokenizer", ""));
+                    const bool gate_b_model_name  = (resident_model_name == hdr_model_name);
+                    const uint32_t gate_b_caps_xor = resident_capabilities ^ hdr_capabilities;
+
+                    if (!gate_b_tokenizer || !gate_b_model_name || (gate_b_caps_xor & 0x3)) {
+                        SRV_WRN("hydra: DECODE_APPLY slot=%d Gate B reject — tokenizer=%d name=%d caps_xor=0x%x\n",
+                                id_slot, gate_b_tokenizer, gate_b_model_name, gate_b_caps_xor);
+                        slot->reserved_for_decode_id = -1;
+                        if (routes_ptr) {
+                            server_routes::decode_result_entry entry;
+                            entry.id_slot = id_slot;
+                            entry.error = "Gate B identity mismatch after model load";
+                            entry.match_json = {{"gate_b_tokenizer", gate_b_tokenizer}, {"gate_b_name", gate_b_model_name}, {"gate_b_caps_xor", gate_b_caps_xor}};
+                            entry.created_at = std::time(nullptr);
+                            entry.ttl_s = routes_ptr->decode_result_ttl_s;
+                            std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                            routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                            routes_ptr->evict_decode_results_locked();
+                        }
+                        break;
+                    }
+
+                    if (resident_model_quant != hdr_model_quant) {
+                        SRV_INF("hydra: DECODE_APPLY slot=%d Gate B quant differs (%s → %s) — mix-quant allowed\n",
+                                id_slot, hdr_model_quant.c_str(), resident_model_quant.c_str());
+                    }
+
+                    // ── KV restore ─────────────────────────────────────────
                     const int64_t restore_start_ms = ggml_time_ms();
 
                     if (!task.hydra_action.kv_data.empty()) {
@@ -4230,9 +4335,18 @@ private:
                             slot->id);
 
                         if (status != 0) {
-                            res->rpc_status = HYDRA_STATUS_ERROR;
-                            res->error = "KV restore failed (llama_state_seq_set_data returned " + std::to_string(status) + ")";
-                            queue_results.send(std::move(res));
+                            SRV_WRN("hydra: DECODE_APPLY slot=%d KV restore failed (%d)\n", id_slot, status);
+                            slot->reserved_for_decode_id = -1;
+                            if (routes_ptr) {
+                                server_routes::decode_result_entry entry;
+                                entry.id_slot = id_slot;
+                                entry.error = "KV restore failed (llama_state_seq_set_data returned " + std::to_string(status) + ")";
+                                entry.created_at = std::time(nullptr);
+                                entry.ttl_s = routes_ptr->decode_result_ttl_s;
+                                std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                                routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                                routes_ptr->evict_decode_results_locked();
+                            }
                             break;
                         }
 
@@ -4243,20 +4357,16 @@ private:
                         }
                     }
 
-                    res->restore_slot_ms = (double)(ggml_time_ms() - restore_start_ms);
-                    res->n_past = slot->n_prompt_tokens_cache + slot->n_decoded;
+                    const double restore_slot_ms = (double)(ggml_time_ms() - restore_start_ms);
+                    const int n_past = slot->n_prompt_tokens_cache + slot->n_decoded;
 
-                    SRV_INF("hydra: DECODE slot=%d identity OK, restore=%.1fms n_past=%d\n",
-                            id_slot, res->restore_slot_ms, res->n_past);
+                    SRV_INF("hydra: DECODE_APPLY slot=%d restore=%.1fms n_past=%d model_load_ms=%.1f\n",
+                            id_slot, restore_slot_ms, n_past, model_load_ms);
 
-                    res->rpc_status = HYDRA_STATUS_OK;
-                    queue_results.send(std::move(res));
+                    // Release reservation — slot is now processing via completion
+                    slot->reserved_for_decode_id = -1;
 
-                    // ── Phase 2: post COMPLETION task for generation ────────
-                    // Build a SERVER_TASK_TYPE_COMPLETION task the same way
-                    // handle_completions_impl does. This runs on the inference
-                    // thread, so we have full access to vocab, model, params, etc.
-                    // The task is posted to the queue and update_slots() drives it.
+                    // ── Build and post COMPLETION task ──────────────────────
                     {
                         json prompt = decode_req["prompt"];
                         json cmpl_data;
@@ -4274,9 +4384,6 @@ private:
 
                         std::string prompt_str;
                         if (prompt.contains("messages") && !prompt["messages"].is_null()) {
-                            // Apply chat template to messages — same path as
-                            // handle_completions_impl / OAII chat completions.
-                            // Build a minimal body for oaicompat_chat_params_parse.
                             json chat_body;
                             chat_body["messages"] = prompt["messages"];
                             if (prompt.contains("tools"))        chat_body["tools"]        = prompt["tools"];
@@ -4292,69 +4399,32 @@ private:
                                 std::vector<raw_buffer> dummy_files;
                                 json chat_result = oaicompat_chat_params_parse(chat_body, chat_params, dummy_files);
                                 prompt_str = chat_result.value("prompt", std::string());
-
-                                // Merge chat-template-derived fields into cmpl_data so
-                                // params_from_json_cmpl picks up grammar, stops, etc.
-                                if (chat_result.contains("grammar") && !chat_result["grammar"].is_null()) {
-                                    cmpl_data["grammar"] = chat_result["grammar"];
-                                }
-                                if (chat_result.contains("grammar_type")) {
-                                    cmpl_data["grammar_type"] = chat_result["grammar_type"];
-                                }
-                                if (chat_result.contains("grammar_lazy")) {
-                                    cmpl_data["grammar_lazy"] = chat_result["grammar_lazy"];
-                                }
-                                if (chat_result.contains("grammar_triggers")) {
-                                    cmpl_data["grammar_triggers"] = chat_result["grammar_triggers"];
-                                }
-                                if (chat_result.contains("chat_format")) {
-                                    cmpl_data["chat_format"] = chat_result["chat_format"];
-                                }
-                                if (chat_result.contains("chat_parser")) {
-                                    cmpl_data["chat_parser"] = chat_result["chat_parser"];
-                                }
-                                if (chat_result.contains("parse_tool_calls")) {
-                                    cmpl_data["parse_tool_calls"] = chat_result["parse_tool_calls"];
-                                }
-                                if (chat_result.contains("preserved_tokens")) {
-                                    cmpl_data["preserved_tokens"] = chat_result["preserved_tokens"];
-                                }
-                                if (chat_result.contains("reasoning_budget_tokens")) {
-                                    cmpl_data["reasoning_budget_tokens"] = chat_result["reasoning_budget_tokens"];
-                                }
-                                if (chat_result.contains("reasoning_budget_start_tag")) {
-                                    cmpl_data["reasoning_budget_start_tag"] = chat_result["reasoning_budget_start_tag"];
-                                }
-                                if (chat_result.contains("reasoning_budget_end_tag")) {
-                                    cmpl_data["reasoning_budget_end_tag"] = chat_result["reasoning_budget_end_tag"];
-                                }
-                                if (chat_result.contains("reasoning_budget_message")) {
-                                    cmpl_data["reasoning_budget_message"] = chat_result["reasoning_budget_message"];
-                                }
-                                if (chat_result.contains("reasoning_control")) {
-                                    cmpl_data["reasoning_control"] = chat_result["reasoning_control"];
-                                }
-                                // Merge additional stop sequences from chat template
+                                if (chat_result.contains("grammar") && !chat_result["grammar"].is_null()) cmpl_data["grammar"] = chat_result["grammar"];
+                                if (chat_result.contains("grammar_type")) cmpl_data["grammar_type"] = chat_result["grammar_type"];
+                                if (chat_result.contains("grammar_lazy")) cmpl_data["grammar_lazy"] = chat_result["grammar_lazy"];
+                                if (chat_result.contains("grammar_triggers")) cmpl_data["grammar_triggers"] = chat_result["grammar_triggers"];
+                                if (chat_result.contains("chat_format")) cmpl_data["chat_format"] = chat_result["chat_format"];
+                                if (chat_result.contains("chat_parser")) cmpl_data["chat_parser"] = chat_result["chat_parser"];
+                                if (chat_result.contains("parse_tool_calls")) cmpl_data["parse_tool_calls"] = chat_result["parse_tool_calls"];
+                                if (chat_result.contains("preserved_tokens")) cmpl_data["preserved_tokens"] = chat_result["preserved_tokens"];
+                                if (chat_result.contains("reasoning_budget_tokens")) cmpl_data["reasoning_budget_tokens"] = chat_result["reasoning_budget_tokens"];
+                                if (chat_result.contains("reasoning_budget_start_tag")) cmpl_data["reasoning_budget_start_tag"] = chat_result["reasoning_budget_start_tag"];
+                                if (chat_result.contains("reasoning_budget_end_tag")) cmpl_data["reasoning_budget_end_tag"] = chat_result["reasoning_budget_end_tag"];
+                                if (chat_result.contains("reasoning_budget_message")) cmpl_data["reasoning_budget_message"] = chat_result["reasoning_budget_message"];
+                                if (chat_result.contains("reasoning_control")) cmpl_data["reasoning_control"] = chat_result["reasoning_control"];
                                 if (chat_result.contains("stop") && chat_result["stop"].is_array()) {
                                     json existing_stops = cmpl_data.value("stop", json::array());
-                                    for (const auto & s : chat_result["stop"]) {
-                                        existing_stops.push_back(s);
-                                    }
+                                    for (const auto & s : chat_result["stop"]) existing_stops.push_back(s);
                                     cmpl_data["stop"] = existing_stops;
                                 }
-                                SRV_INF("hydra: DECODE slot=%d applied chat template to messages (request_id=%d, prompt_len=%zu)\n",
-                                        id_slot, decode_request_id, prompt_str.size());
                             } catch (const std::exception & e) {
-                                SRV_WRN("hydra: DECODE slot=%d chat template failed: %s (request_id=%d)\n",
-                                        id_slot, e.what(), decode_request_id);
+                                SRV_WRN("hydra: DECODE_APPLY slot=%d chat template failed: %s\n", id_slot, e.what());
                                 if (routes_ptr) {
                                     server_routes::decode_result_entry entry;
-                                    entry.id_slot    = id_slot;
-                                    entry.error      = std::string("chat template error: ") + e.what();
-                                    entry.match_json = match_j;
+                                    entry.id_slot = id_slot;
+                                    entry.error = std::string("chat template error: ") + e.what();
                                     entry.created_at = std::time(nullptr);
-                                    entry.ttl_s      = routes_ptr->decode_result_ttl_s;
-
+                                    entry.ttl_s = routes_ptr->decode_result_ttl_s;
                                     std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
                                     routes_ptr->decode_results[decode_request_id] = std::move(entry);
                                     routes_ptr->evict_decode_results_locked();
@@ -4368,8 +4438,6 @@ private:
 
                         auto inputs = tokenize_input_prompts(vocab, mctx, prompt_str, true, true);
                         if (!inputs.empty()) {
-                            // Use a distinct task id for the completion task to avoid racing
-                            // on waiting_task_ids with the validation task's decode_request_id.
                             const int32_t completion_id = queue_tasks.get_new_id();
 
                             server_task cmpl_task(SERVER_TASK_TYPE_COMPLETION);
@@ -4384,31 +4452,28 @@ private:
 
                             queue_results.add_waiting_task_id(completion_id);
                             queue_tasks.post(std::move(cmpl_task));
-                            SRV_INF("hydra: DECODE slot=%d posted COMPLETION task (completion_id=%d, request_id=%d)\n",
+                            SRV_INF("hydra: DECODE_APPLY slot=%d posted COMPLETION (completion_id=%d, request_id=%d)\n",
                                     id_slot, completion_id, decode_request_id);
 
-                            // ── Background consumer: drain queue_results for the
-                            // completion task and populate decode_results so
-                            // GET /v1/decode/{id} has something to return. Mirrors
-                            // the STATE_GET background-thread pattern (see the
-                            // std::thread(...).detach() block earlier in this file).
+                            // ── Background consumer ─────────────────────────
                             if (routes_ptr) {
                                 std::thread([this, completion_id, decode_request_id, id_slot,
                                              match_j, resident_tokenizer, resident_model_name,
                                              resident_model_quant, resident_capabilities,
                                              oaicompat_model_name = model_name,
+                                             model_load_ms, restore_slot_ms, n_past,
                                              &results = queue_results]() mutable {
                                     std::unordered_set<int> ids = {(int)completion_id};
                                     auto res_ptr = results.recv_with_timeout(ids, 120);
                                     results.remove_waiting_task_id(completion_id);
                                     if (!res_ptr) {
-                                        SRV_WRN("hydra: DECODE slot=%d generation timeout (request_id=%d, completion_id=%d)\n",
+                                        SRV_WRN("hydra: DECODE_APPLY slot=%d generation timeout (request_id=%d, completion_id=%d)\n",
                                                 id_slot, decode_request_id, completion_id);
                                         return;
                                     }
                                     auto * cres = dynamic_cast<server_task_result_cmpl_final*>(res_ptr.get());
                                     if (!cres) {
-                                        SRV_WRN("hydra: DECODE slot=%d unexpected result type (request_id=%d, completion_id=%d)\n",
+                                        SRV_WRN("hydra: DECODE_APPLY slot=%d unexpected result type (request_id=%d, completion_id=%d)\n",
                                                 id_slot, decode_request_id, completion_id);
                                         return;
                                     }
@@ -4434,6 +4499,8 @@ private:
                                     metrics["n_past"]            = cres->n_prompt_tokens_cache + cres->n_decoded;
                                     metrics["decode_ms"]         = cres->timings.predicted_ms;
                                     metrics["prompt_ms"]         = cres->timings.prompt_ms;
+                                    metrics["model_load_ms"]     = model_load_ms;
+                                    metrics["restore_slot_ms"]   = restore_slot_ms;
                                     metrics["model_identity"]    = {
                                         {"tokenizer", resident_tokenizer},
                                         {"model_name", resident_model_name},
@@ -4441,20 +4508,19 @@ private:
                                         {"model_capabilities", resident_capabilities}
                                     };
                                     metrics["match"]        = match_j;
-                                    metrics["t3_reloaded"]  = false;  // TODO: wire real T3 reload state
-                                    metrics["t3_reload_ms"] = 0.0;    // TODO: wire real T3 reload timing
+                                    metrics["model_fallback"] = false;
                                     entry.hydra_metrics = metrics;
 
                                     std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
                                     routes_ptr->decode_results[decode_request_id] = std::move(entry);
                                     routes_ptr->evict_decode_results_locked();
 
-                                    SRV_INF("hydra: DECODE slot=%d generation complete, buffered (request_id=%d, n_decoded=%d)\n",
+                                    SRV_INF("hydra: DECODE_APPLY slot=%d generation complete (request_id=%d, n_decoded=%d)\n",
                                             id_slot, decode_request_id, cres->n_decoded);
                                 }).detach();
                             }
                         } else {
-                            SRV_WRN("hydra: DECODE slot=%d tokenization failed, no generation\n", id_slot);
+                            SRV_WRN("hydra: DECODE_APPLY slot=%d tokenization failed\n", id_slot);
                         }
                     }
                 } break;
