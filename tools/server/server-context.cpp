@@ -8434,6 +8434,7 @@ static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ct
     // Register BEFORE posting — server_response::send() silently drops results
     // for ids not in waiting_task_ids.
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     // Wait for result (n_past + state_size always set; state_data only on M1)
@@ -8533,6 +8534,7 @@ static void hydra_handle_state_put(int fd, int slot_id, uint64_t payload_len, co
     const int task_id = task.id;
     // Register BEFORE posting — results for unregistered ids are dropped.
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     // Wait for result from inference thread (30s timeout for large restore)
@@ -8585,6 +8587,7 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
     const int task_id = task.id;
     // Register BEFORE posting — results for unregistered ids are dropped.
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     // Wait for result from inference thread (5s timeout — allows for queue congestion)
@@ -8643,6 +8646,7 @@ static void hydra_handle_configure(int fd, int slot_id, uint64_t payload_len, co
     task.hydra_action.config_json = std::move(config_json);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -8703,6 +8707,7 @@ static void hydra_handle_info(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
     task.hydra_action.id_slot = slot_id;
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -8744,6 +8749,7 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
     task.hydra_action.request_json = std::move(json_str);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -8877,6 +8883,7 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     val_task.hydra_action.kv_data = std::move(kv_data);
     val_task.hydra_action.decode_request_id = decode_request_id;
     ctx.queue_results->add_waiting_task_id(decode_request_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(val_task));
 
     // Wait for validation+restore to complete (30s timeout for large KV blobs)
@@ -8944,6 +8951,7 @@ static void hydra_handle_set_expert_mode(int fd, int slot_id, uint64_t payload_l
     task.hydra_action.expert_mode = std::move(mode);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -9007,6 +9015,7 @@ static void hydra_handle_swap_quant(int fd, int slot_id, uint64_t payload_len, c
     task.hydra_action.tensor_pattern = std::move(tensor_pattern);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -9048,6 +9057,7 @@ static void hydra_handle_pipeline_attach(int fd, int slot_id, uint64_t payload_l
     task.hydra_action.request_json = std::move(json_body);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
