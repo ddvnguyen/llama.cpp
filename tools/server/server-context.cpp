@@ -834,6 +834,10 @@ private:
         mctx = nullptr;
 
         llama_batch_free(batch);
+        batch = {}; // zero dangling pointers to prevent double-free
+                     // if destroy() is called again (e.g. T3 rollback
+                     // after a failed load_model that released the old
+                     // model but never reached llama_batch_init).
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -4995,6 +4999,11 @@ private:
                 if (comma == std::string::npos) break;
                 start = comma + 1;
             }
+            // Null-terminate the overrides list — ggml/model-load
+            // asserts that the last entry has a nullptr pattern.
+            // (Matches the terminator added by common/arg.cpp for
+            // the --override-tensor CLI path; see #499.)
+            swapped_params.tensor_buft_overrides.push_back({nullptr, nullptr});
         }
 
         // COMBINED-mode teardown. We must remove the peer's RPC
@@ -8821,6 +8830,8 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
         return;
     }
 
+    SRV_INF("hydra rpc: DECODE DEBUG json_len=%u (0x%08x)\n", json_len, json_len);
+
     if (json_len > HYDRA_MAX_JSON_HEADER) {
         SRV_WRN("hydra rpc: DECODE JSON header %u B exceeds cap %u B\n",
                 json_len, HYDRA_MAX_JSON_HEADER);
@@ -8833,6 +8844,14 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     if (json_len > 0 && !hydra_recv_all(fd, json_str.data(), json_len)) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
+    }
+
+    if (json_len > 0) {
+        fprintf(stderr, "[DECODE DEBUG] JSON first 20 bytes: ");
+        for (uint32_t i = 0; i < std::min(json_len, 20u); i++) {
+            fprintf(stderr, "%02x ", (uint8_t)json_str[i]);
+        }
+        fprintf(stderr, "\n");
     }
 
     // Read remaining KV bytes
