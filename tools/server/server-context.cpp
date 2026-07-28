@@ -5781,6 +5781,18 @@ private:
                                 // n_slot = tokens resident in KV (blob, prior turn, or prefill).
                                 // n_new  = tokens in the incoming prompt.
                                 // n_common = length of common prefix (== n_past before alora).
+                                //
+                                // SAFETY: Every slot must produce at least one batch row to
+                                // reach common_sampler_sample() (server-context.cpp:6591).
+                                // The batch-assembly loop [6170] adds tokens in
+                                // [slot.prompt.n_tokens(), n_new).  When n_past == n_new
+                                // (zero-prompt decode) that range is empty, leaving the slot
+                                // with no batch row, no slot.i_batch, and a failed
+                                // GGML_ASSERT(batch.n_tokens > 0) at [6240].  All branches
+                                // therefore set n_past < n_new to ensure at least one token
+                                // enters the batch; for the logits_reused path the restored
+                                // logits are injected before sampling (line 6578), so the
+                                // model-computed logits for that row are safely overwritten.
                                 {
                                     const int n_slot = (int) slot.prompt.tokens.size();
                                     const int n_new  = (int) input_tokens.size();
@@ -5796,11 +5808,20 @@ private:
 
                                     if (n_common_val == n_new && logits_valid) {
                                         // Full prompt matches resident KV and restored logits are
-                                        // valid.  Sample directly — zero prompt tokens processed.
-                                        n_past = n_new;
+                                        // valid.  Re-decode the final token so the slot gets a
+                                        // batch row (required to reach common_sampler_sample);
+                                        // the restored logits are injected before sampling,
+                                        // overwriting the model-computed logits for that row.
+                                        // NOTE: n_past cannot be set to n_new here because the
+                                        // batch-assembly loop at [6170] only adds tokens in
+                                        // [slot.prompt.n_tokens(), n_new) — with n_past == n_new
+                                        // zero tokens would be added, leaving the slot with no
+                                        // batch row, no slot.i_batch, and a failed assertion at
+                                        // GGML_ASSERT(batch.n_tokens > 0) [6240].
+                                        n_past = n_new - 1;
                                         slot.logits_reused = true;
-                                        slot.n_prompt_processed = 0;
-                                        SLT_INF(slot, "#PD-TRACE N_COMMON zero-prompt decode n_common=%d logits_reused=true\n", n_common_val);
+                                        slot.n_prompt_processed = 1;
+                                        SLT_INF(slot, "#PD-TRACE N_COMMON zero-prompt decode n_common=%d logits_reused=true (1-token batch row)\n", n_common_val);
                                     } else if (n_common_val == n_new && !logits_valid) {
                                         // Full prompt matches but restored logits are stale or
                                         // absent.  Re-decode the final token to regenerate logits
