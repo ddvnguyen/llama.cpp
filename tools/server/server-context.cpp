@@ -868,6 +868,10 @@ private:
         mctx = nullptr;
 
         llama_batch_free(batch);
+        batch = {}; // zero dangling pointers to prevent double-free
+                     // if destroy() is called again (e.g. T3 rollback
+                     // after a failed load_model that released the old
+                     // model but never reached llama_batch_init).
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -2307,8 +2311,12 @@ private:
 
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // Save the FULL KV state (kv_base + kv_swa) so that in COMBINED mode
+        // the RPC0 (peer GPU) KV is also checkpointed. PARTIAL_ONLY skips
+        // kv_base (full-attention layers) which causes CUDA illegal memory
+        // access on the second turn because the RPC0 backend has stale data.
+        cur.update_tgt(ctx_tgt,       slot.id, 0);
+        cur.update_dft(ctx_dft.get(), slot.id, 0);
 
         SLT_INF(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3068,8 +3076,12 @@ private:
 
                     slot->hydra_transferring->store(true);
 
-                    // M2: background thread streams directly to socket (zero-copy).
-                    // Falls back to buffer path if fd < 0 (no fd in task).
+                    // M2: stream directly to socket (zero-copy).
+                    // Runs SYNCHRONOUSLY on the inference thread to avoid
+                    // concurrent ggml-RPC socket access with llama_decode
+                    // on another slot (fixes crash at ggml-rpc.cpp:532).
+                    // The coordinator already does Store Put as fire-and-forget
+                    // so blocking here only delays slot release, not decode.
                     const int      snap_seq_id = slot->id;
                     llama_context * snap_ctx   = ctx_tgt;
                     // shared_ptr keeps the atomic alive even if the slot is reallocated
@@ -3110,12 +3122,8 @@ private:
                         if (dft_sz > 0) memcpy(snapshot_ckpt.data() + off, ckpt.data_dft.data(), (size_t)dft_sz);
                     }
 
-                    std::thread([snap_ctx, snap_seq_id, state_size, hydra_fd,
-                                 res = std::move(res), flag_ptr,
-                                 prompt_tokens_get, n_past_val,
-                                 hdr_flags, snapshot_ckpt = std::move(snapshot_ckpt),
-                                 &results = queue_results]() mutable {
-                        SRV_INF("hydra: STATE_GET background thread starting (fd=%d state=%.1f MiB)\n",
+                    {
+                        SRV_INF("hydra: STATE_GET streaming (fd=%d state=%.1f MiB)\n",
                                 hydra_fd, state_size / (1024.0 * 1024.0));
                         if (hydra_fd >= 0) {
                             // M2 path: stream v2 blob (header + checkpoint + GPU state) to fd.
@@ -3243,13 +3251,15 @@ private:
                         const uint64_t out_bytes = (hydra_fd >= 0)
                                 ? res->streamed_bytes
                                 : (uint64_t) res->state_data.size();
-                        SRV_INF("hydra: STATE_GET background done slot=%d rpc_status=%d path=%s bytes=%" PRIu64 "\n",
+                        SRV_INF("hydra: STATE_GET done slot=%d rpc_status=%d path=%s bytes=%" PRIu64 "\n",
                                 snap_seq_id, res->rpc_status,
                                 hydra_fd >= 0 ? "M2-stream" : "M1-buffer", out_bytes);
-                        results.send(std::move(res));
-                    }).detach();
+                        queue_results.send(std::move(res));
+                    }
 
-                    // Inference thread returns immediately — no stall on decode for other slots.
+                    // STATE_GET is synchronous — blocks until KV state is fully
+                    // streamed to the socket. The coordinator's Store Put is
+                    // fire-and-forget, so only slot release is delayed.
                 } break;
 
             case SERVER_TASK_TYPE_HYDRA_STATE_PUT:
@@ -5153,6 +5163,11 @@ private:
     bool apply_t3_rebuild() {
         bool is_first_load = !ctx_tgt;
 
+        // Track the last override_tensor string that was actually
+        // applied so we can detect "nothing changed" on subsequent
+        // calls and skip the expensive unload+reload cycle.
+        static std::string old_override_applied;
+
         common_params old_params = params_base;
         common_params swapped_params = params_base;
 
@@ -5286,6 +5301,31 @@ private:
             }
         }
 
+        // Early-exit: if the model and all T3-relevant params are
+        // identical to what is already loaded, skip the expensive
+        // unload+reload cycle.  Without this, every COMPLETION
+        // request that carries hydra_config triggers a full model
+        // swap even when nothing changed (the coordinator sends the
+        // same config on every decode request).
+        if (!is_first_load) {
+            const char * cur_override = llama_hydra_get_pending_override_tensor();
+            bool params_unchanged =
+                swapped_params.model.path == old_params.model.path &&
+                swapped_params.n_gpu_layers == old_params.n_gpu_layers &&
+                swapped_params.split_mode == old_params.split_mode &&
+                ((cur_override == nullptr && old_override_applied.empty()) ||
+                 (cur_override && old_override_applied == cur_override));
+            if (params_unchanged) {
+                // T3 overrides (override_tensor, split_mode) were staged by
+                // the COMPLETION hydra_config path. But the model reload is
+                // being skipped. Clear the staged override so the next decode
+                // uses the current tensor placement (not the staged override).
+                llama_hydra_set_override_tensor(ctx_tgt, nullptr);
+                SRV_INF("%s", "hydra: T3 rebuild: model and params unchanged — skipping reload, cleared staged overrides\n");
+                return true;
+            }
+        }
+
         // COMBINED-mode teardown. We must remove the peer's RPC
         // backend and clear the dual-load bindings BEFORE the
         // model reload — otherwise the new ctx_tgt (post-reload)
@@ -5340,6 +5380,13 @@ private:
             SRV_INF("hydra: T3 rollback succeeded — restored old model '%s'\n",
                     old_params.model.path.c_str());
             return false;
+        }
+
+        // Record the override_tensor that was just applied so the
+        // next call can skip the reload if nothing changed.
+        {
+            const char * cur = llama_hydra_get_pending_override_tensor();
+            old_override_applied = cur ? cur : "";
         }
 
         // T3 reload confirmed. Log model identity for traceability.
@@ -6056,8 +6103,8 @@ private:
                                     if (!do_reset) {
                                         if (it != slot.prompt.checkpoints.rend()) {
                                             // restore the context checkpoint
-                                            it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                            it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            it->load_tgt(ctx_tgt,       slot.id, 0);
+                                            it->load_dft(ctx_dft.get(), slot.id, 0);
 
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -8934,6 +8981,7 @@ static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ct
     // Register BEFORE posting — server_response::send() silently drops results
     // for ids not in waiting_task_ids.
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     // Wait for result (n_past + state_size always set; state_data only on M1)
@@ -9033,6 +9081,7 @@ static void hydra_handle_state_put(int fd, int slot_id, uint64_t payload_len, co
     const int task_id = task.id;
     // Register BEFORE posting — results for unregistered ids are dropped.
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     // Wait for result from inference thread (30s timeout for large restore)
@@ -9085,6 +9134,7 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
     const int task_id = task.id;
     // Register BEFORE posting — results for unregistered ids are dropped.
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     // Wait for result from inference thread (5s timeout — allows for queue congestion)
@@ -9143,6 +9193,7 @@ static void hydra_handle_configure(int fd, int slot_id, uint64_t payload_len, co
     task.hydra_action.config_json = std::move(config_json);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -9203,6 +9254,7 @@ static void hydra_handle_info(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
     task.hydra_action.id_slot = slot_id;
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -9244,6 +9296,7 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
     task.hydra_action.request_json = std::move(json_str);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -9539,6 +9592,7 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     val_task.hydra_action.kv_data = std::move(kv_data);
     val_task.hydra_action.decode_request_id = decode_request_id;
     ctx.queue_results->add_waiting_task_id(decode_request_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(val_task));
 
     // Wait for validation+restore to complete (30s timeout for large KV blobs)
@@ -9606,6 +9660,7 @@ static void hydra_handle_set_expert_mode(int fd, int slot_id, uint64_t payload_l
     task.hydra_action.expert_mode = std::move(mode);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -9669,6 +9724,7 @@ static void hydra_handle_swap_quant(int fd, int slot_id, uint64_t payload_len, c
     task.hydra_action.tensor_pattern = std::move(tensor_pattern);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -9710,6 +9766,7 @@ static void hydra_handle_pipeline_attach(int fd, int slot_id, uint64_t payload_l
     task.hydra_action.request_json = std::move(json_body);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
@@ -9767,12 +9824,22 @@ static void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx) {
         if (!hydra_recv_all(fd, key.data(),      key_len))   break;
         if (!hydra_recv_all(fd, trace_id.data(), trace_len)) break;
 
+        // Slot-key parsing: engine-level opcodes (INFO, CONFIGURE, SET_EXPERT_MODE,
+        // SWAP_QUANT) don't need a valid slot — use slot_id = 0 when the key is
+        // empty or invalid. Slot-level opcodes (STATE_GET, STATE_PUT, STATE_META,
+        // PREFILL, DECODE) still require a valid integer key.
         int slot_id = -1;
-        try { slot_id = std::stoi(key); }
-        catch (...) {
-            SRV_WRN("hydra rpc: invalid slot key '%s'\n", key.c_str());
-            hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
-            continue;
+        bool is_engine_level_op = (op == HYDRA_OP_INFO || op == HYDRA_OP_CONFIGURE ||
+                                   op == HYDRA_OP_SET_EXPERT_MODE || op == HYDRA_OP_SWAP_QUANT);
+        if (key.empty() && is_engine_level_op) {
+            slot_id = 0;
+        } else {
+            try { slot_id = std::stoi(key); }
+            catch (...) {
+                SRV_WRN("hydra rpc: invalid slot key '%s'\n", key.c_str());
+                hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+                continue;
+            }
         }
 
         // Dispatch to handler via task queue (no direct slot access)
