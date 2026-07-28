@@ -469,20 +469,19 @@ std::string                  s_hydra_pending_model_path;            // "" = unch
 } // namespace
 
 int llama_hydra_set_override_tensor(struct llama_context * ctx, const char * pattern) {
-    if (!pattern) {
-        LLAMA_LOG_WARN("hydra: set_override_tensor called with null pattern\n");
-        return -1;
+    // pattern=nullptr clears the staged override (used when T3 rebuild is
+    // skipped but the COMPLETION path already staged an override).
+    s_hydra_pending_override_tensor = pattern ? pattern : "";
+    // NOTE: Do NOT call ggml_backend_sched_reset here. The graph cache
+    // invalidation should happen during the actual model reload (T3 apply),
+    // not at staging time. Resetting at staging time leaves the graph in an
+    // invalidated state when T3 rebuild is skipped, causing CUDA illegal
+    // memory access on the next decode after checkpoint restore.
+    if (pattern) {
+        LLAMA_LOG_INFO("hydra: CONFIGURE override_tensor staged: '%s' (will apply on next model reload)\n", pattern);
+    } else {
+        LLAMA_LOG_INFO("hydra: CONFIGURE override_tensor cleared (T3 rebuild skipped)\n");
     }
-    s_hydra_pending_override_tensor = pattern;
-    // Invalidate graph cache: the next compute will see the new override
-    // and re-place tensors. (See llama-context.cpp: graph reuse key includes
-    // tensor placement; a change to override invalidates the cached graph.)
-    if (ctx) {
-        if (auto sched = ctx->get_sched()) {
-            ggml_backend_sched_reset(sched);
-        }
-    }
-    LLAMA_LOG_INFO("hydra: CONFIGURE override_tensor staged: '%s' (will apply on next model reload)\n", pattern);
     return 0;
 }
 
