@@ -46,6 +46,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_HYDRA_ENGINE_SET_EXPERT_MODE, // 0x44 — switch solo/combined
     SERVER_TASK_TYPE_HYDRA_ENGINE_SWAP_QUANT,      // 0x45 — swap expert quantization
     SERVER_TASK_TYPE_HYDRA_ENGINE_PIPELINE_ATTACH,  // 0x46 — attach to peer engine (issue #287)
+    SERVER_TASK_TYPE_HYDRA_DECODE_APPLY,            // async phase of merged DECODE (0x43)
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common

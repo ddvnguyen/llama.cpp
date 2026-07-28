@@ -44,9 +44,11 @@ static constexpr uint8_t  HYDRA_STATUS_BAD_REQUEST      = 0x05;
 static constexpr uint64_t HYDRA_MAX_STATE_BYTES  = 4ULL * 1024 * 1024 * 1024;
 
 // ── Merged DECODE (0x43) framing constants ─────────────────────────────────────
-static constexpr uint32_t HYDRA_MAX_JSON_HEADER  = 32U * 1024; // 32 KiB cap on JSON header
+static constexpr uint32_t HYDRA_MAX_JSON_HEADER  = 32U * 1024; // 32 KiB cap on JSON header (control header)
+static constexpr uint64_t HYDRA_MAX_PROMPT_BYTES = 64ULL * 1024 * 1024; // 64 MiB cap on prompt segment
 static constexpr int      HYDRA_DECODE_RESULT_TTL_S_DEFAULT = 300;
 static constexpr int      HYDRA_DECODE_RESULT_MAX_DEFAULT   = 1024;
+static constexpr uint8_t  HYDRA_DECODE_HDR_VERSION = 3; // current wire format version
 
 // ── Unified RPC server (Phase 1, #36) ────────────────────────────────────────
 // The protocol-detecting accept loop lives in
