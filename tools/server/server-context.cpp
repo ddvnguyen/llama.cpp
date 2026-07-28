@@ -4944,7 +4944,7 @@ private:
             if (m == "none")      swapped_params.split_mode = LLAMA_SPLIT_MODE_NONE;
             else if (m == "layer") swapped_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
             else if (m == "row")   swapped_params.split_mode = LLAMA_SPLIT_MODE_ROW;
-            else SRV_WRN("hydra: T3 split_mode='%s' unknown; keeping current\n", m);
+            else SRV_WRN("hydra: T3 split_mode='%s' unknown; keeping current\n", m.c_str());
         }
         const size_t n_split = llama_hydra_get_pending_tensor_split_count();
         if (n_split > 0) {
@@ -4965,8 +4965,8 @@ private:
         if (override && *override) {
             // Wire-shape: comma-separated "pattern=buft" pairs (e.g.
             // "blk.*.ffn_*_exps.weight=CPU"). The C++ side stores
-            // these as a vector<llama_model_tensor_buft_override>;
-            // parse the string and append. Buft names are looked up
+            // these as a vector<llama_model_tensor_buft_override>.
+            // Buft names are looked up
             // via ggml_backend_dev_buffer_type() + ggml_backend_buft_name()
             // (mirrors common/arg.cpp:parse_tensor_buffer_overrides).
             ggml_backend_load_all();
@@ -4987,6 +4987,8 @@ private:
             // dangle.  Matches the safe pattern in common/arg.cpp.
             static std::list<std::string> buft_override_patterns;
 
+            std::vector<llama_model_tensor_buft_override> staged;
+
             const std::string ovr(override);
             size_t start = 0;
             while (start < ovr.size()) {
@@ -5002,7 +5004,7 @@ private:
                         llama_model_tensor_buft_override entry;
                         entry.pattern = buft_override_patterns.back().c_str();
                         entry.buft = it->second;
-                        swapped_params.tensor_buft_overrides.push_back(entry);
+                        staged.push_back(entry);
                     } else {
                         SRV_WRN("%s", "hydra: T3 rebuild: override_tensor buft name not in registered list; skipping pattern\n");
                     }
@@ -5010,11 +5012,43 @@ private:
                 if (comma == std::string::npos) break;
                 start = comma + 1;
             }
-            // Null-terminate the overrides list — ggml/model-load
-            // asserts that the last entry has a nullptr pattern.
-            // (Matches the terminator added by common/arg.cpp for
-            // the --override-tensor CLI path; see #499.)
-            swapped_params.tensor_buft_overrides.push_back({nullptr, nullptr});
+
+            // Install the staged patterns *in place of* the base ones instead of
+            // appending to them.
+            //
+            // common_params_parse_ex() (common/arg.cpp) unconditionally pads this
+            // vector out to llama_max_tensor_buft_overrides() entries of
+            // {nullptr, nullptr}, so by the time we get here the real CLI overrides
+            // sit at the head and the rest is terminator padding. push_back() would
+            // land *behind* that padding, which breaks twice over:
+            //   1. common_model_params_to_llama() asserts that back().pattern is
+            //      nullptr, so the engine aborts before the model loads;
+            //   2. even without that assert, llama_model_loader stops scanning at
+            //      the first nullptr pattern, so appended entries are never read —
+            //      the override would be silently dropped and the MoE experts would
+            //      land on the GPU.
+            // Replacing also matches the sibling fields handled above: model.path,
+            // split_mode, n_gpu_layers and tensor_split are all overwritten by the
+            // staged T3 config rather than merged into it.
+            const size_t ntbo = llama_max_tensor_buft_overrides();
+            if (staged.empty()) {
+                // Nothing resolved (every buft name was unknown). Wiping the base
+                // overrides here would silently change how the model is placed, so
+                // keep them and make the no-op explicit.
+                SRV_WRN("%s", "hydra: T3 rebuild: staged override_tensor resolved to no usable patterns; keeping base overrides\n");
+            } else {
+                if (staged.size() + 1 > ntbo) {
+                    SRV_WRN("hydra: T3 rebuild: %zu override_tensor patterns exceed the %zu-entry limit; keeping the first %zu\n",
+                            staged.size(), ntbo, ntbo - 1);
+                    staged.resize(ntbo - 1);
+                }
+                // assign() re-establishes the full terminator padding, so everything
+                // from staged.size() onward is {nullptr, nullptr}.
+                swapped_params.tensor_buft_overrides.assign(ntbo, llama_model_tensor_buft_override{ nullptr, nullptr });
+                for (size_t i = 0; i < staged.size(); ++i) {
+                    swapped_params.tensor_buft_overrides[i] = staged[i];
+                }
+            }
         }
 
         // Early-exit: if the model and all T3-relevant params are
