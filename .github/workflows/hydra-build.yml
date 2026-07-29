@@ -85,6 +85,27 @@ jobs:
           fi
           "$CUDA_PATH/bin/nvcc" --version
 
+      - name: Set up ccache
+        run: |
+          CCACHE_VERSION="4.10.2"
+          CCACHE_BIN="$HOME/.local/bin/ccache"
+
+          if [ ! -x "$CCACHE_BIN" ]; then
+            mkdir -p "$HOME/.local/bin"
+            curl -fsSL "https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/ccache-${CCACHE_VERSION}-linux-x86_64.tar.xz" -o /tmp/ccache.tar.xz
+            tar -xJf /tmp/ccache.tar.xz -C /tmp
+            cp "/tmp/ccache-${CCACHE_VERSION}-linux-x86_64/ccache" "$CCACHE_BIN"
+            rm -rf /tmp/ccache.tar.xz "/tmp/ccache-${CCACHE_VERSION}-linux-x86_64"
+          fi
+
+          # No sudo on this host, so ccache lives under $HOME rather than /usr/local — persists across runs since this is a persistent self-hosted runner
+          mkdir -p "$HOME/.cache/hydra-ccache"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.cache/hydra-ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=10G" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=pch_defines,time_macros,locale" >> "$GITHUB_ENV"
+          "$CCACHE_BIN" --version | head -1
+
       - name: CMake configure
         run: |
           CUDA_PATH="${{ steps.params.outputs.cuda_path }}"
@@ -96,6 +117,9 @@ jobs:
           CMAKE_ARGS="
             -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}
             -DCMAKE_CUDA_COMPILER=${CUDA_PATH}/bin/nvcc
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
             -DGGML_CUDA=ON
             -DGGML_CUDA_FORCE_CUBLAS=ON
             -DGGML_RPC=ON
@@ -137,6 +161,9 @@ jobs:
           TARGET="${{ steps.params.outputs.target }}"
           BUILD_DIR="build_hydra_${{ inputs.architecture }}"
           cmake --build "$BUILD_DIR" --target "$TARGET" -j$(nproc)
+
+      - name: ccache stats
+        run: ccache -s
 
       - name: Sanity check
         run: |
@@ -309,7 +336,23 @@ jobs:
             build-essential \
             g++-14 \
             libssl-dev \
-            libgomp1
+            libgomp1 \
+            ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ inputs.architecture }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ inputs.architecture }}-
+
+      - name: Configure ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=2G" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=pch_defines,time_macros,locale" >> "$GITHUB_ENV"
 
       - name: Compute SHA
         id: meta
@@ -325,6 +368,9 @@ jobs:
 
           CMAKE_ARGS="
             -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
             -DGGML_CUDA=ON
             -DGGML_CUDA_FORCE_CUBLAS=ON
             -DGGML_RPC=ON
@@ -362,6 +408,9 @@ jobs:
           TARGET="${{ steps.params.outputs.target }}"
           BUILD_DIR="build_hydra_${{ inputs.architecture }}"
           cmake --build "$BUILD_DIR" --target "$TARGET" -j$(nproc)
+
+      - name: ccache stats
+        run: ccache -s
 
       - name: Sanity check
         run: |
