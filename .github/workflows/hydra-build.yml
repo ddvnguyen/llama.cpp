@@ -1,0 +1,434 @@
+name: Hydra Build & Push
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_binary:
+        description: "Binary to build"
+        required: true
+        type: choice
+        options:
+          - llama-engine
+          - llama-server
+        default: llama-engine
+      architecture:
+        description: "CUDA architecture target"
+        required: true
+        type: choice
+        options:
+          - sm86-sm120
+          - sm60
+        default: sm86-sm120
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_REPO: ghcr.io/ddvnguyen/llama-server
+
+jobs:
+  # ── Local build (self-hosted runner) ────────────────────────────────────
+  build-local:
+    name: Build (${{ inputs.architecture }}) — local
+    runs-on: self-hosted
+    timeout-minutes: 30
+
+    outputs:
+      image_tag: ${{ steps.push.outputs.image_tag }}
+      image_url: ${{ steps.push.outputs.image_url }}
+      image_size: ${{ steps.push.outputs.image_size }}
+      build_sha: ${{ steps.meta.outputs.sha }}
+      runner: local
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve build parameters
+        id: params
+        run: |
+          ARCH="${{ inputs.architecture }}"
+          BINARY="${{ inputs.target_binary }}"
+
+          case "$ARCH" in
+            sm86-sm120)
+              echo "cuda_arch=86;120" >> "$GITHUB_OUTPUT"
+              echo "cuda_path=/opt/software/cuda/13.2" >> "$GITHUB_OUTPUT"
+              echo "cuda_version=13.2" >> "$GITHUB_OUTPUT"
+              # For sm86-sm120, always use llama-engine (COMBINED mode)
+              if [ "$BINARY" = "llama-server" ]; then
+                echo "target=llama-server" >> "$GITHUB_OUTPUT"
+              else
+                echo "target=llama-engine" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            sm60)
+              echo "cuda_arch=60" >> "$GITHUB_OUTPUT"
+              echo "cuda_path=/opt/software/cuda/12.9" >> "$GITHUB_OUTPUT"
+              echo "cuda_version=12.9" >> "$GITHUB_OUTPUT"
+              # For sm_60, use llama-server (no COMBINED mode on P100)
+              echo "target=llama-server" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+          echo "Building ${BINARY} for ${ARCH} (CUDA ${{ steps.params.outputs.cuda_version }})"
+
+      - name: Verify CUDA toolkit
+        run: |
+          CUDA_PATH="${{ steps.params.outputs.cuda_path }}"
+          if [ ! -d "$CUDA_PATH" ]; then
+            echo "ERROR: CUDA toolkit not found at $CUDA_PATH"
+            exit 1
+          fi
+          "$CUDA_PATH/bin/nvcc" --version
+
+      - name: CMake configure
+        run: |
+          CUDA_PATH="${{ steps.params.outputs.cuda_path }}"
+          CUDA_ARCH="${{ steps.params.outputs.cuda_arch }}"
+          TARGET="${{ steps.params.outputs.target }}"
+          BUILD_DIR="build_hydra_${{ inputs.architecture }}"
+
+          # Base flags shared by all builds
+          CMAKE_ARGS="
+            -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}
+            -DCMAKE_CUDA_COMPILER=${CUDA_PATH}/bin/nvcc
+            -DGGML_CUDA=ON
+            -DGGML_CUDA_FORCE_CUBLAS=ON
+            -DGGML_RPC=ON
+            -DGGML_NVML=ON
+            -DGGML_NATIVE=ON
+            -DCMAKE_BUILD_TYPE=Release
+            -DBUILD_SHARED_LIBS=ON
+            -DCMAKE_BUILD_RPATH=\$ORIGIN
+            -DCMAKE_INSTALL_RPATH=\$ORIGIN
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+            -DLLAMA_BUILD_EXAMPLES=OFF
+            -DLLAMA_BUILD_TESTS=OFF
+          ]
+
+          # Architecture-specific flags
+          if [ "${{ inputs.architecture }}" = "sm86-sm120" ]; then
+            CMAKE_ARGS="$CMAKE_ARGS
+              -DGGML_CUDA_FA=ON
+              -DGGML_CUDA_FA_ALL_QUANTS=ON
+              -DGGML_CUDA_GRAPHS=ON
+              -DGGML_CUDA_NCCL=ON
+            "
+          fi
+
+          # sm_60 needs explicit host compiler and reduced FA
+          if [ "${{ inputs.architecture }}" = "sm60" ]; then
+            CMAKE_ARGS="$CMAKE_ARGS
+              -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14
+              -DGGML_CUDA_FA_ALL_QUANTS=OFF
+            "
+          fi
+
+          echo "CMake args: $CMAKE_ARGS"
+          cmake -B "$BUILD_DIR" -G Ninja $CMAKE_ARGS .
+
+      - name: CMake build
+        run: |
+          TARGET="${{ steps.params.outputs.target }}"
+          BUILD_DIR="build_hydra_${{ inputs.architecture }}"
+          cmake --build "$BUILD_DIR" --target "$TARGET" -j$(nproc)
+
+      - name: Sanity check
+        run: |
+          TARGET="${{ steps.params.outputs.target }}"
+          BUILD_DIR="build_hydra_${{ inputs.architecture }}"
+          VERSION=$("$BUILD_DIR/bin/$TARGET" --version 2>&1 || true)
+          echo "Binary version: $VERSION"
+
+          if echo "$VERSION" | grep -q "\[shared\]"; then
+            echo "✓ Build type: shared (correct)"
+          else
+            echo "✗ WARNING: Build type may not be shared. Expected [shared] in version output."
+            echo "  This could cause hangs on RTX (see #346)."
+          fi
+
+      - name: Compute SHA
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Full SHA: $(git rev-parse HEAD)"
+          echo "Short SHA: $SHORT_SHA"
+
+      - name: Build OCI image
+        run: |
+          TARGET="${{ steps.params.outputs.target }}"
+          BUILD_DIR="build_hydra_${{ inputs.architecture }}"
+          CUDA_VERSION="${{ steps.params.outputs.cuda_version }}"
+          SHORT_SHA="${{ steps.meta.outputs.sha }}"
+          ARCH="${{ inputs.architecture }}"
+          IMAGE_TAG="${ARCH}-${SHORT_SHA}"
+
+          # Copy binary + libs to staging dir
+          mkdir -p staging/bin
+          cp "$BUILD_DIR/bin/$TARGET" staging/bin/
+          cp "$BUILD_DIR/bin/"*.so* staging/bin/ 2>/dev/null || true
+
+          # Build the OCI image
+          podman build \
+            --build-arg CUDA_VERSION="${CUDA_VERSION}" \
+            --build-arg BINARY="${TARGET}" \
+            -t "${IMAGE_REPO}:${IMAGE_TAG}" \
+            -f .github/workflows/hydra-build.Dockerfile \
+            staging/
+
+          # Also tag as latest for this architecture
+          podman tag "${IMAGE_REPO}:${IMAGE_TAG}" "${IMAGE_REPO}:${ARCH}-latest"
+
+          echo "Built image: ${IMAGE_REPO}:${IMAGE_TAG}"
+          podman images "${IMAGE_REPO}:${IMAGE_TAG}"
+
+      - name: Push to ghcr.io
+        id: push
+        run: |
+          TARGET="${{ steps.params.outputs.target }}"
+          ARCH="${{ inputs.architecture }}"
+          SHORT_SHA="${{ steps.meta.outputs.sha }}"
+          IMAGE_TAG="${ARCH}-${SHORT_SHA}"
+
+          # Login to ghcr.io
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+          # Push tagged image
+          podman push "${IMAGE_REPO}:${IMAGE_TAG}"
+          podman push "${IMAGE_REPO}:${ARCH}-latest"
+
+          IMAGE_URL="${IMAGE_REPO}:${IMAGE_TAG}"
+          IMAGE_SIZE=$(podman image inspect "${IMAGE_REPO}:${IMAGE_TAG}" --format '{{.Size}}' 2>/dev/null || echo "unknown")
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_url=$IMAGE_URL" >> "$GITHUB_OUTPUT"
+          echo "image_size=$IMAGE_SIZE" >> "$GITHUB_OUTPUT"
+
+          echo "✓ Pushed: $IMAGE_URL"
+          echo "  Size: $IMAGE_SIZE bytes"
+
+      - name: Summary
+        run: |
+          TARGET="${{ steps.params.outputs.target }}"
+          ARCH="${{ inputs.architecture }}"
+          SHORT_SHA="${{ steps.meta.outputs.sha }}"
+          IMAGE_TAG="${ARCH}-${SHORT_SHA}"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Hydra Build Summary
+
+          | Field | Value |
+          |-------|-------|
+          | Binary | \`$TARGET\` |
+          | Architecture | \`$ARCH\` |
+          | CUDA | \`${{ steps.params.outputs.cuda_version }}\` |
+          | Commit | \`${{ steps.meta.outputs.sha }}\` |
+          | Runner | local (hydra-rtx-host) |
+          | Image | \`${IMAGE_REPO}:${IMAGE_TAG}\` |
+          | Size | \`${{ steps.push.outputs.image_size }}\` bytes |
+
+          ### Deploy
+
+          Update the \`source:\` field in the node config:
+          - \`infra/hydra-head/config/node-rtx.yaml\`
+          - \`infra/hydra-head/config/node-p100.yaml\`
+
+          Then run: \`bash scripts/deploy-hydra-head.sh rtx\`
+          EOF
+
+  # ── Cloud build fallback (ubuntu-latest) ────────────────────────────────
+  build-cloud:
+    name: Build (${{ inputs.architecture }}) — cloud
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: build-local
+    if: failure() || cancelled()
+
+    outputs:
+      image_tag: ${{ steps.push.outputs.image_tag }}
+      image_url: ${{ steps.push.outputs.image_url }}
+      image_size: ${{ steps.push.outputs.image_size }}
+      build_sha: ${{ steps.meta.outputs.sha }}
+      runner: cloud
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve build parameters
+        id: params
+        run: |
+          ARCH="${{ inputs.architecture }}"
+          BINARY="${{ inputs.target_binary }}"
+
+          case "$ARCH" in
+            sm86-sm120)
+              echo "cuda_arch=86;120" >> "$GITHUB_OUTPUT"
+              echo "cuda_version=13.2" >> "$GITHUB_OUTPUT"
+              echo "target=llama-engine" >> "$GITHUB_OUTPUT"
+              ;;
+            sm60)
+              echo "cuda_arch=60" >> "$GITHUB_OUTPUT"
+              echo "cuda_version=12.9" >> "$GITHUB_OUTPUT"
+              echo "target=llama-server" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Install CUDA toolkit
+        run: |
+          CUDA_VERSION="${{ steps.params.outputs.cuda_version }}"
+          CUDA_MAJOR=$(echo "$CUDA_VERSION" | cut -d. -f1)
+          CUDA_MINOR=$(echo "$CUDA_VERSION" | cut -d. -f2)
+
+          # Add NVIDIA CUDA repository
+          curl -fSsL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -o cuda-keyring.deb
+          sudo dpkg -i cuda-keyring.deb
+          rm cuda-keyring.deb
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-toolkit-${CUDA_MAJOR}-${CUDA_MINOR} \
+            libgomp1
+
+          # Set PATH
+          echo "/usr/local/cuda-${CUDA_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            ninja-build \
+            build-essential \
+            g++-14 \
+            libssl-dev \
+            libgomp1
+
+      - name: Compute SHA
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: CMake configure
+        run: |
+          CUDA_ARCH="${{ steps.params.outputs.cuda_arch }}"
+          TARGET="${{ steps.params.outputs.target }}"
+          BUILD_DIR="build_hydra_${{ inputs.architecture }}"
+
+          CMAKE_ARGS="
+            -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}
+            -DGGML_CUDA=ON
+            -DGGML_CUDA_FORCE_CUBLAS=ON
+            -DGGML_RPC=ON
+            -DGGML_NVML=ON
+            -DGGML_NATIVE=OFF
+            -DCMAKE_BUILD_TYPE=Release
+            -DBUILD_SHARED_LIBS=ON
+            -DCMAKE_BUILD_RPATH=\$ORIGIN
+            -DCMAKE_INSTALL_RPATH=\$ORIGIN
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+            -DLLAMA_BUILD_EXAMPLES=OFF
+            -DLLAMA_BUILD_TESTS=OFF
+          "
+
+          if [ "${{ inputs.architecture }}" = "sm86-sm120" ]; then
+            CMAKE_ARGS="$CMAKE_ARGS
+              -DGGML_CUDA_FA=ON
+              -DGGML_CUDA_FA_ALL_QUANTS=ON
+              -DGGML_CUDA_GRAPHS=ON
+              -DGGML_CUDA_NCCL=ON
+            "
+          fi
+
+          if [ "${{ inputs.architecture }}" = "sm60" ]; then
+            CMAKE_ARGS="$CMAKE_ARGS
+              -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14
+              -DGGML_CUDA_FA_ALL_QUANTS=OFF
+            "
+          fi
+
+          cmake -B "$BUILD_DIR" -G Ninja $CMAKE_ARGS .
+
+      - name: CMake build
+        run: |
+          TARGET="${{ steps.params.outputs.target }}"
+          BUILD_DIR="build_hydra_${{ inputs.architecture }}"
+          cmake --build "$BUILD_DIR" --target "$TARGET" -j$(nproc)
+
+      - name: Sanity check
+        run: |
+          TARGET="${{ steps.params.outputs.target }}"
+          BUILD_DIR="build_hydra_${{ inputs.architecture }}"
+          VERSION=$("$BUILD_DIR/bin/$TARGET" --version 2>&1 || true)
+          echo "Binary version: $VERSION"
+
+      - name: Build OCI image
+        run: |
+          TARGET="${{ steps.params.outputs.target }}"
+          BUILD_DIR="build_hydra_${{ inputs.architecture }}"
+          CUDA_VERSION="${{ steps.params.outputs.cuda_version }}"
+          SHORT_SHA="${{ steps.meta.outputs.sha }}"
+          ARCH="${{ inputs.architecture }}"
+          IMAGE_TAG="${ARCH}-${SHORT_SHA}"
+
+          mkdir -p staging/bin
+          cp "$BUILD_DIR/bin/$TARGET" staging/bin/
+          cp "$BUILD_DIR/bin/"*.so* staging/bin/ 2>/dev/null || true
+
+          podman build \
+            --build-arg CUDA_VERSION="${CUDA_VERSION}" \
+            --build-arg BINARY="${TARGET}" \
+            -t "${IMAGE_REPO}:${IMAGE_TAG}" \
+            -f .github/workflows/hydra-build.Dockerfile \
+            staging/
+
+          podman tag "${IMAGE_REPO}:${IMAGE_TAG}" "${IMAGE_REPO}:${ARCH}-latest"
+
+      - name: Push to ghcr.io
+        id: push
+        run: |
+          ARCH="${{ inputs.architecture }}"
+          SHORT_SHA="${{ steps.meta.outputs.sha }}"
+          IMAGE_TAG="${ARCH}-${SHORT_SHA}"
+
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+          podman push "${IMAGE_REPO}:${IMAGE_TAG}"
+          podman push "${IMAGE_REPO}:${ARCH}-latest"
+
+          IMAGE_URL="${IMAGE_REPO}:${IMAGE_TAG}"
+          IMAGE_SIZE=$(podman image inspect "${IMAGE_REPO}:${IMAGE_TAG}" --format '{{.Size}}' 2>/dev/null || echo "unknown")
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_url=$IMAGE_URL" >> "$GITHUB_OUTPUT"
+          echo "image_size=$IMAGE_SIZE" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          TARGET="${{ steps.params.outputs.target }}"
+          ARCH="${{ inputs.architecture }}"
+          SHORT_SHA="${{ steps.meta.outputs.sha }}"
+          IMAGE_TAG="${ARCH}-${SHORT_SHA}"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Hydra Build Summary (Cloud Fallback)
+
+          | Field | Value |
+          |-------|-------|
+          | Binary | \`$TARGET\` |
+          | Architecture | \`$ARCH\` |
+          | CUDA | \`${{ steps.params.outputs.cuda_version }}\` |
+          | Commit | \`${{ steps.meta.outputs.sha }}\` |
+          | Runner | cloud (ubuntu-latest) |
+          | Image | \`${IMAGE_REPO}:${IMAGE_TAG}\` |
+          | Size | \`${{ steps.push.outputs.image_size }}\` bytes |
+          EOF
