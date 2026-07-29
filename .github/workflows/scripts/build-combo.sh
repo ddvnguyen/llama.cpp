@@ -86,8 +86,17 @@ cp "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
 cp "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
 
 echo "=== [$ARCH/$BINARY] Build + push OCI image ==="
+# Docker Hub's nvidia/cuda runtime images are tagged with a full patch
+# version (e.g. 13.2.1), not just major.minor — map our major.minor
+# convention to the newest known-good patch tag for the base image.
+case "$CUDA_VERSION" in
+  13.2) DOCKER_CUDA_VERSION="13.2.1" ;;
+  12.9) DOCKER_CUDA_VERSION="12.9.2" ;;
+  *) echo "::error::No known nvidia/cuda runtime tag mapped for CUDA_VERSION=$CUDA_VERSION"; exit 1 ;;
+esac
+
 podman build \
-  --build-arg CUDA_VERSION="${CUDA_VERSION}" \
+  --build-arg CUDA_VERSION="${DOCKER_CUDA_VERSION}" \
   --build-arg BINARY="${BINARY}" \
   -t "${IMAGE_REPO}:${IMAGE_TAG}" \
   -f .github/workflows/hydra-build.Dockerfile \
