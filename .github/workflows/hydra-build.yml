@@ -92,7 +92,7 @@ jobs:
 
   # ── Parallel: one job per selected combination ──────────────────────────
   build-matrix:
-    name: Build ${{ matrix.arch }} / ${{ matrix.binary }}
+    name: Build ${{ matrix.arch }} / ${{ matrix.binary }} - ${{ inputs.runner_target }}
     needs: resolve
     if: inputs.execution_mode == 'matrix'
     runs-on: ${{ inputs.runner_target == 'cloud' && 'ubuntu-latest' || 'self-hosted' }}
