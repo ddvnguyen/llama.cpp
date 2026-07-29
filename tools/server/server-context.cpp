@@ -4362,10 +4362,65 @@ private:
                         slot->n_prompt_tokens_processed = 0;
                         slot->n_decoded = 0;
 
+                        // The coordinator may send the v2 blob (header + raw KV)
+                        // or just the raw KV data.  Parse the v2 header to extract
+                        // the token list so update_slots()'s n_common decision can
+                        // match incoming tokens against the restored KV — without
+                        // this, prompt.tokens is empty after prompt_clear(), n_past
+                        // computes to 0, and seq_rm(slot, 0, -1) wipes the KV that
+                        // llama_state_seq_set_data just loaded (issue #506).
+                        const uint8_t * kv_ptr = task.hydra_action.kv_data.data();
+                        size_t          kv_len = task.hydra_action.kv_data.size();
+                        int32_t         blob_n_past = 0;
+                        int32_t         blob_n_tok  = 0;
+
+                        const bool is_v2 = kv_len >= 1 && kv_ptr[0] == 0x02;
+                        if (is_v2 && kv_len >= 9) {
+                            memcpy(&blob_n_past, kv_ptr + 1, 4);
+                            memcpy(&blob_n_tok,  kv_ptr + 5, 4);
+
+                            const size_t token_start = 9;
+                            const size_t token_end   = token_start + (size_t)blob_n_tok * sizeof(llama_token);
+                            if (blob_n_tok > 0 && token_end <= kv_len) {
+                                // Restore token list from v2 blob header
+                                slot->prompt.tokens.clear();
+                                const llama_token * tok_ptr = (const llama_token *)(kv_ptr + token_start);
+                                llama_tokens restored_tokens(tok_ptr, tok_ptr + (size_t)blob_n_tok);
+                                slot->prompt.tokens.insert(restored_tokens);
+                                SRV_INF("hydra: DECODE_APPLY slot=%d v2 blob: restored %d tokens from header\n",
+                                        id_slot, blob_n_tok);
+                            }
+
+                            // Skip past v2 header (version + n_past + n_tok + tokens + flags + optional checkpoint)
+                            size_t hdr_offset = token_end;
+                            if (hdr_offset < kv_len) {
+                                const uint8_t flags = kv_ptr[hdr_offset];
+                                hdr_offset += 1;
+                                if (flags & 0x01) {
+                                    // Skip checkpoint: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz | tgt_data | 8B dft_sz | dft_data
+                                    if (hdr_offset + 4 + 4 + 8 + 8 <= kv_len) {
+                                        uint64_t tgt_sz;
+                                        memcpy(&tgt_sz, kv_ptr + hdr_offset + 16, 8);
+                                        hdr_offset += 4 + 4 + 8 + 8 + (size_t)tgt_sz;
+                                        if (hdr_offset + 8 <= kv_len) {
+                                            uint64_t dft_sz;
+                                            memcpy(&dft_sz, kv_ptr + hdr_offset, 8);
+                                            hdr_offset += 8 + (size_t)dft_sz;
+                                        }
+                                    }
+                                }
+                            }
+                            // Advance kv_ptr/kv_len past the v2 header to the raw KV state
+                            if (hdr_offset <= kv_len) {
+                                kv_ptr = kv_ptr + hdr_offset;
+                                kv_len = kv_len - hdr_offset;
+                            }
+                        }
+
                         auto status = llama_state_seq_set_data(
                             ctx_tgt,
-                            task.hydra_action.kv_data.data(),
-                            task.hydra_action.kv_data.size(),
+                            kv_ptr,
+                            kv_len,
                             slot->id);
 
                         if (status != 0) {
@@ -4384,11 +4439,12 @@ private:
                             break;
                         }
 
-                        const int n_past = kv_meta.value("n_past", 0);
+                        const int n_past = is_v2 ? blob_n_past : kv_meta.value("n_past", 0);
                         if (n_past > 0) {
                             slot->n_prompt_tokens_cache = n_past;
                             slot->n_prompt_tokens_processed = n_past;
                         }
+                        slot->just_restored = true;
                     }
 
                     const double restore_slot_ms = (double)(ggml_time_ms() - restore_start_ms);
