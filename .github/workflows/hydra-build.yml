@@ -219,28 +219,27 @@ jobs:
           ARCH="${{ inputs.architecture }}"
           SHORT_SHA="${{ steps.meta.outputs.sha }}"
           IMAGE_TAG="${ARCH}-${SHORT_SHA}"
-
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
           ## Hydra Build Summary
-
+          
           | Field | Value |
           |-------|-------|
-          | Binary | `$TARGET` |
-          | Architecture | `$ARCH` |
-          | CUDA | `${{ steps.params.outputs.cuda_version }}` |
-          | Commit | `${{ steps.meta.outputs.sha }}` |
+          | Binary | \`$TARGET\` |
+          | Architecture | \`$ARCH\` |
+          | CUDA | \`${{ steps.params.outputs.cuda_version }}\` |
+          | Commit | \`${{ steps.meta.outputs.sha }}\` |
           | Runner | local (hydra-rtx-host) |
-          | Image | `${IMAGE_REPO}:${IMAGE_TAG}` |
-          | Size | `${{ steps.push.outputs.image_size }}` bytes |
-
+          | Image | \`${IMAGE_REPO}:${IMAGE_TAG}\` |
+          | Size | \`${{ steps.push.outputs.image_size }}\` bytes |
+          
           ### Deploy
-
-          Update the `source:` field in the node config:
-          - `infra/hydra-head/config/node-rtx.yaml`
-          - `infra/hydra-head/config/node-p100.yaml`
-
-          Then run: `bash scripts/deploy-hydra-head.sh rtx`
-EOF
+          
+          Update the \`source:\` field in the node config:
+          - \`infra/hydra-head/config/node-rtx.yaml\`
+          - \`infra/hydra-head/config/node-p100.yaml\`
+          
+          Then run: \`bash scripts/deploy-hydra-head.sh rtx\`
+          EOF
 
   # ── Cloud build fallback (ubuntu-latest) ────────────────────────────────
   build-cloud:
@@ -418,17 +417,16 @@ EOF
           ARCH="${{ inputs.architecture }}"
           SHORT_SHA="${{ steps.meta.outputs.sha }}"
           IMAGE_TAG="${ARCH}-${SHORT_SHA}"
-
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
           ## Hydra Build Summary (Cloud Fallback)
-
+          
           | Field | Value |
           |-------|-------|
-          | Binary | `$TARGET` |
-          | Architecture | `$ARCH` |
-          | CUDA | `${{ steps.params.outputs.cuda_version }}` |
-          | Commit | `${{ steps.meta.outputs.sha }}` |
+          | Binary | \`$TARGET\` |
+          | Architecture | \`$ARCH\` |
+          | CUDA | \`${{ steps.params.outputs.cuda_version }}\` |
+          | Commit | \`${{ steps.meta.outputs.sha }}\` |
           | Runner | cloud (ubuntu-latest) |
-          | Image | `${IMAGE_REPO}:${IMAGE_TAG}` |
-          | Size | `${{ steps.push.outputs.image_size }}` bytes |
-EOF
+          | Image | \`${IMAGE_REPO}:${IMAGE_TAG}\` |
+          | Size | \`${{ steps.push.outputs.image_size }}\` bytes |
+          EOF
