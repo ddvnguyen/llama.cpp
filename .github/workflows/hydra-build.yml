@@ -191,7 +191,7 @@ jobs:
 
   # ── Sequential: one job, loops over every selected combination ─────────
   build-sequential:
-    name: Build (sequential, ${{ inputs.runner_target }})
+    name: Build (sequential)
     needs: resolve
     if: inputs.execution_mode == 'sequential'
     runs-on: ${{ inputs.runner_target == 'cloud' && 'ubuntu-latest' || 'self-hosted' }}
