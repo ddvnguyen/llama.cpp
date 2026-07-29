@@ -240,7 +240,7 @@ jobs:
           - `infra/hydra-head/config/node-p100.yaml`
 
           Then run: `bash scripts/deploy-hydra-head.sh rtx`
-          EOF
+EOF
 
   # ── Cloud build fallback (ubuntu-latest) ────────────────────────────────
   build-cloud:
@@ -431,4 +431,4 @@ jobs:
           | Runner | cloud (ubuntu-latest) |
           | Image | `${IMAGE_REPO}:${IMAGE_TAG}` |
           | Size | `${{ steps.push.outputs.image_size }}` bytes |
-          EOF
+EOF
