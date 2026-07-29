@@ -5364,6 +5364,14 @@ private:
         // NOTE: load_model() does `params_base = params` internally
         // (line 844), so after a successful load params_base reflects
         // swapped_params — no explicit reassignment needed by us.
+        //
+        // #507: Skip the fit_params probe during T3 rebuild. The probe
+        // does a full model-structure load with no_alloc=true to measure
+        // GPU memory — expensive (~45-90s) and unnecessary here because:
+        // (a) we just freed VRAM by destroying the old model, (b) the new
+        // model's requirements are known (same or smaller), (c) a controlled
+        // inference server has predictable VRAM. Disabling saves ~1 min.
+        swapped_params.fit_params = false;
         if (!load_model(swapped_params)) {
             if (is_first_load) {
                 SRV_WRN("%s", "hydra: T3 first load failed — engine stays empty\n");
