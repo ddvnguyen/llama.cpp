@@ -852,6 +852,14 @@ private:
     // any non-empty `model` value as a fallback signal.
     std::map<std::string, std::string> preset_alias_to_path;
 
+    // Full preset objects keyed by alias, used at swap time to apply the
+    // target model's tensor_buft_overrides, n_gpu_layers, split_mode, etc.
+    // via common_preset::apply_to_params().  Without this, the bare-alias
+    // swap path copies params_base (source model's overrides) and only
+    // patches model.path — causing a VRAM mismatch when the target model
+    // has different tensor placement rules (e.g. n-cpu-moe, override-tensor).
+    std::map<std::string, common_preset> preset_alias_to_preset;
+
     bool sleeping = false;
 
     void destroy() {
@@ -1330,6 +1338,7 @@ private:
         // map is left empty and the PREFILL handler treats any non-empty
         // `model` value as a fallback signal.
         preset_alias_to_path.clear();
+        preset_alias_to_preset.clear();
         if (!params_base.models_preset.empty()) {
             // The preset may be either a single .ini file or a directory
             // containing one .ini per alias. We try the file first, then
@@ -1357,6 +1366,7 @@ private:
                         std::string model_path;
                         if (preset.get_option("LLAMA_ARG_MODEL", model_path) && !model_path.empty()) {
                             preset_alias_to_path[alias] = model_path;
+                            preset_alias_to_preset[alias] = preset;
                             SRV_INF("hydra: preset alias '%s' → %s\n", alias.c_str(), model_path.c_str());
                         }
                     }
@@ -3792,6 +3802,18 @@ private:
                                     requested_model.c_str(), params_base.model.path.c_str(),
                                     it->second.c_str());
                             common_params swapped_params = params_base;
+                            // Apply the target alias's full preset so that
+                            // tensor_buft_overrides, n_gpu_layers, split_mode,
+                            // tensor_split, etc. are replaced — not inherited
+                            // from the source model.
+                            auto pit = preset_alias_to_preset.find(requested_model);
+                            if (pit != preset_alias_to_preset.end()) {
+                                pit->second.apply_to_params(swapped_params);
+                                SRV_INF("hydra: PREFILL swap applied preset for '%s' "
+                                        "(tensor_buft_overrides=%zu entries)\n",
+                                        requested_model.c_str(),
+                                        swapped_params.tensor_buft_overrides.size());
+                            }
                             swapped_params.model.path   = it->second;
                             // Update the alias so model_name is re-derived
                             // correctly in load_model() (model_name is set from
@@ -4273,6 +4295,12 @@ private:
                                     id_slot, requested_model.c_str(), params_base.model.path.c_str(),
                                     it->second.c_str());
                             common_params swapped_params = params_base;
+                            // Apply the target alias's full preset (same
+                            // treatment as the PREFILL path above).
+                            auto pit = preset_alias_to_preset.find(requested_model);
+                            if (pit != preset_alias_to_preset.end()) {
+                                pit->second.apply_to_params(swapped_params);
+                            }
                             swapped_params.model.path  = it->second;
                             swapped_params.model_alias = { requested_model };
                             const int64_t model_load_start_ms = ggml_time_ms();
