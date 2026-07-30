@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       build_llama_engine:
-        description: "Build llama-engine (COMBINED mode — only applies to sm86-sm120)"
+        description: "Build llama-engine (adds Hydra RPC / COMBINED-mode support over llama-server)"
         type: boolean
         default: true
       build_llama_server:
@@ -21,7 +21,7 @@ on:
         type: boolean
         default: true
       arch_sm60:
-        description: "Target sm60 (Tesla P100, CUDA 12.9) — always builds llama-server, no COMBINED peer"
+        description: "Target sm60 (Tesla P100, CUDA 12.9)"
         type: boolean
         default: false
       runner_target:
@@ -73,13 +73,16 @@ jobs:
           fi
 
           if [ "${{ inputs.arch_sm60 }}" = "true" ]; then
-            # sm_60 (P100) has no COMBINED-mode peer — always llama-server,
-            # regardless of the binary checkboxes above.
-            combos+=('{"arch":"sm60","binary":"llama-server","cuda_version":"12.9","cuda_arch":"60"}')
+            if [ "${{ inputs.build_llama_engine }}" = "true" ]; then
+              combos+=('{"arch":"sm60","binary":"llama-engine","cuda_version":"12.9","cuda_arch":"60"}')
+            fi
+            if [ "${{ inputs.build_llama_server }}" = "true" ]; then
+              combos+=('{"arch":"sm60","binary":"llama-server","cuda_version":"12.9","cuda_arch":"60"}')
+            fi
           fi
 
           if [ ${#combos[@]} -eq 0 ]; then
-            echo "::error::No build selected — check at least one architecture (and a binary, for sm86-sm120)."
+            echo "::error::No build selected — check at least one architecture and at least one binary."
             exit 1
           fi
 
