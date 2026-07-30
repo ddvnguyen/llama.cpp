@@ -72,15 +72,16 @@ cmake --build "$BUILD_DIR" --target "$BINARY" -j"$(nproc)"
 
 ccache -s || true
 
-VERSION=$("$BUILD_DIR/bin/$BINARY" --version 2>&1 || true)
-echo "Binary version: $VERSION"
-if echo "$VERSION" | grep -q "\[shared\]"; then
+VERSION_OUTPUT=$("$BUILD_DIR/bin/$BINARY" --version 2>&1 || true)
+echo "Binary version: $VERSION_OUTPUT"
+if echo "$VERSION_OUTPUT" | grep -q "\[shared\]"; then
   echo "OK: build type is shared"
 else
   echo "WARNING: expected [shared] in version output (see hydra_vortex#346) — may hang on RTX"
 fi
 
-IMAGE_TAG="${ARCH}-${BINARY}-${SHORT_SHA}"
+FORK_VERSION=$(tr -d '[:space:]' < VERSION)
+IMAGE_TAG="${ARCH}-${BINARY}-${FORK_VERSION}-${SHORT_SHA}"
 mkdir -p "${STAGING_DIR}/bin"
 cp "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
 cp "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
@@ -114,6 +115,7 @@ echo "Pushed: ${IMAGE_REPO}:${IMAGE_TAG} (${IMAGE_SIZE} bytes)"
   echo ""
   echo "| Field | Value |"
   echo "|-------|-------|"
+  echo "| Fork version | \`${FORK_VERSION}\` |"
   echo "| CUDA | \`${CUDA_VERSION}\` |"
   echo "| Image | \`${IMAGE_REPO}:${IMAGE_TAG}\` |"
   echo "| Size | \`${IMAGE_SIZE}\` bytes |"
