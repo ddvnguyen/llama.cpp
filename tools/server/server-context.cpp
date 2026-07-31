@@ -3808,7 +3808,23 @@ private:
                             // from the source model.
                             auto pit = preset_alias_to_preset.find(requested_model);
                             if (pit != preset_alias_to_preset.end()) {
+                                // Clear inherited tensor_buft_overrides (padded
+                                // to 4096 by common_params_parse_ex) BEFORE
+                                // apply_to_params, which push_back()'s the new
+                                // preset's entries via CLI handlers.  Without
+                                // this, the new entries land after the
+                                // nullptr-terminator and exceed the 4096 limit,
+                                // triggering GGML_ASSERT in
+                                // common_model_params_to_llama (#499 regression).
+                                swapped_params.tensor_buft_overrides.clear();
                                 pit->second.apply_to_params(swapped_params);
+                                // Re-pad to the max with nullptr terminator so
+                                // the model loader can iterate safely.
+                                const size_t ntbo = llama_max_tensor_buft_overrides();
+                                while (swapped_params.tensor_buft_overrides.size() + 1 < ntbo) {
+                                    swapped_params.tensor_buft_overrides.push_back({nullptr, nullptr});
+                                }
+                                swapped_params.tensor_buft_overrides.push_back({nullptr, nullptr});
                                 SRV_INF("hydra: PREFILL swap applied preset for '%s' "
                                         "(tensor_buft_overrides=%zu entries)\n",
                                         requested_model.c_str(),
@@ -4299,7 +4315,14 @@ private:
                             // treatment as the PREFILL path above).
                             auto pit = preset_alias_to_preset.find(requested_model);
                             if (pit != preset_alias_to_preset.end()) {
+                                // Same clear+re-pad as the PREFILL path.
+                                swapped_params.tensor_buft_overrides.clear();
                                 pit->second.apply_to_params(swapped_params);
+                                const size_t ntbo = llama_max_tensor_buft_overrides();
+                                while (swapped_params.tensor_buft_overrides.size() + 1 < ntbo) {
+                                    swapped_params.tensor_buft_overrides.push_back({nullptr, nullptr});
+                                }
+                                swapped_params.tensor_buft_overrides.push_back({nullptr, nullptr});
                             }
                             swapped_params.model.path  = it->second;
                             swapped_params.model_alias = { requested_model };
