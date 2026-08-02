@@ -65,9 +65,6 @@ on:
       p100-image:
         description: "OCI image ref pushed for P100 (sm60)"
         value: ${{ jobs.build-matrix.outputs.p100-image || jobs.build-sequential.outputs.p100-image }}
-    secrets:
-      GITHUB_TOKEN:
-        required: true
 
 permissions:
   contents: read
@@ -88,6 +85,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Validate inputs (workflow_call)
+        if: github.event_name == 'workflow_call'
+        run: |
+          case "${{ inputs.runner_target }}" in
+            local|cloud) ;;
+            *) echo "::error::Invalid runner_target '${{ inputs.runner_target }}' — must be 'local' or 'cloud'"; exit 1 ;;
+          esac
+          case "${{ inputs.execution_mode }}" in
+            matrix|sequential) ;;
+            *) echo "::error::Invalid execution_mode '${{ inputs.execution_mode }}' — must be 'matrix' or 'sequential'"; exit 1 ;;
+          esac
+
       - name: Resolve selected combinations
         id: resolve
         run: |
@@ -96,8 +105,7 @@ jobs:
           if [ "${{ inputs.arch_sm86_sm120 }}" = "true" ]; then
             if [ "${{ inputs.build_llama_engine }}" = "true" ]; then
               combos+=('{"arch":"sm86-sm120","binary":"llama-engine","cuda_version":"13.2","cuda_arch":"86;120"}')
-            fi
-            if [ "${{ inputs.build_llama_server }}" = "true" ]; then
+            elif [ "${{ inputs.build_llama_server }}" = "true" ]; then
               combos+=('{"arch":"sm86-sm120","binary":"llama-server","cuda_version":"13.2","cuda_arch":"86;120"}')
             fi
           fi
@@ -105,8 +113,7 @@ jobs:
           if [ "${{ inputs.arch_sm60 }}" = "true" ]; then
             if [ "${{ inputs.build_llama_engine }}" = "true" ]; then
               combos+=('{"arch":"sm60","binary":"llama-engine","cuda_version":"12.9","cuda_arch":"60"}')
-            fi
-            if [ "${{ inputs.build_llama_server }}" = "true" ]; then
+            elif [ "${{ inputs.build_llama_server }}" = "true" ]; then
               combos+=('{"arch":"sm60","binary":"llama-server","cuda_version":"12.9","cuda_arch":"60"}')
             fi
           fi
@@ -256,7 +263,7 @@ jobs:
       - name: Provision toolchain (local)
         if: inputs.runner_target == 'local'
         run: |
-          for CUDA_VERSION in $(echo '${{ needs.resolve.outputs.combos }}' | jq -r '.[].cuda_version' | sort -u); do
+          for CUDA_VERSION in $(echo '${{ needs.resolve.outputs.combos }}' | jq -r '[.[].cuda_version] | unique[]'); do
             CUDA_PATH="/opt/software/cuda/${CUDA_VERSION}"
             if [ ! -x "$CUDA_PATH/bin/nvcc" ]; then
               echo "ERROR: CUDA toolkit not found at $CUDA_PATH"
@@ -288,7 +295,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build build-essential g++-14 libssl-dev libgomp1 ccache
 
-          for CUDA_VERSION in $(echo '${{ needs.resolve.outputs.combos }}' | jq -r '.[].cuda_version' | sort -u); do
+          for CUDA_VERSION in $(echo '${{ needs.resolve.outputs.combos }}' | jq -r '[.[].cuda_version] | unique[]'); do
             CUDA_MAJOR=$(echo "$CUDA_VERSION" | cut -d. -f1)
             CUDA_MINOR=$(echo "$CUDA_VERSION" | cut -d. -f2)
             sudo apt-get install -y --no-install-recommends cuda-toolkit-${CUDA_MAJOR}-${CUDA_MINOR}
