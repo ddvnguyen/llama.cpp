@@ -61,10 +61,10 @@ on:
     outputs:
       rtx-image:
         description: "OCI image ref pushed for RTX (sm86-sm120)"
-        value: ${{ jobs.build-matrix.outputs.rtx-image || jobs.build-sequential.outputs.rtx-image }}
+        value: ${{ jobs.resolve-outputs.outputs.rtx-image || jobs.build-sequential.outputs.rtx-image }}
       p100-image:
         description: "OCI image ref pushed for P100 (sm60)"
-        value: ${{ jobs.build-matrix.outputs.p100-image || jobs.build-sequential.outputs.p100-image }}
+        value: ${{ jobs.resolve-outputs.outputs.p100-image || jobs.build-sequential.outputs.p100-image }}
 
 permissions:
   contents: read
@@ -139,9 +139,6 @@ jobs:
     if: inputs.execution_mode == 'matrix'
     runs-on: ${{ inputs.runner_target == 'cloud' && 'ubuntu-latest' || 'self-hosted' }}
     timeout-minutes: ${{ inputs.runner_target == 'cloud' && 45 || 30 }}
-    outputs:
-      rtx-image: ${{ steps.set-outputs.outputs.rtx-image }}
-      p100-image: ${{ steps.set-outputs.outputs.p100-image }}
     strategy:
       fail-fast: false
       matrix:
@@ -223,23 +220,6 @@ jobs:
             "${{ matrix.arch }}" "${{ matrix.binary }}" "${{ matrix.cuda_version }}" "${{ matrix.cuda_arch }}" \
             "$CUDA_PATH" "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}"
 
-      # Every matrix instance writes its output.  When both engine and
-      # server target the same arch, last-writer-wins across parallel
-      # jobs is acceptable — the caller gets a valid image ref either
-      # way.  When only server is built, it's the sole writer and fills
-      # the slot (fixes server-only builds returning empty outputs).
-      - name: Set outputs
-        id: set-outputs
-        run: |
-          IMAGE_TAG="${{ matrix.arch }}-${{ matrix.binary }}-${{ needs.resolve.outputs.sha }}"
-          IMAGE="${{ env.IMAGE_REPO }}:${IMAGE_TAG}"
-          if [[ "${{ matrix.arch }}" == sm86-sm120 ]]; then
-            echo "rtx-image=$IMAGE" >> "$GITHUB_OUTPUT"
-          fi
-          if [[ "${{ matrix.arch }}" == sm60 ]]; then
-            echo "p100-image=$IMAGE" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Deploy reminder
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
@@ -250,6 +230,49 @@ jobs:
           - \`infra/hydra-head/config/node-rtx.yaml\`
           - \`infra/hydra-head/config/node-p100.yaml\`
           EOF
+
+  # ── Post-build: deterministically pick canonical image per arch ────────
+  # Matrix jobs don't expose per-instance outputs — GitHub flattens
+  # same-named keys with last-writer-wins (nondeterministic).  Instead
+  # of relying on that, this lightweight job reads the combos list from
+  # resolve (which binaries were requested) and the commit sha, then
+  # constructs the image tag deterministically — preferring llama-engine
+  # over llama-server per arch (engine has Hydra RPC / COMBINED-mode
+  # support that RTX nodes require).
+  resolve-outputs:
+    name: Resolve image outputs
+    needs: [resolve, build-matrix]
+    if: inputs.execution_mode == 'matrix'
+    runs-on: ubuntu-latest
+    outputs:
+      rtx-image: ${{ steps.pick.outputs.rtx-image }}
+      p100-image: ${{ steps.pick.outputs.p100-image }}
+    steps:
+      - name: Pick canonical image per arch
+        id: pick
+        run: |
+          RTX_IMAGE=""
+          P100_IMAGE=""
+          for combo in $(echo '${{ needs.resolve.outputs.combos }}' | jq -c '.[]'); do
+            ARCH=$(echo "$combo" | jq -r '.arch')
+            BINARY=$(echo "$combo" | jq -r '.binary')
+            IMAGE_TAG="${ARCH}-${BINARY}-${{ needs.resolve.outputs.sha }}"
+            IMAGE="${{ env.IMAGE_REPO }}:${IMAGE_TAG}"
+            # Prefer llama-engine over llama-server per arch.  Engine has
+            # Hydra RPC / COMBINED-mode support that RTX nodes require.
+            # If engine is present, it always wins; server only fills the
+            # slot when engine was not selected for this arch.
+            if [[ "$ARCH" == sm86-sm120 ]] && [[ "$BINARY" == llama-engine || -z "$RTX_IMAGE" ]]; then
+              RTX_IMAGE="$IMAGE"
+            fi
+            if [[ "$ARCH" == sm60 ]] && [[ "$BINARY" == llama-engine || -z "$P100_IMAGE" ]]; then
+              P100_IMAGE="$IMAGE"
+            fi
+          done
+          [ -n "$RTX_IMAGE" ] && echo "rtx-image=$RTX_IMAGE" >> "$GITHUB_OUTPUT"
+          [ -n "$P100_IMAGE" ] && echo "p100-image=$P100_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "rtx-image: ${RTX_IMAGE:-'(none)'}"
+          echo "p100-image: ${P100_IMAGE:-'(none)'}"
 
   # ── Sequential: one job, loops over every selected combination ─────────
   build-sequential:
@@ -347,8 +370,8 @@ jobs:
               "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}"
           done
 
-      # Prefer llama-engine per arch (last match wins in the loop), but
-      # fall back to llama-server if engine wasn't built.
+      # Same deterministic logic as resolve-outputs: prefer llama-engine
+      # per arch, fall back to llama-server if engine wasn't built.
       - name: Set outputs
         id: set-outputs
         run: |
