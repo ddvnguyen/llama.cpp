@@ -105,7 +105,8 @@ jobs:
           if [ "${{ inputs.arch_sm86_sm120 }}" = "true" ]; then
             if [ "${{ inputs.build_llama_engine }}" = "true" ]; then
               combos+=('{"arch":"sm86-sm120","binary":"llama-engine","cuda_version":"13.2","cuda_arch":"86;120"}')
-            elif [ "${{ inputs.build_llama_server }}" = "true" ]; then
+            fi
+            if [ "${{ inputs.build_llama_server }}" = "true" ]; then
               combos+=('{"arch":"sm86-sm120","binary":"llama-server","cuda_version":"13.2","cuda_arch":"86;120"}')
             fi
           fi
@@ -113,7 +114,8 @@ jobs:
           if [ "${{ inputs.arch_sm60 }}" = "true" ]; then
             if [ "${{ inputs.build_llama_engine }}" = "true" ]; then
               combos+=('{"arch":"sm60","binary":"llama-engine","cuda_version":"12.9","cuda_arch":"60"}')
-            elif [ "${{ inputs.build_llama_server }}" = "true" ]; then
+            fi
+            if [ "${{ inputs.build_llama_server }}" = "true" ]; then
               combos+=('{"arch":"sm60","binary":"llama-server","cuda_version":"12.9","cuda_arch":"60"}')
             fi
           fi
@@ -221,8 +223,13 @@ jobs:
             "${{ matrix.arch }}" "${{ matrix.binary }}" "${{ matrix.cuda_version }}" "${{ matrix.cuda_arch }}" \
             "$CUDA_PATH" "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}"
 
+      # Only llama-engine writes the output slot — when both binaries are
+      # built for the same arch the engine tag is the canonical one callers
+      # (Hydra deploy-heads.yml) reference.  llama-server still gets built
+      # and pushed; it just doesn't win the metadata race.
       - name: Set outputs
         id: set-outputs
+        if: matrix.binary == 'llama-engine'
         run: |
           IMAGE_TAG="${{ matrix.arch }}-${{ matrix.binary }}-${{ needs.resolve.outputs.sha }}"
           IMAGE="${{ env.IMAGE_REPO }}:${IMAGE_TAG}"
@@ -340,6 +347,8 @@ jobs:
               "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}"
           done
 
+      # Same logic as build-matrix: llama-engine wins the output slot.
+      # When both binaries are built for an arch, prefer the engine tag.
       - name: Set outputs
         id: set-outputs
         run: |
@@ -350,10 +359,10 @@ jobs:
             BINARY=$(echo "$combo" | jq -r '.binary')
             IMAGE_TAG="${ARCH}-${BINARY}-${{ needs.resolve.outputs.sha }}"
             IMAGE="${{ env.IMAGE_REPO }}:${IMAGE_TAG}"
-            if [[ "$ARCH" == sm86-sm120 ]]; then
+            if [[ "$ARCH" == sm86-sm120 ]] && [[ "$BINARY" == llama-engine || -z "$RTX_IMAGE" ]]; then
               RTX_IMAGE="$IMAGE"
             fi
-            if [[ "$ARCH" == sm60 ]]; then
+            if [[ "$ARCH" == sm60 ]] && [[ "$BINARY" == llama-engine || -z "$P100_IMAGE" ]]; then
               P100_IMAGE="$IMAGE"
             fi
           done
