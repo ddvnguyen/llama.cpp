@@ -223,13 +223,13 @@ jobs:
             "${{ matrix.arch }}" "${{ matrix.binary }}" "${{ matrix.cuda_version }}" "${{ matrix.cuda_arch }}" \
             "$CUDA_PATH" "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}"
 
-      # Only llama-engine writes the output slot — when both binaries are
-      # built for the same arch the engine tag is the canonical one callers
-      # (Hydra deploy-heads.yml) reference.  llama-server still gets built
-      # and pushed; it just doesn't win the metadata race.
+      # Every matrix instance writes its output.  When both engine and
+      # server target the same arch, last-writer-wins across parallel
+      # jobs is acceptable — the caller gets a valid image ref either
+      # way.  When only server is built, it's the sole writer and fills
+      # the slot (fixes server-only builds returning empty outputs).
       - name: Set outputs
         id: set-outputs
-        if: matrix.binary == 'llama-engine'
         run: |
           IMAGE_TAG="${{ matrix.arch }}-${{ matrix.binary }}-${{ needs.resolve.outputs.sha }}"
           IMAGE="${{ env.IMAGE_REPO }}:${IMAGE_TAG}"
@@ -347,8 +347,8 @@ jobs:
               "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}"
           done
 
-      # Same logic as build-matrix: llama-engine wins the output slot.
-      # When both binaries are built for an arch, prefer the engine tag.
+      # Prefer llama-engine per arch (last match wins in the loop), but
+      # fall back to llama-server if engine wasn't built.
       - name: Set outputs
         id: set-outputs
         run: |
