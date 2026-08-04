@@ -13,6 +13,7 @@ CUDA_PATH="$5"
 IMAGE_REPO="$6"
 SHORT_SHA="$7"
 RUNNER_TARGET="$8"  # "local" or "cloud" — native/IPO builds only make sense on the box that runs the binary
+PR_ID="$9"          # optional PR id -> image tag suffix -pr<N> (e.g. 532 -> -pr532)
 
 BUILD_DIR="build_hydra_${ARCH}_${BINARY}"
 STAGING_DIR="staging_${ARCH}_${BINARY}"
@@ -81,7 +82,14 @@ else
 fi
 
 FORK_VERSION=$(tr -d '[:space:]' < VERSION)
-IMAGE_TAG="${ARCH}-${BINARY}-${FORK_VERSION}-${SHORT_SHA}"
+# Canonical tag carries fork version + commit SHA + optional PR id. The
+# unversioned ALIAS_TAG mirrors what hydra-build.yml's resolve-outputs /
+# build-sequential construct for the caller, so the deploy flow's derived
+# refs always resolve.
+PR_TAG=""
+[ -n "$PR_ID" ] && PR_TAG="-pr${PR_ID}"
+IMAGE_TAG="${ARCH}-${BINARY}-${FORK_VERSION}-${SHORT_SHA}${PR_TAG}"
+ALIAS_TAG="${ARCH}-${BINARY}-${SHORT_SHA}${PR_TAG}"
 mkdir -p "${STAGING_DIR}/bin"
 cp "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
 cp "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
@@ -104,7 +112,9 @@ podman build \
   "${STAGING_DIR}/"
 
 podman tag "${IMAGE_REPO}:${IMAGE_TAG}" "${IMAGE_REPO}:${ARCH}-${BINARY}-latest"
+podman tag "${IMAGE_REPO}:${IMAGE_TAG}" "${IMAGE_REPO}:${ALIAS_TAG}"
 podman push "${IMAGE_REPO}:${IMAGE_TAG}"
+podman push "${IMAGE_REPO}:${ALIAS_TAG}"
 podman push "${IMAGE_REPO}:${ARCH}-${BINARY}-latest"
 
 IMAGE_SIZE=$(podman image inspect "${IMAGE_REPO}:${IMAGE_TAG}" --format '{{.Size}}' 2>/dev/null || echo "unknown")

@@ -58,6 +58,10 @@ on:
       execution_mode:
         type: string
         default: matrix
+      pr:
+        description: "PR id to embed in the image tag (e.g. 532 -> -pr532). Callers pass it programmatically; auto-detected from the head branch for direct dispatch."
+        type: string
+        default: ""
     outputs:
       rtx-image:
         description: "OCI image ref pushed for RTX (sm86-sm120)"
@@ -78,9 +82,12 @@ jobs:
   resolve:
     name: Resolve build combinations
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     outputs:
       combos: ${{ steps.resolve.outputs.combos }}
       sha: ${{ steps.resolve.outputs.sha }}
+      pr: ${{ steps.pr.outputs.pr }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -131,6 +138,24 @@ jobs:
 
           SHORT_SHA=$(git rev-parse --short HEAD)
           echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve PR id
+        id: pr
+        run: |
+          PR="${{ inputs.pr }}"
+          if [ -z "$PR" ]; then
+            BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
+            if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
+              BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+            fi
+            if [ -n "$BRANCH" ] && [ "$BRANCH" != "HEAD" ]; then
+              PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+            fi
+          fi
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          echo "PR id: ${PR:-none}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ── Parallel: one job per selected combination ──────────────────────────
   build-matrix:
@@ -218,7 +243,7 @@ jobs:
         run: |
           bash .github/workflows/scripts/build-combo.sh \
             "${{ matrix.arch }}" "${{ matrix.binary }}" "${{ matrix.cuda_version }}" "${{ matrix.cuda_arch }}" \
-            "$CUDA_PATH" "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}"
+            "$CUDA_PATH" "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}" "${{ needs.resolve.outputs.pr }}"
 
       - name: Deploy reminder
         run: |
@@ -256,7 +281,9 @@ jobs:
           for combo in $(echo '${{ needs.resolve.outputs.combos }}' | jq -c '.[]'); do
             ARCH=$(echo "$combo" | jq -r '.arch')
             BINARY=$(echo "$combo" | jq -r '.binary')
-            IMAGE_TAG="${ARCH}-${BINARY}-${{ needs.resolve.outputs.sha }}"
+            PR_TAG=""
+            [ -n "${{ needs.resolve.outputs.pr }}" ] && PR_TAG="-pr${{ needs.resolve.outputs.pr }}"
+            IMAGE_TAG="${ARCH}-${BINARY}-${{ needs.resolve.outputs.sha }}${PR_TAG}"
             IMAGE="${{ env.IMAGE_REPO }}:${IMAGE_TAG}"
             # Prefer llama-engine over llama-server per arch.  Engine has
             # Hydra RPC / COMBINED-mode support that RTX nodes require.
@@ -367,7 +394,7 @@ jobs:
 
             bash .github/workflows/scripts/build-combo.sh \
               "$ARCH" "$BINARY" "$CUDA_VERSION" "$CUDA_ARCH" "$CUDA_PATH" \
-              "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}"
+              "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}" "${{ needs.resolve.outputs.pr }}"
           done
 
       # Same deterministic logic as resolve-outputs: prefer llama-engine
@@ -380,7 +407,9 @@ jobs:
           for combo in $(echo '${{ needs.resolve.outputs.combos }}' | jq -c '.[]'); do
             ARCH=$(echo "$combo" | jq -r '.arch')
             BINARY=$(echo "$combo" | jq -r '.binary')
-            IMAGE_TAG="${ARCH}-${BINARY}-${{ needs.resolve.outputs.sha }}"
+            PR_TAG=""
+            [ -n "${{ needs.resolve.outputs.pr }}" ] && PR_TAG="-pr${{ needs.resolve.outputs.pr }}"
+            IMAGE_TAG="${ARCH}-${BINARY}-${{ needs.resolve.outputs.sha }}${PR_TAG}"
             IMAGE="${{ env.IMAGE_REPO }}:${IMAGE_TAG}"
             if [[ "$ARCH" == sm86-sm120 ]] && [[ "$BINARY" == llama-engine || -z "$RTX_IMAGE" ]]; then
               RTX_IMAGE="$IMAGE"
