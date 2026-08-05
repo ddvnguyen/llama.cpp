@@ -5032,6 +5032,7 @@ private:
                         hydra_rpc::update_backends(backends);
                         SRV_INF("P0-1: updated RPC backends to %zu compute device(s)\n", backends.size());
                     }
+                    SRV_INF("%s", "hydra-engine ready — model loaded via CONFIGURE T3\n");
                 }
             }
         }
