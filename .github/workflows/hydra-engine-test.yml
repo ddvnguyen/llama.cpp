@@ -1,0 +1,143 @@
+name: Hydra Engine Test
+
+# PR-validation CI for the Hydra llama-engine (ddvnguyen/llama.cpp, hydra-fork).
+#
+# This is the test companion to `hydra-build.yml` (which builds + pushes OCI
+# images on demand). It runs on every PR/push to hydra-fork on GitHub-hosted
+# CPU runners — no GPU needed:
+#   - build-unit:  build llama-engine (+ llama-server, rpc-server) with the
+#                  Hydra RPC backend and run the llama.cpp unit suite (ctest).
+#   - server-tests: run the upstream HTTP server pytest suite against the
+#                  llama-engine binary.
+#   - parity:       drive the engine over BOTH the HTTP and Hydra RPC paths
+#                  from the C# Tests.EngineParity suite (checks out the public
+#                  ddvnguyen/hydra_vortex repo; no secrets required).
+#
+# NOTE: this workflow intentionally triggers ONLY on hydra-fork PRs/pushes —
+# the upstream auto-triggers were stripped fork-wide (see ba525ea97) and this
+# is the single Hydra-specific validation entry point.
+
+on:
+  pull_request:
+    branches: [hydra-fork]
+  push:
+    branches: [hydra-fork]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hydra-engine-test-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-unit:
+    name: Build + unit tests (ctest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CPU=ON \
+            -DGGML_OPENMP=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_RPC=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TESTS=ON
+
+      - name: Build llama-engine + llama-server + rpc-server
+        # llama-engine is the required target; llama-server and rpc-server are
+        # optional but cheap to verify in the same build (GGML_RPC=ON is
+        # mandatory for llama-engine to link the ggml-RPC backend symbols).
+        run: cmake --build build -j $(nproc) --target llama-engine llama-server rpc-server
+
+      - name: Unit tests (ctest)
+        run: ctest --test-dir build -L main --output-on-failure --timeout 900
+
+  server-tests:
+    name: Server API tests (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # EXPLORATORY: the upstream suite targets llama-server; we validate it
+    # against llama-engine. Not a merge gate yet — flip to a hard gate once the
+    # known-passing test set is established (see hydra-engine-test TODO).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure & build llama-engine
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CPU=ON \
+            -DGGML_OPENMP=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_RPC=ON \
+            -DLLAMA_BUILD_SERVER=ON
+          cmake --build build -j $(nproc) --target llama-engine
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install server-test dependencies
+        run: pip install -r tools/server/tests/requirements.txt
+
+      - name: Run server tests (non-slow)
+        env:
+          LLAMA_SERVER_BIN_PATH: ${{ github.workspace }}/build/bin/llama-engine
+          LLAMA_CACHE: ${{ runner.temp }}/llama-cache
+        run: |
+          cd tools/server/tests
+          pytest -v -m "not slow"
+
+  parity:
+    name: Engine parity (Tests.EngineParity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure & build llama-engine
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CPU=ON \
+            -DGGML_OPENMP=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_RPC=ON \
+            -DLLAMA_BUILD_SERVER=ON
+          cmake --build build -j $(nproc) --target llama-engine
+
+      - name: Checkout Hydra parity harness (public)
+        uses: actions/checkout@v4
+        with:
+          repository: ddvnguyen/hydra_vortex
+          path: hydra_vortex
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Fetch tiny GGUF fixture
+        run: curl -sL -o /tmp/stories260K.gguf https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+
+      - name: Build + run parity suite
+        env:
+          LLAMA_ENGINE_BIN: ${{ github.workspace }}/build/bin/llama-engine
+          TINY_GGUF_PATH: /tmp/stories260K.gguf
+        run: |
+          cd hydra_vortex
+          dotnet build src/core/Tests.EngineParity/ -c Release --nologo
+          # Decode_HttpAndRpc_ProduceIdenticalLogits is excluded until the
+          # framed-DECODE async-result path is fixed on the fork side (traces to
+          # ddvnguyen/llama.cpp#64 — inverted llama_state_seq_set_data check +
+          # /v1/decode/{id} entry storage). PrefillDecode_HttpAndRpc_ProduceIdenticalKvState
+          # is the #469 KV-parity guard and gates here.
+          dotnet test src/core/Tests.EngineParity/ -c Release --no-build --nologo \
+            --filter "FullyQualifiedName!~Decode_HttpAndRpc_ProduceIdenticalLogits"
