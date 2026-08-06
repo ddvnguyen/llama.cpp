@@ -3805,10 +3805,43 @@ private:
                             // Apply the target alias's full preset so that
                             // tensor_buft_overrides, n_gpu_layers, split_mode,
                             // tensor_split, etc. are replaced — not inherited
-                            // from the source model.
+                            // from the source model. Intentionally the FULL
+                            // preset (sampling, chat template, n_ctx, etc.
+                            // included), not just tensor-placement keys: a
+                            // real model swap targets a different model,
+                            // which plausibly needs its own sampling
+                            // defaults/chat template too, not just a new
+                            // memory layout.
                             auto pit = preset_alias_to_preset.find(requested_model);
                             if (pit != preset_alias_to_preset.end()) {
-                                pit->second.apply_to_params(swapped_params);
+                                // Clear inherited tensor_buft_overrides (padded
+                                // to 4096 by common_params_parse_ex) BEFORE
+                                // apply_to_params, which push_back()'s the new
+                                // preset's entries via CLI handlers.  Without
+                                // this, the new entries land after the
+                                // nullptr-terminator and exceed the 4096 limit,
+                                // triggering GGML_ASSERT in
+                                // common_model_params_to_llama (#499 regression).
+                                swapped_params.tensor_buft_overrides.clear();
+                                try {
+                                    // apply_to_params() replays CLI handlers
+                                    // (parse_tensor_buffer_overrides, the
+                                    // n-cpu-moe std::stoi, two-value option
+                                    // parsers) which throw on a malformed
+                                    // target preset. Uncaught, that exception
+                                    // would escape the task-queue loop and
+                                    // kill the task thread — fail the swap
+                                    // instead.
+                                    pit->second.apply_to_params(swapped_params);
+                                    hydra_repad_tensor_buft_overrides(swapped_params, "PREFILL swap");
+                                } catch (const std::exception & e) {
+                                    SRV_WRN("hydra: PREFILL swap preset apply for '%s' failed: %s\n",
+                                            requested_model.c_str(), e.what());
+                                    res->rpc_status = HYDRA_STATUS_ERROR;
+                                    res->error = std::string("model swap preset apply failed: ") + e.what();
+                                    queue_results.send(std::move(res));
+                                    break;
+                                }
                                 SRV_INF("hydra: PREFILL swap applied preset for '%s' "
                                         "(tensor_buft_overrides=%zu entries)\n",
                                         requested_model.c_str(),
@@ -3819,12 +3852,24 @@ private:
                             // correctly in load_model() (model_name is set from
                             // model_alias.first when non-empty).
                             swapped_params.model_alias  = { requested_model };
+                            // #514: tear down COMBINED state before the
+                            // reload — otherwise the engine loads the
+                            // correct model file but keeps routing tokens
+                            // through the stale peer/expert-binding config,
+                            // collapsing decode throughput.
+                            const bool was_combined = hydra_combined_head_attached || hydra_combined_static;
+                            if (was_combined) {
+                                hydra_teardown_combined_before_reload();
+                            }
                             const int64_t model_load_start_ms = ggml_time_ms();
                             if (!load_model(swapped_params)) {
                                 res->rpc_status = HYDRA_STATUS_ERROR;
                                 res->error = "model swap to '" + requested_model + "' failed";
                                 queue_results.send(std::move(res));
                                 break;
+                            }
+                            if (was_combined) {
+                                hydra_reattach_combined_after_reload();
                             }
                             res->model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
                             model_was_swapped = true;
@@ -4296,13 +4341,45 @@ private:
                                     it->second.c_str());
                             common_params swapped_params = params_base;
                             // Apply the target alias's full preset (same
-                            // treatment as the PREFILL path above).
+                            // treatment, and same intentional full-preset
+                            // scope, as the PREFILL path above).
                             auto pit = preset_alias_to_preset.find(requested_model);
+                            bool preset_apply_failed = false;
                             if (pit != preset_alias_to_preset.end()) {
-                                pit->second.apply_to_params(swapped_params);
+                                // Same clear+re-pad+try/catch as the PREFILL path.
+                                swapped_params.tensor_buft_overrides.clear();
+                                try {
+                                    pit->second.apply_to_params(swapped_params);
+                                    hydra_repad_tensor_buft_overrides(swapped_params, "DECODE_APPLY swap");
+                                } catch (const std::exception & e) {
+                                    SRV_WRN("hydra: DECODE_APPLY slot=%d swap preset apply for '%s' failed: %s\n",
+                                            id_slot, requested_model.c_str(), e.what());
+                                    preset_apply_failed = true;
+                                    if (routes_ptr) {
+                                        server_routes::decode_result_entry entry;
+                                        entry.id_slot = id_slot;
+                                        entry.error = std::string("model swap preset apply failed: ") + e.what();
+                                        entry.created_at = std::time(nullptr);
+                                        entry.ttl_s = routes_ptr->decode_result_ttl_s;
+                                        std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                                        routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                                        routes_ptr->evict_decode_results_locked();
+                                    }
+                                }
+                            }
+                            if (preset_apply_failed) {
+                                server_slot * s = get_slot_by_id(id_slot);
+                                if (s) s->reserved_for_decode_id = -1;
+                                break;
                             }
                             swapped_params.model.path  = it->second;
                             swapped_params.model_alias = { requested_model };
+                            // #514: tear down COMBINED state before the
+                            // reload — see hydra_teardown_combined_before_reload().
+                            const bool was_combined = hydra_combined_head_attached || hydra_combined_static;
+                            if (was_combined) {
+                                hydra_teardown_combined_before_reload();
+                            }
                             const int64_t model_load_start_ms = ggml_time_ms();
                             if (!load_model(swapped_params)) {
                                 SRV_WRN("hydra: DECODE_APPLY slot=%d model swap to '%s' failed\n",
@@ -4320,6 +4397,9 @@ private:
                                     routes_ptr->evict_decode_results_locked();
                                 }
                                 break;
+                            }
+                            if (was_combined) {
+                                hydra_reattach_combined_after_reload();
                             }
                             model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
                             SRV_INF("hydra: DECODE_APPLY slot=%d swap confirmed model_load_ms=%.1f\n",
@@ -5238,6 +5318,85 @@ private:
         }
     }
 
+    // Tear down COMBINED-mode RPC peer bindings before a model reload.
+    // Shared by apply_t3_rebuild() and the bare-alias swap paths (PREFILL,
+    // DECODE_APPLY, server-context.cpp ~3800 / ~4310). Must run BEFORE
+    // load_model() — otherwise the new ctx_tgt (post-reload) inherits a
+    // stale binding to the old peer's device. The bare-alias paths used to
+    // skip this entirely: the engine loaded the correct model file but kept
+    // routing tokens through the old COMBINED config, which is #514
+    // (throughput collapses to ~2-4 tok/s after a dynamic model swap).
+    void hydra_teardown_combined_before_reload() {
+        SRV_INF("hydra: tearing down COMBINED before model reload (was head_attached=%d, static=%d)\n",
+                (int) hydra_combined_head_attached, (int) hydra_combined_static);
+        llama_hydra_set_expert_mode(ctx_tgt, 0);
+        if (!hydra_current_peer.empty()) {
+            ctx_tgt->hydra_remove_combined_rpc_backend(hydra_current_peer.c_str());
+        }
+        llama_hydra_clear_combined_bindings(ctx_tgt, hydra_peer.c_str());
+        hydra_combined_head_attached = false;
+    }
+
+    // Re-attach COMBINED-mode bindings after a model reload, mirroring
+    // hydra_teardown_combined_before_reload() above. Layer-split (static)
+    // just re-enables the mode flag — load_model() already preloaded the
+    // peer device with the new tensor_split. Expert-split re-resolves the
+    // peer's RPC device and rebinds the expert tensors; same fail-open
+    // pattern as SET_EXPERT_MODE — if the peer is unreachable, the engine
+    // stays solo and the coordinator's solo-fallback path handles it.
+    void hydra_reattach_combined_after_reload() {
+        SRV_INF("%s", "hydra: re-attaching COMBINED on new model\n");
+        if (hydra_combined_static) {
+            llama_hydra_set_expert_mode(ctx_tgt, 1);
+        } else if (!hydra_peer.empty() && !hydra_combined_pattern.empty()) {
+            if (llama_hydra_peer_reachable(hydra_peer.c_str())) {
+                ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+                if (rpc_reg) {
+                    using add_server_fn_t = ggml_backend_reg_t (*)(const char *);
+                    auto add_server_fn = (add_server_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+                    ggml_backend_reg_t peer_reg = add_server_fn ? add_server_fn(hydra_peer.c_str()) : nullptr;
+                    ggml_backend_dev_t  peer_dev = (peer_reg && ggml_backend_reg_dev_count(peer_reg) > 0) ? ggml_backend_reg_dev_get(peer_reg, 0) : nullptr;
+                    if (peer_dev) {
+                        int32_t n_bound = llama_hydra_rebind_combined_experts(
+                                ctx_tgt, hydra_peer.c_str(), peer_dev, hydra_combined_pattern.c_str());
+                        if (n_bound > 0) {
+                            hydra_combined_head_attached = true;
+                            llama_hydra_set_expert_mode(ctx_tgt, 1);
+                            SRV_INF("hydra: COMBINED re-attached on peer %s (%d layers bound)\n",
+                                    hydra_peer.c_str(), n_bound);
+                        } else {
+                            SRV_WRN("hydra: rebind returned %d; staying solo\n", n_bound);
+                        }
+                    } else {
+                        SRV_WRN("hydra: peer %s has no device; staying solo\n", hydra_peer.c_str());
+                    }
+                } else {
+                    SRV_WRN("%s\n", "hydra: RPC backend not available; staying solo");
+                }
+            } else {
+                SRV_WRN("hydra: peer %s unreachable; staying solo\n", hydra_peer.c_str());
+            }
+        }
+    }
+
+    // Re-pad tensor_buft_overrides to the nullptr-terminated capacity
+    // llama_max_tensor_buft_overrides() after a preset's apply_to_params()
+    // has push_back()'d entries onto a freshly-cleared vector (see the
+    // bare-alias swap paths, server-context.cpp ~3800 / ~4310). Caps at
+    // the limit with the same guard the override_tensor T3 path already
+    // has (below) — apply_to_params() push_backs unconditionally, so an
+    // unusually large preset could otherwise overflow the same 4096-entry
+    // limit this whole clear/re-pad dance exists to respect.
+    void hydra_repad_tensor_buft_overrides(common_params & p, const char * ctx_label) {
+        const size_t ntbo = llama_max_tensor_buft_overrides();
+        if (p.tensor_buft_overrides.size() + 1 > ntbo) {
+            SRV_WRN("hydra: %s: %zu tensor_buft_overrides exceed the %zu-entry limit; keeping the first %zu\n",
+                    ctx_label, p.tensor_buft_overrides.size(), ntbo, ntbo - 1);
+            p.tensor_buft_overrides.resize(ntbo - 1);
+        }
+        p.tensor_buft_overrides.resize(ntbo, llama_model_tensor_buft_override{ nullptr, nullptr });
+    }
+
     // T3 rebuild: full model reload. Uses the staged T3 statics
     // (override_tensor, split_mode, tensor_split, n_gpu_layers,
     // n_cpu_moe, model.path) populated by hydra_apply_t3_mutators().
@@ -5410,21 +5569,11 @@ private:
             }
         }
 
-        // COMBINED-mode teardown. We must remove the peer's RPC
-        // backend and clear the dual-load bindings BEFORE the
-        // model reload — otherwise the new ctx_tgt (post-reload)
-        // would inherit a stale binding to the old peer's device.
-        // Same pattern as SET_EXPERT_MODE (server-context.cpp:~3890).
+        // COMBINED-mode teardown BEFORE the model reload — see
+        // hydra_teardown_combined_before_reload() above.
         const bool was_combined = hydra_combined_head_attached || hydra_combined_static;
         if (!is_first_load && was_combined) {
-            SRV_INF("hydra: T3 rebuild — tearing down COMBINED before model reload (was head_attached=%d, static=%d)\n",
-                    (int) hydra_combined_head_attached, (int) hydra_combined_static);
-            llama_hydra_set_expert_mode(ctx_tgt, 0);
-            if (!hydra_current_peer.empty()) {
-                ctx_tgt->hydra_remove_combined_rpc_backend(hydra_current_peer.c_str());
-            }
-            llama_hydra_clear_combined_bindings(ctx_tgt, hydra_peer.c_str());
-            hydra_combined_head_attached = false;
+            hydra_teardown_combined_before_reload();
         }
 
         // Register any new RPC peer devices before load_model() so the
@@ -5490,51 +5639,10 @@ private:
                 model_tgt ? llama_model_get_capabilities_bitfield(model_tgt) : 0,
                 swapped_params.model.path.c_str());
 
-        // COMBINED-mode reattach (if was combined). The new model
-        // is loaded; the layer-split allocator has already placed
-        // whole layers per the new tensor_split. For expert-split,
-        // re-bind the expert tensors to the peer's RPC backend.
+        // COMBINED-mode reattach AFTER the model reload — see
+        // hydra_reattach_combined_after_reload() above.
         if (was_combined) {
-            SRV_INF("%s", "hydra: T3 rebuild — re-attaching COMBINED on new model\n");
-            if (hydra_combined_static) {
-                // Layer-split: the new load_model() already preloaded
-                // the peer device with the new tensor_split. Nothing
-                // to do beyond re-enabling the mode flag.
-                llama_hydra_set_expert_mode(ctx_tgt, 1);
-            } else if (!hydra_peer.empty() && !hydra_combined_pattern.empty()) {
-                // Expert-split: re-resolve the peer's RPC device,
-                // rebind the expert tensors. Same fail-open pattern
-                // as SET_EXPERT_MODE — if the peer is unreachable,
-                // the engine stays solo and the Coordinator's
-                // ReportsSolo() path handles the fallback.
-                if (llama_hydra_peer_reachable(hydra_peer.c_str())) {
-                    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
-                    if (rpc_reg) {
-                        using add_server_fn_t = ggml_backend_reg_t (*)(const char *);
-                        auto add_server_fn = (add_server_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
-                        ggml_backend_reg_t peer_reg = add_server_fn ? add_server_fn(hydra_peer.c_str()) : nullptr;
-                        ggml_backend_dev_t  peer_dev = (peer_reg && ggml_backend_reg_dev_count(peer_reg) > 0) ? ggml_backend_reg_dev_get(peer_reg, 0) : nullptr;
-                        if (peer_dev) {
-                            int32_t n_bound = llama_hydra_rebind_combined_experts(
-                                    ctx_tgt, hydra_peer.c_str(), peer_dev, hydra_combined_pattern.c_str());
-                            if (n_bound > 0) {
-                                hydra_combined_head_attached = true;
-                                llama_hydra_set_expert_mode(ctx_tgt, 1);
-                                SRV_INF("hydra: T3 rebuild: COMBINED re-attached on peer %s (%d layers bound)\n",
-                                        hydra_peer.c_str(), n_bound);
-                            } else {
-                                SRV_WRN("hydra: T3 rebuild: rebind returned %d; staying solo\n", n_bound);
-                            }
-                        } else {
-                            SRV_WRN("hydra: T3 rebuild: peer %s has no device; staying solo\n", hydra_peer.c_str());
-                        }
-                    } else {
-                        SRV_WRN("%s\n", "hydra: T3 rebuild: RPC backend not available; staying solo");
-                    }
-                } else {
-                    SRV_WRN("hydra: T3 rebuild: peer %s unreachable; staying solo\n", hydra_peer.c_str());
-                }
-            }
+            hydra_reattach_combined_after_reload();
         }
 
         SRV_INF("hydra: T3 rebuild applied (model='%s', split_mode=%d, n_gpu_layers=%d, slots=%zu)\n",
