@@ -38,6 +38,13 @@ on:
           - matrix
           - sequential
         default: matrix
+      runner:
+        description: "Runner pool for resolve jobs. cloud = ubuntu-latest (default), self-hosted = hydra-rtx-host (during GitHub-hosted outages)."
+        type: choice
+        options:
+          - cloud
+          - self-hosted
+        default: cloud
   workflow_call:
     inputs:
       build_llama_engine:
@@ -55,6 +62,10 @@ on:
       runner_target:
         type: string
         default: local
+      runner:
+        description: "Runner pool for resolve jobs. cloud = ubuntu-latest (default), self-hosted = hydra-rtx-host (during GitHub-hosted outages)."
+        type: string
+        default: cloud
       execution_mode:
         type: string
         default: matrix
@@ -81,7 +92,7 @@ jobs:
   # ── Resolve checked boxes into a list of (arch, binary) combos ──────────
   resolve:
     name: Resolve build combinations
-    runs-on: self-hosted
+    runs-on: ${{ inputs.runner == 'self-hosted' && 'self-hosted' || 'ubuntu-latest' }}
     permissions:
       pull-requests: read
     outputs:
@@ -280,7 +291,7 @@ jobs:
     name: Resolve image outputs
     needs: [resolve, build-matrix]
     if: inputs.execution_mode == 'matrix'
-    runs-on: self-hosted
+    runs-on: ${{ inputs.runner == 'self-hosted' && 'self-hosted' || 'ubuntu-latest' }}
     outputs:
       rtx-image: ${{ steps.pick.outputs.rtx-image }}
       p100-image: ${{ steps.pick.outputs.p100-image }}
