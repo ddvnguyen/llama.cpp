@@ -7801,6 +7801,16 @@ void server_routes::init_routes() {
             {"tokens_processed", hr->tokens_processed},
             {"tokens_total",   hr->tokens_total},
             {"elapsed_ms",     hr->elapsed_ms},
+            // #470/A7: model identity — the Coordinator's merged-decode Gate A
+            // compares these against kv_metadata. Without them the engine's
+            // model_metadata came back empty and every COMBINED merged decode
+            // was rejected (tokenizer/name mismatch) before KV restore.
+            {"model_alias",    hr->model_alias},
+            {"model_path",     hr->model_path},
+            {"tokenizer",      hr->tokenizer},
+            {"model_name",     hr->model_name},
+            {"model_quant",    hr->model_quant},
+            {"model_capabilities", hr->model_capabilities},
         });
         return res;
     };
@@ -9661,18 +9671,48 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
             return;
         }
     }
+    // The coordinator sends the prompt segment as the BARE messages array
+    // (item.Request["messages"].ToString()). The generation-merge below and
+    // DECODE_APPLY's chat-template path both expect an OBJECT with a
+    // "messages" key — merging generation keys into an array throws
+    // nlohmann::type_error, which was silently swallowed by the RPC worker
+    // pool (the connection leaked, no response written, coordinator timed out
+    // after 180s). Wrap a bare array so the prompt object matches the
+    // downstream contract.
+    if (prompt_obj.is_array()) {
+        json wrapped;
+        wrapped["messages"] = std::move(prompt_obj);
+        prompt_obj = std::move(wrapped);
+    }
     // Merge generation params from control header into prompt object
-    if (req.contains("generation") && req["generation"].is_object()) {
-        const json & gen = req["generation"];
-        for (auto it = gen.begin(); it != gen.end(); ++it) {
-            if (!prompt_obj.contains(it.key())) {
-                prompt_obj[it.key()] = it.value();
+    std::string decode_json_str;
+    try {
+        if (req.contains("generation") && req["generation"].is_object()) {
+            const json & gen = req["generation"];
+            for (auto it = gen.begin(); it != gen.end(); ++it) {
+                if (!prompt_obj.contains(it.key())) {
+                    prompt_obj[it.key()] = it.value();
+                }
             }
         }
-    }
-    decode_req["prompt"] = std::move(prompt_obj);
+        decode_req["prompt"] = std::move(prompt_obj);
 
-    const std::string decode_json_str = decode_req.dump();
+        decode_json_str = decode_req.dump();
+    } catch (const std::exception & e) {
+        // Never let a malformed prompt object leak the connection: the worker
+        // pool swallows exceptions and the fd stays open with no response,
+        // hanging the coordinator until its own timeout. Always write an
+        // error frame so the caller sees a terminal (retryable-free) result.
+        SRV_WRN("hydra rpc: DECODE prompt build failed (slot %d): %s\n", slot_id, e.what());
+        json err_j = {
+            {"error", std::string("prompt build failed: ") + e.what()},
+            {"decode_request_id", -1},
+        };
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, (uint32_t) err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
+        return;
+    }
 
     // ── Phase 1: sync validate + restore ──────────────────────────────────
     const int32_t decode_request_id = ctx.queue_tasks->get_new_id();

@@ -545,7 +545,17 @@ int llama_engine(int argc, char ** argv) {
                     {"slot_id", slot_id},
                     {"n_past", hr->n_past},
                     {"state_size", hr->state_size},
-                    {"is_processing", hr->is_processing}
+                    {"is_processing", hr->is_processing},
+                    // #470/A7: model identity for the Coordinator's merged-decode
+                    // Gate A. Without these the model_metadata came back empty and
+                    // every COMBINED merged decode was rejected (tokenizer/name
+                    // mismatch) before KV restore.
+                    {"model_alias", hr->model_alias},
+                    {"model_path", hr->model_path},
+                    {"tokenizer", hr->tokenizer},
+                    {"model_name", hr->model_name},
+                    {"model_quant", hr->model_quant},
+                    {"model_capabilities", hr->model_capabilities}
                 };
                 res->data = j.dump();
                 return res;
