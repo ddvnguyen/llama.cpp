@@ -574,6 +574,8 @@ int llama_engine(int argc, char ** argv) {
 
             routes.update_meta(ctx_server);
             ctx_http.is_ready.store(true);
+            LOG_INF("eng  %12.*s: hydra-engine ready — model loaded, HTTP on %s\n",
+                    12, __func__, ctx_http.listening_address.c_str());
         }
 
         shutdown_handler = [&](int) {
@@ -708,7 +710,7 @@ int llama_engine(int argc, char ** argv) {
                 ctx_http.is_ready.store(true);
             }
 
-            LOG_INF("eng  %12.*s: compute-only peer ready — RPC on :%d, HTTP on :%d\n",
+            LOG_INF("eng  %12.*s: hydra-engine ready — compute-only peer, RPC on :%d, HTTP on :%d\n",
                     12, __func__, rpc_port, params.port);
 
             // Block until signal.
