@@ -81,7 +81,7 @@ jobs:
   # ── Resolve checked boxes into a list of (arch, binary) combos ──────────
   resolve:
     name: Resolve build combinations
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       pull-requests: read
     outputs:
@@ -242,7 +242,14 @@ jobs:
           echo "CCACHE_SLOPPINESS=pch_defines,time_macros,locale" >> "$GITHUB_ENV"
 
       - name: Login to ghcr.io
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          if [ -n "$GHCR_PAT" ]; then
+            echo "$GHCR_PAT" | podman login ghcr.io -u ddvnguyen --password-stdin
+          else
+            echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+          fi
 
       - name: Build, package, push
         run: |
@@ -273,7 +280,7 @@ jobs:
     name: Resolve image outputs
     needs: [resolve, build-matrix]
     if: inputs.execution_mode == 'matrix'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     outputs:
       rtx-image: ${{ steps.pick.outputs.rtx-image }}
       p100-image: ${{ steps.pick.outputs.p100-image }}
@@ -383,7 +390,14 @@ jobs:
           echo "CCACHE_SLOPPINESS=pch_defines,time_macros,locale" >> "$GITHUB_ENV"
 
       - name: Login to ghcr.io
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          if [ -n "$GHCR_PAT" ]; then
+            echo "$GHCR_PAT" | podman login ghcr.io -u ddvnguyen --password-stdin
+          else
+            echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+          fi
 
       - name: Build each selected combination
         run: |
