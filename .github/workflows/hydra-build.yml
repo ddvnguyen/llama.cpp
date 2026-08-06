@@ -81,7 +81,7 @@ jobs:
   # ── Resolve checked boxes into a list of (arch, binary) combos ──────────
   resolve:
     name: Resolve build combinations
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       pull-requests: read
     outputs:
@@ -280,7 +280,7 @@ jobs:
     name: Resolve image outputs
     needs: [resolve, build-matrix]
     if: inputs.execution_mode == 'matrix'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     outputs:
       rtx-image: ${{ steps.pick.outputs.rtx-image }}
       p100-image: ${{ steps.pick.outputs.p100-image }}
