@@ -307,17 +307,21 @@ jobs:
             PR_TAG=""
             [ -n "${{ needs.resolve.outputs.pr }}" ] && PR_TAG="-pr${{ needs.resolve.outputs.pr }}"
             IMAGE_TAG="${ARCH}-${BINARY}-${{ needs.resolve.outputs.sha }}${PR_TAG}"
-            IMAGE="${{ env.IMAGE_REPO }}:${IMAGE_TAG}"
-            # Prefer llama-engine over llama-server per arch.  Engine has
-            # Hydra RPC / COMBINED-mode support that RTX nodes require.
-            # If engine is present, it always wins; server only fills the
-            # slot when engine was not selected for this arch.
-            if [[ "$ARCH" == sm86-sm120 ]] && [[ "$BINARY" == llama-engine || -z "$RTX_IMAGE" ]]; then
-              RTX_IMAGE="$IMAGE"
-            fi
-            if [[ "$ARCH" == sm60 ]] && [[ "$BINARY" == llama-engine || -z "$P100_IMAGE" ]]; then
-              P100_IMAGE="$IMAGE"
-            fi
+             IMAGE="${{ env.IMAGE_REPO }}:${IMAGE_TAG}"
+             # Prefer llama-engine over llama-server for RTX (sm86-sm120):
+             # the RTX nodes' heads run llama-engine (Hydra RPC / COMBINED
+             # support). P100 (sm60) is the opposite: its node config runs
+             # the classic llama-server binary (infra/hydra-head/config/
+             # node-p100.yaml binary: llama-server), so P100 must get the
+             # llama-server image — pinning it to the llama-engine image
+             # makes the head fail extraction with "binary 'llama-server'
+             # not found in any layer".
+             if [[ "$ARCH" == sm86-sm120 ]] && [[ "$BINARY" == llama-engine || -z "$RTX_IMAGE" ]]; then
+               RTX_IMAGE="$IMAGE"
+             fi
+             if [[ "$ARCH" == sm60 ]] && [[ "$BINARY" == llama-server || -z "$P100_IMAGE" ]]; then
+               P100_IMAGE="$IMAGE"
+             fi
           done
           [ -n "$RTX_IMAGE" ] && echo "rtx-image=$RTX_IMAGE" >> "$GITHUB_OUTPUT"
           [ -n "$P100_IMAGE" ] && echo "p100-image=$P100_IMAGE" >> "$GITHUB_OUTPUT"
