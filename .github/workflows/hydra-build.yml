@@ -103,11 +103,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          repository: ${{ github.event_name == 'workflow_call' && 'ddvnguyen/llama.cpp' || github.repository }}
-          ref: ${{ github.event_name == 'workflow_call' && 'hydra-fork' || github.ref }}
+          repository: ${{ github.repository == 'ddvnguyen/llama.cpp' && github.repository || 'ddvnguyen/llama.cpp' }}
+          ref: ${{ github.repository == 'ddvnguyen/llama.cpp' && github.ref || 'hydra-fork' }}
 
       - name: Validate inputs (workflow_call)
-        if: github.event_name == 'workflow_call'
+        if: github.repository != 'ddvnguyen/llama.cpp'
         run: |
           case "${{ inputs.runner_target }}" in
             local|cloud) ;;
@@ -186,8 +186,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          repository: ${{ github.event_name == 'workflow_call' && 'ddvnguyen/llama.cpp' || github.repository }}
-          ref: ${{ github.event_name == 'workflow_call' && 'hydra-fork' || github.ref }}
+          repository: ${{ github.repository == 'ddvnguyen/llama.cpp' && github.repository || 'ddvnguyen/llama.cpp' }}
+          ref: ${{ github.repository == 'ddvnguyen/llama.cpp' && github.ref || 'hydra-fork' }}
           fetch-depth: 0
 
       - name: Provision toolchain (local)
@@ -338,8 +338,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          repository: ${{ github.event_name == 'workflow_call' && 'ddvnguyen/llama.cpp' || github.repository }}
-          ref: ${{ github.event_name == 'workflow_call' && 'hydra-fork' || github.ref }}
+          repository: ${{ github.repository == 'ddvnguyen/llama.cpp' && github.repository || 'ddvnguyen/llama.cpp' }}
+          ref: ${{ github.repository == 'ddvnguyen/llama.cpp' && github.ref || 'hydra-fork' }}
           fetch-depth: 0
 
       - name: Provision toolchain (local)
