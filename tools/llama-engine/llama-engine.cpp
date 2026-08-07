@@ -566,6 +566,13 @@ int llama_engine(int argc, char ** argv) {
             ctx_http.post("/chat/completions",    ex_wrapper(routes.post_chat_completions));
             ctx_http.post("/v1/completions",      ex_wrapper(routes.post_completions_oai));
 
+            // Merged DECODE result retrieval (#86): the coordinator polls
+            // GET /v1/decode/{decode_request_id} after the RPC DECODE 0x43
+            // returns Valid=true. Without these routes llama-engine 404s
+            // every poll and the coordinator hangs until its timeout.
+            ctx_http.get ("/v1/decode/:decode_request_id", ex_wrapper(routes.get_decode_result));
+            ctx_http.del ("/v1/decode/:decode_request_id", ex_wrapper(routes.delete_decode_result));
+
             if (!ctx_http.start()) {
                 LOG_ERR("eng  %12.*s: failed to start HTTP server\n", 12, __func__);
                 llama_backend_free();
@@ -795,6 +802,12 @@ int llama_engine(int argc, char ** argv) {
             ctx_http.post("/v1/chat/completions", ex_wrapper(routes.post_chat_completions));
             ctx_http.post("/chat/completions",    ex_wrapper(routes.post_chat_completions));
             ctx_http.post("/v1/completions",      ex_wrapper(routes.post_completions_oai));
+
+            // Merged DECODE result retrieval (#86): register alongside the
+            // completion routes so bootstrap-mode engines can serve
+            // /v1/decode/{id} after CONFIGURE T3 loads the model.
+            ctx_http.get ("/v1/decode/:decode_request_id", ex_wrapper(routes.get_decode_result));
+            ctx_http.del ("/v1/decode/:decode_request_id", ex_wrapper(routes.delete_decode_result));
 
             if (!ctx_http.start()) {
                 LOG_ERR("eng  %12.*s: failed to start HTTP server\n", 12, __func__);
