@@ -360,6 +360,13 @@ int llama_engine(int argc, char ** argv) {
         // ── HTTP server with full inference routes ──
         server_routes routes(params, ctx_server);
 
+        // Set routes_ptr so the merged-decode result buffer
+        // (server_routes::decode_results) is populated by the RPC DECODE
+        // handler. Without this, routes_ptr stays null in has_model mode,
+        // the entry creation is skipped, and GET /v1/decode/{id} 404s
+        // forever even though the route is registered (#86/#470).
+        ctx_server.set_routes_ptr(&routes);
+
         server_http_context ctx_http;
         if (params.port > 0) {
             if (!ctx_http.init(params)) {
