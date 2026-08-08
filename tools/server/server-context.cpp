@@ -4531,7 +4531,13 @@ private:
                             kv_len,
                             slot->id);
 
-                        if (status != 0) {
+                        // llama_state_seq_set_data returns the number of bytes
+                        // read on success (0 means failed to load) — see its
+                        // doc comment in include/llama.h. Checking the full
+                        // expected count (not just nonzero) also catches short
+                        // reads, matching upstream's own call-site convention
+                        // (tools/server/server-task.cpp, tests/test-save-load-state.cpp).
+                        if (status != kv_len) {
                             SRV_WRN("hydra: DECODE_APPLY slot=%d KV restore failed (%d)\n", id_slot, status);
                             slot->reserved_for_decode_id = -1;
                             if (routes_ptr) {
