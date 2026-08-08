@@ -4533,11 +4533,15 @@ private:
 
                         // llama_state_seq_set_data returns the number of bytes
                         // read on success (0 means failed to load) — see its
-                        // doc comment in include/llama.h. Checking the full
-                        // expected count (not just nonzero) also catches short
-                        // reads, matching upstream's own call-site convention
-                        // (tools/server/server-task.cpp, tests/test-save-load-state.cpp).
-                        if (status != kv_len) {
+                        // doc comment in include/llama.h. `status` only counts
+                        // the KV-cache bytes the reader consumed; it does NOT
+                        // include the trailing logits PREFILL_DONE appends
+                        // (see ~line 4098), so status < kv_len is the normal
+                        // case whenever logits are present — compare against
+                        // kv_len here and this false-fails on every restore
+                        // with logits. Matches the STATE_PUT sibling check
+                        // (server-context.cpp ~line 3395: `if (n_read == 0)`).
+                        if (status == 0) {
                             SRV_WRN("hydra: DECODE_APPLY slot=%d KV restore failed (%d)\n", id_slot, status);
                             slot->reserved_for_decode_id = -1;
                             if (routes_ptr) {
@@ -4551,6 +4555,25 @@ private:
                                 routes_ptr->evict_decode_results_locked();
                             }
                             break;
+                        }
+
+                        // Trailing logits: PREFILL_DONE appends n_vocab floats
+                        // after the KV state (~line 4098) so the decode side
+                        // can sample immediately instead of reading garbage
+                        // after restore. Mirrors STATE_PUT's per-slot
+                        // injection (~line 3405) — DECODE_APPLY was missing
+                        // this step entirely.
+                        {
+                            const size_t remaining = kv_len - status;
+                            const size_t expected_logits = (size_t)llama_vocab_n_tokens(vocab) * sizeof(float);
+                            if (remaining == expected_logits) {
+                                const float * src = (const float *)(kv_ptr + status);
+                                const size_t n_floats = llama_vocab_n_tokens(vocab);
+                                slot->restored_logits.assign(src, src + n_floats);
+                                slot->logits_valid = true;
+                                SRV_INF("hydra: DECODE_APPLY slot=%d restored %zu logits to per-slot buffer\n",
+                                        id_slot, n_floats);
+                            }
                         }
 
                         const int n_past = is_v2 ? blob_n_past : kv_meta.value("n_past", 0);
