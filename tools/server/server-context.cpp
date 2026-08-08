@@ -4481,6 +4481,10 @@ private:
                         size_t          kv_len = task.hydra_action.kv_data.size();
                         int32_t         blob_n_past = 0;
                         int32_t         blob_n_tok  = 0;
+                        bool            has_chkpt = false;
+                        int32_t         ckpt_pos_min_in = 0, ckpt_pos_max_in = 0;
+                        int64_t         ckpt_n_tokens_in = 0;
+                        std::vector<uint8_t> ckpt_tgt_data, ckpt_dft_data;
 
                         const bool is_v2 = kv_len >= 1 && kv_ptr[0] == 0x02;
                         if (is_v2 && kv_len >= 9) {
@@ -4503,18 +4507,32 @@ private:
                             size_t hdr_offset = token_end;
                             if (hdr_offset < kv_len) {
                                 const uint8_t flags = kv_ptr[hdr_offset];
-                                hdr_offset += 1;
+                                hdr_offset += 1; // past flags byte
                                 if (flags & 0x01) {
-                                    // Skip checkpoint: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz | tgt_data | 8B dft_sz | dft_data
+                                    // Capture checkpoint: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz | tgt_data | 8B dft_sz | dft_data
+                                    // Mirrors the STATE_PUT sibling (~line 3343) — the native
+                                    // checkpoint is registered after restore so hybrid/recurrent
+                                    // models get their recurrent memory back (KV restored without
+                                    // its checkpoint is corrupt).
                                     if (hdr_offset + 4 + 4 + 8 + 8 <= kv_len) {
-                                        uint64_t tgt_sz;
-                                        memcpy(&tgt_sz, kv_ptr + hdr_offset + 16, 8);
-                                        hdr_offset += 4 + 4 + 8 + 8 + (size_t)tgt_sz;
-                                        if (hdr_offset + 8 <= kv_len) {
-                                            uint64_t dft_sz;
-                                            memcpy(&dft_sz, kv_ptr + hdr_offset, 8);
-                                            hdr_offset += 8 + (size_t)dft_sz;
+                                        memcpy(&ckpt_pos_min_in, kv_ptr + hdr_offset, 4); hdr_offset += 4;
+                                        memcpy(&ckpt_pos_max_in, kv_ptr + hdr_offset, 4); hdr_offset += 4;
+                                        memcpy(&ckpt_n_tokens_in, kv_ptr + hdr_offset, 8); hdr_offset += 8;
+                                        uint64_t tgt_sz_in;
+                                        memcpy(&tgt_sz_in, kv_ptr + hdr_offset, 8); hdr_offset += 8;
+                                        if (tgt_sz_in > 0 && hdr_offset + tgt_sz_in <= kv_len) {
+                                            ckpt_tgt_data.assign(kv_ptr + hdr_offset, kv_ptr + hdr_offset + (size_t)tgt_sz_in);
+                                            hdr_offset += (size_t)tgt_sz_in;
                                         }
+                                        if (hdr_offset + 8 <= kv_len) {
+                                            uint64_t dft_sz_in;
+                                            memcpy(&dft_sz_in, kv_ptr + hdr_offset, 8); hdr_offset += 8;
+                                            if (dft_sz_in > 0 && hdr_offset + dft_sz_in <= kv_len) {
+                                                ckpt_dft_data.assign(kv_ptr + hdr_offset, kv_ptr + hdr_offset + (size_t)dft_sz_in);
+                                                hdr_offset += (size_t)dft_sz_in;
+                                            }
+                                        }
+                                        has_chkpt = true;
                                     }
                                 }
                             }
@@ -4544,6 +4562,14 @@ private:
                         if (status == 0) {
                             SRV_WRN("hydra: DECODE_APPLY slot=%d KV restore failed (%d)\n", id_slot, status);
                             slot->reserved_for_decode_id = -1;
+                            // Tokens were registered from the v2 header before set_data —
+                            // clear them so the slot is not left poisoned (n_past > 0
+                            // with no KV cells → pos_min == -1 abort on the next decode
+                            // that touches this slot). Matches the STATE_PUT failure path.
+                            slot->prompt.tokens.clear();
+                            slot->prompt.checkpoints.clear();
+                            slot->n_prompt_tokens_cache = 0;
+                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot->id, -1, -1);
                             if (routes_ptr) {
                                 server_routes::decode_result_entry entry;
                                 entry.id_slot = id_slot;
@@ -4578,8 +4604,30 @@ private:
 
                         const int n_past = is_v2 ? blob_n_past : kv_meta.value("n_past", 0);
                         if (n_past > 0) {
-                            slot->n_prompt_tokens_cache = n_past;
-                            slot->n_prompt_tokens_processed = n_past;
+                            // Cache/processed counters come from the same header field
+                            // STATE_PUT reads (hdr_n_tok == blob_n_tok here); PREFILL writes
+                            // both fields as n_tokens so the values are identical today,
+                            // but the two restore paths must read the SAME source.
+                            slot->n_prompt_tokens_cache = is_v2 ? blob_n_tok : n_past;
+                            slot->n_prompt_tokens_processed = is_v2 ? blob_n_tok : n_past;
+
+                            // Register the native checkpoint from the blob (v2) or
+                            // fabricate one (legacy) — mirrors STATE_PUT (~line 3447).
+                            // KV restored without its recurrent-memory checkpoint
+                            // corrupts hybrid/recurrent model output.
+                            slot->prompt.checkpoints.clear();
+                            if (has_chkpt) {
+                                auto & ckpt = slot->prompt.checkpoints.emplace_back();
+                                ckpt.n_tokens = ckpt_n_tokens_in;
+                                ckpt.pos_min  = ckpt_pos_min_in;
+                                ckpt.pos_max  = ckpt_pos_max_in;
+                                ckpt.data_tgt = std::move(ckpt_tgt_data);
+                                ckpt.data_dft = std::move(ckpt_dft_data);
+                                SLT_INF(*slot, "DECODE_APPLY registered native checkpoint (pos_min=%d pos_max=%d n_tokens=%" PRId64 " tgt_sz=%zu)\n",
+                                        ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, ckpt.data_tgt.size());
+                            } else {
+                                create_checkpoint(*slot, 0, 0, (llama_pos)(n_past - 1));
+                            }
                         }
                         slot->just_restored = true;
                     }
