@@ -4217,7 +4217,38 @@ private:
                     const std::string tgt_model_name  = model_meta.value("model_name", "");
 
                     const bool tokenizer_match  = (req_tokenizer == tgt_tokenizer);
-                    const bool model_name_match = (req_model_name == tgt_model_name);
+                    bool model_name_match = (req_model_name == tgt_model_name);
+                    // #589: cross-node same-model name tolerance. The KV's
+                    // model_name is the display name (GGUF metadata) of the
+                    // file that BUILT the KV — a different build/quant of the
+                    // same model than the decode node's resident file, so
+                    // string equality legitimately fails for the same logical
+                    // model (e.g. kv_metadata carries the source node's
+                    // display name, the decode node reports its resident
+                    // filename). When the header carries the KV's source
+                    // alias (kv_metadata.model_alias) or the resolved request
+                    // alias ("model") and that alias maps through the preset
+                    // table to the resident model path, the KV was built by
+                    // the same logical model — accept. The alias→path check
+                    // is exact (per-node preset INI), so a different model
+                    // (Mini vs Balanced, 27B vs 35B) still maps to a
+                    // different path and is rejected.
+                    if (!model_name_match) {
+                        const std::string kv_alias  = kv_meta.value("model_alias", "");
+                        const std::string hdr_alias = decode_req.value("model", std::string());
+                        for (const auto & cand : { kv_alias, hdr_alias }) {
+                            if (cand.empty()) {
+                                continue;
+                            }
+                            auto pit = preset_alias_to_path.find(cand);
+                            if (pit != preset_alias_to_path.end() && pit->second == params_base.model.path) {
+                                SRV_INF("hydra: DECODE slot=%d Gate A name fallback — alias '%s' maps to resident path, same logical model\n",
+                                        id_slot, cand.c_str());
+                                model_name_match = true;
+                                break;
+                            }
+                        }
+                    }
                     const uint32_t capabilities_xor = req_capabilities ^ model_meta.value("model_capabilities", 0u);
 
                     static const char * kCapBitNames[] = {"MTP", "VISION", "REASONING", "TOOL_USE", "CODE"};
