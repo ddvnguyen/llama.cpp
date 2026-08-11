@@ -2185,3 +2185,1127 @@ struct hydra_engine_extension : server_hydra_extension {
 std::unique_ptr<server_hydra_extension> hydra_create_extension() {
     return std::make_unique<hydra_engine_extension>();
 }
+
+// ---------------------------------------------------------------------------
+// WS3.5: Hydra RPC server (moved from server-context.cpp, epic #610).
+// Same TU via the bottom #include, so hydra_rpc_ctx and the static handlers
+// can reach server_context_impl privates (friend) and the file-scope
+// queue/response objects. Wire format: specs/rpc-protocol.md | server-rpc.h.
+// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════════════
+// Hydra RPC server — KV state transfer (M1: task-queue based)
+// Wire format: specs/rpc-protocol.md  |  constants: server-rpc.h
+// Ops implemented: STATE_GET (0x30), STATE_PUT (0x31), STATE_META (0x32)
+// M1: All llama API calls routed through task queue (inference thread safe)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#if !defined(_WIN32)
+
+// ── Context for RPC thread — pass to handlers ─────────────────────────────────
+
+struct hydra_rpc_ctx {
+    server_queue * queue_tasks = nullptr;
+    server_response * queue_results = nullptr;
+};
+
+// ── Low-level I/O helpers ─────────────────────────────────────────────────────
+
+// Hydra #43: failures here were previously silent — every caller treats a
+// `false` return as "give up" but none logged *why*, so a wedged RPC
+// response looked identical to a client that vanished. Log once, centrally,
+// instead of touching the ~30 call sites.
+static bool hydra_recv_all(int fd, void * buf, size_t n) {
+    char * p = reinterpret_cast<char *>(buf);
+    const size_t total = n;
+    while (n > 0) {
+        ssize_t r = ::recv(fd, p, n, 0);
+        if (r < 0) {
+            SRV_WRN("hydra rpc: recv failed on fd=%d (%zu/%zu bytes): %s\n",
+                    fd, total - n, total, std::strerror(errno));
+            return false;
+        }
+        if (r == 0) {
+            SRV_DBG("hydra rpc: recv EOF on fd=%d (%zu/%zu bytes)\n", fd, total - n, total);
+            return false;
+        }
+        p += r; n -= r;
+    }
+    return true;
+}
+
+static bool hydra_send_all(int fd, const void * buf, size_t n) {
+    const char * p = reinterpret_cast<const char *>(buf);
+    const size_t total = n;
+    while (n > 0) {
+        ssize_t w = ::send(fd, p, n, MSG_NOSIGNAL);
+        if (w <= 0) {
+            SRV_WRN("hydra rpc: send failed on fd=%d (%zu/%zu bytes) w=%zd: %s\n",
+                    fd, total - n, total, w, std::strerror(errno));
+            return false;
+        }
+        p += w; n -= w;
+    }
+    return true;
+}
+
+// Response header: status(1) | meta_len(3 LE uint24) | payload_len(8 LE) — 12 bytes
+static void hydra_write_res(int fd, uint8_t status, uint32_t meta_len, uint64_t payload_len) {
+    uint8_t buf[HYDRA_RES_HEADER_SIZE] = {};
+    buf[0] = status;
+    buf[1] = (meta_len)       & 0xFF;
+    buf[2] = (meta_len >>  8) & 0xFF;
+    buf[3] = (meta_len >> 16) & 0xFF;
+    memcpy(buf + 4, &payload_len, 8); // little-endian (x86/arm64)
+    hydra_send_all(fd, buf, HYDRA_RES_HEADER_SIZE);
+}
+
+// ── Op handlers (M1: dispatch via task queue) ─────────────────────────────────
+
+// STATE_GET (0x30): Post task, wait for result.
+//
+// M1 path (hydra_fd < 0): inference thread serializes 800 MB into result buffer;
+//   RPC thread sends response header + meta JSON + buffer here.
+//
+// M2 path (hydra_fd = fd): background thread streams GPU→socket directly using
+//   llama_state_seq_get_data_to_fd; result carries only n_past + streamed_bytes.
+//   Response header + meta are sent BEFORE the task (we know size from STATE_META),
+//   so the payload is already on the wire before we even get the result back.
+//   Actually: we must send header AFTER knowing state_size. So:
+//   - If M2: we get state_size first from a quick STATE_META query (n_past already known),
+//     OR we embed state_size in the result from get_size() on the inference thread.
+//   The inference thread always calls llama_state_seq_get_size (cheap) and stores it
+//   in res->state_size for M2 so we can send the header before the stream completes.
+//
+// Timeout: 30s — streaming 800 MB over localhost may take a few seconds.
+static void hydra_handle_state_get(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
+    // Build task — pass fd for M2 zero-copy streaming
+    server_task task(SERVER_TASK_TYPE_HYDRA_STATE_GET);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot  = slot_id;
+    task.hydra_action.hydra_fd = fd;    // M2: background thread streams here
+    const int task_id = task.id;
+    // Register BEFORE posting — server_response::send() silently drops results
+    // for ids not in waiting_task_ids.
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
+    ctx.queue_tasks->post(std::move(task));
+
+    // Wait for result (n_past + state_size always set; state_data only on M1)
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 30); // seconds
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        SRV_WRN("hydra rpc: STATE_GET timeout for slot %d\n", slot_id);
+        // M2 caveat: the background thread may own the fd (header possibly sent);
+        // writing an error header here could interleave with the stream. Shut the
+        // socket down instead so the client unblocks with a clean EOF.
+        ::shutdown(fd, SHUT_RDWR);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_state*>(res_ptr.get());
+    if (!res) {
+        SRV_WRN("hydra rpc: STATE_GET result type mismatch for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    if (res->rpc_status != HYDRA_STATUS_OK) {
+        if (res->header_sent) {
+            // M2 failure: header already sent but stream failed; background thread
+            // shut the socket down — connection loop will close the fd on next read.
+            // Log and return without sending a second response header.
+            SRV_WRN("hydra rpc: STATE_GET slot=%d M2 stream failed: %s\n",
+                    slot_id, res->error.c_str());
+            return;
+        }
+        hydra_write_res(fd, res->rpc_status, 0, 0);
+        if (!res->error.empty()) {
+            hydra_send_all(fd, res->error.data(), res->error.size());
+        }
+        return;
+    }
+
+    if (res->streamed_bytes > 0) {
+        // M2 path: data already on the wire — response header + meta were sent by background thread.
+        // Nothing left for RPC thread to do. The protocol framing (header + meta + payload)
+        // was completed inside llama_io_write_socket / the background thread.
+        // Note: header was sent AFTER state_size was known (inference thread called get_size).
+        SRV_INF("hydra rpc: STATE_GET slot=%d M2 streamed %.1f MiB directly\n",
+                slot_id, res->streamed_bytes / (1024.0 * 1024.0));
+    } else {
+        // M1 path: inference thread buffered 800 MB; send it now.
+        const uint64_t payload = (uint64_t)res->state_data.size();
+        json meta_j;
+        meta_j["n_past"]     = res->n_past;
+        meta_j["state_size"] = payload;
+        if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+        if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+        if (!res->tokenizer.empty())   meta_j["tokenizer"]   = res->tokenizer;
+        if (!res->model_name.empty())  meta_j["model_name"]  = res->model_name;
+        if (!res->model_quant.empty()) meta_j["model_quant"] = res->model_quant;
+        if (res->model_capabilities)   meta_j["model_capabilities"] = res->model_capabilities;
+        const std::string meta_str = meta_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), payload);
+        hydra_send_all(fd, meta_str.data(), meta_str.size());
+        hydra_send_all(fd, res->state_data.data(), (size_t)payload);
+        SRV_INF("hydra rpc: STATE_GET slot=%d M1 sent %.1f MiB from buffer\n",
+                slot_id, payload / (1024.0 * 1024.0));
+    }
+}
+
+// STATE_PUT (0x31): Receive payload, post task, wait for result, send ack.
+static void hydra_handle_state_put(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    if (payload_len > HYDRA_MAX_STATE_BYTES) {
+        SRV_WRN("hydra rpc: STATE_PUT payload %" PRIu64 " B exceeds cap %" PRIu64 " B\n",
+                payload_len, HYDRA_MAX_STATE_BYTES);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        // Drain to keep persistent connection alive
+        std::vector<uint8_t> drain(65536);
+        for (uint64_t rem = payload_len; rem > 0; ) {
+            size_t chunk = (size_t)std::min(rem, (uint64_t)drain.size());
+            if (!hydra_recv_all(fd, drain.data(), chunk)) break;
+            rem -= chunk;
+        }
+        return;
+    }
+
+    // Read payload from socket
+    std::vector<uint8_t> buf((size_t)payload_len);
+    if (!hydra_recv_all(fd, buf.data(), (size_t)payload_len)) {
+        SRV_WRN("%s", "hydra rpc: STATE_PUT failed to read payload\n");
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // Post task to inference thread
+    server_task task(SERVER_TASK_TYPE_HYDRA_STATE_PUT);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.erase_existing = true; // RPC restore always replaces slot state
+    task.hydra_action.state_data = std::move(buf);
+    const int task_id = task.id;
+    // Register BEFORE posting — results for unregistered ids are dropped.
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
+    ctx.queue_tasks->post(std::move(task));
+
+    // Wait for result from inference thread (30s timeout for large restore)
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 30); // seconds
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        SRV_WRN("hydra rpc: STATE_PUT timeout for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_state*>(res_ptr.get());
+    if (!res) {
+        SRV_WRN("hydra rpc: STATE_PUT result type mismatch for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // Send result back to client
+    uint8_t rpc_status = res->rpc_status;
+    if (rpc_status == HYDRA_STATUS_OK) {
+        json meta_j;
+        meta_j["restored"]    = true;
+        meta_j["bytes"]       = res->bytes;
+        meta_j["model_match"] = res->model_match;
+        if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+        if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+        if (!res->tokenizer.empty())   meta_j["tokenizer"]   = res->tokenizer;
+        if (!res->model_name.empty())  meta_j["model_name"]  = res->model_name;
+        if (!res->model_quant.empty()) meta_j["model_quant"] = res->model_quant;
+        if (res->model_capabilities)   meta_j["model_capabilities"] = res->model_capabilities;
+        const std::string meta_str = meta_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+        hydra_send_all(fd, meta_str.data(), meta_str.size());
+    } else {
+        json err_j;
+        err_j["error"] = res->error;
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, rpc_status, (uint32_t)err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
+    }
+}
+
+// STATE_META (0x32): Post task, wait for result, send JSON metadata.
+static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
+    server_task task(SERVER_TASK_TYPE_HYDRA_STATE_META);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    const int task_id = task.id;
+    // Register BEFORE posting — results for unregistered ids are dropped.
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
+    ctx.queue_tasks->post(std::move(task));
+
+    // Wait for result from inference thread (5s timeout — allows for queue congestion)
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5); // seconds
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        SRV_WRN("hydra rpc: STATE_META timeout for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_state*>(res_ptr.get());
+    if (!res) {
+        SRV_WRN("hydra rpc: STATE_META result type mismatch for slot %d\n", slot_id);
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // Send result back to client
+    uint8_t rpc_status = res->rpc_status;
+    if (rpc_status == HYDRA_STATUS_OK) {
+        json meta_j;
+        meta_j["slot_id"]         = res->id_slot;
+        meta_j["n_past"]          = res->n_past;
+        meta_j["state_size"]      = res->state_size;
+        meta_j["is_processing"]   = res->is_processing;
+        meta_j["is_transferring"] = res->is_transferring;
+        if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+        if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+        if (!res->tokenizer.empty())   meta_j["tokenizer"]   = res->tokenizer;
+        if (!res->model_name.empty())  meta_j["model_name"]  = res->model_name;
+        if (!res->model_quant.empty()) meta_j["model_quant"] = res->model_quant;
+        if (res->model_capabilities)   meta_j["model_capabilities"] = res->model_capabilities;
+        const std::string meta_str = meta_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+        hydra_send_all(fd, meta_str.data(), meta_str.size());
+    } else {
+        hydra_write_res(fd, rpc_status, 0, 0);
+    }
+}
+
+// ── E1 Engine control handlers ────────────────────────────────────────────────
+
+// CONFIGURE (0x33): Read JSON config payload, post task, return success.
+static void hydra_handle_configure(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    std::string config_json(payload_len, '\0');
+    if (payload_len > 0 && !hydra_recv_all(fd, config_json.data(), payload_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_CONFIGURE);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.config_json = std::move(config_json);
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res || !res->success) {
+        // hydra#406: on failure, include the error message in the meta so
+        // the Coordinator can distinguish "drain timeout" from a parse
+        // error. We still write HYDRA_STATUS_ERROR (0x02) per the wire
+        // contract — the meta body is for diagnostics only.
+        if (res && !res->error.empty()) {
+            json err_j = {{"success", false}, {"error", res->error}};
+            if (!res->tier.empty()) err_j["tier"] = res->tier;
+            const std::string err_str = err_j.dump();
+            hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
+            hydra_send_all(fd, err_str.data(), err_str.size());
+        } else {
+            hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        }
+        return;
+    }
+
+    // hydra#406: tiered CONFIGURE response shape. Always present: success,
+    // tier, params_applied (T1 keys), deferred_keys (T2/T3 keys).
+    json meta_j = {
+        {"success",        true},
+        {"tier",           res->tier.empty() ? std::string("T1") : res->tier},
+        {"params_applied", json::object()},
+        {"deferred_keys",  json::array()},
+    };
+    for (const auto & kv : res->params_applied) {
+        meta_j["params_applied"][kv.first] = kv.second;
+    }
+    for (const auto & k : res->deferred_keys) {
+        meta_j["deferred_keys"].push_back(k);
+    }
+    // hydra#334: echo the post-clamp value for the state_chunk_size legacy
+    // path so the Coordinator's existing detection logic still works
+    // (the same value is also in params_applied, with the dotted key).
+    if (res->state_chunk_size_applied > 0) {
+        meta_j["state_chunk_size_applied"] = res->state_chunk_size_applied;
+    }
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
+// INFO (0x34): Return engine capabilities as JSON.
+static void hydra_handle_info(int fd, int slot_id, const hydra_rpc_ctx & ctx) {
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_INFO);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    const std::string & info_str = res->info_json;
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)info_str.size(), 0);
+    hydra_send_all(fd, info_str.data(), info_str.size());
+}
+
+// PREFILL (0x35): Read JSON payload with {"messages": [...]},
+// tokenize internally, run prefill, return n_past + KV state blob.
+static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    if (payload_len == 0) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    std::string json_str((size_t)payload_len, '\0');
+    if (!hydra_recv_all(fd, json_str.data(), (size_t)payload_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_PREFILL);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.request_json = std::move(json_str);
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    // Bumped from 60s to 180s. Prefill for 32k+ token prompts exceeds 120s
+    // (we measured 32s for 22k tokens; 48k ≈ 70s, 100k ≈ 150s+). Long autoregressive
+    // decode on P100 (28 tok/s) for 4k+ token outputs also exceeds 120s. The C++
+    // side was timing out and returning HYDRA_STATUS_ERROR before the C# client
+    // gave up, surfacing as a 503 from the coordinator even though the model was
+    // still working.
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 180);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res || res->rpc_status != HYDRA_STATUS_OK) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // Return n_past + sizes + model identity in meta; full blob (v2 header + KV + logits) as payload.
+    // logits_size > 0 signals the decode GPU to inject them into ctx->logits via STATE_PUT.
+    // M-Perf.9 #289: model identity fields (already populated on res by the PREFILL handler)
+    // are included so the Coordinator can record which model built the KV.
+    json meta_j = {
+        {"n_past",      res->n_past},
+        {"state_size",  res->state_size},
+        {"logits_size", res->logits_size}
+    };
+    if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+    if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+    if (!res->tokenizer.empty())   meta_j["tokenizer"]   = res->tokenizer;
+    if (!res->model_name.empty())  meta_j["model_name"]  = res->model_name;
+    if (!res->model_quant.empty()) meta_j["model_quant"] = res->model_quant;
+    if (res->model_capabilities)   meta_j["model_capabilities"] = res->model_capabilities;
+    meta_j["model_fallback"] = res->model_fallback;
+    if (res->prefill_ms > 0)     meta_j["prefill_ms"]     = res->prefill_ms;
+    if (res->model_load_ms > 0)  meta_j["model_load_ms"]  = res->model_load_ms;
+    const std::string meta_str = meta_j.dump();
+    const uint64_t total_payload = (uint64_t)res->state_data.size();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), total_payload);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+    if (total_payload > 0) {
+        hydra_send_all(fd, res->state_data.data(), (size_t)total_payload);
+    }
+    SRV_INF("hydra: PREFILL slot=%d sent n_past=%d kv=%" PRIu64 "B logits=%" PRIu64 "B total=%" PRIu64 "B\n",
+            slot_id, res->n_past, res->state_size, res->logits_size, total_payload);
+}
+
+// DECODE (0x43) — Merged P/D: framed request with async HTTP retrieval.
+// Wire format v3 (segmented):
+//   [4B hdr_len LE]       <= 32768
+//   [8B  hdr_hash LE]     xxh3-64 of the hdr JSON bytes that follow
+//   [hdr_len bytes]       control header JSON
+//   [prompt_len bytes]    prompt JSON segment (may be zero-length)
+//   [kv_len bytes]        raw KV blob (may be zero-length)
+//
+// Control header:
+//   { "v": 3, "model": "...", "kv_metadata": {...}, "model_metadata": {...},
+//     "generation": {...}, "segments": [...] }
+//
+// Two-phase flow:
+//   Phase 1 (sync): identity validation + KV restore — waits for inference thread
+//   Phase 2 (async): background thread posts SERVER_TASK_TYPE_COMPLETION,
+//           update_slots() drives generation, result stored in decode_results buffer.
+// Actual result retrieved via GET /v1/decode/{decode_request_id}.
+static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    // ── Read frame header: [4B hdr_len][8B hdr_hash] ──────────────────────
+    if (payload_len < sizeof(uint32_t) + sizeof(uint64_t)) {
+        SRV_WRN("%s", "hydra rpc: DECODE payload too small for frame header\n");
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    uint32_t hdr_len = 0;
+    if (!hydra_recv_all(fd, &hdr_len, sizeof(hdr_len))) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    if (hdr_len > HYDRA_MAX_JSON_HEADER) {
+        SRV_WRN("hydra rpc: DECODE hdr_len %u B exceeds cap %u B\n",
+                hdr_len, HYDRA_MAX_JSON_HEADER);
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    uint64_t hdr_hash = 0;
+    if (!hydra_recv_all(fd, &hdr_hash, sizeof(hdr_hash))) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // ── Read control header JSON ──────────────────────────────────────────
+    std::string hdr_json_str(hdr_len, '\0');
+    if (hdr_len > 0 && !hydra_recv_all(fd, hdr_json_str.data(), hdr_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // Verify hdr_hash (xxh3-64 of the JSON bytes)
+    {
+        const uint64_t computed = XXH3_64bits(hdr_json_str.data(), hdr_json_str.size());
+        if (computed != hdr_hash) {
+            SRV_WRN("hydra rpc: DECODE HDR_HASH_MISMATCH expected=%016" PRIx64 " got=%016" PRIx64 "\n",
+                    hdr_hash, computed);
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+    }
+
+    // Parse control header
+    json req;
+    try {
+        req = json::parse(hdr_json_str);
+    } catch (const std::exception & e) {
+        SRV_WRN("hydra rpc: DECODE invalid JSON in control header: %s\n", e.what());
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    // Validate version
+    const int hdr_version = req.value("v", 0);
+    if (hdr_version < 3) {
+        SRV_WRN("hydra rpc: DECODE unsupported version %d (need >= 3)\n", hdr_version);
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    // Validate required fields
+    if (!req.contains("kv_metadata")) {
+        SRV_WRN("%s", "hydra rpc: DECODE missing kv_metadata in control header\n");
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+    if (!req.contains("segments") || !req["segments"].is_array()) {
+        SRV_WRN("%s", "hydra rpc: DECODE missing or invalid segments array\n");
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    // ── Parse and validate segment table ──────────────────────────────────
+    const json & segments = req["segments"];
+    const size_t n_segments = segments.size();
+    if (n_segments > 3) {
+        SRV_WRN("hydra rpc: DECODE SEGMENT_TABLE_INVALID: too many segments (%zu)\n", n_segments);
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    // Each segment: {"id":"prompt"|"kv", "offset":N, "len":N, "hash":"xxh3:HEX"}
+    uint64_t prompt_len = 0;
+    uint64_t kv_len = 0;
+    std::string prompt_hash_str;
+    std::string kv_hash_str;
+    uint64_t expected_offset = 0;
+    for (size_t i = 0; i < n_segments; i++) {
+        const json & seg = segments[i];
+        if (!seg.contains("id") || !seg.contains("offset") || !seg.contains("len") || !seg.contains("hash")) {
+            SRV_WRN("hydra rpc: DECODE SEGMENT_TABLE_INVALID: segment %zu missing required fields\n", i);
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+        const std::string id = seg["id"].get<std::string>();
+        const uint64_t offset = seg["offset"].get<uint64_t>();
+        const uint64_t len = seg["len"].get<uint64_t>();
+        const std::string hash = seg["hash"].get<std::string>();
+
+        if (offset != expected_offset) {
+            SRV_WRN("hydra rpc: DECODE SEGMENT_TABLE_INVALID: segment %zu offset=%" PRIu64 " expected=%" PRIu64 "\n",
+                    i, offset, expected_offset);
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+        expected_offset = offset + len;
+
+        if (id == "prompt") {
+            prompt_len = len;
+            prompt_hash_str = hash;
+        } else if (id == "kv") {
+            kv_len = len;
+            kv_hash_str = hash;
+        } else {
+            SRV_WRN("hydra rpc: DECODE SEGMENT_TABLE_INVALID: unknown segment id '%s'\n", id.c_str());
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+    }
+
+    // Verify total segment size matches remaining payload
+    const uint64_t segments_total = prompt_len + kv_len;
+    const uint64_t remaining_after_hdr = payload_len - sizeof(uint32_t) - sizeof(uint64_t) - hdr_len;
+    if (segments_total != remaining_after_hdr) {
+        SRV_WRN("hydra rpc: DECODE SEGMENT_TABLE_INVALID: segments total %" PRIu64 " != remaining %" PRIu64 "\n",
+                segments_total, remaining_after_hdr);
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    // Caps
+    if (prompt_len > HYDRA_MAX_PROMPT_BYTES) {
+        SRV_WRN("hydra rpc: DECODE PROMPT_TOO_LARGE %" PRIu64 " > %" PRIu64 "\n",
+                prompt_len, HYDRA_MAX_PROMPT_BYTES);
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+    if (kv_len > HYDRA_MAX_STATE_BYTES) {
+        SRV_WRN("hydra rpc: DECODE KV_TOO_LARGE %" PRIu64 " > %" PRIu64 "\n",
+                kv_len, HYDRA_MAX_STATE_BYTES);
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+        return;
+    }
+
+    // ── Read prompt segment ───────────────────────────────────────────────
+    std::vector<uint8_t> prompt_data((size_t)prompt_len);
+    if (prompt_len > 0 && !hydra_recv_all(fd, prompt_data.data(), (size_t)prompt_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // ── Read KV segment (may be zero-length) ──────────────────────────────
+    std::vector<uint8_t> kv_data((size_t)kv_len);
+    if (kv_len > 0 && !hydra_recv_all(fd, kv_data.data(), (size_t)kv_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    // Verify KV segment hash BEFORE passing to llama_state_seq_set_data
+    if (kv_len > 0 && !kv_hash_str.empty()) {
+        // Parse "xxh3:HEX" format
+        if (kv_hash_str.rfind("xxh3:", 0) == 0) {
+            const std::string hex_str = kv_hash_str.substr(5);
+            uint64_t expected_kv_hash = 0;
+            try {
+                expected_kv_hash = std::stoull(hex_str, nullptr, 16);
+            } catch (const std::exception &) {
+                SRV_WRN("hydra rpc: DECODE invalid KV hash format: %s\n", kv_hash_str.c_str());
+                hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                return;
+            }
+            const uint64_t computed_kv = XXH3_64bits(kv_data.data(), kv_data.size());
+            if (computed_kv != expected_kv_hash) {
+                SRV_WRN("hydra rpc: DECODE SEGMENT_HASH_MISMATCH kv expected=%016" PRIx64 " got=%016" PRIx64 "\n",
+                        expected_kv_hash, computed_kv);
+                hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                return;
+            }
+            SRV_INF("hydra rpc: DECODE KV hash verified (%" PRIu64 " B)\n", kv_len);
+        } else {
+            SRV_WRN("hydra rpc: DECODE unsupported KV hash prefix: %s\n", kv_hash_str.c_str());
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+    }
+
+    // ── Build decode_json from control header + prompt segment ─────────────
+    // The prompt JSON segment may contain { "prompt": "..." } or { "messages": [...] }
+    // Merge it into the control header as decode_req["prompt"].
+    // Also merge generation params from control header's "generation" key.
+    json decode_req = req; // control header already has kv_metadata, model, etc.
+    json prompt_obj;
+    if (prompt_len > 0) {
+        try {
+            prompt_obj = json::parse(std::string(prompt_data.begin(), prompt_data.end()));
+        } catch (const std::exception & e) {
+            SRV_WRN("hydra rpc: DECODE invalid prompt segment JSON: %s\n", e.what());
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+    }
+    // The coordinator sends the prompt segment as the BARE messages array
+    // (item.Request["messages"].ToString()). The generation-merge below and
+    // DECODE_APPLY's chat-template path both expect an OBJECT with a
+    // "messages" key — merging generation keys into an array throws
+    // nlohmann::type_error, which was silently swallowed by the RPC worker
+    // pool (the connection leaked, no response written, coordinator timed out
+    // after 180s). Wrap a bare array so the prompt object matches the
+    // downstream contract.
+    if (prompt_obj.is_array()) {
+        json wrapped;
+        wrapped["messages"] = std::move(prompt_obj);
+        prompt_obj = std::move(wrapped);
+    }
+    // Merge generation params from control header into prompt object
+    std::string decode_json_str;
+    try {
+        if (req.contains("generation") && req["generation"].is_object()) {
+            const json & gen = req["generation"];
+            for (auto it = gen.begin(); it != gen.end(); ++it) {
+                if (!prompt_obj.contains(it.key())) {
+                    prompt_obj[it.key()] = it.value();
+                }
+            }
+        }
+        decode_req["prompt"] = std::move(prompt_obj);
+
+        decode_json_str = decode_req.dump();
+    } catch (const std::exception & e) {
+        // Never let a malformed prompt object leak the connection: the worker
+        // pool swallows exceptions and the fd stays open with no response,
+        // hanging the coordinator until its own timeout. Always write an
+        // error frame so the caller sees a terminal (retryable-free) result.
+        SRV_WRN("hydra rpc: DECODE prompt build failed (slot %d): %s\n", slot_id, e.what());
+        json err_j = {
+            {"error", std::string("prompt build failed: ") + e.what()},
+            {"decode_request_id", -1},
+        };
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, (uint32_t) err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
+        return;
+    }
+
+    // ── Phase 1: sync validate + restore ──────────────────────────────────
+    const int32_t decode_request_id = ctx.queue_tasks->get_new_id();
+
+    server_task val_task(SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE);
+    val_task.id = decode_request_id;
+    val_task.hydra_action.id_slot = slot_id;
+    val_task.hydra_action.decode_json = std::move(decode_json_str);
+    val_task.hydra_action.kv_data = std::move(kv_data);
+    val_task.hydra_action.decode_request_id = decode_request_id;
+    ctx.queue_results->add_waiting_task_id(decode_request_id);
+    ctx.queue_tasks->wait_until_no_sleep();
+    ctx.queue_tasks->post(std::move(val_task));
+
+    // Wait for validation+restore to complete (30s timeout for large KV blobs)
+    std::unordered_set<int> val_ids = {decode_request_id};
+    auto val_res_ptr = ctx.queue_results->recv_with_timeout(val_ids, 30);
+    ctx.queue_results->remove_waiting_task_id(decode_request_id);
+
+    if (!val_res_ptr) {
+        SRV_WRN("hydra rpc: DECODE validation timeout for slot %d (request_id=%d)\n",
+                slot_id, decode_request_id);
+        json err_j = {
+            {"error", "validation timeout"},
+            {"decode_request_id", decode_request_id},
+        };
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
+        return;
+    }
+
+    auto * val_res = dynamic_cast<server_task_result_hydra_engine*>(val_res_ptr.get());
+    if (!val_res || val_res->rpc_status != HYDRA_STATUS_OK) {
+        json err_j = {
+            {"valid", false},
+            {"decode_request_id", decode_request_id},
+        };
+        if (val_res) {
+            if (!val_res->match_json.is_null()) err_j["match"] = val_res->match_json;
+            if (!val_res->error.empty()) err_j["reason"] = val_res->error;
+            err_j["error_code"] = "CAP_MISMATCH";
+        }
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
+        return;
+    }
+
+    // Validation passed — build real success response
+    json meta_j = {
+        {"valid", true},
+        {"match", val_res->match_json},
+        {"decode_request_id", decode_request_id},
+        {"n_past_after_restore", val_res->n_past},
+        {"restore_slot_ms", val_res->restore_slot_ms},
+    };
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+
+    SRV_INF("hydra: DECODE slot=%d accepted, request_id=%d, restore=%.1fms\n",
+            slot_id, decode_request_id, val_res->restore_slot_ms);
+}
+
+// SET_EXPERT_MODE (0x37): Read mode string, post task, return success.
+static void hydra_handle_set_expert_mode(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    std::string mode(payload_len, '\0');
+    if (payload_len > 0 && !hydra_recv_all(fd, mode.data(), payload_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_SET_EXPERT_MODE);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.expert_mode = std::move(mode);
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res || !res->success) {
+        const std::string err = (res && !res->error.empty()) ? res->error : std::string();
+        json err_j = {{"success", false}};
+        if (!err.empty()) err_j["error"] = err;
+        const std::string err_str = err_j.dump();
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
+        hydra_send_all(fd, err_str.data(), err_str.size());
+        return;
+    }
+
+    // Report the ACTUAL mode applied (may be "solo" even though "combined" was
+    // requested, if this engine never dual-loaded combined experts) — the
+    // Coordinator's ReportsSolo() reads this key to detect the fallback.
+    json meta_j = {{"success", true}, {"mode", res->expert_mode_applied}};
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
+// SWAP_QUANT (0x38): Read quant_key + tensor_pattern, post task, return success.
+static void hydra_handle_swap_quant(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    if (payload_len < sizeof(uint16_t)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    uint16_t quant_key_len = 0;
+    if (!hydra_recv_all(fd, &quant_key_len, sizeof(quant_key_len))) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    std::string quant_key(quant_key_len, '\0');
+    if (quant_key_len > 0 && !hydra_recv_all(fd, quant_key.data(), quant_key_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    const uint64_t pattern_len = payload_len - sizeof(uint16_t) - quant_key_len;
+    std::string tensor_pattern(pattern_len, '\0');
+    if (pattern_len > 0 && !hydra_recv_all(fd, tensor_pattern.data(), pattern_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_SWAP_QUANT);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.quant_key = std::move(quant_key);
+    task.hydra_action.tensor_pattern = std::move(tensor_pattern);
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 30);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    if (!res || !res->success) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    json meta_j = {{"success", true}};
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, HYDRA_STATUS_OK, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
+// PIPELINE_ATTACH (0x46): M-Perf.9 (#289) / issue #287 — two-engine "work
+// together" routing scaffolding. The C# Coordinator sends the peer address
+// and the --override-tensor regex; the engine should load the assigned
+// tensor slice from its OWN local model (no weight transfer). This opcode
+// is stubbed for now (returns NOT_IMPLEMENTED) — full implementation is
+// tracked under issue #287.
+static void hydra_handle_pipeline_attach(int fd, int slot_id, uint64_t payload_len, const hydra_rpc_ctx & ctx) {
+    std::string json_body(payload_len, '\0');
+    if (payload_len > 0 && !hydra_recv_all(fd, json_body.data(), payload_len)) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_PIPELINE_ATTACH);
+    task.id = ctx.queue_tasks->get_new_id();
+    task.hydra_action.id_slot = slot_id;
+    task.hydra_action.request_json = std::move(json_body);
+    const int task_id = task.id;
+    ctx.queue_results->add_waiting_task_id(task_id);
+    ctx.queue_tasks->wait_until_no_sleep();
+    ctx.queue_tasks->post(std::move(task));
+
+    std::unordered_set<int> task_ids = {task_id};
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 5);
+    ctx.queue_results->remove_waiting_task_id(task_id);
+    if (!res_ptr) {
+        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        return;
+    }
+
+    auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
+    // Stubbed: server returns NOT_IMPLEMENTED until issue #287 lands.
+    // Propagate that status to the client so the Coordinator can
+    // distinguish "not yet built" from a real error and fall back to solo.
+    const uint8_t status = (res && res->rpc_status == HYDRA_STATUS_NOT_IMPLEMENTED)
+        ? HYDRA_STATUS_NOT_IMPLEMENTED : HYDRA_STATUS_ERROR;
+    json meta_j;
+    if (res && !res->error.empty()) meta_j["error"] = res->error;
+    meta_j["success"] = res && res->success;
+    const std::string meta_str = meta_j.dump();
+    hydra_write_res(fd, status, (uint32_t)meta_str.size(), 0);
+    hydra_send_all(fd, meta_str.data(), meta_str.size());
+}
+
+// ── Per-connection loop ───────────────────────────────────────────────────────
+// Persistent: one TCP connection handles many sequential requests.
+
+static void hydra_handle_connection(int fd, const hydra_rpc_ctx & ctx) {
+    // Set receive timeout to prevent hung connections on stalled clients
+    struct timeval tv;
+    tv.tv_sec  = 120; // 2 min inactivity timeout
+    tv.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    while (true) {
+        uint8_t hdr[HYDRA_REQ_HEADER_SIZE];
+        if (!hydra_recv_all(fd, hdr, HYDRA_REQ_HEADER_SIZE)) break;
+
+        uint16_t magic = 0;
+        memcpy(&magic, hdr + 0, 2);
+        if (magic != HYDRA_MAGIC) {
+            SRV_WRN("hydra rpc: bad magic 0x%04x — closing connection\n", (unsigned)magic);
+            break;
+        }
+
+        const uint8_t op = hdr[2];
+        // hdr[3] = flags (reserved, unused in M1)
+        uint16_t key_len = 0, trace_len = 0;
+        uint64_t payload_len = 0;
+        memcpy(&key_len,     hdr + 4,  2);
+        memcpy(&payload_len, hdr + 6,  8);
+        memcpy(&trace_len,   hdr + 14, 2);
+
+        std::string key(key_len, '\0');
+        std::string trace_id(trace_len, '\0');
+        if (!hydra_recv_all(fd, key.data(),      key_len))   break;
+        if (!hydra_recv_all(fd, trace_id.data(), trace_len)) break;
+
+        // Slot-key parsing: engine-level opcodes (INFO, CONFIGURE, SET_EXPERT_MODE,
+        // SWAP_QUANT) don't need a valid slot — use slot_id = 0 when the key is
+        // empty or invalid. Slot-level opcodes (STATE_GET, STATE_PUT, STATE_META,
+        // PREFILL, DECODE) still require a valid integer key.
+        int slot_id = -1;
+        bool is_engine_level_op = (op == HYDRA_OP_INFO || op == HYDRA_OP_CONFIGURE ||
+                                   op == HYDRA_OP_SET_EXPERT_MODE || op == HYDRA_OP_SWAP_QUANT);
+        if (key.empty() && is_engine_level_op) {
+            slot_id = 0;
+        } else {
+            try { slot_id = std::stoi(key); }
+            catch (...) {
+                SRV_WRN("hydra rpc: invalid slot key '%s'\n", key.c_str());
+                hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+                continue;
+            }
+        }
+
+        // Dispatch to handler via task queue (no direct slot access)
+        switch (op) {
+            case HYDRA_OP_STATE_GET:
+                SRV_DBG("hydra rpc: STATE_GET  slot=%d trace=%s\n", slot_id, trace_id.c_str());
+                hydra_handle_state_get(fd, slot_id, ctx);
+                break;
+            case HYDRA_OP_STATE_PUT:
+                SRV_DBG("hydra rpc: STATE_PUT  slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_state_put(fd, slot_id, payload_len, ctx);
+                break;
+            case HYDRA_OP_STATE_META:
+                SRV_DBG("hydra rpc: STATE_META slot=%d trace=%s\n", slot_id, trace_id.c_str());
+                hydra_handle_state_meta(fd, slot_id, ctx);
+                break;
+            case HYDRA_OP_CONFIGURE:
+                SRV_DBG("hydra rpc: CONFIGURE slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_configure(fd, slot_id, payload_len, ctx);
+                break;
+            case HYDRA_OP_INFO:
+                SRV_DBG("hydra rpc: INFO slot=%d trace=%s\n", slot_id, trace_id.c_str());
+                hydra_handle_info(fd, slot_id, ctx);
+                break;
+            case HYDRA_OP_PREFILL:
+                SRV_DBG("hydra rpc: PREFILL slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_prefill(fd, slot_id, payload_len, ctx);
+                break;
+            case HYDRA_OP_DECODE:
+                SRV_DBG("hydra rpc: DECODE slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_decode(fd, slot_id, payload_len, ctx);
+                break;
+            case HYDRA_OP_SET_EXPERT_MODE:
+                SRV_DBG("hydra rpc: SET_EXPERT_MODE slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_set_expert_mode(fd, slot_id, payload_len, ctx);
+                break;
+            case HYDRA_OP_SWAP_QUANT:
+                SRV_DBG("hydra rpc: SWAP_QUANT slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_swap_quant(fd, slot_id, payload_len, ctx);
+                break;
+            // M-Perf.9 (#289) / issue #287: PIPELINE_ATTACH (0x46) is the
+            // two-engine "work together" attach. Stubbed: full impl in #287.
+            case HYDRA_OP_PIPELINE_ATTACH:
+                SRV_DBG("hydra rpc: PIPELINE_ATTACH slot=%d payload=%" PRIu64 " trace=%s\n",
+                        slot_id, payload_len, trace_id.c_str());
+                hydra_handle_pipeline_attach(fd, slot_id, payload_len, ctx);
+                break;
+            default:
+                SRV_WRN("hydra rpc: unknown op 0x%02x — ignoring\n", (unsigned)op);
+                hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        }
+    }
+    ::close(fd);
+}
+
+// ── Unified RPC server implementation ───────────────────────────────────────
+//
+// `#36` Phase 1: the merged server lives in `tools/llama-engine/hydra_rpc/`
+// (fork-isolated). `server_context::start_rpc_server` is a thin adapter that
+// builds the settings and delegates to `hydra_rpc::start()`. The Hydra
+// protocol entry `hydra_handle_connection` is reached through the
+// `hydra_rpc_bridge` trampoline (defined below) — the bridge takes a
+// `void*` so the new module can stay decoupled from this file's includes.
+
+#include "../llama-engine/hydra_rpc/hydra_rpc.h"
+
+void server_context::start_rpc_server(int port,
+                                       std::vector<ggml_backend *> backends) {
+    if (port <= 0) return;
+
+    // Hydra #43: MUST outlive this function. `hydra_rpc::start()` below
+    // stores `&ctx` as a raw pointer inside `hydra_rpc::state()`, a
+    // process-lifetime singleton that every subsequent RPC connection reads
+    // (from a bounded-thread-pool worker thread) to recover queue_tasks /
+    // queue_results. An automatic-storage `ctx` here would dangle the
+    // instant this function returns — a stack-use-after-return that "works"
+    // until the freed stack slot gets reused, then silently corrupts the
+    // RPC response path. `start_rpc_server` only ever runs once per process
+    // (hydra_rpc::start() itself guards double-start), so `static` gives it
+    // exactly the lifetime the singleton needs.
+    static hydra_rpc_ctx ctx{};
+    if (impl) {
+        ctx.queue_tasks   = &impl->queue_tasks;
+        ctx.queue_results = &impl->queue_results;
+    }
+
+    hydra_rpc::settings s;
+    s.port       = port;
+    s.backends   = std::move(backends);
+    s.hydra_ctx  = (ctx.queue_tasks && ctx.queue_results) ? &ctx : nullptr;
+    s.pool_size  = 2;
+    s.max_queue  = 64;
+    s.host       = "0.0.0.0";
+
+    if (!hydra_rpc::start(s)) {
+        SRV_ERR("hydra rpc: start() failed on port %d\n", port);
+        return;
+    }
+
+    if (s.hydra_ctx) {
+        SRV_INF("hydra rpc: unified server on 0.0.0.0:%d (ggml-RPC + Hydra protocol)\n", port);
+    } else {
+        SRV_INF("hydra rpc: unified server on 0.0.0.0:%d (ggml-RPC only)\n", port);
+    }
+}
+
+// `hydra_rpc_bridge` — extern "C" trampoline. `hydra_rpc.cpp` calls this
+// when the first byte on a new connection is not `RPC_CMD_HELLO`. It
+// re-enters the C++ entry point with the typed `hydra_rpc_ctx &`.
+//
+// Forward-declared with the matching signature so the new
+// `tools/llama-engine/hydra_rpc/hydra_rpc.cpp` module can take its
+// address without including this heavy header.
+extern "C" void hydra_rpc_bridge(int fd, const void * ctx);
+extern "C" void hydra_rpc_bridge(int fd, const void * ctx) {
+    hydra_handle_connection(fd, *static_cast<const hydra_rpc_ctx *>(ctx));
+}
+
+#else
+// Windows: RPC server not implemented — target hardware is Linux-only for M0.
+void server_context::start_rpc_server(int port, std::vector<ggml_backend *>) {
+    if (port > 0) {
+        SRV_WRN("hydra rpc: not supported on Windows (port %d ignored)\n", port);
+    }
+    GGML_UNUSED(port);
+}
+#endif // !_WIN32
