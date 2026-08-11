@@ -860,6 +860,21 @@ private:
     // has different tensor placement rules (e.g. n-cpu-moe, override-tensor).
     std::map<std::string, common_preset> preset_alias_to_preset;
 
+    // #470: T3-current alias → file map. Records the engine's own identity
+    // aliases (model_name + model_aliases members) → the resident file path
+    // as of the last successful model load. Maintained by
+    // hydra_t3_record_current_alias_to_path() at the end of load_model().
+    // DECODE_APPLY consults this BEFORE preset_alias_to_path: the
+    // coordinator's T3 config (model_path) can deliberately load a file
+    // that differs from the preset INI's file for the same alias (e.g. the
+    // dense-27b-combined session T3-loads the 27B-Coder file while the
+    // engine's alias identity still says qwen3.6-35B-balanced from an
+    // earlier SOLO session). In that case the requested alias describes the
+    // resident — swapping to the INI's file is a pointless 73-81s reload
+    // that tears down COMBINED state and then fails Gate B (header metadata
+    // of the pre-swap resident vs the swapped-in model's identity).
+    std::map<std::string, std::string> t3_current_alias_to_path;
+
     bool sleeping = false;
 
     void destroy() {
@@ -1380,6 +1395,12 @@ private:
                         preset_alias_to_path.size(), params_base.models_preset.c_str());
             }
         }
+
+        // #470: refresh the T3-current alias → file map now that
+        // model_name / model_aliases reflect the freshly loaded resident
+        // (a no-op on boot, where the identity is the boot file's). Must
+        // run AFTER the identity members above are re-derived.
+        hydra_t3_record_current_alias_to_path();
 
         // propagate new defaults back to caller
         params = params_base;
@@ -4361,80 +4382,98 @@ private:
                     bool model_fallback = false;
 
                     if (!requested_model.empty()) {
-                        auto it = preset_alias_to_path.find(requested_model);
-                        if (it == preset_alias_to_path.end()) {
-                            SRV_WRN("hydra: DECODE_APPLY slot=%d model='%s' unknown — falling back to resident '%s'\n",
-                                    id_slot, requested_model.c_str(), model_name.c_str());
-                            model_fallback = true;
-                        } else if (it->second != params_base.model.path) {
-                            SRV_INF("hydra: DECODE_APPLY slot=%d model='%s' swapping %s -> %s\n",
-                                    id_slot, requested_model.c_str(), params_base.model.path.c_str(),
-                                    it->second.c_str());
-                            common_params swapped_params = params_base;
-                            // Apply the target alias's full preset (same
-                            // treatment, and same intentional full-preset
-                            // scope, as the PREFILL path above).
-                            auto pit = preset_alias_to_preset.find(requested_model);
-                            bool preset_apply_failed = false;
-                            if (pit != preset_alias_to_preset.end()) {
-                                // Same clear+re-pad+try/catch as the PREFILL path.
-                                swapped_params.tensor_buft_overrides.clear();
-                                try {
-                                    pit->second.apply_to_params(swapped_params);
-                                    hydra_repad_tensor_buft_overrides(swapped_params, "DECODE_APPLY swap");
-                                } catch (const std::exception & e) {
-                                    SRV_WRN("hydra: DECODE_APPLY slot=%d swap preset apply for '%s' failed: %s\n",
-                                            id_slot, requested_model.c_str(), e.what());
-                                    preset_apply_failed = true;
+                        // #470: resolve the requested alias against the
+                        // T3-CURRENT alias → file map FIRST. The coordinator's
+                        // T3 config (model_path) can load a file the preset INI
+                        // does not associate with the engine's current alias
+                        // (e.g. the dense-27b-combined session T3-loads the
+                        // 27B-Coder file while the alias identity still says
+                        // qwen3.6-35B-balanced). When the requested alias's
+                        // T3-current file == resident, the alias describes the
+                        // resident — swapping to the INI's file would be a
+                        // pointless 73-81s reload + COMBINED teardown/reattach
+                        // that then fails Gate B (header model_metadata of the
+                        // pre-swap resident vs the swapped-in model's identity).
+                        const auto t3it = t3_current_alias_to_path.find(requested_model);
+                        if (t3it != t3_current_alias_to_path.end() && t3it->second == params_base.model.path) {
+                            SRV_INF("hydra: DECODE_APPLY slot=%d model='%s' matches T3-current resident '%s' — no swap\n",
+                                    id_slot, requested_model.c_str(), params_base.model.path.c_str());
+                        } else {
+                            auto it = preset_alias_to_path.find(requested_model);
+                            if (it == preset_alias_to_path.end()) {
+                                SRV_WRN("hydra: DECODE_APPLY slot=%d model='%s' unknown — falling back to resident '%s'\n",
+                                        id_slot, requested_model.c_str(), model_name.c_str());
+                                model_fallback = true;
+                            } else if (it->second != params_base.model.path) {
+                                SRV_INF("hydra: DECODE_APPLY slot=%d model='%s' swapping %s -> %s\n",
+                                        id_slot, requested_model.c_str(), params_base.model.path.c_str(),
+                                        it->second.c_str());
+                                common_params swapped_params = params_base;
+                                // Apply the target alias's full preset (same
+                                // treatment, and same intentional full-preset
+                                // scope, as the PREFILL path above).
+                                auto pit = preset_alias_to_preset.find(requested_model);
+                                bool preset_apply_failed = false;
+                                if (pit != preset_alias_to_preset.end()) {
+                                    // Same clear+re-pad+try/catch as the PREFILL path.
+                                    swapped_params.tensor_buft_overrides.clear();
+                                    try {
+                                        pit->second.apply_to_params(swapped_params);
+                                        hydra_repad_tensor_buft_overrides(swapped_params, "DECODE_APPLY swap");
+                                    } catch (const std::exception & e) {
+                                        SRV_WRN("hydra: DECODE_APPLY slot=%d swap preset apply for '%s' failed: %s\n",
+                                                id_slot, requested_model.c_str(), e.what());
+                                        preset_apply_failed = true;
+                                        if (routes_ptr) {
+                                            server_routes::decode_result_entry entry;
+                                            entry.id_slot = id_slot;
+                                            entry.error = std::string("model swap preset apply failed: ") + e.what();
+                                            entry.created_at = std::time(nullptr);
+                                            entry.ttl_s = routes_ptr->decode_result_ttl_s;
+                                            std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                                            routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                                            routes_ptr->evict_decode_results_locked();
+                                        }
+                                    }
+                                }
+                                if (preset_apply_failed) {
+                                    server_slot * s = get_slot_by_id(id_slot);
+                                    if (s) s->reserved_for_decode_id = -1;
+                                    break;
+                                }
+                                swapped_params.model.path  = it->second;
+                                swapped_params.model_alias = { requested_model };
+                                // #514: tear down COMBINED state before the
+                                // reload — see hydra_teardown_combined_before_reload().
+                                const bool was_combined = hydra_combined_head_attached || hydra_combined_static;
+                                if (was_combined) {
+                                    hydra_teardown_combined_before_reload();
+                                }
+                                const int64_t model_load_start_ms = ggml_time_ms();
+                                if (!load_model(swapped_params)) {
+                                    SRV_WRN("hydra: DECODE_APPLY slot=%d model swap to '%s' failed\n",
+                                            id_slot, requested_model.c_str());
+                                    server_slot * s = get_slot_by_id(id_slot);
+                                    if (s) s->reserved_for_decode_id = -1;
                                     if (routes_ptr) {
                                         server_routes::decode_result_entry entry;
                                         entry.id_slot = id_slot;
-                                        entry.error = std::string("model swap preset apply failed: ") + e.what();
+                                        entry.error = "model swap to '" + requested_model + "' failed";
                                         entry.created_at = std::time(nullptr);
                                         entry.ttl_s = routes_ptr->decode_result_ttl_s;
                                         std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
                                         routes_ptr->decode_results[decode_request_id] = std::move(entry);
                                         routes_ptr->evict_decode_results_locked();
                                     }
+                                    break;
                                 }
-                            }
-                            if (preset_apply_failed) {
-                                server_slot * s = get_slot_by_id(id_slot);
-                                if (s) s->reserved_for_decode_id = -1;
-                                break;
-                            }
-                            swapped_params.model.path  = it->second;
-                            swapped_params.model_alias = { requested_model };
-                            // #514: tear down COMBINED state before the
-                            // reload — see hydra_teardown_combined_before_reload().
-                            const bool was_combined = hydra_combined_head_attached || hydra_combined_static;
-                            if (was_combined) {
-                                hydra_teardown_combined_before_reload();
-                            }
-                            const int64_t model_load_start_ms = ggml_time_ms();
-                            if (!load_model(swapped_params)) {
-                                SRV_WRN("hydra: DECODE_APPLY slot=%d model swap to '%s' failed\n",
-                                        id_slot, requested_model.c_str());
-                                server_slot * s = get_slot_by_id(id_slot);
-                                if (s) s->reserved_for_decode_id = -1;
-                                if (routes_ptr) {
-                                    server_routes::decode_result_entry entry;
-                                    entry.id_slot = id_slot;
-                                    entry.error = "model swap to '" + requested_model + "' failed";
-                                    entry.created_at = std::time(nullptr);
-                                    entry.ttl_s = routes_ptr->decode_result_ttl_s;
-                                    std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
-                                    routes_ptr->decode_results[decode_request_id] = std::move(entry);
-                                    routes_ptr->evict_decode_results_locked();
+                                if (was_combined) {
+                                    hydra_reattach_combined_after_reload();
                                 }
-                                break;
+                                model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
+                                SRV_INF("hydra: DECODE_APPLY slot=%d swap confirmed model_load_ms=%.1f\n",
+                                        id_slot, model_load_ms);
                             }
-                            if (was_combined) {
-                                hydra_reattach_combined_after_reload();
-                            }
-                            model_load_ms = (double)(ggml_time_ms() - model_load_start_ms);
-                            SRV_INF("hydra: DECODE_APPLY slot=%d swap confirmed model_load_ms=%.1f\n",
-                                    id_slot, model_load_ms);
                         }
                     }
 
@@ -5474,6 +5513,32 @@ private:
                         endpoint.c_str());
             }
         }
+    }
+
+    // #470: refresh the T3-current alias → file map after a successful
+    // model load. The map's keys are the engine's own identity aliases
+    // (model_name + model_aliases, as recomputed by load_model()); the
+    // value is the resident file. Called from load_model() right after the
+    // identity members are re-derived, so the map always tracks the CURRENT
+    // resident — covering boot, apply_t3_rebuild(), the bare-alias swap
+    // paths and T3 rollback alike.
+    //
+    // Why this map exists: preset_alias_to_path is the static INI mapping,
+    // but the coordinator's T3 config (hydra_config.model_path) can load a
+    // file that the INI does NOT associate with the engine's current alias
+    // (e.g. the dense-27b-combined session T3-loads the 27B-Coder file
+    // while the engine's identity still says qwen3.6-35B-balanced from an
+    // earlier SOLO session). DECODE_APPLY must know that the requested
+    // alias already refers to the resident before it decides to swap.
+    void hydra_t3_record_current_alias_to_path() {
+        t3_current_alias_to_path.clear();
+        const std::string & resident = params_base.model.path;
+        t3_current_alias_to_path[model_name] = resident;
+        for (const auto & alias : model_aliases) {
+            t3_current_alias_to_path[alias] = resident;
+        }
+        SRV_DBG("hydra: T3-current alias→file map recorded %zu alias(es) → '%s'\n",
+                t3_current_alias_to_path.size(), resident.c_str());
     }
 
     // Tear down COMBINED-mode RPC peer bindings before a model reload.
