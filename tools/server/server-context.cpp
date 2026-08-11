@@ -4847,9 +4847,27 @@ private:
                                         // Populates oaicompat_msg / oaicompat_msg_diffs
                                         // (and sets is_updated, so to_json() won't
                                         // assert on relayed partials).
-                                        const size_t idx = res_ptr->index;
-                                        GGML_ASSERT(idx < states.size());
-                                        res_ptr->update(states[idx]);
+                                        try {
+                                            const size_t idx = res_ptr->index;
+                                            GGML_ASSERT(idx < states.size());
+                                            res_ptr->update(states[idx]);
+                                        } catch (const std::exception & e) {
+                                            // Mirror the standard stream loop's tolerance
+                                            // of chat-parse failures (server-context.cpp:7685).
+                                            // This is a detached thread: an uncaught
+                                            // exception would std::terminate() the whole
+                                            // engine. Continue with the unparsed result
+                                            // (raw content; reasoning extraction skipped).
+                                            SRV_WRN("hydra: DECODE_APPLY slot=%d result update() failed: %s (continuing with unparsed result)\n",
+                                                    id_slot, e.what());
+                                            if (partial && !partial->is_begin) {
+                                                // Keep the relay well-formed: partial
+                                                // to_json() asserts is_updated in debug
+                                                // builds; with no diffs it emits an empty
+                                                // delta, which clients merge harmlessly.
+                                                partial->is_updated = true;
+                                            }
+                                        }
 
                                         if (partial && !partial->is_begin) {
                                             // Relay partial to streaming queue
