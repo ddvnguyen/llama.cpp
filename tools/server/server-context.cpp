@@ -4723,6 +4723,7 @@ private:
                                 if (chat_result.contains("grammar_triggers")) cmpl_data["grammar_triggers"] = chat_result["grammar_triggers"];
                                 if (chat_result.contains("chat_format")) cmpl_data["chat_format"] = chat_result["chat_format"];
                                 if (chat_result.contains("chat_parser")) cmpl_data["chat_parser"] = chat_result["chat_parser"];
+                                if (chat_result.contains("generation_prompt")) cmpl_data["generation_prompt"] = chat_result["generation_prompt"];
                                 if (chat_result.contains("parse_tool_calls")) cmpl_data["parse_tool_calls"] = chat_result["parse_tool_calls"];
                                 if (chat_result.contains("preserved_tokens")) cmpl_data["preserved_tokens"] = chat_result["preserved_tokens"];
                                 if (chat_result.contains("reasoning_budget_tokens")) cmpl_data["reasoning_budget_tokens"] = chat_result["reasoning_budget_tokens"];
