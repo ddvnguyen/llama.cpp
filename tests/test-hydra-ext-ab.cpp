@@ -42,21 +42,21 @@ static void set_ext_mode(const char * value) {
 #endif
 
 int main() {
-    // --- mode parsing -------------------------------------------------
+    // --- mode parsing (WS5: default = seam unless explicitly legacy) ----
     set_ext_mode(nullptr);
-    expect("unset HYDRA_EXT_MODE -> legacy",      !hydra_ext_mode_seam());
+    expect("unset HYDRA_EXT_MODE -> seam (default)", hydra_ext_mode_seam());
 
     set_ext_mode("legacy");
-    expect("HYDRA_EXT_MODE=legacy -> legacy",     !hydra_ext_mode_seam());
+    expect("HYDRA_EXT_MODE=legacy -> legacy",        !hydra_ext_mode_seam());
 
     set_ext_mode("seam");
-    expect("HYDRA_EXT_MODE=seam -> seam",          hydra_ext_mode_seam());
+    expect("HYDRA_EXT_MODE=seam -> seam",            hydra_ext_mode_seam());
 
     set_ext_mode("garbage");
-    expect("HYDRA_EXT_MODE=garbage -> legacy",    !hydra_ext_mode_seam());
+    expect("HYDRA_EXT_MODE=garbage -> seam (default)", hydra_ext_mode_seam());
 
-    set_ext_mode("LEGACY");  // case-sensitive: not "seam"
-    expect("HYDRA_EXT_MODE=LEGACY -> legacy",     !hydra_ext_mode_seam());
+    set_ext_mode("LEGACY");  // case-sensitive: not "legacy"
+    expect("HYDRA_EXT_MODE=LEGACY -> seam (default)", hydra_ext_mode_seam());
 
     // --- factory + WS1 no-op contract ---------------------------------
     std::unique_ptr<server_hydra_extension> ext = hydra_create_extension();

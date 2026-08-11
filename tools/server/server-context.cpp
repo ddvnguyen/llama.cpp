@@ -801,9 +801,9 @@ public:
         mtmd_helper_log_set(common_log_default_callback, nullptr);
         if (hydra_ext_active) {
             hydra_ext = hydra_create_extension();
-            SRV_INF("hydra ext: seam mode active (HYDRA_EXT_MODE=seam), impl=%s\n", hydra_ext->name());
+            SRV_INF("hydra ext: seam mode active (default), impl=%s\n", hydra_ext->name());
         } else {
-            SRV_INF("%s", "hydra ext: legacy mode active (default) - A/B baseline\n");
+            SRV_INF("%s", "hydra ext: legacy mode active (HYDRA_EXT_MODE=legacy) - A/B baseline\n");
         }
     }
 
