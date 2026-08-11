@@ -9,8 +9,8 @@
 //
 // A/B toggle: the HYDRA_EXT_MODE env var selects which implementation drives
 // Hydra behavior at runtime, so the SAME binary can be A/B tested:
-//   HYDRA_EXT_MODE=legacy  -> the inline Hydra code in server-context.cpp (default)
-//   HYDRA_EXT_MODE=seam    -> the extension (WS1: no-op, behavior identical)
+//   HYDRA_EXT_MODE=seam   -> the extension (default since WS5)
+//   HYDRA_EXT_MODE=legacy -> the inline Hydra code in server-context.cpp
 // Both paths stay compiled; only one is consulted per run. WS4 diffs the same
 // scenario through both modes to prove the refactor is behavior-identical.
 #pragma once
@@ -22,10 +22,10 @@
 struct server_context_impl;
 struct server_task;
 
-// True when HYDRA_EXT_MODE=seam. Anything else (including unset) = legacy.
+// True when HYDRA_EXT_MODE is NOT "legacy" (i.e. default = seam since WS5).
 inline bool hydra_ext_mode_seam() {
     const char * m = std::getenv("HYDRA_EXT_MODE");
-    return m && std::strcmp(m, "seam") == 0;
+    return !(m && std::strcmp(m, "legacy") == 0);
 }
 
 struct server_hydra_extension {
