@@ -4854,6 +4854,9 @@ private:
                                             entry.completion_id         = final_r->oaicompat_cmpl_id;
                                             entry.oaicompat_model       = oaicompat_model_name;
                                             entry.content               = final_r->content;
+                                            if (!final_r->oaicompat_msg.reasoning_content.empty()) {
+                                                entry.reasoning_content = final_r->oaicompat_msg.reasoning_content;
+                                            }
                                             entry.n_decoded             = final_r->n_decoded;
                                             entry.n_prompt_tokens       = final_r->n_prompt_tokens;
                                             entry.n_prompt_tokens_cache = final_r->n_prompt_tokens_cache;
@@ -8742,6 +8745,7 @@ void server_routes::init_routes() {
         const std::string completion_id = it->second.completion_id;
         const std::string oaicompat_model = it->second.oaicompat_model;
         const std::string content = it->second.content;
+        const std::string reasoning_content = it->second.reasoning_content;
         const int32_t n_decoded  = it->second.n_decoded;
         const int32_t n_prompt_tokens = it->second.n_prompt_tokens;
         const int32_t n_prompt_tokens_cache = it->second.n_prompt_tokens_cache;
@@ -8875,6 +8879,10 @@ void server_routes::init_routes() {
                     {"object", "chat.completion.chunk"},
                 };
 
+                if (!reasoning_content.empty()) {
+                    delta["choices"][0]["delta"]["reasoning_content"] = reasoning_content;
+                }
+
                 if (include_usage) {
                     delta["usage"] = json {
                         {"completion_tokens", n_decoded},
@@ -8895,6 +8903,9 @@ void server_routes::init_routes() {
                 json message;
                 message["role"] = "assistant";
                 message["content"] = content;
+                if (!reasoning_content.empty()) {
+                    message["reasoning_content"] = reasoning_content;
+                }
 
                 json choice {
                     {"finish_reason", stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS ? "stop" : "length"},

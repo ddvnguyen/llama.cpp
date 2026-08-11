@@ -221,6 +221,7 @@ struct server_routes {
         std::string     oaicompat_model;
         json            generation_params;
         std::string     content;           // full generated text
+        std::string     reasoning_content; // model thinking text (reasoning_content from OAI chat message)
         int32_t         n_decoded = 0;
         int32_t         n_prompt_tokens = 0;
         int32_t         n_prompt_tokens_cache = 0;
