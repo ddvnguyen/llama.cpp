@@ -3736,3 +3736,797 @@ void server_context::start_rpc_server(int port, std::vector<ggml_backend *>) {
     GGML_UNUSED(port);
 }
 #endif // !_WIN32
+
+// --- WS3.5 moved helper methods ---
+
+    bool server_context_impl::apply_t3_rebuild() {
+        bool is_first_load = !ctx_tgt;
+
+        // Track the last override_tensor string that was actually
+        // applied so we can detect "nothing changed" on subsequent
+        // calls and skip the expensive unload+reload cycle.
+        static std::string old_override_applied;
+
+        common_params old_params = params_base;
+        common_params swapped_params = params_base;
+
+        // Read the staged T3 statics and apply them to swapped_params.
+        if (llama_hydra_get_pending_n_gpu_layers() >= 0) {
+            swapped_params.n_gpu_layers = llama_hydra_get_pending_n_gpu_layers();
+        }
+        // n_cpu_moe is informational only — the actual MoE expert
+        // offload is done via override_tensor (parsed below into
+        // tensor_buft_overrides). The standard common_params struct
+        // has no n_cpu_moe field; we just log the staged value for
+        // operator visibility.
+        if (llama_hydra_get_pending_n_cpu_moe() >= 0) {
+            SRV_INF("hydra: T3 rebuild: staged n_cpu_moe=%d (informational; expert routing via override_tensor)\n",
+                    llama_hydra_get_pending_n_cpu_moe());
+        }
+        const char * path = llama_hydra_get_pending_model_path();
+        if (path && *path) {
+            swapped_params.model.path = path;
+        }
+        const char * mode = llama_hydra_get_pending_split_mode();
+        if (mode && *mode) {
+            std::string m(mode);
+            if (m == "none")      swapped_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+            else if (m == "layer") swapped_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+            else if (m == "row")   swapped_params.split_mode = LLAMA_SPLIT_MODE_ROW;
+            else SRV_WRN("hydra: T3 split_mode='%s' unknown; keeping current\n", m.c_str());
+        }
+        const size_t n_split = llama_hydra_get_pending_tensor_split_count();
+        if (n_split > 0) {
+            const float * split = llama_hydra_get_pending_tensor_split();
+            // common_params::tensor_split is a fixed-size array.
+            const size_t cap = sizeof(swapped_params.tensor_split) /
+                                sizeof(swapped_params.tensor_split[0]);
+            const size_t n = n_split < cap ? n_split : cap;
+            for (size_t i = 0; i < n; i++) {
+                swapped_params.tensor_split[i] = split[i];
+            }
+            // Zero the rest so the engine doesn't see stale values.
+            for (size_t i = n; i < cap; i++) {
+                swapped_params.tensor_split[i] = 0.0f;
+            }
+        }
+        const char * override = llama_hydra_get_pending_override_tensor();
+        if (override && *override) {
+            // Wire-shape: comma-separated "pattern=buft" pairs (e.g.
+            // "blk.*.ffn_*_exps.weight=CPU"). The C++ side stores
+            // these as a vector<llama_model_tensor_buft_override>.
+            // Buft names are looked up
+            // via ggml_backend_dev_buffer_type() + ggml_backend_buft_name()
+            // (mirrors common/arg.cpp:parse_tensor_buffer_overrides).
+            ggml_backend_load_all();
+            std::map<std::string, ggml_backend_buffer_type_t> buft_list;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * dev = ggml_backend_dev_get(i);
+                auto * buft = ggml_backend_dev_buffer_type(dev);
+                if (buft) {
+                    buft_list[std::string(ggml_backend_buft_name(buft))] = buft;
+                }
+            }
+            // CPU is the common case (MoE expert routing) — also lookup
+            // explicitly since some backends may not register the CPU buft.
+            buft_list["CPU"] = ggml_backend_cpu_buffer_type();
+
+            // Keep pattern strings alive for the lifetime of the
+            // process — entry.pattern is a const char* that must not
+            // dangle.  Matches the safe pattern in common/arg.cpp.
+            static std::list<std::string> buft_override_patterns;
+
+            std::vector<llama_model_tensor_buft_override> staged;
+
+            const std::string ovr(override);
+            size_t start = 0;
+            while (start < ovr.size()) {
+                size_t comma = ovr.find(',', start);
+                std::string part = ovr.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                size_t eq = part.find('=');
+                if (eq != std::string::npos) {
+                    std::string pattern = part.substr(0, eq);
+                    std::string buft_name = part.substr(eq + 1);
+                    auto it = buft_list.find(buft_name);
+                    if (it != buft_list.end()) {
+                        buft_override_patterns.push_back(pattern);
+                        llama_model_tensor_buft_override entry;
+                        entry.pattern = buft_override_patterns.back().c_str();
+                        entry.buft = it->second;
+                        staged.push_back(entry);
+                    } else {
+                        SRV_WRN("%s", "hydra: T3 rebuild: override_tensor buft name not in registered list; skipping pattern\n");
+                    }
+                }
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+
+            // Install the staged patterns *in place of* the base ones instead of
+            // appending to them.
+            //
+            // common_params_parse_ex() (common/arg.cpp) unconditionally pads this
+            // vector out to llama_max_tensor_buft_overrides() entries of
+            // {nullptr, nullptr}, so by the time we get here the real CLI overrides
+            // sit at the head and the rest is terminator padding. push_back() would
+            // land *behind* that padding, which breaks twice over:
+            //   1. common_model_params_to_llama() asserts that back().pattern is
+            //      nullptr, so the engine aborts before the model loads;
+            //   2. even without that assert, llama_model_loader stops scanning at
+            //      the first nullptr pattern, so appended entries are never read —
+            //      the override would be silently dropped and the MoE experts would
+            //      land on the GPU.
+            // Replacing also matches the sibling fields handled above: model.path,
+            // split_mode, n_gpu_layers and tensor_split are all overwritten by the
+            // staged T3 config rather than merged into it.
+            const size_t ntbo = llama_max_tensor_buft_overrides();
+            if (staged.empty()) {
+                // Nothing resolved (every buft name was unknown). Wiping the base
+                // overrides here would silently change how the model is placed, so
+                // keep them and make the no-op explicit.
+                SRV_WRN("%s", "hydra: T3 rebuild: staged override_tensor resolved to no usable patterns; keeping base overrides\n");
+            } else {
+                if (staged.size() + 1 > ntbo) {
+                    SRV_WRN("hydra: T3 rebuild: %zu override_tensor patterns exceed the %zu-entry limit; keeping the first %zu\n",
+                            staged.size(), ntbo, ntbo - 1);
+                    staged.resize(ntbo - 1);
+                }
+                // assign() re-establishes the full terminator padding, so everything
+                // from staged.size() onward is {nullptr, nullptr}.
+                swapped_params.tensor_buft_overrides.assign(ntbo, llama_model_tensor_buft_override{ nullptr, nullptr });
+                for (size_t i = 0; i < staged.size(); ++i) {
+                    swapped_params.tensor_buft_overrides[i] = staged[i];
+                }
+            }
+        }
+
+        // Early-exit: if the model and all T3-relevant params are
+        // identical to what is already loaded, skip the expensive
+        // unload+reload cycle.  Without this, every COMPLETION
+        // request that carries hydra_config triggers a full model
+        // swap even when nothing changed (the coordinator sends the
+        // same config on every decode request).
+        if (!is_first_load) {
+            const char * cur_override = llama_hydra_get_pending_override_tensor();
+            bool params_unchanged =
+                swapped_params.model.path == old_params.model.path &&
+                swapped_params.n_gpu_layers == old_params.n_gpu_layers &&
+                swapped_params.split_mode == old_params.split_mode &&
+                ((cur_override == nullptr && old_override_applied.empty()) ||
+                 (cur_override && old_override_applied == cur_override));
+            if (params_unchanged) {
+                // T3 overrides (override_tensor, split_mode) were staged by
+                // the COMPLETION hydra_config path. But the model reload is
+                // being skipped. Clear the staged override so the next decode
+                // uses the current tensor placement (not the staged override).
+                llama_hydra_set_override_tensor(ctx_tgt, nullptr);
+                SRV_INF("%s", "hydra: T3 rebuild: model and params unchanged — skipping reload, cleared staged overrides\n");
+                return true;
+            }
+        }
+
+        // COMBINED-mode teardown BEFORE the model reload — see
+        // hydra_teardown_combined_before_reload() above.
+        const bool was_combined = hydra_combined_head_attached || hydra_combined_static;
+        if (!is_first_load && was_combined) {
+            hydra_teardown_combined_before_reload();
+        }
+
+        // Register any new RPC peer devices before load_model() so the
+        // peer's device exists in the global ggml backend registry when
+        // common_init_from_params() tries to place tensors per
+        // tensor_split/split_mode. Only genuinely new endpoints are
+        // registered (hydra_register_rpc_servers tracks already-registered
+        // endpoints to avoid unsafe repeated registration).
+        if (!g_pending_rpc_servers.empty()) {
+            json rpc_arr = json::array();
+            for (const auto & s : g_pending_rpc_servers) {
+                rpc_arr.push_back(s);
+            }
+            hydra_register_rpc_servers(rpc_arr);
+            g_pending_rpc_servers.clear();
+        }
+
+        // Full model reload. load_model() handles the unload of the
+        // current model, the load of the new model, the new context
+        // creation, the MTP/draft paths, and the slot rebuild.
+        // NOTE: load_model() does `params_base = params` internally
+        // (line 844), so after a successful load params_base reflects
+        // swapped_params — no explicit reassignment needed by us.
+        //
+        // #507: Skip the fit_params probe during T3 rebuild. The probe
+        // does a full model-structure load with no_alloc=true to measure
+        // GPU memory — expensive (~45-90s) and unnecessary here because:
+        // (a) we just freed VRAM by destroying the old model, (b) the new
+        // model's requirements are known (same or smaller), (c) a controlled
+        // inference server has predictable VRAM. Disabling saves ~1 min.
+        swapped_params.fit_params = false;
+        if (!load_model(swapped_params)) {
+            if (is_first_load) {
+                SRV_WRN("%s", "hydra: T3 first load failed — engine stays empty\n");
+                return false;
+            }
+            SRV_ERR("hydra: T3 reload to '%s' failed (load_model returned false); "
+                    "rolling back to old model\n",
+                    swapped_params.model.path.c_str());
+            if (!load_model(old_params)) {
+                SRV_ERR("%s", "hydra: T3 rollback also failed — engine in unrecoverable state\n");
+                GGML_ABORT("hydra: T3 rollback failed (cannot reload old model). "
+                           "Engine exiting to prevent serving with corrupted state.");
+            }
+            SRV_INF("hydra: T3 rollback succeeded — restored old model '%s'\n",
+                    old_params.model.path.c_str());
+            return false;
+        }
+
+        // Record the override_tensor that was just applied so the
+        // next call can skip the reload if nothing changed.
+        {
+            const char * cur = llama_hydra_get_pending_override_tensor();
+            old_override_applied = cur ? cur : "";
+        }
+
+        // T3 reload confirmed. Log model identity for traceability.
+        SRV_INF("hydra: T3 reload confirmed model_alias='%s' tokenizer='%s' model_name='%s' quant='%s' caps=0x%x model_path='%s'\n",
+                swapped_params.model_alias.empty() ? "?" : swapped_params.model_alias.begin()->c_str(),
+                model_tgt ? llama_model_get_tokenizer_model(model_tgt) : "",
+                model_tgt ? llama_model_get_display_name(model_tgt) : "",
+                model_tgt ? llama_model_get_quant_label(model_tgt) : "",
+                model_tgt ? llama_model_get_capabilities_bitfield(model_tgt) : 0,
+                swapped_params.model.path.c_str());
+
+        // COMBINED-mode reattach AFTER the model reload — see
+        // hydra_reattach_combined_after_reload() above.
+        if (was_combined) {
+            hydra_reattach_combined_after_reload();
+        }
+
+        SRV_INF("hydra: T3 rebuild applied (model='%s', split_mode=%d, n_gpu_layers=%d, slots=%zu)\n",
+                params_base.model.path.c_str(), (int) params_base.split_mode,
+                params_base.n_gpu_layers, slots.size());
+        return true;
+    }
+
+    void server_context_impl::hydra_repad_tensor_buft_overrides(common_params & p, const char * ctx_label) {
+        const size_t ntbo = llama_max_tensor_buft_overrides();
+        if (p.tensor_buft_overrides.size() + 1 > ntbo) {
+            SRV_WRN("hydra: %s: %zu tensor_buft_overrides exceed the %zu-entry limit; keeping the first %zu\n",
+                    ctx_label, p.tensor_buft_overrides.size(), ntbo, ntbo - 1);
+            p.tensor_buft_overrides.resize(ntbo - 1);
+        }
+        p.tensor_buft_overrides.resize(ntbo, llama_model_tensor_buft_override{ nullptr, nullptr });
+    }
+
+    void server_context_impl::hydra_reattach_combined_after_reload() {
+        SRV_INF("%s", "hydra: re-attaching COMBINED on new model\n");
+        if (hydra_combined_static) {
+            llama_hydra_set_expert_mode(ctx_tgt, 1);
+        } else if (!hydra_peer.empty() && !hydra_combined_pattern.empty()) {
+            if (llama_hydra_peer_reachable(hydra_peer.c_str())) {
+                ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+                if (rpc_reg) {
+                    using add_server_fn_t = ggml_backend_reg_t (*)(const char *);
+                    auto add_server_fn = (add_server_fn_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+                    ggml_backend_reg_t peer_reg = add_server_fn ? add_server_fn(hydra_peer.c_str()) : nullptr;
+                    ggml_backend_dev_t  peer_dev = (peer_reg && ggml_backend_reg_dev_count(peer_reg) > 0) ? ggml_backend_reg_dev_get(peer_reg, 0) : nullptr;
+                    if (peer_dev) {
+                        int32_t n_bound = llama_hydra_rebind_combined_experts(
+                                ctx_tgt, hydra_peer.c_str(), peer_dev, hydra_combined_pattern.c_str());
+                        if (n_bound > 0) {
+                            hydra_combined_head_attached = true;
+                            llama_hydra_set_expert_mode(ctx_tgt, 1);
+                            SRV_INF("hydra: COMBINED re-attached on peer %s (%d layers bound)\n",
+                                    hydra_peer.c_str(), n_bound);
+                        } else {
+                            SRV_WRN("hydra: rebind returned %d; staying solo\n", n_bound);
+                        }
+                    } else {
+                        SRV_WRN("hydra: peer %s has no device; staying solo\n", hydra_peer.c_str());
+                    }
+                } else {
+                    SRV_WRN("%s\n", "hydra: RPC backend not available; staying solo");
+                }
+            } else {
+                SRV_WRN("hydra: peer %s unreachable; staying solo\n", hydra_peer.c_str());
+            }
+        }
+    }
+
+    void server_context_impl::hydra_teardown_combined_before_reload() {
+        SRV_INF("hydra: tearing down COMBINED before model reload (was head_attached=%d, static=%d)\n",
+                (int) hydra_combined_head_attached, (int) hydra_combined_static);
+        llama_hydra_set_expert_mode(ctx_tgt, 0);
+        if (!hydra_current_peer.empty()) {
+            ctx_tgt->hydra_remove_combined_rpc_backend(hydra_current_peer.c_str());
+        }
+        llama_hydra_clear_combined_bindings(ctx_tgt, hydra_peer.c_str());
+        hydra_combined_head_attached = false;
+    }
+
+    void server_context_impl::hydra_register_rpc_servers(const json & servers_arr) {
+        static std::set<std::string> registered;
+
+        if (!servers_arr.is_array() || servers_arr.empty()) {
+            return;
+        }
+
+        ggml_backend_load_all();
+        ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+        if (!rpc_reg) {
+            SRV_WRN("%s", "hydra: rpc_servers: RPC backend not available\n");
+            return;
+        }
+
+        typedef ggml_backend_reg_t (*ggml_backend_rpc_add_server_t)(const char * endpoint);
+        auto add_server_fn = (ggml_backend_rpc_add_server_t)
+            ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+        if (!add_server_fn) {
+            SRV_WRN("%s", "hydra: rpc_servers: ggml_backend_rpc_add_server not found\n");
+            return;
+        }
+
+        for (const auto & v : servers_arr) {
+            if (!v.is_string()) continue;
+            const std::string endpoint = v.get<std::string>();
+            if (endpoint.empty()) continue;
+            if (registered.count(endpoint)) {
+                SRV_DBG("hydra: rpc_servers: endpoint '%s' already registered, skipping\n",
+                        endpoint.c_str());
+                continue;
+            }
+            ggml_backend_reg_t reg = add_server_fn(endpoint.c_str());
+            if (reg) {
+                ggml_backend_register(reg);
+                registered.insert(endpoint);
+                SRV_INF("hydra: rpc_servers: registered endpoint '%s'\n", endpoint.c_str());
+            } else {
+                SRV_WRN("hydra: rpc_servers: failed to register endpoint '%s'\n",
+                        endpoint.c_str());
+            }
+        }
+    }
+
+    bool server_context_impl::apply_t2_rebuild(const std::string & pending_json) {
+        if (!ctx_tgt || !model_tgt) return false;
+
+        json cfg;
+        try {
+            cfg = json::parse(pending_json);
+        } catch (const std::exception & e) {
+            SRV_WRN("hydra: T2 apply: invalid JSON in pending_config: %s\n", e.what());
+            return false;
+        }
+
+        // Snapshot the old params for rollback. params_base is the
+        // canonical "what's in effect" state; restoring it plus a
+        // recreate-cycle is the rollback path.
+        common_params old_params = params_base;
+
+        // Update params_base with the T2 keys. Each is optional;
+        // absence means "leave unchanged".
+        if (cfg.contains("n_ctx") && cfg["n_ctx"].is_number_integer()) {
+            const int32_t n_ctx = cfg["n_ctx"].get<int32_t>();
+            // Clamp to the model's training ctx. The wire spec does
+            // not require a reject-on-too-large (the engine's own
+            // check below does that); we clamp and report.
+            const int32_t max_ctx = (int32_t) llama_model_n_ctx_train(model_tgt);
+            if (n_ctx > max_ctx) {
+                SRV_WRN("hydra: T2 n_ctx=%d exceeds model_n_ctx_train=%d; clamping\n",
+                        n_ctx, max_ctx);
+                params_base.n_ctx = max_ctx;
+            } else {
+                params_base.n_ctx = n_ctx;
+            }
+        }
+        if (cfg.contains("cache_type_k") && cfg["cache_type_k"].is_string()) {
+            const std::string & s = cfg["cache_type_k"].get_ref<const std::string &>();
+            ggml_type t = hydra_parse_cache_type(s);
+            if (t == GGML_TYPE_COUNT) {
+                SRV_WRN("hydra: T2 cache_type_k='%s' unparseable; ignoring\n", s.c_str());
+            } else {
+                params_base.cache_type_k = t;
+            }
+        }
+        if (cfg.contains("cache_type_v") && cfg["cache_type_v"].is_string()) {
+            const std::string & s = cfg["cache_type_v"].get_ref<const std::string &>();
+            ggml_type t = hydra_parse_cache_type(s);
+            if (t == GGML_TYPE_COUNT) {
+                SRV_WRN("hydra: T2 cache_type_v='%s' unparseable; ignoring\n", s.c_str());
+            } else {
+                params_base.cache_type_v = t;
+            }
+        }
+        if (cfg.contains("rope_freq_base") && cfg["rope_freq_base"].is_number()) {
+            params_base.rope_freq_base = cfg["rope_freq_base"].get<float>();
+        }
+        if (cfg.contains("rope_freq_scale") && cfg["rope_freq_scale"].is_number()) {
+            params_base.rope_freq_scale = cfg["rope_freq_scale"].get<float>();
+        }
+        if (cfg.contains("yarn_ext_factor") && cfg["yarn_ext_factor"].is_number()) {
+            params_base.yarn_ext_factor = cfg["yarn_ext_factor"].get<float>();
+        }
+        if (cfg.contains("yarn_attn_factor") && cfg["yarn_attn_factor"].is_number()) {
+            params_base.yarn_attn_factor = cfg["yarn_attn_factor"].get<float>();
+        }
+        if (cfg.contains("yarn_beta_fast") && cfg["yarn_beta_fast"].is_number()) {
+            params_base.yarn_beta_fast = cfg["yarn_beta_fast"].get<float>();
+        }
+        if (cfg.contains("yarn_beta_slow") && cfg["yarn_beta_slow"].is_number()) {
+            params_base.yarn_beta_slow = cfg["yarn_beta_slow"].get<float>();
+        }
+        if (cfg.contains("yarn_orig_ctx") && cfg["yarn_orig_ctx"].is_number_integer()) {
+            params_base.yarn_orig_ctx = cfg["yarn_orig_ctx"].get<int32_t>();
+        }
+
+        // Free the live context. KV cache is destroyed; this is the
+        // T2 cost. The model is kept (T2 is context-only).
+        llama_free(ctx_tgt);
+        if (ctx_dft) {
+            llama_free(ctx_dft.get());
+            ctx_dft.reset();
+        }
+
+        // Build new cparams from the updated params_base. This is
+        // the same call site load_model() uses internally.
+        auto cparams = common_context_params_to_llama(params_base);
+
+        // Recreate the context with the new cparams.
+        ctx_tgt = llama_new_context_with_model(model_tgt, cparams);
+        if (!ctx_tgt) {
+            // Rollback: rebuild with the old params_base. The old
+            // params must work (we just freed and recreated the
+            // context with them). If they don't, the engine is in
+            // a bad state — abort.
+            SRV_WRN("hydra: T2 rebuild failed with n_ctx=%d cache_type=%d/%d; "
+                    "rolling back to old params\n",
+                    params_base.n_ctx, (int) params_base.cache_type_k,
+                    (int) params_base.cache_type_v);
+            params_base = old_params;
+            auto cparams_old = common_context_params_to_llama(params_base);
+            ctx_tgt = llama_new_context_with_model(model_tgt, cparams_old);
+            if (!ctx_tgt) {
+                GGML_ABORT("hydra: T2 rollback failed (cannot rebuild context with old params). "
+                           "Engine exiting to prevent serving with corrupted state.");
+            }
+            return false;
+        }
+
+        // Re-init per-slot samplers. The old samplers were bound to
+        // the now-freed context; common_sampler_init() on the new
+        // model picks up the (possibly changed) sampling config.
+        for (auto & slot : slots) {
+            slot.smpl.reset(common_sampler_init(model_tgt, params_base.sampling));
+        }
+
+        n_ctx = llama_n_ctx(ctx_tgt);
+        SRV_INF("hydra: T2 rebuild applied (n_ctx=%d, cache=%d/%d, slots=%zu)\n",
+                n_ctx, (int) params_base.cache_type_k,
+                (int) params_base.cache_type_v, slots.size());
+        return true;
+    }
+
+    ggml_type server_context_impl::hydra_parse_cache_type(const std::string & s) {
+        if (s.empty()) return GGML_TYPE_COUNT;
+        for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+            ggml_type t = (ggml_type) i;
+            if (strcmp(ggml_type_name(t), s.c_str()) == 0) return t;
+        }
+        return GGML_TYPE_COUNT;
+    }
+
+    bool server_context_impl::apply_pending_hydra_config() {
+        const bool is_first_load = !ctx_tgt;
+        if (is_first_load) {
+            if (!first_load_pending) {
+                return false;
+            }
+            // Don't check hydra_has_pending_config — ctx_tgt doesn't exist yet.
+            // The T3 statics were staged by hydra_apply_t3_mutators() in the
+            // CONFIGURE handler. Set a default tier for the rebuild path.
+        } else if (!ctx_tgt->hydra_has_pending_config()) {
+            return false;
+        }
+
+        // 1. Drain timeout — skipped for first load (no ctx_tgt timestamp).
+        std::string tier;
+        std::string pending_json;
+
+        if (is_first_load) {
+            tier = "T3";
+            // pending_json stays empty — T3 statics are staged in global
+            // overrides, not in pending_config (ctx_tgt doesn't exist yet).
+        } else {
+            constexpr time_t k_drain_timeout_default = 300;
+            time_t now = std::time(nullptr);
+            time_t elapsed = now - ctx_tgt->hydra_get_pending_config_set_at();
+            int env_timeout = 0;
+            if (const char * e = getenv("HYDRA_COORD_PROFILE_SWITCH_DRAIN_TIMEOUT")) {
+                env_timeout = atoi(e);
+            }
+            time_t drain_timeout = env_timeout > 0 ? env_timeout : k_drain_timeout_default;
+            if (elapsed > drain_timeout) {
+                SRV_WRN("hydra: pending config drain timeout (elapsed=%lld, limit=%lld) — discarding, "
+                        "tier='%s' payload_size=%zu\n",
+                        (long long) elapsed, (long long) drain_timeout,
+                        ctx_tgt->hydra_get_pending_config_tier().c_str(),
+                        ctx_tgt->hydra_get_pending_config().size());
+                ctx_tgt->hydra_clear_pending_config();
+                llama_hydra_clear_pending_t3();
+                return false;
+            }
+
+            tier = ctx_tgt->hydra_get_pending_config_tier();
+            pending_json = ctx_tgt->hydra_get_pending_config();
+            SRV_INF("hydra: applying pending config (tier='%s', age=%llds, payload_size=%zu)\n",
+                    tier.c_str(), (long long) elapsed, pending_json.size());
+        }
+
+        bool ok = true;
+
+        // 2. T2 work: free + rebuild context with the new cparams.
+        //    Skipped when tier is T3 (T3's load_model() handles both).
+        if (tier == "T2") {
+            if (!apply_t2_rebuild(pending_json)) {
+                SRV_ERR("%s", "hydra: T2 rebuild failed; engine continues with old context\n");
+                ok = false;
+            }
+        }
+
+        // 3. T3 work: full model reload with the staged T3 statics.
+        //    load_model() handles the unload+reload cycle. COMBINED-mode
+        //    expert bindings are torn down before the reload and re-
+        //    attached after, in the same pattern as SET_EXPERT_MODE.
+        if (tier == "T3") {
+            if (!apply_t3_rebuild()) {
+                SRV_ERR("%s", "hydra: T3 rebuild failed; engine continues with old model\n");
+                ok = false;
+            } else {
+                // P1-6: T3 model changed — the cached server_context_meta
+                // (model_path, split_mode, tensor_split, chat_params, …)
+                // is now stale.  Refresh it on the task-queue thread
+                // (safe — runs during the drain window when no slots are
+                // processing and no new requests are being dispatched).
+                if (routes_ptr) {
+                    routes_ptr->refresh_meta();
+                }
+                // P0-1 (#49): after deferred first-load, apply staged capabilities
+                // so ENGINE_INFO(0x41) and COMBINED-mode logic work correctly.
+                if (is_first_load) {
+                    hydra_rpc_backend_active = bootstrap_rpc_active;
+                    hydra_peer               = bootstrap_peer;
+                    hydra_peer_reachable     = bootstrap_peer_reachable;
+                    hydra_combined_pattern   = bootstrap_pattern;
+                    hydra_split_mode         = bootstrap_split_mode;
+                    if (bootstrap_combined_static) {
+                        hydra_combined_static = true;
+                        SRV_INF("%s", "P0-1: deferred first-load — combined_static mode activated\n");
+                    }
+                    // Register local tensors and enable shared-backend compute
+                    // lock so the model can serve inbound RPC requests.
+                    if (model_tgt && ctx_tgt) {
+                        llama_hydra_register_local_tensors_for_rpc(ctx_tgt);
+                        llama_hydra_enable_shared_backend_compute_lock();
+                    }
+                    // Update the RPC server's compute backends now that the
+                    // model is loaded. The RPC server was started with empty
+                    // backends (head-bootstrap mode); now populate it.
+                    if (ctx_tgt) {
+                        std::vector<ggml_backend_t> backends(8);
+                        size_t n = llama_hydra_get_compute_backends(ctx_tgt, backends.data(), backends.size());
+                        if (n > backends.size()) {
+                            backends.resize(n);
+                            n = llama_hydra_get_compute_backends(ctx_tgt, backends.data(), backends.size());
+                        }
+                        backends.resize(n);
+                        hydra_rpc::update_backends(backends);
+                        SRV_INF("P0-1: updated RPC backends to %zu compute device(s)\n", backends.size());
+                    }
+                    SRV_INF("%s", "hydra-engine ready — model loaded via CONFIGURE T3\n");
+                }
+            }
+        }
+
+        // 4. Clear the staged state regardless of success. On failure
+        //    the rollback in apply_t{2,3}_rebuild has restored the
+        //    previous state; clearing the staged state prevents the
+        //    next slot-free moment from re-attempting the same rebuild.
+        if (is_first_load) {
+            first_load_pending = false;
+        } else {
+            ctx_tgt->hydra_clear_pending_config();
+        }
+        llama_hydra_clear_pending_t3();
+        return ok;
+    }
+
+    void server_context_impl::hydra_apply_t3_mutators(llama_context * ctx, const json & cfg, std::vector<std::string> & deferred_keys) {
+        if (cfg.contains("n_gpu_layers") && cfg["n_gpu_layers"].is_number_integer()) {
+            llama_hydra_set_pending_n_gpu_layers(cfg["n_gpu_layers"].get<int32_t>());
+            deferred_keys.push_back("n_gpu_layers");
+        }
+        if (cfg.contains("n_cpu_moe") && cfg["n_cpu_moe"].is_number_integer()) {
+            llama_hydra_set_pending_n_cpu_moe(cfg["n_cpu_moe"].get<int32_t>());
+            deferred_keys.push_back("n_cpu_moe");
+        }
+        if (cfg.contains("override_tensor") && cfg["override_tensor"].is_string()) {
+            llama_hydra_set_override_tensor(ctx, cfg["override_tensor"].get<std::string>().c_str());
+            deferred_keys.push_back("override_tensor");
+        }
+        if (cfg.contains("split_mode") && cfg["split_mode"].is_string()) {
+            std::vector<float> split;
+            if (cfg.contains("tensor_split") && cfg["tensor_split"].is_array()) {
+                for (const auto & v : cfg["tensor_split"]) {
+                    if (v.is_number()) split.push_back(v.get<float>());
+                }
+            }
+            llama_hydra_set_split_mode(ctx, cfg["split_mode"].get<std::string>().c_str(),
+                                       split.empty() ? nullptr : split.data(), split.size());
+            deferred_keys.push_back("split_mode");
+            if (!split.empty()) deferred_keys.push_back("tensor_split");
+        } else if (cfg.contains("tensor_split") && cfg["tensor_split"].is_array()) {
+            // tensor_split without split_mode is meaningless; record it as
+            // deferred and let the apply step surface the missing mode.
+            deferred_keys.push_back("tensor_split");
+        }
+        if (cfg.contains("model") && cfg["model"].is_object() &&
+            cfg["model"].contains("path") && cfg["model"]["path"].is_string()) {
+            llama_hydra_set_pending_model_path(cfg["model"]["path"].get<std::string>().c_str());
+            deferred_keys.push_back("model.path");
+        } else if (cfg.contains("model") && cfg["model"].is_string()) {
+            // legacy shorthand: {"model": "/path/to.gguf"}
+            llama_hydra_set_pending_model_path(cfg["model"].get<std::string>().c_str());
+            deferred_keys.push_back("model");
+        }
+        // hydra_config flat key: {"model_path": "/path/to.gguf"}
+        if (cfg.contains("model_path") && cfg["model_path"].is_string()) {
+            llama_hydra_set_pending_model_path(cfg["model_path"].get<std::string>().c_str());
+            deferred_keys.push_back("model_path");
+        }
+        // hydra_config: {"rpc_servers": ["host1:port1", "host2:port2"]}
+        // Stored in a static for apply_t3_rebuild() to consume before
+        // load_model(). The actual ggml backend registration happens in
+        // hydra_register_rpc_servers() called from apply_t3_rebuild().
+        if (cfg.contains("rpc_servers") && cfg["rpc_servers"].is_array()) {
+            g_pending_rpc_servers.clear();
+            for (const auto & v : cfg["rpc_servers"]) {
+                if (v.is_string()) {
+                    g_pending_rpc_servers.push_back(v.get<std::string>());
+                }
+            }
+            deferred_keys.push_back("rpc_servers");
+        }
+    }
+
+    bool server_context_impl::hydra_apply_t1_config(common_params & params, llama_context * ctx, const json & cfg, std::map<std::string, json> & params_applied) {
+        // sampling.* — set on the common_params, which the next launch_slot
+        // will pick up when re-initializing the slot's common_sampler.
+        if (cfg.contains("sampling") && cfg["sampling"].is_object()) {
+            const json & s = cfg["sampling"];
+            #define COPY_FLOAT(field) \
+                if (s.contains(#field) && s[#field].is_number()) { \
+                    params.sampling.field = s[#field].get<float>(); \
+                    params_applied["sampling." #field] = params.sampling.field; \
+                }
+            #define COPY_INT(field) \
+                if (s.contains(#field) && s[#field].is_number()) { \
+                    params.sampling.field = s[#field].get<int32_t>(); \
+                    params_applied["sampling." #field] = params.sampling.field; \
+                }
+            COPY_FLOAT(temp)
+            COPY_FLOAT(top_p)
+            COPY_FLOAT(min_p)
+            COPY_FLOAT(penalty_repeat)
+            COPY_INT(top_k)
+            COPY_INT(seed)
+            #undef COPY_FLOAT
+            #undef COPY_INT
+        }
+        // n_predict
+        if (cfg.contains("n_predict") && cfg["n_predict"].is_number_integer()) {
+            params.n_predict = cfg["n_predict"].get<int32_t>();
+            params_applied["n_predict"] = params.n_predict;
+        } else if (cfg.contains("n_predict") && !cfg["n_predict"].is_number_integer()) {
+            SRV_WRN("%s", "hydra: CONFIGURE n_predict must be an integer\n");
+            return false;
+        }
+        // n_keep
+        if (cfg.contains("n_keep") && cfg["n_keep"].is_number_integer()) {
+            params.n_keep = cfg["n_keep"].get<int32_t>();
+            params_applied["n_keep"] = params.n_keep;
+        } else if (cfg.contains("n_keep") && !cfg["n_keep"].is_number_integer()) {
+            SRV_WRN("%s", "hydra: CONFIGURE n_keep must be an integer\n");
+            return false;
+        }
+        // seed (top-level — sets the sampler's seed via common_params::sampling).
+        // common_params itself has no top-level seed; common_params_sampling does.
+        if (cfg.contains("seed") && cfg["seed"].is_number_unsigned()) {
+            params.sampling.seed = cfg["seed"].get<uint32_t>();
+            params_applied["seed"] = params.sampling.seed;
+        } else if (cfg.contains("seed") && cfg["seed"].is_number_integer()) {
+            params.sampling.seed = (uint32_t) cfg["seed"].get<int32_t>();
+            params_applied["seed"] = params.sampling.seed;
+        } else if (cfg.contains("seed") && !cfg["seed"].is_number()) {
+            SRV_WRN("%s", "hydra: CONFIGURE seed must be a number\n");
+            return false;
+        }
+        // antiprompt — full replacement (matches the existing semantics
+        // of CLI --reverse-prompt)
+        if (cfg.contains("antiprompt") && cfg["antiprompt"].is_array()) {
+            std::vector<std::string> new_antiprompt;
+            for (const auto & v : cfg["antiprompt"]) {
+                if (!v.is_string()) {
+                    SRV_WRN("%s", "hydra: CONFIGURE antiprompt entries must be strings\n");
+                    return false;
+                }
+                new_antiprompt.push_back(v.get<std::string>());
+            }
+            params.antiprompt = std::move(new_antiprompt);
+            params_applied["antiprompt"] = params.antiprompt;
+        } else if (cfg.contains("antiprompt") && !cfg["antiprompt"].is_array()) {
+            SRV_WRN("%s", "hydra: CONFIGURE antiprompt must be an array of strings\n");
+            return false;
+        }
+        // state_chunk_size — apply via the existing llama_hydra API (clamps
+        // and echoes the post-clamp value)
+        if (cfg.contains("state_chunk_size") && cfg["state_chunk_size"].is_number_unsigned()) {
+            const size_t bytes = cfg["state_chunk_size"].get<size_t>();
+            if (ctx) {
+                llama_hydra_set_state_chunk_size(ctx, bytes);
+            }
+            const size_t applied = ctx ? llama_hydra_get_state_chunk_size(ctx) : llama_hydra_clamp_state_chunk_size(bytes);
+            params_applied["state_chunk_size"] = (uint64_t) applied;
+        } else if (cfg.contains("state_chunk_size") && !cfg["state_chunk_size"].is_number_unsigned()) {
+            SRV_WRN("%s", "hydra: CONFIGURE state_chunk_size must be a non-negative integer\n");
+            return false;
+        }
+        return true;
+    }
+
+    int server_context_impl::hydra_classify_config_key(const std::string & key) {
+        // T1: sampling nested keys
+        if (key == "sampling.temp"           ||
+            key == "sampling.top_p"          ||
+            key == "sampling.top_k"          ||
+            key == "sampling.min_p"          ||
+            key == "sampling.penalty_repeat" ||
+            key == "sampling.seed") {
+            return 1;
+        }
+        // T1: top-level fields
+        if (key == "n_predict" ||
+            key == "n_keep"    ||
+            key == "seed"      ||
+            key == "antiprompt" ||
+            key == "state_chunk_size") {
+            return 1;
+        }
+        // T2: context-level (KV cache / RoPE / ctx)
+        if (key == "n_ctx"        ||
+            key == "cache_type_k" ||
+            key == "cache_type_v" ||
+            key.rfind("rope_", 0) == 0) {
+            return 2;
+        }
+        // T3: model-level (offload / placement / model)
+        if (key == "n_gpu_layers"    ||
+            key == "n_cpu_moe"       ||
+            key == "override_tensor" ||
+            key == "split_mode"      ||
+            key == "tensor_split"    ||
+            key == "model_path"      ||  // hydra_config: absolute GGUF path
+            key == "rpc_servers"     ||  // hydra_config: RPC peer endpoints to register
+            key == "model.path"      ||
+            key == "model") {        // legacy alias for { "model": { "path": ... } }
+            return 3;
+        }
+        return 0;  // unknown
+    }
+
+    const char * server_context_impl::hydra_tier_label(int tier) {
+        switch (tier) {
+            case 1: return "T1";
+            case 2: return "T2";
+            case 3: return "T3";
+            default: return "T1";  // 0 (no recognized keys) → degenerate T1
+        }
+    }
