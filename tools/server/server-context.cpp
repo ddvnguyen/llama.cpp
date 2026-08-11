@@ -4677,6 +4677,18 @@ private:
                         json prompt = decode_req["prompt"];
                         json cmpl_data;
                         cmpl_data["stream"] = prompt.value("stream", false);
+                        // #622: the DECODE 0x43 frame has no dedicated stream_options
+                        // channel, but the coordinator always requests usage on the
+                        // merged path (it injects stream_options.include_usage=true on
+                        // its HTTP body). Honor stream_options when the request carries
+                        // it (generation header / prompt segment), otherwise mirror the
+                        // coordinator's injection so the DONE-SSE delta carries usage
+                        // natively and the coordinator's usage-based gate fires.
+                        if (prompt.contains("stream_options") && prompt["stream_options"].is_object()) {
+                            cmpl_data["stream_options"] = prompt["stream_options"];
+                        } else {
+                            cmpl_data["stream_options"] = json{{"include_usage", true}};
+                        }
                         cmpl_data["n_predict"] = prompt.value("n_predict", 256);
                         cmpl_data["id_slot"] = id_slot;
                         if (prompt.contains("sampling")) {
