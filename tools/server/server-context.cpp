@@ -4768,6 +4768,11 @@ private:
                             cmpl_task.params.oaicompat_cmpl_id = gen_chatcmplid();
                             cmpl_task.params.oaicompat_model = model_name;
 
+                            // Mirror server_response_reader::post_task(): the
+                            // consumer thread keeps its own result state so it
+                            // can run result->update() per received result.
+                            task_result_state cmpl_state = cmpl_task.create_state();
+
                             queue_results.add_waiting_task_id(completion_id);
                             queue_tasks.post(std::move(cmpl_task));
                             SRV_INF("hydra: DECODE_APPLY slot=%d posted COMPLETION (completion_id=%d, request_id=%d)\n",
@@ -4809,7 +4814,8 @@ private:
                                              resident_model_quant, resident_capabilities,
                                              oaicompat_model_name = model_name,
                                              model_load_ms, restore_slot_ms, n_past,
-                                             &results = queue_results]() mutable {
+                                             &results = queue_results,
+                                             states = std::vector<task_result_state>{ std::move(cmpl_state) }]() mutable {
                                     std::unordered_set<int> ids = {(int)completion_id};
                                     bool got_final = false;
 
@@ -4835,6 +4841,15 @@ private:
                                         // Check if this is a partial or final result
                                         auto * partial = dynamic_cast<server_task_result_cmpl_partial*>(res_ptr.get());
                                         auto * final_r = dynamic_cast<server_task_result_cmpl_final*>(res_ptr.get());
+
+                                        // Mirror server_response_reader::next(): run
+                                        // update() on every result before handling.
+                                        // Populates oaicompat_msg / oaicompat_msg_diffs
+                                        // (and sets is_updated, so to_json() won't
+                                        // assert on relayed partials).
+                                        const size_t idx = res_ptr->index;
+                                        GGML_ASSERT(idx < states.size());
+                                        res_ptr->update(states[idx]);
 
                                         if (partial && !partial->is_begin) {
                                             // Relay partial to streaming queue
