@@ -62,6 +62,17 @@ hydra_generic_key_status hydra_classify_generic_key(const std::string & key);
 // JSON type cannot be converted (the failure is logged with SRV_WRN).
 bool hydra_apply_generic_key(common_params & params, const std::string & key, const json & value);
 
+// hydra#470: a synchronous hydra_config apply whose highest tier is >= 3
+// may have rebuilt the slots (T3 statics or a T4-only generic config both
+// route through apply_t3_rebuild() → load_model() → slots.clear()). Callers
+// that hold a server_slot* across hydra_apply_config(sync=true) MUST use
+// this predicate to decide whether to re-look-up the slot — otherwise the
+// held pointer dangles (use-after-free on the first T4-triggered reload).
+// Exported so the configure-tier test can pin the condition.
+static inline bool hydra_config_requires_slot_relookup(int highest_tier) {
+    return highest_tier >= 3;
+}
+
 struct server_context_meta {
     std::string build_info;
     std::string model_name;

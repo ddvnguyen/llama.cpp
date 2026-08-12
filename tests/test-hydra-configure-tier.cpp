@@ -322,6 +322,82 @@ int main() {
         }
     }
 
+    // Case 11 (hydra#470 QA): a synchronous hydra_config apply may rebuild
+    // the slots whenever the highest tier is >= 3 — T3 statics AND a
+    // T4-only generic config both route through apply_t3_rebuild() →
+    // load_model() → slots.clear(). Callers holding a server_slot* across
+    // the apply MUST re-look-up the slot in that case (use-after-free
+    // otherwise). Pin the predicate so the condition cannot regress.
+    {
+        if (hydra_config_requires_slot_relookup(1) || hydra_config_requires_slot_relookup(2)) {
+            fprintf(stderr, "FAIL: T1/T2 applies must not require a slot re-lookup\n");
+            g_failures++;
+        }
+        if (!hydra_config_requires_slot_relookup(3) || !hydra_config_requires_slot_relookup(4)) {
+            fprintf(stderr, "FAIL: T3/T4 applies MUST require a slot re-lookup (slots may be rebuilt)\n");
+            g_failures++;
+        }
+        // The reload-path routing follows from the classifier: any T4 key
+        // yields highest_tier == 4 (>= 3), so a T4-only payload triggers
+        // the reload path and the re-lookup.
+        if (hydra_classify_config_key("flash_attn") != 4 || hydra_classify_config_key("spec_type") != 4) {
+            fprintf(stderr, "FAIL: T4 keys must classify to tier 4 (reload path + slot re-lookup)\n");
+            g_failures++;
+        }
+    }
+
+    // Case 12 (hydra#470 QA): mixed T2+T4 payload — both key classes must
+    // be staged (the reload config carries T2 + appliable-T4 keys, applied
+    // by the same helper on the context-reload AND model-reload paths), and
+    // the T4 key wins the tier so the reload path fires. No stranding.
+    {
+        if (hydra_classify_config_key("n_ctx") != 2) {
+            fprintf(stderr, "FAIL: n_ctx must classify to T2\n");
+            g_failures++;
+        }
+        if (hydra_classify_config_key("rope_scale") != 2) {
+            fprintf(stderr, "FAIL: rope_scale must classify to T2\n");
+            g_failures++;
+        }
+        if (hydra_classify_config_key("ubatch_size") != 4) {
+            fprintf(stderr, "FAIL: ubatch_size must classify to T4\n");
+            g_failures++;
+        }
+        // A mixed config routes to the model-reload path (highest tier 4),
+        // which applies the staged T2 keys (n_ctx, rope_scale) AND the
+        // staged T4 keys (ubatch_size) before load_model() — the T2 path
+        // applies the same keys before the context rebuild. Both values
+        // must be appliable through the arg table for the reload path.
+        if (hydra_classify_generic_key("rope_scale") != hydra_generic_key_status::APPLIABLE) {
+            fprintf(stderr, "FAIL: rope_scale must be appliable via --rope-scale (T2 stranding guard)\n");
+            g_failures++;
+        }
+        if (hydra_classify_generic_key("ubatch_size") != hydra_generic_key_status::APPLIABLE) {
+            fprintf(stderr, "FAIL: ubatch_size must be appliable via --ubatch-size\n");
+            g_failures++;
+        }
+    }
+
+    // Case 13 (hydra#470 QA): --spec-type must not wipe the previously
+    // applied types when the new value is invalid (the handler throws) —
+    // the previous list is restored and the apply reports failure.
+    {
+        common_params p;
+        if (!hydra_apply_generic_key(p, "spec_type", json("draft-mtp"))) {
+            fprintf(stderr, "FAIL: spec_type apply returned false\n");
+            g_failures++;
+        }
+        const std::vector<enum common_speculative_type> before = p.speculative.types;
+        if (hydra_apply_generic_key(p, "spec_type", json("definitely_not_a_spec_type"))) {
+            fprintf(stderr, "FAIL: invalid spec_type must be rejected\n");
+            g_failures++;
+        }
+        if (p.speculative.types != before) {
+            fprintf(stderr, "FAIL: invalid spec_type wiped the previously applied types\n");
+            g_failures++;
+        }
+    }
+
     if (g_failures == 0) {
         printf("test-hydra-configure-tier: all checks passed\n");
         return 0;
