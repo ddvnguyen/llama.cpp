@@ -9342,10 +9342,12 @@ void server_routes::init_routes() {
             return res;
         }
 
-        // httplib (server-http.cpp get_headers) stores header names
-        // case-preserved, so match the Accept header case-insensitively
-        // (httplib's own Request::has_header semantics) — otherwise clients
-        // sending "Accept: text/event-stream" never reach the SSE branches.
+        // httplib's own Headers map is case-insensitive
+        // (detail::case_ignore::hash, httplib.h), but server-http.cpp
+        // get_headers() copies it into a plain case-sensitive
+        // std::map<string,string>, so match the Accept header
+        // case-insensitively here — otherwise clients sending
+        // "Accept: text/event-stream" never reach the SSE branches.
         const bool stream = [&]() {
             for (const auto & [hname, hval] : req.headers) {
                 if (hval.find("text/event-stream") == std::string::npos) {
@@ -9435,11 +9437,17 @@ void server_routes::init_routes() {
                     }
 
                     // Queue empty — stream finished: emit the final DONE delta
-                    // (finish_reason + content/reasoning_content/tool_calls/usage,
-                    // mirroring the DONE+SSE single-delta branch below) exactly
-                    // once, then terminate with [DONE]. Without it a client
-                    // attached during GENERATING never sees the final
-                    // finish_reason / tool_calls / usage.
+                    // exactly once, then terminate with [DONE]. Without it a
+                    // client attached during GENERATING never sees the final
+                    // finish_reason / usage / hydra_metrics. Content is
+                    // deliberately NOT repeated: the relay already streamed
+                    // content/reasoning_content/tool_calls incrementally via
+                    // the partial deltas, so this is OpenAI's empty final
+                    // chunk ({"delta": {...}, "finish_reason": ...}) — echoing
+                    // full content/tool_calls again would make concat-based
+                    // clients see output twice. (The DONE+SSE single-delta
+                    // branch below keeps full content: that one fires for
+                    // attach-after-DONE clients that saw no partials.)
                     if (entry.stream && entry.stream->stream_finished) {
                         if (!sent_final && entry.state == server_routes::DECODE_STATE_DONE) {
                             sent_final = true;
@@ -9451,7 +9459,7 @@ void server_routes::init_routes() {
                                             ? (entry.tool_calls.empty() ? "stop" : "tool_calls")
                                             : "length"},
                                         {"index", 0},
-                                        {"delta", json{{"role", "assistant"}, {"content", entry.content}}},
+                                        {"delta", json{{"role", "assistant"}, {"content", ""}}},
                                     },
                                 })},
                                 {"created", t},
@@ -9460,12 +9468,6 @@ void server_routes::init_routes() {
                                 {"system_fingerprint", std::string(llama_build_info())},
                                 {"object", "chat.completion.chunk"},
                             };
-                            if (!entry.reasoning_content.empty()) {
-                                delta["choices"][0]["delta"]["reasoning_content"] = entry.reasoning_content;
-                            }
-                            if (!entry.tool_calls.empty()) {
-                                delta["choices"][0]["delta"]["tool_calls"] = entry.tool_calls;
-                            }
                             if (entry.include_usage) {
                                 delta["usage"] = json {
                                     {"completion_tokens", entry.n_decoded},
