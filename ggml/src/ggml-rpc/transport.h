@@ -16,6 +16,13 @@ struct socket_t {
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
 
+    // Non-blocking liveness probe for a client socket. Returns false when the
+    // underlying fd is known-dead: peer closed/reset the connection, or the
+    // fd was closed underneath us (e.g. EBADF on a stale cached socket after a
+    // peer teardown). Used by get_socket() to evict stale cached sockets
+    // instead of handing them out (issue #634, smoke #8).
+    bool is_peer_alive() const;
+
     socket_ptr accept();
 
     void get_caps(uint8_t * local_caps);

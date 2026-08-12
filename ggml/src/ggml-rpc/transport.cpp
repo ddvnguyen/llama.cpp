@@ -15,6 +15,7 @@
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <netdb.h>
+#  include <poll.h>
 #  include <unistd.h>
 #endif
 #include <cstdlib>
@@ -121,6 +122,9 @@ struct socket_t::impl {
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
+    // Non-blocking liveness probe (see socket_t::is_peer_alive).
+    bool is_peer_alive() const;
+
 #ifdef GGML_RPC_RDMA
     bool tcp_peer_closed();
     std::optional<rdma_gid_t> rdma_build_target_gid();
@@ -159,6 +163,33 @@ bool socket_t::impl::tcp_peer_closed() {
     return r > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP));
 #else
     return false;
+#endif
+}
+
+// Non-blocking liveness probe for a cached client socket (see socket_t::
+// is_peer_alive). Mirrors tcp_peer_closed() but also treats a closed/unusable
+// fd as dead: a stale cached socket can hold an fd that was closed underneath
+// us after a peer teardown, in which case poll() returns POLLNVAL (or -1/EBADF)
+// and the first send would fail with "Bad file descriptor" (smoke #8, #634).
+bool socket_t::impl::is_peer_alive() const {
+    if (fd < 0) {
+        return false;
+    }
+#ifndef _WIN32
+    struct pollfd pfd = { fd, POLLIN | POLLRDHUP, 0 };
+    int r = poll(&pfd, 1, 0);
+    if (r < 0) {
+        // poll error (e.g. EBADF): fd unusable -> dead
+        return false;
+    }
+    if (r == 0) {
+        // no events: connection healthy
+        return true;
+    }
+    // events: POLLIN alone = data available (alive); HUP/ERR/RDHUP/NVAL = dead
+    return (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL)) == 0;
+#else
+    return true;
 #endif
 }
 
@@ -554,6 +585,10 @@ bool socket_t::send_data(const void * data, size_t size) {
 
 bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
+}
+
+bool socket_t::is_peer_alive() const {
+    return pimpl->is_peer_alive();
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {

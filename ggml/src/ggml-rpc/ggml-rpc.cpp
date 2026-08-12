@@ -27,7 +27,12 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 namespace fs = std::filesystem;
 
-// macro for nicer error messages on server crash
+// Macro for nicer error messages on server crash. NOTE (issue #634, smoke
+// #8, 2026-08-12): this macro GGML_ABORTs the whole process, so it must ONLY
+// be used for genuinely invariant-breaking conditions (malformed response,
+// protocol corruption, server crashed mid-operation). A send/recv failure on
+// a stale/broken PEER CONNECTION is a recoverable runtime condition — handle
+// it by logging + returning the caller's error/fallback path, never here.
 #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
 
 // all RPC structures must be packed
@@ -385,10 +390,26 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
 
+    // smoke #8 (2026-08-12): the rtx engine (sm_120) crashed mid P/D-prefill
+    // with 'send failed (bytes_sent=0, size_to_send=1)' at ggml-rpc.cpp:657 ->
+    // RPC_STATUS_ASSERT -> GGML_ABORT. The mini P/D-prefill model spreads
+    // tensors onto the 3060 peer (RPC0, localhost:9504); ggml-rpc caches ONE
+    // socket per endpoint in this map and used to hand it out with NO liveness
+    // check. After 9 hydra teardown/reattach cycles the 10th swap left a dead
+    // cached fd ('hydra rpc: send failed on fd=39 ... Bad file descriptor'),
+    // so the first 1-byte send on the stale socket failed and the assert
+    // aborted the entire engine. Fix: probe the cached socket before reuse
+    // (same poll mechanism as tcp_peer_closed); if dead, evict it from the
+    // cache, reconnect to the endpoint and re-negotiate the HELLO handshake
+    // below. A dead peer is a recoverable condition — never GGML_ABORT here.
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
         if (auto sock = it->second.lock()) {
-            return sock;
+            if (sock->is_peer_alive()) {
+                return sock;
+            }
+            LOG_DBG("[%s] cached socket for %s is dead, reconnecting\n", __func__, endpoint.c_str());
+            it = sockets.erase(it);
         }
     }
     std::string host;
@@ -654,7 +675,19 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         // TODO: cache the alloc responses to avoid extra RPC calls?
         rpc_msg_get_alloc_size_rsp response;
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
+        // smoke #8 (issue #634): a stale/broken peer connection used to hit
+        // RPC_STATUS_ASSERT here and GGML_ABORT the entire engine mid-decode
+        // ('send failed (bytes_sent=0, size_to_send=1)' -> abort). get_socket()
+        // now reconnects dead cached sockets, but the peer can still die in
+        // the window between the liveness probe and this send. A peer failure
+        // is recoverable: log and degrade to the local byte estimate — the
+        // same fallback this function already returns when rpc_get is false —
+        // and let the graph allocator's existing path handle a mismatch.
+        if (!status) {
+            GGML_LOG_ERROR("[%s] RPC_CMD_GET_ALLOC_SIZE failed for %s on %s, using local estimate (%zu bytes)\n",
+                           __func__, tensor->name, buft_ctx->endpoint.c_str(), ggml_nbytes(tensor));
+            return ggml_nbytes(tensor);
+        }
 
         return response.alloc_size;
     }
