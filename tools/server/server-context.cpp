@@ -6439,6 +6439,24 @@ private:
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
                                 }
 
+                                // Hydra #641: post-decode KV restore (STATE_PUT / merged DECODE) freezes the
+                                // slot's checkpoint at PREFILL end — checkpoints are only created during prompt
+                                // processing, and the prompt loop breaks 4+n_ubatch/4 tokens early — so on the
+                                // NEXT continuation that stale early checkpoint matches (is_rec: pos_max <= pos_next)
+                                // and load_tgt() overwrites the whole sequence state (attention + SSM) with the
+                                // old snapshot, re-prefilling ~800-1400 already-cached tokens (5.5s on RTX, 51s on
+                                // P100 for the warm-affinity turn 2). A pure extension — the whole cache is a
+                                // strict prefix of the new prompt and memory really ends at pos_next-1 — must not
+                                // enter the checkpoint search. Logic is pinned by
+                                // tests/test-hydra-checkpoint-policy.cpp (see server_should_rewind_to_checkpoint).
+                                const auto pos_max_mem = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                                const bool no_rewind_needed = !server_should_rewind_to_checkpoint(
+                                        n_past,
+                                        (llama_pos) slot.prompt.n_tokens(),
+                                        (llama_pos) slot.task->n_tokens(),
+                                        pos_next,
+                                        pos_max_mem);
+
                                 // when the prompt prefix does not match, print the tokens around the mismatch
                                 // this is useful for debugging prompt caching
                                 if (slots_debug) {
@@ -6482,7 +6500,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                if (pos_min >= pos_min_thold && !no_rewind_needed) {
                                     // For recurrent/hybrid models (e.g. Qwen3.x MTP) a checkpoint's
                                     // pos_min equals the full sequence length, so the usual
                                     // `pos_min < pos_min_thold` test is perpetually false → every turn
@@ -6545,6 +6563,15 @@ private:
                                         pos_next = 0;
                                         n_past = 0;
                                     }
+                                } else if (pos_min >= pos_min_thold) {
+                                    // #641: pure extension — the whole cached sequence is a strict prefix of
+                                    // the new prompt and memory ends exactly at pos_next - 1, so no rewind is
+                                    // needed and the stale PREFILL-end checkpoint must not be loaded on top of
+                                    // the restored state (which would re-prefill already-cached tokens).
+                                    SLT_INF(slot, "no rewind needed — memory at pos_next-1 (n_past = %d, prompt = %d, task = %d, pos_next = %d, pos_max_mem = %d); skipping checkpoint search\n",
+                                            n_past, (int) slot.prompt.n_tokens(), (int) slot.task->n_tokens(), (int) pos_next, (int) pos_max_mem);
+                                    // consume the one-shot STATE_PUT flag so it can't leak into a later turn
+                                    slot.just_restored = false;
                                 }
                             }
 

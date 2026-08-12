@@ -65,6 +65,40 @@ int main() {
     expect("non-completion task -> no checkpoint even for hybrid",
         call(32, /*is_completion=*/false, FULL, 1, true, 9500), false);
 
+    // --- #641: server_should_rewind_to_checkpoint truth table ---
+    // The rewind decision lives in update_slots() and is load-bearing for
+    // post-decode KV restore (#641): a stale PREFILL-end checkpoint matching on
+    // the next continuation re-prefills already-cached tokens. Pinned here so
+    // the predicate can't be silently reverted (same rationale as #316/#8).
+    //
+    // Pure extension: the whole cached sequence is a strict prefix of the new
+    // prompt (n_past == n_prompt_tokens < n_task_tokens) and memory ends
+    // exactly at the resume point (pos_max_mem == pos_next - 1) -> no rewind,
+    // the checkpoint search must NOT run. This restores pre-#23280 extension
+    // semantics (upstream PR #23280 / ccee42642 widened the search gate to also
+    // cover the exact-match case, inadvertently swallowing pure extensions).
+    expect("pure extension -> no rewind (search skipped)",
+        server_should_rewind_to_checkpoint(
+            /*n_past=*/100, /*n_prompt_tokens=*/100, /*n_task_tokens=*/120,
+            /*pos_next=*/100, /*pos_max_mem=*/99), false);
+    // Exact match: n_past == n_prompt_tokens == n_task_tokens — 0 tokens left
+    // to decode; the rewind to the final checkpoint supplies the logits
+    // [TAG_PROMPT_LOGITS]. #23280's exact-match fix must be preserved.
+    expect("exact match -> rewind (search runs)",
+        server_should_rewind_to_checkpoint(100, 100, 100, 100, 99), true);
+    // Divergence: the cache is NOT a full prefix (n_past < n_prompt_tokens) —
+    // the mismatch path must still search for a checkpoint to rewind to.
+    expect("divergence -> rewind (search runs)",
+        server_should_rewind_to_checkpoint(80, 100, 120, 80, 79), true);
+    // Memory behind the resume point (dishonest header, pos_max_mem < pos_next-1):
+    // bookkeeping and memory disagree -> fail safe, the search runs unchanged.
+    expect("memory behind resume point -> rewind (search runs)",
+        server_should_rewind_to_checkpoint(100, 100, 120, 100, 50), true);
+    // No memory at all (pos_max_mem == -1): nothing to extend -> fail safe,
+    // the search runs unchanged.
+    expect("no memory (pos_max_mem == -1) -> rewind (search runs)",
+        server_should_rewind_to_checkpoint(100, 100, 120, 100, -1), true);
+
     if (g_failures == 0) {
         printf("OK: server_should_create_checkpoint truth table holds\n");
         return 0;
