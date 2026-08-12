@@ -276,6 +276,7 @@ struct server_routes {
         json            generation_params;
         std::string     content;           // full generated text
         std::string     reasoning_content; // model thinking text (reasoning_content from OAI chat message)
+        json            tool_calls;        // parsed OAI tool calls (array of {type,function{name,arguments},id}); empty when none
         int32_t         n_decoded = 0;
         int32_t         n_prompt_tokens = 0;
         int32_t         n_prompt_tokens_cache = 0;

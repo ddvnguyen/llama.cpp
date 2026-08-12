@@ -5243,6 +5243,25 @@ private:
                                             if (!final_r->oaicompat_msg.reasoning_content.empty()) {
                                                 entry.reasoning_content = final_r->oaicompat_msg.reasoning_content;
                                             }
+                                            if (!final_r->oaicompat_msg.tool_calls.empty()) {
+                                                // Mirror common_chat_msg::to_json_oaicompat() shape so
+                                                // GET /v1/decode/:id returns OpenAI-format tool_calls.
+                                                json jtool_calls = json::array();
+                                                for (const auto & tool_call : final_r->oaicompat_msg.tool_calls) {
+                                                    json tc {
+                                                        {"type", "function"},
+                                                        {"function", {
+                                                            {"name", tool_call.name},
+                                                            {"arguments", json(tool_call.arguments)},
+                                                        }},
+                                                    };
+                                                    if (!tool_call.id.empty()) {
+                                                        tc["id"] = tool_call.id;
+                                                    }
+                                                    jtool_calls.push_back(std::move(tc));
+                                                }
+                                                entry.tool_calls = std::move(jtool_calls);
+                                            }
                                             entry.n_decoded             = final_r->n_decoded;
                                             entry.n_prompt_tokens       = final_r->n_prompt_tokens;
                                             entry.n_prompt_tokens_cache = final_r->n_prompt_tokens_cache;
@@ -9294,6 +9313,7 @@ void server_routes::init_routes() {
         const std::string oaicompat_model = it->second.oaicompat_model;
         const std::string content = it->second.content;
         const std::string reasoning_content = it->second.reasoning_content;
+        const json tool_calls = it->second.tool_calls;
         const int32_t n_decoded  = it->second.n_decoded;
         const int32_t n_prompt_tokens = it->second.n_prompt_tokens;
         const int32_t n_prompt_tokens_cache = it->second.n_prompt_tokens_cache;
@@ -9322,8 +9342,37 @@ void server_routes::init_routes() {
             return res;
         }
 
-        const bool stream = req.headers.count("accept") > 0 &&
-                            req.headers.at("accept").find("text/event-stream") != std::string::npos;
+        // httplib's own Headers map is case-insensitive
+        // (detail::case_ignore::hash, httplib.h), but server-http.cpp
+        // get_headers() copies it into a plain case-sensitive
+        // std::map<string,string>, so match the Accept header
+        // case-insensitively here — otherwise clients sending
+        // "Accept: text/event-stream" never reach the SSE branches.
+        const bool stream = [&]() {
+            for (const auto & [hname, hval] : req.headers) {
+                if (hval.find("text/event-stream") == std::string::npos) {
+                    continue;
+                }
+                if (hname.size() != 6) {
+                    continue;
+                }
+                bool is_accept = true;
+                for (size_t i = 0; i < 6; i++) {
+                    char c = hname[i];
+                    if (c >= 'A' && c <= 'Z') {
+                        c = (char)(c - 'A' + 'a');
+                    }
+                    if (c != "accept"[i]) {
+                        is_accept = false;
+                        break;
+                    }
+                }
+                if (is_accept) {
+                    return true;
+                }
+            }
+            return false;
+        }();
 
         // ── In-progress states → 202 ──────────────────────────────────────
         if (entry_state == server_routes::DECODE_STATE_LOADING ||
@@ -9349,7 +9398,8 @@ void server_routes::init_routes() {
             res->content_type = "text/event-stream";
             res->data = ""; // no initial chunk — send headers immediately
 
-            res->next = [this, res_this = res.get(), decode_request_id, &req](std::string & output) -> bool {
+            res->next = [this, res_this = res.get(), decode_request_id, &req, sent_final = false](
+                    std::string & output) mutable -> bool {
                 try {
                     if (req.should_stop()) {
                         return false;
@@ -9386,8 +9436,52 @@ void server_routes::init_routes() {
                         }
                     }
 
-                    // Queue empty — check if stream is finished
+                    // Queue empty — stream finished: emit the final DONE delta
+                    // exactly once, then terminate with [DONE]. Without it a
+                    // client attached during GENERATING never sees the final
+                    // finish_reason / usage / hydra_metrics. Content is
+                    // deliberately NOT repeated: the relay already streamed
+                    // content/reasoning_content/tool_calls incrementally via
+                    // the partial deltas, so this is OpenAI's empty final
+                    // chunk ({"delta": {...}, "finish_reason": ...}) — echoing
+                    // full content/tool_calls again would make concat-based
+                    // clients see output twice. (The DONE+SSE single-delta
+                    // branch below keeps full content: that one fires for
+                    // attach-after-DONE clients that saw no partials.)
                     if (entry.stream && entry.stream->stream_finished) {
+                        if (!sent_final && entry.state == server_routes::DECODE_STATE_DONE) {
+                            sent_final = true;
+                            std::time_t t = std::time(0);
+                            json delta {
+                                {"choices", json::array({
+                                    json {
+                                        {"finish_reason", entry.stop == STOP_TYPE_WORD || entry.stop == STOP_TYPE_EOS
+                                            ? (entry.tool_calls.empty() ? "stop" : "tool_calls")
+                                            : "length"},
+                                        {"index", 0},
+                                        {"delta", json{{"role", "assistant"}, {"content", ""}}},
+                                    },
+                                })},
+                                {"created", t},
+                                {"id", entry.completion_id},
+                                {"model", entry.oaicompat_model},
+                                {"system_fingerprint", std::string(llama_build_info())},
+                                {"object", "chat.completion.chunk"},
+                            };
+                            if (entry.include_usage) {
+                                delta["usage"] = json {
+                                    {"completion_tokens", entry.n_decoded},
+                                    {"prompt_tokens",     entry.n_prompt_tokens},
+                                    {"total_tokens",      entry.n_decoded + entry.n_prompt_tokens},
+                                    {"prompt_tokens_details", json{{"cached_tokens", entry.n_prompt_tokens_cache}}},
+                                };
+                            }
+                            if (!entry.hydra_metrics.is_null()) {
+                                delta["hydra_metrics"] = entry.hydra_metrics;
+                            }
+                            output = format_oai_sse(delta);
+                            return true;
+                        }
                         output = "data: [DONE]\n\n";
                         return false;
                     }
@@ -9415,7 +9509,9 @@ void server_routes::init_routes() {
                 json delta {
                     {"choices", json::array({
                         json {
-                            {"finish_reason", stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS ? "stop" : "length"},
+                            {"finish_reason", stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS
+                                ? (tool_calls.empty() ? "stop" : "tool_calls")
+                                : "length"},
                             {"index", 0},
                             {"delta", json{{"role", "assistant"}, {"content", content}}},
                         },
@@ -9429,6 +9525,10 @@ void server_routes::init_routes() {
 
                 if (!reasoning_content.empty()) {
                     delta["choices"][0]["delta"]["reasoning_content"] = reasoning_content;
+                }
+
+                if (!tool_calls.empty()) {
+                    delta["choices"][0]["delta"]["tool_calls"] = tool_calls;
                 }
 
                 if (include_usage) {
@@ -9454,9 +9554,14 @@ void server_routes::init_routes() {
                 if (!reasoning_content.empty()) {
                     message["reasoning_content"] = reasoning_content;
                 }
+                if (!tool_calls.empty()) {
+                    message["tool_calls"] = tool_calls;
+                }
 
                 json choice {
-                    {"finish_reason", stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS ? "stop" : "length"},
+                    {"finish_reason", stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS
+                        ? (tool_calls.empty() ? "stop" : "tool_calls")
+                        : "length"},
                     {"index", 0},
                     {"message", message},
                 };
