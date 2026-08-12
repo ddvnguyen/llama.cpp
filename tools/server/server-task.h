@@ -783,6 +783,15 @@ struct server_task_result_hydra_engine : server_task_result {
     // (per Q2 — "old config wins").
     std::vector<std::string> deferred_keys;
 
+    // CONFIGURE tiered (hydra#470): generic (T4) keys that were NOT
+    // accepted. unrecognized_keys = no entry in llama.cpp's own arg table;
+    // rejected_keys = startup-only / flag / two-value args that cannot
+    // change at reload. Both are also logged with SRV_WRN at CONFIGURE
+    // time — this list exists so the Coordinator can see them on the wire
+    // (zero silent drops). Always emitted for CONFIGURE, even when empty.
+    std::vector<std::string> unrecognized_keys;
+    std::vector<std::string> rejected_keys;
+
     std::string error; // human-readable, non-empty on failure
 
     // Merged DECODE (0x43): match result and timing

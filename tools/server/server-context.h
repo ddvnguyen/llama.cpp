@@ -19,6 +19,49 @@ struct ggml_backend;
 
 struct server_context_impl; // private implementation
 
+// ── Hydra #470: generic CONFIGURE key pass-through (T4) ────────────────────
+//
+// hydra_classify_config_key() is the tiered CONFIGURE classifier:
+//   1 = T1  apply immediately (no rebuild) — sampling.*, n_predict, ...
+//   2 = T2  defer to slot-free moment, context reload — n_ctx, cache_type_*,
+//           rope_*, ...
+//   3 = T3  defer to slot-free moment, model reload — n_gpu_layers,
+//           override_tensor, split_mode, model_path, ...
+//   4 = T4  generic-arg pass-through: any key not in the special lists is
+//           mapped to llama.cpp's own CLI arg table (snake_case → kebab-case)
+//           and applied through the arg's canonical handler, so a valid
+//           llama.cpp arg ALWAYS lands in common_params. No silent drops.
+//
+// Exported (non-static) so the header-only configure-tier test can pin the
+// contract: every coordinator-emitted key must classify as T1/T2/T3 (special)
+// or as a T4 key that is APPLIABLE / explicitly DENIED — never silently
+// ignored.
+int hydra_classify_config_key(const std::string & key);
+
+// For a T4 (generic) key: its reload disposition.
+//   NONE         — not a T4 key (classified T1/T2/T3 by the classifier)
+//   APPLIABLE    — has a reload-safe entry in the llama.cpp arg table; the
+//                  value will be applied via the arg's canonical handler
+//   DENIED       — startup-only / flag / two-value arg; reported as a
+//                  rejected_key with a visible SRV_WRN ("cannot change at
+//                  reload") instead of being silently dropped
+//   UNRECOGNIZED — no entry in the llama.cpp arg table; reported as an
+//                  unrecognized_key with a visible SRV_WRN
+enum class hydra_generic_key_status {
+    NONE,
+    APPLIABLE,
+    DENIED,
+    UNRECOGNIZED,
+};
+
+hydra_generic_key_status hydra_classify_generic_key(const std::string & key);
+
+// Apply one generic key (snake_case name, JSON value from the CONFIGURE
+// payload) to `params` via the arg-table handler. Returns true when the
+// value was applied; false when the key is not appliable or the value's
+// JSON type cannot be converted (the failure is logged with SRV_WRN).
+bool hydra_apply_generic_key(common_params & params, const std::string & key, const json & value);
+
 struct server_context_meta {
     std::string build_info;
     std::string model_name;

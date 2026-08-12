@@ -10,6 +10,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "arg.h"
 #include "fit.h"
 #include "llama.h"
 #include "../src/llama-context.h"
@@ -38,7 +39,9 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <set>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #if !defined(_WIN32)
@@ -66,6 +69,14 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 // by apply_t3_rebuild() before load_model(). File-scope static so both
 // functions (methods of server_context_impl) can access it.
 static std::vector<std::string> g_pending_rpc_servers;
+
+// hydra#470: generic (T4) config keys staged by hydra_apply_config() and
+// consumed by apply_t3_rebuild() (model-reload path). Kept as a JSON dump
+// string (same shape as the context's pending_config). File-scope static
+// because the T3 apply step is a member of server_context_impl while the
+// CONFIGURE stage path is not, and because first-load staging happens
+// before any context exists (ctx_tgt == nullptr).
+static std::string g_pending_generic_config;
 
 // Forward-declared so the background thread lambda in process_single_task can use it
 // before the full RPC helper definitions appear later in this file.
@@ -715,6 +726,296 @@ struct server_metrics {
 //
 // server_context_impl (private implementation)
 //
+
+// ── Hydra #406: tiered CONFIGURE (T1/T2/T3) helpers ──────────────────────
+//
+// The T1/T2/T3 classification is defined in specs/rpc-protocol.md (PR #406).
+//   T1 (apply immediately, no rebuild): sampling.*, n_predict, n_keep,
+//     seed, antiprompt, state_chunk_size
+//   T2 (defer to slot-free moment, context reload): n_ctx, cache_type_k,
+//     cache_type_v, rope_*
+//   T3 (defer to slot-free moment, model reload): n_gpu_layers, n_cpu_moe,
+//     override_tensor, split_mode, tensor_split, model.path
+//   T4 (hydra#470, defer to slot-free moment, generic-arg pass-through):
+//     EVERY other key. The key is snake_case→kebab-case mapped onto
+//     llama.cpp's own CLI arg table and applied via the arg's canonical
+//     handler (see hydra_generic_key_status / hydra_apply_generic_key).
+//     Keys with no arg-table entry are reported as unrecognized_keys and
+//     keys that cannot change at reload as rejected_keys — never silent.
+//
+// Returns 1/2/3/4; there is no "unknown" tier anymore (any unlisted key
+// is a T4 generic key).
+int hydra_classify_config_key(const std::string & key) {
+    // T1: sampling nested keys
+    if (key == "sampling.temp"           ||
+        key == "sampling.top_p"          ||
+        key == "sampling.top_k"          ||
+        key == "sampling.min_p"          ||
+        key == "sampling.penalty_repeat" ||
+        key == "sampling.seed") {
+        return 1;
+    }
+    // T1: top-level fields
+    if (key == "n_predict" ||
+        key == "n_keep"    ||
+        key == "seed"      ||
+        key == "antiprompt" ||
+        key == "state_chunk_size") {
+        return 1;
+    }
+    // T2: context-level (KV cache / RoPE / ctx)
+    if (key == "n_ctx"        ||
+        key == "cache_type_k" ||
+        key == "cache_type_v" ||
+        key.rfind("rope_", 0) == 0) {
+        return 2;
+    }
+    // T3: model-level (offload / placement / model)
+    if (key == "n_gpu_layers"    ||
+        key == "n_cpu_moe"       ||
+        key == "override_tensor" ||
+        key == "split_mode"      ||
+        key == "tensor_split"    ||
+        key == "model_path"      ||  // hydra_config: absolute GGUF path
+        key == "rpc_servers"     ||  // hydra_config: RPC peer endpoints to register
+        key == "model.path"      ||
+        key == "model") {        // legacy alias for { "model": { "path": ... } }
+        return 3;
+    }
+    // T4: generic-arg pass-through (hydra#470) — every other key.
+    return 4;
+}
+
+// Tier number → label for the response payload.
+static const char * hydra_tier_label(int tier) {
+    switch (tier) {
+        case 1: return "T1";
+        case 2: return "T2";
+        case 3: return "T3";
+        case 4: return "T4";  // generic-arg pass-through (hydra#470)
+        default: return "T1";  // 0 (no recognized keys) → degenerate T1
+    }
+}
+
+// ── Hydra #470: T4 generic-arg pass-through ─────────────────────────────
+//
+// Every CONFIGURE key that is not a T1/T2/T3 special key is mapped
+// snake_case → kebab-case onto llama.cpp's OWN CLI arg table (the same
+// common_arg table common_params_parse() uses at startup, built via
+// common_params_parser_init() with the server example) and applied by
+// invoking the arg's canonical handler. This guarantees a valid
+// llama.cpp arg ALWAYS lands in common_params — no hand-maintained
+// whitelist, no silent drops.
+//
+// Keys whose arg exists but cannot change at reload (startup-only
+// params: batch/threads/devices/parallel/fit) are denied explicitly;
+// flag args (handler_void, e.g. --version/--metrics) and two-value args
+// (handler_str_str) are denied too. Denied keys are reported as
+// rejected_keys; keys with no arg-table entry as unrecognized_keys.
+// Both get a loud SRV_WRN — never a silent drop.
+
+// Startup-only / non-reloadable keys (snake_case, as sent by the
+// Coordinator). Small and explicit: changing any of these mid-flight
+// cannot take effect without a full engine restart.
+static const std::set<std::string> hydra_generic_denylist = {
+    "n_batch",       // --n-batch        (context batch; fixed at server init)
+    "threads",       // --threads        (CPU thread pools sized at startup)
+    "threads_batch", // --threads-batch
+    "devices",       // --devices        (backend device assignment)
+    "main_gpu",      // --main-gpu
+    "n_parallel",    // --n-parallel     (slot count fixed at startup)
+    "fit",           // --fit            (model-fitting-only family)
+    "fit_print",     // --fit-print
+    "fit_target",    // --fit-target
+    "fit_ctx",       // --fit-ctx
+};
+
+// The server's own arg table (common_arg options as filtered for
+// LLAMA_EXAMPLE_SERVER — exactly the args the engine accepts on the
+// command line). Built once; the returned vector is a static copy so
+// the pointers stored in the lookup map stay valid for the process
+// lifetime. The scratch common_params is only a carrier for the
+// per-example defaults inside common_params_parser_init().
+static const std::vector<common_arg> & hydra_arg_options() {
+    static const std::vector<common_arg> options = []() {
+        common_params scratch;
+        common_params_context ctx = common_params_parser_init(scratch, LLAMA_EXAMPLE_SERVER, nullptr);
+        return ctx.options;
+    }();
+    return options;
+}
+
+// "--kebab-name" → arg entry (positive and negated names both map to
+// the same entry; the handler receives the boolean value directly, so
+// --no-* flags are covered by handler_bool with value=false).
+static const std::unordered_map<std::string, const common_arg *> & hydra_arg_lookup() {
+    static const std::unordered_map<std::string, const common_arg *> table = []() {
+        std::unordered_map<std::string, const common_arg *> t;
+        for (const auto & opt : hydra_arg_options()) {
+            for (const auto & arg : opt.args) {
+                t[arg] = &opt;
+            }
+            for (const auto & arg : opt.args_neg) {
+                t[arg] = &opt;
+            }
+        }
+        return t;
+    }();
+    return table;
+}
+
+// snake_case → kebab-case ("spec_draft_n_max" → "spec-draft-n-max").
+static std::string hydra_snake_to_kebab(const std::string & key) {
+    std::string kebab = key;
+    std::replace(kebab.begin(), kebab.end(), '_', '-');
+    return kebab;
+}
+
+hydra_generic_key_status hydra_classify_generic_key(const std::string & key) {
+    if (hydra_generic_denylist.count(key) > 0) {
+        return hydra_generic_key_status::DENIED;
+    }
+    const std::string arg = "--" + hydra_snake_to_kebab(key);
+    const auto & table = hydra_arg_lookup();
+    const auto it = table.find(arg);
+    if (it == table.end()) {
+        return hydra_generic_key_status::UNRECOGNIZED;
+    }
+    const common_arg & opt = *it->second;
+    // Flag args (--metrics, --version, ...) and two-value args
+    // (--override-kv, ...) have no single-value reload semantics —
+    // deny them explicitly instead of invoking an exit()/print side
+    // effect or mis-applying a half of a pair.
+    if (opt.handler_void || opt.handler_str_str) {
+        return hydra_generic_key_status::DENIED;
+    }
+    return hydra_generic_key_status::APPLIABLE;
+}
+
+// Convert a CONFIGURE JSON value to the CLI string form the arg
+// handler expects. Returns false when the JSON type cannot be mapped.
+static bool hydra_generic_value_to_string(const json & value, std::string & out) {
+    if (value.is_string()) {
+        out = value.get<std::string>();
+        return true;
+    }
+    if (value.is_boolean()) {
+        out = value.get<bool>() ? "on" : "off";
+        return true;
+    }
+    if (value.is_number_integer()) {
+        out = std::to_string(value.get<int64_t>());
+        return true;
+    }
+    if (value.is_number_unsigned()) {
+        out = std::to_string(value.get<uint64_t>());
+        return true;
+    }
+    if (value.is_number_float()) {
+        out = std::to_string(value.get<double>());
+        return true;
+    }
+    if (value.is_array()) {
+        // comma-joined list (e.g. --spec-draft-device dev1,dev2)
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (!value[i].is_string() && !value[i].is_number()) {
+                return false;
+            }
+            if (i > 0) out += ',';
+            out += value[i].is_string() ? value[i].get<std::string>() : std::to_string(value[i].get<double>());
+        }
+        return true;
+    }
+    if (value.is_object()) {
+        // e.g. --chat-template-kwargs '{"enable_thinking":true}'
+        out = value.dump();
+        return true;
+    }
+    return false;
+}
+
+bool hydra_apply_generic_key(common_params & params, const std::string & key, const json & value) {
+    if (hydra_classify_generic_key(key) != hydra_generic_key_status::APPLIABLE) {
+        return false;
+    }
+    const std::string kebab = hydra_snake_to_kebab(key);
+    const std::string arg   = "--" + kebab;
+    const common_arg & opt  = *hydra_arg_lookup().find(arg)->second;
+
+    try {
+        if (opt.handler_bool) {
+            bool b = false;
+            if (value.is_boolean()) {
+                b = value.get<bool>();
+            } else if (value.is_number()) {
+                b = value.get<double>() != 0.0;
+            } else if (value.is_string()) {
+                const std::string & s = value.get_ref<const std::string &>();
+                if (common_arg_utils::is_truthy(s)) {
+                    b = true;
+                } else if (common_arg_utils::is_falsey(s)) {
+                    b = false;
+                } else {
+                    SRV_WRN("hydra: generic arg '%s' expects on/off, got '%s' — rejected\n",
+                            arg.c_str(), s.c_str());
+                    return false;
+                }
+            } else {
+                SRV_WRN("hydra: generic arg '%s' expects a boolean, got %s — rejected\n",
+                        arg.c_str(), value.type_name());
+                return false;
+            }
+            opt.handler_bool(params, b);
+            return true;
+        }
+        if (opt.handler_int) {
+            int v = 0;
+            if (value.is_number_integer()) {
+                v = value.get<int>();
+            } else if (value.is_number_unsigned()) {
+                v = (int) value.get<uint64_t>();
+            } else if (value.is_number_float()) {
+                v = (int) value.get<double>();
+            } else if (value.is_string()) {
+                const std::string & s = value.get_ref<const std::string &>();
+                try {
+                    v = std::stoi(s);
+                } catch (const std::exception &) {
+                    SRV_WRN("hydra: generic arg '%s' expects an integer, got '%s' — rejected\n",
+                            arg.c_str(), s.c_str());
+                    return false;
+                }
+            } else {
+                SRV_WRN("hydra: generic arg '%s' expects an integer, got %s — rejected\n",
+                        arg.c_str(), value.type_name());
+                return false;
+            }
+            opt.handler_int(params, v);
+            return true;
+        }
+        if (opt.handler_string) {
+            std::string s;
+            if (!hydra_generic_value_to_string(value, s)) {
+                SRV_WRN("hydra: generic arg '%s' has a value of unsupported JSON type %s — rejected\n",
+                        arg.c_str(), value.type_name());
+                return false;
+            }
+            // --spec-type is additive on the CLI (repeatable); a
+            // CONFIGURE is absolute state, so replace the list instead
+            // of appending to whatever the engine was started with.
+            if (kebab == "spec-type") {
+                params.speculative.types.clear();
+            }
+            opt.handler_string(params, s);
+            return true;
+        }
+        SRV_WRN("hydra: generic arg '%s' has no usable handler — rejected\n", arg.c_str());
+        return false;
+    } catch (const std::exception & e) {
+        SRV_WRN("hydra: generic arg '%s' rejected: %s\n", arg.c_str(), e.what());
+        return false;
+    }
+}
 
 struct server_context_impl {
     friend struct server_context;
@@ -2355,70 +2656,6 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
-    // ── Hydra #406: tiered CONFIGURE (T1/T2/T3) helpers ──────────────────────
-    //
-    // The T1/T2/T3 classification is defined in specs/rpc-protocol.md (PR #406).
-    //   T1 (apply immediately, no rebuild): sampling.*, n_predict, n_keep,
-    //     seed, antiprompt, state_chunk_size
-    //   T2 (defer to slot-free moment, context reload): n_ctx, cache_type_k,
-    //     cache_type_v, rope_*
-    //   T3 (defer to slot-free moment, model reload): n_gpu_layers, n_cpu_moe,
-    //     override_tensor, split_mode, tensor_split, model.path
-    //
-    // Returns 1/2/3 for recognized keys, 0 for unknown (the handler echoes
-    // unknown keys in params_applied unchanged so the Coordinator can spot
-    // typos — see the legacy {"state_chunk_size":N} case in
-    // WorkerSchedulerService.cs:2842 which is treated as a degenerate T1).
-    static int hydra_classify_config_key(const std::string & key) {
-        // T1: sampling nested keys
-        if (key == "sampling.temp"           ||
-            key == "sampling.top_p"          ||
-            key == "sampling.top_k"          ||
-            key == "sampling.min_p"          ||
-            key == "sampling.penalty_repeat" ||
-            key == "sampling.seed") {
-            return 1;
-        }
-        // T1: top-level fields
-        if (key == "n_predict" ||
-            key == "n_keep"    ||
-            key == "seed"      ||
-            key == "antiprompt" ||
-            key == "state_chunk_size") {
-            return 1;
-        }
-        // T2: context-level (KV cache / RoPE / ctx)
-        if (key == "n_ctx"        ||
-            key == "cache_type_k" ||
-            key == "cache_type_v" ||
-            key.rfind("rope_", 0) == 0) {
-            return 2;
-        }
-        // T3: model-level (offload / placement / model)
-        if (key == "n_gpu_layers"    ||
-            key == "n_cpu_moe"       ||
-            key == "override_tensor" ||
-            key == "split_mode"      ||
-            key == "tensor_split"    ||
-            key == "model_path"      ||  // hydra_config: absolute GGUF path
-            key == "rpc_servers"     ||  // hydra_config: RPC peer endpoints to register
-            key == "model.path"      ||
-            key == "model") {        // legacy alias for { "model": { "path": ... } }
-            return 3;
-        }
-        return 0;  // unknown
-    }
-
-    // Tier number → label for the response payload.
-    static const char * hydra_tier_label(int tier) {
-        switch (tier) {
-            case 1: return "T1";
-            case 2: return "T2";
-            case 3: return "T3";
-            default: return "T1";  // 0 (no recognized keys) → degenerate T1
-        }
-    }
-
     // Apply the T1 keys from `cfg` to `params` and to the live context (for
     // state_chunk_size). Echoes each applied key + post-clamp value into
     // `params_applied`. Returns true on success; false if a key's value is
@@ -2593,28 +2830,56 @@ private:
         bool ok = true;
         std::string error;
         uint64_t state_chunk_size_applied = 0;
+        // hydra#470: generic (T4) keys that cannot take effect. Echoed to
+        // the Coordinator via the CONFIGURE response so nothing is silent.
+        std::vector<std::string> unrecognized_keys;  // no llama.cpp arg-table entry
+        std::vector<std::string> rejected_keys;      // startup-only / flag / two-value arg
     };
 
     hydra_config_result hydra_apply_config(const json & cfg, bool sync) {
         hydra_config_result result;
 
-        // 1. Classify every top-level key. T1 → apply now; T2/T3 →
+        // 1. Classify every top-level key. T1 → apply now; T2/T3/T4 →
         //    defer (stage) or apply synchronously depending on `sync`.
+        //    T4 (generic) keys are additionally validated against the
+        //    llama.cpp arg table here so the CONFIGURE response can report
+        //    unrecognized/rejected keys before the deferred apply runs.
         json t1_subset = json::object();
+        json t4_subset = json::object();
         for (auto it = cfg.begin(); it != cfg.end(); ++it) {
             const std::string key = it.key();
             int tier = hydra_classify_config_key(key);
-            if (tier == 0) {
-                SRV_DBG("hydra: config unknown key '%s' — ignored\n", key.c_str());
-                continue;
-            }
             if (tier == 1) {
                 t1_subset[key] = it.value();
-            } else {
+            } else if (tier == 2 || tier == 3) {
                 result.t2t3_subset[key] = it.value();
                 result.deferred_keys.push_back(key);
+            } else {
+                // T4: generic-arg pass-through. Classify against the arg
+                // table; only appliable keys are staged for the deferred
+                // slot-free moment. The rest are reported loudly.
+                const hydra_generic_key_status st = hydra_classify_generic_key(key);
+                if (st == hydra_generic_key_status::APPLIABLE) {
+                    t4_subset[key] = it.value();
+                    result.t2t3_subset[key] = it.value();
+                    result.deferred_keys.push_back(key);
+                } else if (st == hydra_generic_key_status::DENIED) {
+                    SRV_WRN("hydra: CONFIGURE key '%s' cannot change at reload (startup-only/flag arg) — rejected\n",
+                            key.c_str());
+                    result.rejected_keys.push_back(key);
+                } else {
+                    SRV_WRN("hydra: CONFIGURE key '%s' is not a known llama.cpp argument — unrecognized, value ignored\n",
+                            key.c_str());
+                    result.unrecognized_keys.push_back(key);
+                }
             }
             if (tier > result.highest_tier) result.highest_tier = tier;
+        }
+        // Stage the generic (T4) subset for the model-reload path. The
+        // same keys also ride in t2t3_subset (pending_config JSON) so the
+        // T2 context-reload path applies them too.
+        if (!t4_subset.empty()) {
+            g_pending_generic_config = t4_subset.dump();
         }
         // The "sampling" object may contain unlisted nested keys
         // (e.g. penalty_last_n, mirostat) — route the whole object
@@ -2665,13 +2930,18 @@ private:
             }
         }
 
-        // 3. T2/T3 handling — diverges based on sync flag.
+        // 3. T2/T3/T4 handling — diverges based on sync flag.
         if (!result.t2t3_subset.empty()) {
             if (sync) {
-                // Synchronous mode (PREFILL / HTTP decode): apply T2/T3 now
-                // on the task-queue thread. The caller owns this thread context
-                // so blocking is safe.
-                if (result.highest_tier == 3) {
+                // Synchronous mode (PREFILL / HTTP decode): apply now
+                // on the task-queue thread. The caller owns this thread
+                // context so blocking is safe.
+                if (result.highest_tier >= 3) {
+                    // T3 (model reload) also covers a T4-only config:
+                    // load_model() recreates the context and the
+                    // speculative/draft state, so every generic key
+                    // takes effect. hydra_apply_t3_mutators() is a no-op
+                    // when no T3 keys are staged.
                     hydra_apply_t3_mutators(ctx_tgt, result.t2t3_subset, result.deferred_keys);
                     if (!apply_t3_rebuild()) {
                         result.ok = false;
@@ -2691,7 +2961,7 @@ private:
             } else {
                 // Stage mode (CONFIGURE): record the mutators and store
                 // pending_config for application at the next slot-free moment.
-                if (result.highest_tier == 3) {
+                if (result.highest_tier >= 3) {
                     hydra_apply_t3_mutators(ctx_tgt, result.t2t3_subset, result.deferred_keys);
                 }
                 if (ctx_tgt) {
@@ -3604,8 +3874,15 @@ private:
                     }
 
                     // Route through the shared classify → apply helper.
-                    // sync=false: T2/T3 are staged for the slot-free moment.
+                    // sync=false: T2/T3/T4 are staged for the slot-free moment.
                     hydra_config_result cfg_result = hydra_apply_config(cfg, /*sync=*/false);
+
+                    // hydra#470: report generic (T4) keys that cannot be
+                    // applied BEFORE the tier-0 early return — a payload
+                    // whose keys are all unrecognized/rejected still has
+                    // to surface them (zero silent drops).
+                    res->unrecognized_keys = cfg_result.unrecognized_keys;
+                    res->rejected_keys     = cfg_result.rejected_keys;
 
                     if (cfg_result.highest_tier == 0) {
                         // No recognized keys — still emit a T1 success
@@ -3633,10 +3910,12 @@ private:
                     res->deferred_keys = std::move(cfg_result.deferred_keys);
                     res->state_chunk_size_applied = cfg_result.state_chunk_size_applied;
 
-                    SRV_INF("hydra: CONFIGURE tier=%s applied=%zu deferred=%zu (slot %d)\n",
+                    SRV_INF("hydra: CONFIGURE tier=%s applied=%zu deferred=%zu unrecognized=%zu rejected=%zu (slot %d)\n",
                             res->tier.c_str(),
                             res->params_applied.size(),
                             res->deferred_keys.size(),
+                            res->unrecognized_keys.size(),
+                            res->rejected_keys.size(),
                             task.hydra_action.id_slot);
                     queue_results.send(std::move(res));
                 } break;
@@ -5239,6 +5518,10 @@ private:
                         ctx_tgt->hydra_get_pending_config().size());
                 ctx_tgt->hydra_clear_pending_config();
                 llama_hydra_clear_pending_t3();
+                // hydra#470: the staged generic (T4) subset must not
+                // survive the discard — a stale config would be applied
+                // on the next unrelated reload.
+                g_pending_generic_config.clear();
                 return false;
             }
 
@@ -5263,7 +5546,10 @@ private:
         //    load_model() handles the unload+reload cycle. COMBINED-mode
         //    expert bindings are torn down before the reload and re-
         //    attached after, in the same pattern as SET_EXPERT_MODE.
-        if (tier == "T3") {
+        //    T4 (generic-arg) configs route here too: a model reload is
+        //    the only apply that makes EVERY generic key take effect
+        //    (speculative types need load_model's MTP/draft setup).
+        if (tier == "T3" || tier == "T4") {
             if (!apply_t3_rebuild()) {
                 SRV_ERR("%s", "hydra: T3 rebuild failed; engine continues with old model\n");
                 ok = false;
@@ -5416,6 +5702,39 @@ private:
         if (cfg.contains("yarn_orig_ctx") && cfg["yarn_orig_ctx"].is_number_integer()) {
             params_base.yarn_orig_ctx = cfg["yarn_orig_ctx"].get<int32_t>();
         }
+
+        // hydra#470: generic (T4) pass-through. Every key in the pending
+        // config that the explicit T2 code above did NOT handle is applied
+        // via llama.cpp's own arg table (snake_case → kebab-case), so a
+        // valid llama.cpp arg always lands in common_params. This also
+        // covers special-classified keys with no explicit handling here
+        // (rope_scale / rope_scaling, which classify as T2 via the rope_*
+        // prefix but have no dedicated code above).
+        //
+        // The generic subset was already validated at CONFIGURE stage time
+        // (appliable keys only) — the fallback re-checks per key so any
+        // value-level failure is loud, never silent.
+        {
+            static const std::set<std::string> t2_handled = {
+                "n_ctx", "cache_type_k", "cache_type_v",
+                "rope_freq_base", "rope_freq_scale",
+                "yarn_ext_factor", "yarn_attn_factor",
+                "yarn_beta_fast", "yarn_beta_slow", "yarn_orig_ctx",
+            };
+            for (auto it = cfg.begin(); it != cfg.end(); ++it) {
+                const std::string & key = it.key();
+                if (t2_handled.count(key) > 0) {
+                    continue;  // applied by the explicit code above
+                }
+                if (!hydra_apply_generic_key(params_base, key, it.value())) {
+                    SRV_WRN("hydra: T2 rebuild: generic key '%s' not applied (see log)\n", key.c_str());
+                }
+            }
+        }
+        // The staged generic subset was consumed by the fallback above
+        // (its keys ride in the pending_config JSON); clear the static so
+        // a later T3 reload does not re-apply stale values.
+        g_pending_generic_config.clear();
 
         // Free the live context. KV cache is destroyed; this is the
         // T2 cost. The model is kept (T2 is context-only).
@@ -5767,12 +6086,41 @@ private:
             }
         }
 
-        // Early-exit: if the model and all T3-relevant params are
-        // identical to what is already loaded, skip the expensive
-        // unload+reload cycle.  Without this, every COMPLETION
-        // request that carries hydra_config triggers a full model
-        // swap even when nothing changed (the coordinator sends the
-        // same config on every decode request).
+        // hydra#470: apply the staged generic (T4) keys to swapped_params
+        // BEFORE any model (re)load — they must land in common_params
+        // before load_model() consumes them (speculative types, cache,
+        // context-shift, ...). The staged JSON is consumed here (cleared),
+        // so a later T2/T3 apply does not re-apply stale values.
+        std::string staged_generic = g_pending_generic_config;
+        g_pending_generic_config.clear();
+        if (!staged_generic.empty()) {
+            json generic_cfg;
+            try {
+                generic_cfg = json::parse(staged_generic);
+            } catch (const std::exception & e) {
+                SRV_WRN("hydra: T3 rebuild: staged generic config failed to parse: %s\n", e.what());
+                staged_generic.clear();
+            }
+            if (!generic_cfg.is_null()) {
+                for (auto it = generic_cfg.begin(); it != generic_cfg.end(); ++it) {
+                    if (!hydra_apply_generic_key(swapped_params, it.key(), it.value())) {
+                        SRV_WRN("hydra: T3 rebuild: generic key '%s' not applied (see log)\n",
+                                it.key().c_str());
+                    }
+                }
+            }
+        }
+
+        // Early-exit: if the model, all T3-relevant params AND the staged
+        // generic config are identical to what is already loaded, skip the
+        // expensive unload+reload cycle.  Without this, every COMPLETION
+        // request that carries hydra_config triggers a full model swap even
+        // when nothing changed (the coordinator sends the same config on
+        // every decode request). The generic comparison is against the last
+        // staged generic JSON that was actually loaded — identical config →
+        // identical dump → skip; changed config → forced reload.
+        static std::string last_generic_applied;  // JSON dump actually loaded
+        const bool generic_unchanged = (staged_generic == last_generic_applied);
         if (!is_first_load) {
             const char * cur_override = llama_hydra_get_pending_override_tensor();
             bool params_unchanged =
@@ -5781,7 +6129,7 @@ private:
                 swapped_params.split_mode == old_params.split_mode &&
                 ((cur_override == nullptr && old_override_applied.empty()) ||
                  (cur_override && old_override_applied == cur_override));
-            if (params_unchanged) {
+            if (params_unchanged && generic_unchanged) {
                 // T3 overrides (override_tensor, split_mode) were staged by
                 // the COMPLETION hydra_config path. But the model reload is
                 // being skipped. Clear the staged override so the next decode
@@ -5851,6 +6199,10 @@ private:
         {
             const char * cur = llama_hydra_get_pending_override_tensor();
             old_override_applied = cur ? cur : "";
+            // hydra#470: also record the generic (T4) config that was
+            // just loaded, so a repeated identical CONFIGURE/decode
+            // payload skips the reload (early-exit above).
+            last_generic_applied = staged_generic;
         }
 
         // T3 reload confirmed. Log model identity for traceability.

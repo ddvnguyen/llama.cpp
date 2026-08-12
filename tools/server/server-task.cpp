@@ -2087,6 +2087,11 @@ json server_task_result_hydra_engine::to_json() {
             j["params_applied"][kv.first] = kv.second;
         }
         j["deferred_keys"]  = deferred_keys;
+        // hydra#470: generic (T4) keys that were not accepted — emitted
+        // unconditionally (even when empty) for the same diff-ability
+        // reason as deferred_keys.
+        j["unrecognized_keys"] = unrecognized_keys;
+        j["rejected_keys"]     = rejected_keys;
     }
     if (op == 0x44 && !expert_mode_applied.empty()) { // SET_EXPERT_MODE
         j["mode"] = expert_mode_applied;
