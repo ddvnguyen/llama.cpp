@@ -92,6 +92,7 @@ static std::string g_last_reload_config_applied;
 // before the full RPC helper definitions appear later in this file.
 #if !defined(_WIN32)
 static bool hydra_send_all(int fd, const void * buf, size_t n);
+static bool hydra_recv_all(int fd, void * buf, size_t n); // DECODE_APPLY M2 logits tail
 #endif
 
 static uint32_t server_n_outputs_max(const common_params & params) {
@@ -4947,7 +4948,13 @@ private:
                     // ── KV restore ─────────────────────────────────────────
                     const int64_t restore_start_ms = ggml_time_ms();
 
-                    if (!task.hydra_action.kv_data.empty()) {
+                    // M2 (#470): the v2 header arrives pre-parsed (kv_v2_hdr,
+                    // small) and the KV state stream is read directly off
+                    // hydra_fd via llama_state_seq_set_data_from_fd — the engine
+                    // never materializes the full blob (2.3 GB today, 10 GB
+                    // target). M1 (kv_data) is the buffered fallback.
+                    const bool m2_stream = !task.hydra_action.kv_v2_hdr.empty();
+                    if (!task.hydra_action.kv_data.empty() || m2_stream) {
                         slot->prompt_clear(false);
                         slot->n_prompt_tokens_cache = 0;
                         slot->n_prompt_tokens_processed = 0;
@@ -4960,8 +4967,12 @@ private:
                         // this, prompt.tokens is empty after prompt_clear(), n_past
                         // computes to 0, and seq_rm(slot, 0, -1) wipes the KV that
                         // llama_state_seq_set_data just loaded (issue #506).
-                        const uint8_t * kv_ptr = task.hydra_action.kv_data.data();
-                        size_t          kv_len = task.hydra_action.kv_data.size();
+                        const uint8_t * kv_ptr = m2_stream
+                                ? task.hydra_action.kv_v2_hdr.data()
+                                : task.hydra_action.kv_data.data();
+                        size_t          kv_len = m2_stream
+                                ? task.hydra_action.kv_v2_hdr.size()
+                                : task.hydra_action.kv_data.size();
                         int32_t         blob_n_past = 0;
                         int32_t         blob_n_tok  = 0;
                         bool            has_chkpt = false;
@@ -5026,11 +5037,30 @@ private:
                             }
                         }
 
-                        auto status = llama_state_seq_set_data(
-                            ctx_tgt,
-                            kv_ptr,
-                            kv_len,
-                            slot->id);
+                        // M2 (#470): hash the whole kv segment as it streams —
+                        // v2 header first, then every byte the fd restore
+                        // consumes, then the logits tail (wire order).
+                        XXH3_state_t * hst = nullptr;
+                        if (m2_stream) {
+                            hst = XXH3_createState();
+                            XXH3_64bits_reset(hst);
+                            XXH3_64bits_update(hst, task.hydra_action.kv_v2_hdr.data(),
+                                        task.hydra_action.kv_v2_hdr.size());
+                        }
+
+                        size_t status = 0;
+                        if (m2_stream) {
+                            // Stream restore: consumes [4B magic][4B seq_id] + KV
+                            // state off the fd; logits tail is read separately below.
+                            status = llama_state_seq_set_data_from_fd(
+                                    ctx_tgt, slot->id, task.hydra_action.hydra_fd, hst);
+                        } else {
+                            status = llama_state_seq_set_data(
+                                    ctx_tgt,
+                                    kv_ptr,
+                                    kv_len,
+                                    slot->id);
+                        }
 
                         // llama_state_seq_set_data returns the number of bytes
                         // read on success (0 means failed to load) — see its
@@ -5044,6 +5074,14 @@ private:
                         // (server-context.cpp ~line 3395: `if (n_read == 0)`).
                         if (status == 0) {
                             SRV_WRN("hydra: DECODE_APPLY slot=%d KV restore failed (%d)\n", id_slot, status);
+                            if (hst) { XXH3_freeState(hst); hst = nullptr; }
+                            if (m2_stream) {
+                                // The stream broke mid-way: drop the read side so
+                                // residual unread bytes cannot misalign the next
+                                // request frame. The RPC thread still writes the
+                                // error response (write side stays open).
+                                ::shutdown(task.hydra_action.hydra_fd, SHUT_RD);
+                            }
                             slot->reserved_for_decode_id = -1;
                             // Tokens were registered from the v2 header before set_data —
                             // clear them so the slot is not left poisoned (n_past > 0
@@ -5073,17 +5111,74 @@ private:
                         // injection (~line 3405) — DECODE_APPLY was missing
                         // this step entirely.
                         {
-                            const size_t remaining = kv_len - status;
                             const size_t expected_logits = (size_t)llama_vocab_n_tokens(vocab) * sizeof(float);
-                            if (remaining == expected_logits) {
-                                const float * src = (const float *)(kv_ptr + status);
-                                const size_t n_floats = llama_vocab_n_tokens(vocab);
-                                slot->restored_logits.assign(src, src + n_floats);
-                                slot->logits_valid = true;
-                                SRV_INF("hydra: DECODE_APPLY slot=%d restored %zu logits to per-slot buffer\n",
-                                        id_slot, n_floats);
+                            if (m2_stream) {
+                                // Read the logits tail straight off the fd (small).
+                                const size_t remaining =
+                                        (size_t)(task.hydra_action.kv_stream_len - status);
+                                if (remaining == expected_logits) {
+                                    std::vector<uint8_t> logits_buf(remaining);
+                                    if (hydra_recv_all(task.hydra_action.hydra_fd,
+                                                       logits_buf.data(), remaining)) {
+                                        XXH3_64bits_update(hst, logits_buf.data(), remaining);
+                                        const size_t n_floats = llama_vocab_n_tokens(vocab);
+                                        slot->restored_logits.assign(
+                                                reinterpret_cast<const float *>(logits_buf.data()),
+                                                reinterpret_cast<const float *>(logits_buf.data()) + n_floats);
+                                        slot->logits_valid = true;
+                                        SRV_INF("hydra: DECODE_APPLY slot=%d restored %zu logits to per-slot buffer\n",
+                                                id_slot, n_floats);
+                                    } else {
+                                        SRV_WRN("hydra: DECODE_APPLY slot=%d logits tail read failed\n", id_slot);
+                                    }
+                                }
+                            } else {
+                                const size_t remaining = kv_len - status;
+                                if (remaining == expected_logits) {
+                                    const float * src = (const float *)(kv_ptr + status);
+                                    const size_t n_floats = llama_vocab_n_tokens(vocab);
+                                    slot->restored_logits.assign(src, src + n_floats);
+                                    slot->logits_valid = true;
+                                    SRV_INF("hydra: DECODE_APPLY slot=%d restored %zu logits to per-slot buffer\n",
+                                            id_slot, n_floats);
+                                }
                             }
                         }
+
+                        // M2 wire-hash verification (post-restore — with streaming
+                        // the bytes reach the GPU before a pre-restore hash could
+                        // be computed). On mismatch the slot is cleared so the next
+                        // decode cannot sample corrupt state, and the response
+                        // carries the terminal error for the Coordinator to retry.
+                        if (m2_stream && task.hydra_action.kv_expected_hash != 0) {
+                            const uint64_t computed_kv = XXH3_64bits_digest(hst);
+                            if (computed_kv != task.hydra_action.kv_expected_hash) {
+                                SRV_WRN("hydra: DECODE_APPLY slot=%d SEGMENT_HASH_MISMATCH kv expected=%016" PRIx64 " got=%016" PRIx64 "\n",
+                                        id_slot, task.hydra_action.kv_expected_hash, computed_kv);
+                                XXH3_freeState(hst);
+                                hst = nullptr;
+                                slot->reserved_for_decode_id = -1;
+                                slot->prompt.tokens.clear();
+                                slot->prompt.checkpoints.clear();
+                                slot->n_prompt_tokens_cache = 0;
+                                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot->id, -1, -1);
+                                if (routes_ptr) {
+                                    server_routes::decode_result_entry entry;
+                                    entry.id_slot = id_slot;
+                                    entry.error = "KV segment hash mismatch (corrupt stream)";
+                                    entry.created_at = std::time(nullptr);
+                                    entry.ttl_s = routes_ptr->decode_result_ttl_s;
+                                    std::lock_guard<std::mutex> lock(routes_ptr->decode_results_mutex);
+                                    routes_ptr->decode_results[decode_request_id] = std::move(entry);
+                                    routes_ptr->evict_decode_results_locked();
+                                }
+                                break;
+                            }
+                            SRV_INF("hydra: DECODE_APPLY slot=%d KV hash verified (%zu + %" PRIu64 " B)\n",
+                                    id_slot, task.hydra_action.kv_v2_hdr.size(),
+                                    task.hydra_action.kv_stream_len);
+                        }
+                        if (hst) { XXH3_freeState(hst); hst = nullptr; }
 
                         const int n_past = is_v2 ? blob_n_past : kv_meta.value("n_past", 0);
                         if (n_past > 0) {
@@ -10640,37 +10735,155 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     }
 
     // ── Read KV segment (may be zero-length) ──────────────────────────────
-    std::vector<uint8_t> kv_data((size_t)kv_len);
-    if (kv_len > 0 && !hydra_recv_all(fd, kv_data.data(), (size_t)kv_len)) {
-        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
-        return;
-    }
-
-    // Verify KV segment hash BEFORE passing to llama_state_seq_set_data
+    // M2 (#470): the KV blob (2.3 GB today, 10 GB target) is never materialized.
+    // The v2 blob header (small: version + n_past + n_tok + tokens + flags +
+    // checkpoint) is read here; the remaining stream (magic + seq_id + KV state
+    // + logits) stays on the fd and is consumed by the DECODE task thread via
+    // llama_state_seq_set_data_from_fd. The wire hash (xxh3-64 over the whole
+    // kv segment) is verified post-restore in the task thread — with streaming
+    // the bytes reach the GPU before a pre-restore hash could be computed.
+    uint64_t expected_kv_hash = 0;
+    bool     has_kv_hash      = false;
     if (kv_len > 0 && !kv_hash_str.empty()) {
-        // Parse "xxh3:HEX" format
-        if (kv_hash_str.rfind("xxh3:", 0) == 0) {
-            const std::string hex_str = kv_hash_str.substr(5);
-            uint64_t expected_kv_hash = 0;
-            try {
-                expected_kv_hash = std::stoull(hex_str, nullptr, 16);
-            } catch (const std::exception &) {
-                SRV_WRN("hydra rpc: DECODE invalid KV hash format: %s\n", kv_hash_str.c_str());
-                hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
-                return;
-            }
-            const uint64_t computed_kv = XXH3_64bits(kv_data.data(), kv_data.size());
-            if (computed_kv != expected_kv_hash) {
-                SRV_WRN("hydra rpc: DECODE SEGMENT_HASH_MISMATCH kv expected=%016" PRIx64 " got=%016" PRIx64 "\n",
-                        expected_kv_hash, computed_kv);
-                hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
-                return;
-            }
-            SRV_INF("hydra rpc: DECODE KV hash verified (%" PRIu64 " B)\n", kv_len);
-        } else {
+        if (kv_hash_str.rfind("xxh3:", 0) != 0) {
             SRV_WRN("hydra rpc: DECODE unsupported KV hash prefix: %s\n", kv_hash_str.c_str());
             hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
             return;
+        }
+        try {
+            expected_kv_hash = std::stoull(kv_hash_str.substr(5), nullptr, 16);
+            has_kv_hash = true;
+        } catch (const std::exception &) {
+            SRV_WRN("hydra rpc: DECODE invalid KV hash format: %s\n", kv_hash_str.c_str());
+            hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+            return;
+        }
+    }
+
+    std::vector<uint8_t> kv_data;      // M1 fallback (legacy non-v2 blobs)
+    std::vector<uint8_t> kv_v2_hdr;    // M2: parsed v2 header (small)
+    uint64_t             kv_stream_len = 0; // M2: bytes remaining on fd after the header
+    if (kv_len > 0) {
+        uint8_t version_byte = 0;
+        if (!hydra_recv_all(fd, &version_byte, 1)) {
+            hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+            return;
+        }
+        if (version_byte != 0x02) {
+            // Legacy non-v2 blob — buffered M1 path (pre-#470 behavior).
+            // Replay the consumed version byte into the buffer.
+            kv_data.resize((size_t)kv_len);
+            kv_data[0] = version_byte;
+            if (kv_len > 1 && !hydra_recv_all(fd, kv_data.data() + 1, (size_t)kv_len - 1)) {
+                hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+                return;
+            }
+            if (has_kv_hash) {
+                const uint64_t computed_kv = XXH3_64bits(kv_data.data(), kv_data.size());
+                if (computed_kv != expected_kv_hash) {
+                    SRV_WRN("hydra rpc: DECODE SEGMENT_HASH_MISMATCH kv expected=%016" PRIx64 " got=%016" PRIx64 "\n",
+                            expected_kv_hash, computed_kv);
+                    hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                    return;
+                }
+                SRV_INF("hydra rpc: DECODE KV hash verified (%" PRIu64 " B)\n", kv_len);
+            }
+        } else {
+            // M2: parse the v2 header incrementally (all small reads) and leave
+            // the state stream on the fd for the task thread.
+            kv_v2_hdr.push_back(version_byte);
+            if (kv_len < 9) {
+                SRV_WRN("hydra rpc: DECODE KV segment too small for v2 header (%" PRIu64 " B)\n", kv_len);
+                hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                return;
+            }
+            uint32_t n_past_in = 0, n_tok_in = 0;
+            if (!hydra_recv_all(fd, &n_past_in, 4) || !hydra_recv_all(fd, &n_tok_in, 4)) {
+                hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+                return;
+            }
+            kv_v2_hdr.insert(kv_v2_hdr.end(), (const uint8_t *)&n_past_in, (const uint8_t *)&n_past_in + 4);
+            kv_v2_hdr.insert(kv_v2_hdr.end(), (const uint8_t *)&n_tok_in, (const uint8_t *)&n_tok_in + 4);
+
+            const size_t tokens_bytes = (size_t)n_tok_in * sizeof(llama_token);
+            if (9 + tokens_bytes + 1 > kv_len) {
+                SRV_WRN("hydra rpc: DECODE v2 header tokens exceed kv_len (%" PRIu64 " B)\n", kv_len);
+                hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                return;
+            }
+            std::vector<uint8_t> tokens_buf(tokens_bytes);
+            if (tokens_bytes > 0 && !hydra_recv_all(fd, tokens_buf.data(), tokens_bytes)) {
+                hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+                return;
+            }
+            kv_v2_hdr.insert(kv_v2_hdr.end(), tokens_buf.begin(), tokens_buf.end());
+
+            uint8_t flags = 0;
+            if (!hydra_recv_all(fd, &flags, 1)) {
+                hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+                return;
+            }
+            kv_v2_hdr.push_back(flags);
+
+            if (flags & 0x01) {
+                // Checkpoint: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz |
+                // tgt_data | 8B dft_sz | dft_data (mirrors the DECODE_APPLY parse).
+                if (kv_v2_hdr.size() + 24 > kv_len) {
+                    SRV_WRN("hydra rpc: DECODE v2 checkpoint header exceeds kv_len (%" PRIu64 " B)\n", kv_len);
+                    hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                    return;
+                }
+                uint8_t ckpt_fixed[24]; // pos_min + pos_max + n_tokens + tgt_sz
+                if (!hydra_recv_all(fd, ckpt_fixed, sizeof(ckpt_fixed))) {
+                    hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+                    return;
+                }
+                kv_v2_hdr.insert(kv_v2_hdr.end(), ckpt_fixed, ckpt_fixed + sizeof(ckpt_fixed));
+                uint64_t tgt_sz_in = 0;
+                memcpy(&tgt_sz_in, ckpt_fixed + 16, 8);
+                if (kv_v2_hdr.size() + (size_t)tgt_sz_in + 8 > kv_len) {
+                    SRV_WRN("hydra rpc: DECODE v2 checkpoint payload exceeds kv_len (%" PRIu64 " B)\n", kv_len);
+                    hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                    return;
+                }
+                if (tgt_sz_in > 0) {
+                    std::vector<uint8_t> tgt_buf((size_t)tgt_sz_in);
+                    if (!hydra_recv_all(fd, tgt_buf.data(), (size_t)tgt_sz_in)) {
+                        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+                        return;
+                    }
+                    kv_v2_hdr.insert(kv_v2_hdr.end(), tgt_buf.begin(), tgt_buf.end());
+                }
+                uint8_t dft_sz_buf[8];
+                if (!hydra_recv_all(fd, dft_sz_buf, sizeof(dft_sz_buf))) {
+                    hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+                    return;
+                }
+                kv_v2_hdr.insert(kv_v2_hdr.end(), dft_sz_buf, dft_sz_buf + sizeof(dft_sz_buf));
+                uint64_t dft_sz_in = 0;
+                memcpy(&dft_sz_in, dft_sz_buf, 8);
+                if (kv_v2_hdr.size() + (size_t)dft_sz_in > kv_len) {
+                    SRV_WRN("hydra rpc: DECODE v2 checkpoint payload exceeds kv_len (%" PRIu64 " B)\n", kv_len);
+                    hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                    return;
+                }
+                if (dft_sz_in > 0) {
+                    std::vector<uint8_t> dft_buf((size_t)dft_sz_in);
+                    if (!hydra_recv_all(fd, dft_buf.data(), (size_t)dft_sz_in)) {
+                        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+                        return;
+                    }
+                    kv_v2_hdr.insert(kv_v2_hdr.end(), dft_buf.begin(), dft_buf.end());
+                }
+            }
+
+            kv_stream_len = kv_len - kv_v2_hdr.size();
+            // The stream must at least hold the [4B magic][4B seq_id] framing.
+            if (kv_stream_len < 8) {
+                SRV_WRN("hydra rpc: DECODE v2 stream too small (%" PRIu64 " B after header)\n", kv_stream_len);
+                hydra_write_res(fd, HYDRA_STATUS_BAD_REQUEST, 0, 0);
+                return;
+            }
         }
     }
 
@@ -10740,14 +10953,23 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     val_task.hydra_action.id_slot = slot_id;
     val_task.hydra_action.decode_json = std::move(decode_json_str);
     val_task.hydra_action.kv_data = std::move(kv_data);
+    // M2 (#470): the KV state stream stays on the fd and is consumed by the
+    // task thread (llama_state_seq_set_data_from_fd) — no full-blob buffer.
+    val_task.hydra_action.hydra_fd = fd;
+    val_task.hydra_action.kv_v2_hdr = std::move(kv_v2_hdr);
+    val_task.hydra_action.kv_stream_len = kv_stream_len;
+    val_task.hydra_action.kv_expected_hash = has_kv_hash ? expected_kv_hash : 0;
     val_task.hydra_action.decode_request_id = decode_request_id;
     ctx.queue_results->add_waiting_task_id(decode_request_id);
     ctx.queue_tasks->wait_until_no_sleep();
     ctx.queue_tasks->post(std::move(val_task));
 
-    // Wait for validation+restore to complete (30s timeout for large KV blobs)
+    // Wait for validation+restore to complete. Raised 30s -> 600s (#470): the
+    // M2 restore streams the whole KV blob (2.3 GB today, 10 GB target) off the
+    // fd inside the task, so compute + transfer must fit the wait. The
+    // Coordinator enforces its own idle-based client budget.
     std::unordered_set<int> val_ids = {decode_request_id};
-    auto val_res_ptr = ctx.queue_results->recv_with_timeout(val_ids, 30);
+    auto val_res_ptr = ctx.queue_results->recv_with_timeout(val_ids, 600);
     ctx.queue_results->remove_waiting_task_id(decode_request_id);
 
     if (!val_res_ptr) {

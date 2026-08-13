@@ -18,6 +18,26 @@ LLAMA_API size_t llama_state_seq_get_data_to_fd(
                 llama_seq_id   seq_id,
                          int   fd);
 
+// Hydra M2 decode side (#470): restore the KV state of a single sequence
+// directly from an open POSIX file descriptor (typically a TCP socket). No
+// intermediate full-blob buffer is allocated — the wire stream is read in
+// chunks (size set by llama_hydra_set_state_chunk_size) and copied into GPU
+// memory per chunk. The fd stream must start with [4B io_magic][4B seq_id]
+// followed by the KV state (same framing llama_state_seq_get_data_to_fd emits);
+// trailing logits are NOT consumed here.
+//
+// xxh3_state: optional opaque XXH3_state_t* (see vendor/xxhash/xxhash.h).
+// When non-null, every byte consumed from the fd is fed to it so the caller can
+// verify the wire hash of the whole kv segment after restore. nullptr skips.
+//
+// Returns bytes read from the fd (magic + seq_id + state), or 0 on error.
+// Not supported on Windows (returns 0 with a log warning).
+LLAMA_API size_t llama_state_seq_set_data_from_fd(
+        struct llama_context * ctx,
+                llama_seq_id   seq_id,
+                         int   fd,
+                        void * xxh3_state);
+
 // Hydra #334: set/get the chunk size (bytes) used by llama_state_seq_get_data_to_fd's
 // GPU->host copy + socket send loop. Settable at runtime via CONFIGURE (0x40)
 // "state_chunk_size" so Hydra can tune it without a rebuild. Clamped internally

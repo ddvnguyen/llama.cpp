@@ -26,6 +26,10 @@ size_t llama_state_seq_get_data_to_fd(struct llama_context * ctx, llama_seq_id s
     return ctx->state_seq_get_data_to_fd(seq_id, fd);
 }
 
+size_t llama_state_seq_set_data_from_fd(struct llama_context * ctx, llama_seq_id seq_id, int fd, void * xxh3_state) {
+    return ctx->state_seq_set_data_from_fd(seq_id, fd, xxh3_state);
+}
+
 void llama_hydra_set_state_chunk_size(struct llama_context * ctx, size_t bytes) {
     ctx->hydra_set_state_chunk_size(bytes);
 }

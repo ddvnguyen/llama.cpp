@@ -2985,6 +2985,8 @@ size_t llama_context::state_get_size() {
 // hydra: zero-copy socket streaming (class stays here; C wrapper in llama-hydra.cpp)
 #if !defined(_WIN32)
 #include <sys/socket.h>
+// xxh3 for M2 decode-side wire-hash verification (see state_seq_set_data_from_fd)
+#include "../vendor/xxhash/xxhash.h"
 
 class llama_io_write_socket : public llama_io_write_i {
     // hydra#334: chunk size is caller-supplied (see llama_cparams::hydra_state_chunk_size,
@@ -3032,6 +3034,78 @@ public:
     }
 
     size_t n_bytes() override { return bytes_written; }
+};
+
+class llama_io_read_socket : public llama_io_read_i {
+    // Hydra M2 decode side (#470): mirror of llama_io_write_socket — the KV
+    // restore reads the state stream straight off the socket through a staging
+    // buffer (cparams.hydra_state_chunk_size), so the engine never materializes
+    // the full blob (2.3 GB today, 10 GB target). Chunk size matches the write
+    // side: 256 KB was too small (per-hydra#334), 2 MiB default amortizes the
+    // syscall + cudaMemcpy round trips.
+
+    int    fd           = -1;
+    size_t bytes_read   = 0;
+    std::vector<uint8_t> staging;
+    size_t staging_pos  = 0;   // consumed bytes within staging
+    size_t staging_len  = 0;   // valid bytes within staging
+
+    // Optional xxh3-64 state updated with every byte consumed from the fd, so
+    // the caller can verify the wire hash over the streamed segment after
+    // restore. nullptr = skip hashing.
+    XXH3_state_t * hash_state = nullptr;
+
+    void refill() {
+        if (staging_pos < staging_len) {
+            return;
+        }
+        ssize_t r = ::recv(fd, staging.data(), staging.size(), 0);
+        if (r <= 0) {
+            throw std::runtime_error("hydra: socket recv failed during state restore");
+        }
+        staging_pos = 0;
+        staging_len = (size_t)r;
+        if (hash_state != nullptr) {
+            XXH3_64bits_update(hash_state, staging.data(), staging_len);
+        }
+    }
+
+public:
+    llama_io_read_socket(int fd, size_t chunk_size) : fd(fd), staging(chunk_size) {}
+
+    void set_hash_state(XXH3_state_t * st) { hash_state = st; }
+
+    void read(void * dst, size_t size) override {
+        size_t done = 0;
+        uint8_t * p = static_cast<uint8_t *>(dst);
+        while (done < size) {
+            refill();
+            const size_t avail = staging_len - staging_pos;
+            const size_t take  = std::min(size - done, avail);
+            memcpy(p + done, staging.data() + staging_pos, take);
+            staging_pos += take;
+            done        += take;
+        }
+        bytes_read += size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        size_t done = 0;
+        while (done < size) {
+            refill();
+            const size_t avail = staging_len - staging_pos;
+            const size_t take  = std::min(size - done, avail);
+            // Synchronous per-chunk host->device copy before the staging region
+            // is reused for the next recv (matches llama_io_write_socket's
+            // tensor_get pattern, which is proven on the production path).
+            ggml_backend_tensor_set(tensor, staging.data() + staging_pos, offset + done, take);
+            staging_pos += take;
+            done        += take;
+        }
+        bytes_read += size;
+    }
+
+    size_t n_bytes() override { return bytes_read; }
 };
 #endif // !_WIN32
 
@@ -3087,6 +3161,44 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
     }
+}
+
+// Hydra M2 decode side (#470): restore KV state for one sequence directly from
+// a socket fd. No intermediate full-blob buffer — the wire stream is read in
+// chunks (size set by cparams.hydra_state_chunk_size, see CONFIGURE/0x40) into
+// a staging area and copied into GPU memory per chunk. The fd stream must start
+// with [4B io_magic][4B seq_id] (same framing the writer emits), followed by
+// the KV state; trailing logits are NOT consumed here — the caller reads them
+// off the fd after this returns (status == 8 + state bytes).
+//
+// xxh3_state (opaque XXH3_state_t*) is optional: when non-null, every byte
+// consumed from the fd is fed to it so the caller can verify the wire hash of
+// the whole kv segment (v2 header + stream + logits) after restore.
+// Returns bytes read from the fd (magic + seq_id + state), 0 on error.
+size_t llama_context::state_seq_set_data_from_fd(llama_seq_id seq_id, int fd, void * xxh3_state) {
+#if !defined(_WIN32)
+    llama_io_read_socket io(fd, cparams.hydra_state_chunk_size);
+    io.set_hash_state(static_cast<XXH3_state_t *>(xxh3_state));
+    try {
+        uint32_t magic_read;
+        io.read(&magic_read, sizeof(magic_read));
+        if (io_magic != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+        llama_seq_id seq_id_read;
+        io.read(&seq_id_read, sizeof(seq_id_read));
+        GGML_UNUSED(seq_id_read);
+
+        return state_seq_read_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error streaming state from fd %d: %s\n", __func__, fd, err.what());
+        return 0;
+    }
+#else
+    (void)seq_id; (void)fd; (void)xxh3_state;
+    LLAMA_LOG_WARN("%s: not supported on Windows\n", __func__);
+    return 0;
+#endif
 }
 
 // Hydra M2: stream KV state for one sequence directly to a socket fd.

@@ -226,8 +226,20 @@ struct server_task {
         std::string          tensor_pattern;
         // Merged DECODE (0x43): full JSON header (kv_metadata + prompt)
         std::string          decode_json;
-        // Merged DECODE (0x43): raw KV bytes to restore
+        // Merged DECODE (0x43): raw KV bytes to restore (M1 buffered path)
         std::vector<uint8_t> kv_data;
+        // Merged DECODE (0x43) M2 (#470): parsed v2 blob header (small: version +
+        // n_past + n_tok + tokens + flags + checkpoint). When non-empty, the KV
+        // state stream (magic + seq_id + state + logits) is NOT in kv_data — the
+        // task thread reads it directly off hydra_fd via
+        // llama_state_seq_set_data_from_fd.
+        std::vector<uint8_t> kv_v2_hdr;
+        // Merged DECODE (0x43) M2: bytes remaining on hydra_fd after the v2 header
+        // (magic + seq_id + KV state + logits tail).
+        uint64_t             kv_stream_len = 0;
+        // Merged DECODE (0x43) M2: xxh3-64 of the whole kv segment (v2 header +
+        // streamed bytes). 0 = no hash to verify (coordinator sent none).
+        uint64_t             kv_expected_hash = 0;
         // Merged DECODE (0x43): request ID for result retrieval
         int32_t              decode_request_id = -1;
     };
