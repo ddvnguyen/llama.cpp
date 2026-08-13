@@ -10503,7 +10503,13 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
     auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 600);
     ctx.queue_results->remove_waiting_task_id(task_id);
     if (!res_ptr) {
-        hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        // #470: the M2 stream task owns the fd (header + KV already streaming);
+        // writing an error header here could interleave with the stream. Mirror
+        // the STATE_GET M2 caveat (see hydra_handle_state_get): shut the socket
+        // down so the client unblocks with a clean EOF and the worker frees
+        // immediately (SO_SNDTIMEO bounds the send-side park meanwhile).
+        SRV_WRN("hydra rpc: PREFILL timeout for slot %d (task_id=%d)\n", slot_id, task_id);
+        ::shutdown(fd, SHUT_RDWR);
         return;
     }
 
@@ -10975,13 +10981,11 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
     if (!val_res_ptr) {
         SRV_WRN("hydra rpc: DECODE validation timeout for slot %d (request_id=%d)\n",
                 slot_id, decode_request_id);
-        json err_j = {
-            {"error", "validation timeout"},
-            {"decode_request_id", decode_request_id},
-        };
-        const std::string err_str = err_j.dump();
-        hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t)err_str.size(), 0);
-        hydra_send_all(fd, err_str.data(), err_str.size());
+        // #470: same M2 caveat as STATE_GET/PREFILL — the restore task may own
+        // the fd mid-stream; shut the socket down instead of writing an error
+        // header that could interleave. Client unblocks with a clean EOF, the
+        // worker frees immediately.
+        ::shutdown(fd, SHUT_RDWR);
         return;
     }
 

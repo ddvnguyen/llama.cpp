@@ -33,6 +33,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <thread>
 #include <unistd.h>
 
@@ -107,6 +108,14 @@ void set_conn_socket_options(int fd) {
     int flag = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
     ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+    // #470: bound the blocking state-stream send (llama_io_write_socket::
+    // send_all) so a peer that stops reading cannot park an RPC worker
+    // forever. 30s covers a multi-GB KV stream in flight; a stalled reader
+    // unblocks the worker after one send-timeout (EAGAIN -> exception -> task
+    // ends -> worker freed). The coordinator's own idle budget (120s) is the
+    // outer bound on the client side.
+    struct timeval snd = { .tv_sec = 30, .tv_usec = 0 };
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
 }
 
 void accept_loop(state_t & s) {
