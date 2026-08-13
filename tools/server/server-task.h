@@ -711,9 +711,21 @@ struct server_task_result_hydra_engine : server_task_result {
     // PREFILL: KV state data (returned inline, no separate StateGet needed)
     // state_data layout: [v2 blob (header + KV)] + [logits (n_vocab * float)]
     // logits_size is non-zero when logits are appended (activation handoff for P/D split).
+    // M2 path (hydra_fd >= 0): state_data is empty; the task thread streamed the
+    // full payload (12B header + meta + v2 header + GPU state + logits) directly
+    // to the socket; streamed_bytes is the byte count written.
     std::vector<uint8_t> state_data;
     uint64_t             state_size  = 0; // raw KV bytes only (from llama_state_seq_get_size)
     uint64_t             logits_size = 0; // appended logits bytes (n_vocab * sizeof(float))
+
+    // PREFILL M2 path: set when the payload was streamed directly to the socket
+    // (hydra_fd >= 0). state_data stays empty; streamed_bytes = v2 header + KV
+    // state + logits (the whole payload_len promised in the response header).
+    uint64_t streamed_bytes = 0;
+
+    // PREFILL M2: true = response header already written to the socket (avoids
+    // double-write on error, mirrors server_task_result_hydra_state).
+    bool     header_sent    = false;
 
     // M-Perf.9 #289 / #470: model identity for the slot the prefill was built on.
     // model_alias: the alias (or filename if no aliases) the engine reports.

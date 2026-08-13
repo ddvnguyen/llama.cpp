@@ -4378,7 +4378,9 @@ private:
                     // Checkpoint already registered above, before the final
                     // token was decoded (#469 fix).
 
-                    // Build v2 blob: [1B version=0x02][4B n_past][4B n_tok][n_tok*4B tokens][1B flags][?ckpt?][raw KV state]
+                    // Build v2 header: [1B version=0x02][4B n_past][4B n_tok][n_tok*4B tokens][1B flags][?ckpt?]
+                    // Shared by both response paths — M1 embeds it at the head of the
+                    // buffered blob, M2 sends it before streaming the GPU state.
                     const uint32_t hdr_n_past = (uint32_t)n_tokens;
                     const uint32_t hdr_n_tok  = (uint32_t)(tokens.size());
                     uint8_t hdr_flags = 0x00;
@@ -4405,48 +4407,48 @@ private:
                     }
                     const size_t base_hdr_size = 1 + 4 + 4 + hdr_n_tok * sizeof(llama_token) + 1;
                     const size_t v2_size = base_hdr_size + ckpt_buf.size();
-
-                    // Get raw KV state
-                    const size_t state_size = llama_state_seq_get_size(ctx_tgt, slot->id);
-                    std::vector<uint8_t> v2_blob(v2_size + state_size);
+                    std::vector<uint8_t> v2_hdr(v2_size);
                     {
                         size_t off = 0;
                         const uint8_t version_byte = 0x02;
-                        memcpy(v2_blob.data() + off, &version_byte, 1); off += 1;
-                        memcpy(v2_blob.data() + off, &hdr_n_past, 4);   off += 4;
-                        memcpy(v2_blob.data() + off, &hdr_n_tok, 4);    off += 4;
+                        memcpy(v2_hdr.data() + off, &version_byte, 1); off += 1;
+                        memcpy(v2_hdr.data() + off, &hdr_n_past, 4);   off += 4;
+                        memcpy(v2_hdr.data() + off, &hdr_n_tok, 4);    off += 4;
                         if (hdr_n_tok > 0) {
                             const auto & toks = slot->prompt.tokens.get_text_tokens();
-                            memcpy(v2_blob.data() + off, toks.data(), toks.size() * sizeof(llama_token));
+                            memcpy(v2_hdr.data() + off, toks.data(), toks.size() * sizeof(llama_token));
                             off += toks.size() * sizeof(llama_token);
                         }
-                        memcpy(v2_blob.data() + off, &hdr_flags, 1);    off += 1;
+                        memcpy(v2_hdr.data() + off, &hdr_flags, 1);    off += 1;
                         if (!ckpt_buf.empty()) {
-                            memcpy(v2_blob.data() + off, ckpt_buf.data(), ckpt_buf.size());
+                            memcpy(v2_hdr.data() + off, ckpt_buf.data(), ckpt_buf.size());
                             off += ckpt_buf.size();
-                        }
-                        if (state_size > 0) {
-                            llama_state_seq_get_data(ctx_tgt, v2_blob.data() + off, state_size, slot->id);
                         }
                     }
 
-                    // Append logits for activation handoff — eliminates the 1-token trick on the
-                    // decode GPU. llama_state_seq_get_data saves KV (k/v tensors) but not the
-                    // logits buffer; without these, common_sampler_sample reads garbage after
-                    // StatePut. Appending n_vocab floats here lets STATE_PUT inject them directly
-                    // into ctx->logits so DECODE can sample immediately.
+                    // Get raw KV state
+                    const size_t state_size = llama_state_seq_get_size(ctx_tgt, slot->id);
+
+                    // Snapshot logits NOW into a small buffer. ctx->logits is
+                    // context-global: a concurrent slot decode can overwrite it
+                    // while the M2 state stream is on the wire. Appending
+                    // n_vocab floats gives the decode GPU the activation handoff
+                    // (llama_state_seq_get_data saves KV but not logits), so
+                    // STATE_PUT / DECODE_APPLY can sample immediately.
                     uint64_t logits_size = 0;
-                    const int n_vocab = llama_vocab_n_tokens(vocab);
-                    const float * logits_ptr = llama_get_logits(ctx_tgt);
-                    if (logits_ptr && n_vocab > 0) {
-                        logits_size = (uint64_t)n_vocab * sizeof(float);
-                        const size_t old_sz = v2_blob.size();
-                        v2_blob.resize(old_sz + (size_t)logits_size);
-                        memcpy(v2_blob.data() + old_sz, logits_ptr, (size_t)logits_size);
+                    std::vector<uint8_t> logits_buf;
+                    {
+                        const int n_vocab = llama_vocab_n_tokens(vocab);
+                        const float * logits_ptr = llama_get_logits(ctx_tgt);
+                        if (logits_ptr && n_vocab > 0) {
+                            logits_size = (uint64_t)n_vocab * sizeof(float);
+                            logits_buf.assign(reinterpret_cast<const uint8_t *>(logits_ptr),
+                                              reinterpret_cast<const uint8_t *>(logits_ptr) + (size_t)logits_size);
+                        }
                     }
 
                     SRV_INF("hydra: PREFILL slot=%d done n_past=%d kv=%zu logits=%" PRIu64 "B total=%zu\n",
-                            id_slot, n_tokens, state_size, logits_size, v2_blob.size());
+                            id_slot, n_tokens, state_size, logits_size, v2_hdr.size() + state_size + (size_t)logits_size);
 
                     // M-Perf.9 #289: model identity for the slot the prefill
                     // was just built on. Coordinator uses this to populate
@@ -4471,7 +4473,6 @@ private:
 
                     res->rpc_status  = HYDRA_STATUS_OK;
                     res->n_past      = n_tokens;
-                    res->state_data  = std::move(v2_blob);
                     res->state_size  = state_size;
                     res->logits_size = logits_size;
                     // #451: populate PREFILL metrics
@@ -4482,9 +4483,108 @@ private:
                         res->tokens_per_second = (double)n_tokens / (res->prefill_ms / 1000.0);
                     }
                     res->cache_tokens = slot->n_prompt_tokens_cache;
+
+                    const int hydra_fd = task.hydra_action.hydra_fd;
+                    if (hydra_fd >= 0) {
+                        // M2 path (#470): stream the response straight to the
+                        // socket — 12B header + meta JSON + v2 header, then the
+                        // GPU KV state zero-copy (chunked via cparams.hydra_state_chunk_size),
+                        // then the (small) logits tail. No full-blob RAM buffer:
+                        // at 60-80K context the blob is ~800 MB and grows toward
+                        // 10 GB; buffering it doubled engine peak memory and the
+                        // send only started after compute + full buffer completed.
+                        // Wire layout is byte-identical to M1: payload =
+                        // v2_hdr + KV state + logits, payload_len = the same
+                        // total the coordinator computes from meta.
+                        const size_t total_payload = v2_hdr.size() + state_size + (size_t)logits_size;
+                        json meta_j = {
+                            {"n_past",      res->n_past},
+                            {"state_size",  res->state_size},
+                            {"logits_size", res->logits_size}
+                        };
+                        if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
+                        if (!res->model_path.empty())  meta_j["model_path"]  = res->model_path;
+                        if (!res->tokenizer.empty())   meta_j["tokenizer"]   = res->tokenizer;
+                        if (!res->model_name.empty())  meta_j["model_name"]  = res->model_name;
+                        if (!res->model_quant.empty()) meta_j["model_quant"] = res->model_quant;
+                        if (res->model_capabilities)   meta_j["model_capabilities"] = res->model_capabilities;
+                        meta_j["model_fallback"] = res->model_fallback;
+                        if (res->prefill_ms > 0)     meta_j["prefill_ms"]     = res->prefill_ms;
+                        if (res->model_load_ms > 0)  meta_j["model_load_ms"]  = res->model_load_ms;
+                        const std::string meta_str = meta_j.dump();
+                        const uint32_t meta_len = (uint32_t)meta_str.size();
+
+                        uint8_t hdr[HYDRA_RES_HEADER_SIZE] = {};
+                        hdr[0] = HYDRA_STATUS_OK;
+                        hdr[1] = (meta_len)       & 0xFF;
+                        hdr[2] = (meta_len >>  8) & 0xFF;
+                        hdr[3] = (meta_len >> 16) & 0xFF;
+                        memcpy(hdr + 4, &total_payload, 8);
+                        if (!hydra_send_all(hydra_fd, hdr, HYDRA_RES_HEADER_SIZE) ||
+                            !hydra_send_all(hydra_fd, meta_str.data(), meta_str.size()) ||
+                            !hydra_send_all(hydra_fd, v2_hdr.data(), v2_hdr.size())) {
+                            res->rpc_status = HYDRA_STATUS_ERROR;
+                            res->error      = "PREFILL M2: response header/meta/v2-hdr send failed";
+                            ::shutdown(hydra_fd, SHUT_RDWR);
+                        } else {
+                            res->header_sent = true; // META + header + v2-hdr before payload
+                            // Stream GPU state to fd (zero-copy from GPU memory)
+                            const size_t streamed = llama_state_seq_get_data_to_fd(ctx_tgt, slot->id, hydra_fd);
+                            if (streamed != state_size) {
+                                // TOCTOU: state size changed between get_size
+                                // (above) and the stream, or the stream failed
+                                // mid-way. The wire framing is now broken — the
+                                // only safe recovery is to kill the connection.
+                                // shutdown(), not close(): the RPC connection
+                                // loop owns the fd (mirrors STATE_GET M2).
+                                res->rpc_status = HYDRA_STATUS_ERROR;
+                                res->error      = "llama_state_seq_get_data_to_fd streamed " +
+                                                  std::to_string(streamed) + " B, expected " +
+                                                  std::to_string(state_size) + " B";
+                                ::shutdown(hydra_fd, SHUT_RDWR);
+                            } else {
+                                // Logits tail after the state stream — PREFILL's
+                                // payload includes logits_size bytes at the end
+                                // (STATE_GET M2 does not send logits).
+                                if (!logits_buf.empty()) {
+                                    if (!hydra_send_all(hydra_fd, logits_buf.data(), logits_buf.size())) {
+                                        res->rpc_status = HYDRA_STATUS_ERROR;
+                                        res->error      = "PREFILL M2: logits tail send failed";
+                                        ::shutdown(hydra_fd, SHUT_RDWR);
+                                    }
+                                }
+                                if (res->rpc_status == HYDRA_STATUS_OK) {
+                                    res->streamed_bytes = (uint64_t)total_payload;
+                                }
+                            }
+                        }
+                    } else {
+                        // M1 path: buffer the full blob in memory; the RPC thread
+                        // sends header + meta + payload afterwards (unchanged).
+                        // v2 blob format (0x02): [1B version][4B n_past][4B n_tok][n_tok*4B tokens]
+                        //   [1B flags (bit 0 = has_checkpoint)]
+                        //   [if flags & 0x01: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz | tgt_data | 8B dft_sz | dft_data]
+                        //   [raw KV state from llama_state_seq_get_data]
+                        //   [logits (n_vocab * float)]
+                        std::vector<uint8_t> v2_blob(v2_hdr.size() + state_size + (size_t)logits_size);
+                        {
+                            size_t off = 0;
+                            memcpy(v2_blob.data() + off, v2_hdr.data(), v2_hdr.size());
+                            off += v2_hdr.size();
+                            if (state_size > 0) {
+                                llama_state_seq_get_data(ctx_tgt, v2_blob.data() + off, state_size, slot->id);
+                            }
+                        }
+                        if (!logits_buf.empty()) {
+                            memcpy(v2_blob.data() + v2_hdr.size() + state_size, logits_buf.data(), logits_buf.size());
+                        }
+                        res->state_data = std::move(v2_blob);
+                    }
                     // #469 trace: log PREFILL completion with token IDs for cross-flow comparison
                     SRV_DBG("hydra: PREFILL_DONE slot=%d n_past=%d state_size=%zu logits_size=%zu blob_size=%zu prefill_ms=%.1f\n",
-                            id_slot, n_tokens, state_size, logits_size, v2_blob.size(), res->prefill_ms);
+                            id_slot, n_tokens, state_size, logits_size,
+                            (hydra_fd >= 0) ? v2_hdr.size() + state_size + (size_t)logits_size : res->state_data.size(),
+                            res->prefill_ms);
                     queue_results.send(std::move(res));
                 } break;
 
@@ -10288,6 +10388,7 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
     server_task task(SERVER_TASK_TYPE_HYDRA_ENGINE_PREFILL);
     task.id = ctx.queue_tasks->get_new_id();
     task.hydra_action.id_slot = slot_id;
+    task.hydra_action.hydra_fd = fd; // M2 (#470): task thread streams the response here
     task.hydra_action.request_json = std::move(json_str);
     const int task_id = task.id;
     ctx.queue_results->add_waiting_task_id(task_id);
@@ -10295,13 +10396,16 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
     ctx.queue_tasks->post(std::move(task));
 
     std::unordered_set<int> task_ids = {task_id};
-    // Bumped from 60s to 180s. Prefill for 32k+ token prompts exceeds 120s
-    // (we measured 32s for 22k tokens; 48k ≈ 70s, 100k ≈ 150s+). Long autoregressive
-    // decode on P100 (28 tok/s) for 4k+ token outputs also exceeds 120s. The C++
-    // side was timing out and returning HYDRA_STATUS_ERROR before the C# client
-    // gave up, surfacing as a 503 from the coordinator even though the model was
-    // still working.
-    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 180);
+    // Bumped from 60s to 180s, then 180s to 600s (#470). Prefill for 32k+
+    // token prompts exceeds 120s (we measured 32s for 22k tokens; 48k ≈ 70s,
+    // 100k ≈ 150s+). Long autoregressive decode on P100 (28 tok/s) for 4k+
+    // token outputs also exceeds 120s. On top of compute, the M2 stream must
+    // push the whole KV blob (≈800 MB today, 10 GB target) over the socket
+    // before this wait returns — the old 180s budget raced that transfer and
+    // dropped the connection mid-frame (coordinator then read garbage framing
+    // like 'RPC payload length out of range'). 600s covers compute + transfer
+    // with headroom; the Coordinator enforces an idle-based budget client-side.
+    auto res_ptr = ctx.queue_results->recv_with_timeout(task_ids, 600);
     ctx.queue_results->remove_waiting_task_id(task_id);
     if (!res_ptr) {
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
@@ -10310,10 +10414,31 @@ static void hydra_handle_prefill(int fd, int slot_id, uint64_t payload_len, cons
 
     auto * res = dynamic_cast<server_task_result_hydra_engine*>(res_ptr.get());
     if (!res || res->rpc_status != HYDRA_STATUS_OK) {
+        if (res && res->header_sent) {
+            // M2 failure: header + meta already on the wire but the stream
+            // failed; the task thread shut the socket down — the connection
+            // loop will close the fd on its next read. Do NOT write a second
+            // response header (would interleave with nothing — socket is
+            // shut — but must not emit a second frame either).
+            SRV_WRN("hydra rpc: PREFILL slot=%d M2 stream failed: %s\n",
+                    slot_id, res->error.c_str());
+            return;
+        }
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
         return;
     }
 
+    if (res->streamed_bytes > 0) {
+        // M2 path: the task thread already wrote the response header + meta +
+        // v2 header + KV state + logits straight to the socket. Nothing left
+        // for the RPC thread to do — protocol framing was completed on the
+        // task thread. (mirrors STATE_GET M2 handling)
+        SRV_INF("hydra rpc: PREFILL slot=%d M2 streamed %.1f MiB directly\n",
+                slot_id, res->streamed_bytes / (1024.0 * 1024.0));
+        return;
+    }
+
+    // M1 path: RPC thread sends header + meta + buffered payload (unchanged).
     // Return n_past + sizes + model identity in meta; full blob (v2 header + KV + logits) as payload.
     // logits_size > 0 signals the decode GPU to inject them into ctx->logits via STATE_PUT.
     // M-Perf.9 #289: model identity fields (already populated on res by the PREFILL handler)
