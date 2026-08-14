@@ -4432,7 +4432,7 @@ private:
                     // Checkpoint already registered above, before the final
                     // token was decoded (#469 fix).
 
-                    // Build v2 header: [1B version=0x02][4B n_past][4B n_tok][n_tok*4B tokens][1B flags][?ckpt?]
+                    // Build v2/v3 header: [1B version=0x02|0x03][4B n_past][4B n_tok][n_tok*4B tokens][1B flags][?ckpt?]
                     // Shared by both response paths — M1 embeds it at the head of the
                     // buffered blob, M2 sends it before streaming the GPU state.
                     const uint32_t hdr_n_past = (uint32_t)n_tokens;
@@ -4447,24 +4447,47 @@ private:
                         ckpt_pos_min = ckpt.pos_min;
                         ckpt_pos_max = ckpt.pos_max;
                         ckpt_n_tokens = ckpt.n_tokens;
-                        const uint64_t tgt_sz = ckpt.data_tgt.size();
-                        const uint64_t dft_sz = ckpt.data_dft.size();
+                        // Hydra M2-stream double-write fix (#470/#620): serialize the
+                        // recurrent-only capture (data_tgt_recr, PARTIAL_ONLY) instead of
+                        // the full data_tgt. The full live state that follows on the wire
+                        // already carries the attention bytes at the live position, so
+                        // sending the full checkpoint duplicates the attention portion
+                        // (which scales with ctx). The recurrent state is genuinely needed
+                        // at BOTH positions, hence the separate recr-only capture.
+                        // hdr_flags bit 0x02 marks a recurrent-only checkpoint section so
+                        // STATE_PUT/DECODE_APPLY can read it back with matched PARTIAL_ONLY
+                        // flags. Fall back to the full capture when the checkpoint has no
+                        // recr buffer (e.g. it was registered from an old 0x02 blob) — a
+                        // PARTIAL_ONLY read of a full-written buffer is a CUDA memory error.
+                        const bool use_recr = !ckpt.data_tgt_recr.empty();
+                        if (use_recr) {
+                            hdr_flags |= 0x02;
+                        }
+                        const uint64_t tgt_sz = use_recr ? ckpt.data_tgt_recr.size() : ckpt.data_tgt.size();
+                        const uint64_t dft_sz = use_recr ? ckpt.data_dft_recr.size() : ckpt.data_dft.size();
+                        const uint8_t * tgt_ptr = use_recr ? ckpt.data_tgt_recr.data() : ckpt.data_tgt.data();
+                        const uint8_t * dft_ptr = use_recr ? ckpt.data_dft_recr.data() : ckpt.data_dft.data();
                         ckpt_buf.resize(4 + 4 + 8 + 8 + (size_t)tgt_sz + 8 + (size_t)dft_sz);
                         size_t off = 0;
                         memcpy(ckpt_buf.data() + off, &ckpt_pos_min, 4); off += 4;
                         memcpy(ckpt_buf.data() + off, &ckpt_pos_max, 4); off += 4;
                         memcpy(ckpt_buf.data() + off, &ckpt_n_tokens, 8); off += 8;
                         memcpy(ckpt_buf.data() + off, &tgt_sz, 8); off += 8;
-                        if (tgt_sz > 0) { memcpy(ckpt_buf.data() + off, ckpt.data_tgt.data(), (size_t)tgt_sz); off += (size_t)tgt_sz; }
+                        if (tgt_sz > 0) { memcpy(ckpt_buf.data() + off, tgt_ptr, (size_t)tgt_sz); off += (size_t)tgt_sz; }
                         memcpy(ckpt_buf.data() + off, &dft_sz, 8); off += 8;
-                        if (dft_sz > 0) memcpy(ckpt_buf.data() + off, ckpt.data_dft.data(), (size_t)dft_sz);
+                        if (dft_sz > 0) memcpy(ckpt_buf.data() + off, dft_ptr, (size_t)dft_sz);
                     }
                     const size_t base_hdr_size = 1 + 4 + 4 + hdr_n_tok * sizeof(llama_token) + 1;
                     const size_t v2_size = base_hdr_size + ckpt_buf.size();
                     std::vector<uint8_t> v2_hdr(v2_size);
                     {
                         size_t off = 0;
-                        const uint8_t version_byte = 0x02;
+                        // 0x03 = v3 blob: checkpoint section carries recurrent-only
+                        // captures (data_tgt_recr, PARTIAL_ONLY). 0x02 = v2 blob:
+                        // checkpoint section carries the full data_tgt. Bumped so a
+                        // mixed-version fleet never misreads a smaller (recr-only)
+                        // checkpoint as a full one.
+                        const uint8_t version_byte = 0x03;
                         memcpy(v2_hdr.data() + off, &version_byte, 1); off += 1;
                         memcpy(v2_hdr.data() + off, &hdr_n_past, 4);   off += 4;
                         memcpy(v2_hdr.data() + off, &hdr_n_tok, 4);    off += 4;
