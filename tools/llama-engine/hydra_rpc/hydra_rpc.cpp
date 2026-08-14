@@ -110,11 +110,17 @@ void set_conn_socket_options(int fd) {
     ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
     // #470: bound the blocking state-stream send (llama_io_write_socket::
     // send_all) so a peer that stops reading cannot park an RPC worker
-    // forever. 30s covers a multi-GB KV stream in flight; a stalled reader
-    // unblocks the worker after one send-timeout (EAGAIN -> exception -> task
-    // ends -> worker freed). The coordinator's own idle budget (120s) is the
-    // outer bound on the client side.
-    struct timeval snd = { .tv_sec = 30, .tv_usec = 0 };
+    // forever. MUST stay ABOVE the coordinator's per-chunk idle budget
+    // (120s Store / 600s relay): the coordinator legitimately pauses its
+    // socket reads while its downstream (relay channel / Store pipe)
+    // backpressures — the decode leg preparing (model load, slot
+    // acquisition) is exactly that case — and resumes reading once the
+    // downstream drains. A send-park shorter than that budget (the old 30s)
+    // killed healthy PREFILL streams mid-frame (engine EAGAIN -> coordinator
+    // EOF -> zero-token turn, run 31760361575). 900s > the coordinator's max
+    // 600s budget, so the coordinator's OWN idle deadline — not this socket
+    // timeout — is what frees the worker on a genuinely stalled peer.
+    struct timeval snd = { .tv_sec = 900, .tv_usec = 0 };
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
 }
 
