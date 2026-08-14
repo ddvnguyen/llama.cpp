@@ -2672,6 +2672,20 @@ private:
         cur.update_tgt(ctx_tgt,       slot.id, 0);
         cur.update_dft(ctx_dft.get(), slot.id, 0);
 
+        // Hydra M2-stream double-write fix (#470/#620): a SECOND, separate
+        // recurrent-only capture used ONLY for the wire checkpoint (STATE_GET
+        // serializes data_tgt_recr, never data_tgt). Hybrid/recurrent models
+        // need the recurrent (SSM) state at BOTH the checkpoint position and
+        // the live position, but the attention portion of the checkpoint is
+        // redundant on the wire — it scales with ctx and the full live state
+        // already carries it. The flags=0 captures above keep serving the
+        // local rewind path unchanged. These *_recr helpers hardcode
+        // LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY and must only ever be read back
+        // via load_tgt_recr/load_dft_recr (matched flags — a PARTIAL_ONLY
+        // buffer physically lacks the mem_attn bytes).
+        cur.update_tgt_recr(ctx_tgt,       slot.id);
+        cur.update_dft_recr(ctx_dft.get(), slot.id);
+
         SLT_INF(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
@@ -3440,8 +3454,26 @@ private:
                         ckpt_pos_max = ckpt.pos_max;
                         ckpt_n_tokens = ckpt.n_tokens;
 
-                        const uint64_t tgt_sz = ckpt.data_tgt.size();
-                        const uint64_t dft_sz = ckpt.data_dft.size();
+                        // Hydra M2-stream double-write fix (#470/#620): serialize the
+                        // recurrent-only capture (data_tgt_recr, PARTIAL_ONLY) instead of
+                        // the full data_tgt. The full live state that follows on the wire
+                        // already carries the attention bytes at the live position, so
+                        // sending the full checkpoint duplicates the attention portion
+                        // (which scales with ctx). The recurrent state is genuinely needed
+                        // at BOTH positions, hence the separate recr-only capture.
+                        // hdr_flags bit 0x02 marks a recurrent-only checkpoint section so
+                        // STATE_PUT/DECODE_APPLY can read it back with matched PARTIAL_ONLY
+                        // flags. Fall back to the full capture when the checkpoint has no
+                        // recr buffer (e.g. it was registered from an old 0x02 blob) — a
+                        // PARTIAL_ONLY read of a full-written buffer is a CUDA memory error.
+                        const bool use_recr = !ckpt.data_tgt_recr.empty();
+                        if (use_recr) {
+                            hdr_flags |= 0x02;
+                        }
+                        const uint64_t tgt_sz = use_recr ? ckpt.data_tgt_recr.size() : ckpt.data_tgt.size();
+                        const uint64_t dft_sz = use_recr ? ckpt.data_dft_recr.size() : ckpt.data_dft.size();
+                        const uint8_t * tgt_ptr = use_recr ? ckpt.data_tgt_recr.data() : ckpt.data_tgt.data();
+                        const uint8_t * dft_ptr = use_recr ? ckpt.data_dft_recr.data() : ckpt.data_dft.data();
                         const size_t ckpt_hdr_sz = 4 + 4 + 8 + 8 + (size_t)tgt_sz + 8 + (size_t)dft_sz;
                         snapshot_ckpt.resize(ckpt_hdr_sz);
                         size_t off = 0;
@@ -3449,22 +3481,27 @@ private:
                         memcpy(snapshot_ckpt.data() + off, &ckpt_pos_max, 4); off += 4;
                         memcpy(snapshot_ckpt.data() + off, &ckpt_n_tokens, 8); off += 8;
                         memcpy(snapshot_ckpt.data() + off, &tgt_sz, 8); off += 8;
-                        if (tgt_sz > 0) { memcpy(snapshot_ckpt.data() + off, ckpt.data_tgt.data(), (size_t)tgt_sz); off += (size_t)tgt_sz; }
+                        if (tgt_sz > 0) { memcpy(snapshot_ckpt.data() + off, tgt_ptr, (size_t)tgt_sz); off += (size_t)tgt_sz; }
                         memcpy(snapshot_ckpt.data() + off, &dft_sz, 8); off += 8;
-                        if (dft_sz > 0) memcpy(snapshot_ckpt.data() + off, ckpt.data_dft.data(), (size_t)dft_sz);
+                        if (dft_sz > 0) memcpy(snapshot_ckpt.data() + off, dft_ptr, (size_t)dft_sz);
                     }
 
                     {
                         SRV_INF("hydra: STATE_GET streaming (fd=%d state=%.1f MiB)\n",
                                 hydra_fd, state_size / (1024.0 * 1024.0));
                         if (hydra_fd >= 0) {
-                            // M2 path: stream v2 blob (header + checkpoint + GPU state) to fd.
+                            // M2 path: stream v2/v3 blob (header + checkpoint + GPU state) to fd.
                             // Response header + meta JSON sent first, then v2 header bytes,
                             // then llama_state_seq_get_data_to_fd writes GPU state directly.
                             const size_t n_tok = prompt_tokens_get.size();
                             const uint32_t hdr_n_tok = (uint32_t)n_tok;
                             const uint32_t hdr_n_past = (uint32_t)n_past_val;
-                            const uint8_t version_byte = 0x02;
+                            // 0x03 = v3 blob: checkpoint section carries recurrent-only
+                            // captures (data_tgt_recr, PARTIAL_ONLY). 0x02 = v2 blob:
+                            // checkpoint section carries the full data_tgt. Bumped so a
+                            // mixed-version fleet never misreads a smaller (recr-only)
+                            // checkpoint as a full one.
+                            const uint8_t version_byte = 0x03;
                             const size_t base_hdr_size = 1 + 4 + 4 + n_tok * sizeof(llama_token) + 1;
                             const size_t hdr_size = base_hdr_size + snapshot_ckpt.size();
                             const size_t total_payload = hdr_size + state_size;
@@ -3530,18 +3567,18 @@ private:
                              } else {
                                  res->streamed_bytes = total_payload;
                              }
-                         } else {
-                             // M1 path: buffer in memory, RPC thread sends afterwards.
-                             // v2 blob format (0x02): [1B version][4B n_past][4B n_tok][n_tok*4B tokens]
-                             //   [1B flags (bit 0 = has_checkpoint)]
-                             //   [if flags & 0x01: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz | tgt_data | 8B dft_sz | dft_data]
-                             //   [raw KV state from llama_state_seq_get_data]
-                             const size_t n_tok = prompt_tokens_get.size();
-                             const uint32_t hdr_n_tok = (uint32_t)n_tok;
-                             const uint32_t hdr_n_past = (uint32_t)n_past_val;
-                             const uint8_t version_byte = 0x02;
-                             const size_t base_hdr_size = 1 + 4 + 4 + n_tok * sizeof(llama_token) + 1; // version + n_past + n_tok + tokens + flags
-                             const size_t hdr_size = base_hdr_size + snapshot_ckpt.size();
+                          } else {
+                              // M1 path: buffer in memory, RPC thread sends afterwards.
+                              // v3 blob format (0x03): [1B version][4B n_past][4B n_tok][n_tok*4B tokens]
+                              //   [1B flags (bit 0 = has_checkpoint)]
+                              //   [if flags & 0x01: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz | recr_tgt_data | 8B dft_sz | recr_dft_data]
+                              //   [raw KV state from llama_state_seq_get_data]
+                              const size_t n_tok = prompt_tokens_get.size();
+                              const uint32_t hdr_n_tok = (uint32_t)n_tok;
+                              const uint32_t hdr_n_past = (uint32_t)n_past_val;
+                              const uint8_t version_byte = 0x03;
+                              const size_t base_hdr_size = 1 + 4 + 4 + n_tok * sizeof(llama_token) + 1; // version + n_past + n_tok + tokens + flags
+                              const size_t hdr_size = base_hdr_size + snapshot_ckpt.size();
 
                               // TOCTOU retry: if another slot grew the state between
                               // get_size (inference thread) and get_data (background thread),
@@ -3637,21 +3674,23 @@ private:
 
                     const auto & buf = task.hydra_action.state_data;
 
-                    // Detect v2 blob (0x02 at offset 0) vs legacy format (no version byte).
+                    // Detect v2/v3 blob (0x02/0x03 at offset 0) vs legacy format (no version byte).
                     // v2: [1B version=0x02][4B n_past][4B n_tok][n_tok*4B tokens][1B flags][?ckpt?][KV state]
-                    // legacy: [4B n_past][4B n_tok][n_tok*4B tokens][KV state]
-                    const bool is_v2 = buf.size() >= 1 && buf[0] == 0x02;
+                    // v3: same, but the checkpoint section may be a recurrent-only capture
+                    // (hdr_flags bit 0x02 set). Bumped to 0x03 by the M2-stream double-write fix.
+                    const bool is_v2 = buf.size() >= 1 && (buf[0] == 0x02 || buf[0] == 0x03);
 
                     size_t hdr_offset = 0;
                     int32_t hdr_n_tok = 0;
                     int32_t hdr_n_past = 0;
                     bool has_chkpt = false;
+                    bool ckpt_is_recr_only = false;
                     int32_t ckpt_pos_min_in = 0, ckpt_pos_max_in = 0;
                     int64_t ckpt_n_tokens_in = 0;
                     std::vector<uint8_t> ckpt_tgt_data, ckpt_dft_data;
 
                     if (is_v2) {
-                        // v2: version at [0], n_past at [1..4], n_tok at [5..8]
+                        // v2/v3: version at [0], n_past at [1..4], n_tok at [5..8]
                         if (buf.size() >= 9) {
                             memcpy(&hdr_n_past, buf.data() + 1, 4);
                             memcpy(&hdr_n_tok,  buf.data() + 5, 4);
@@ -3662,6 +3701,10 @@ private:
                         if (hdr_offset < buf.size()) {
                             const uint8_t flags = buf[hdr_offset];
                             hdr_offset += 1; // past flags byte
+                            // bit 0x01 = has checkpoint; bit 0x02 = checkpoint section is
+                            // recurrent-only (PARTIAL_ONLY). A v3 blob that fell back to the
+                            // full capture (old-registered checkpoint) leaves 0x02 clear.
+                            ckpt_is_recr_only = (flags & 0x02) != 0;
                             if (flags & 0x01) {
                                 // Parse checkpoint: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz | tgt_data | 8B dft_sz | dft_data
                                 if (hdr_offset + 4 + 4 + 8 + 8 <= buf.size()) {
@@ -3772,10 +3815,20 @@ private:
                                 ckpt.n_tokens = ckpt_n_tokens_in;
                                 ckpt.pos_min  = ckpt_pos_min_in;
                                 ckpt.pos_max  = ckpt_pos_max_in;
-                                ckpt.data_tgt = std::move(ckpt_tgt_data);
-                                ckpt.data_dft = std::move(ckpt_dft_data);
-                                SLT_INF(*slot, "STATE_PUT registered native checkpoint (pos_min=%d pos_max=%d n_tokens=%" PRId64 " tgt_sz=%zu)\n",
-                                        ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, ckpt.data_tgt.size());
+                                // New-format (v3) checkpoints carry a recurrent-only capture —
+                                // route it into data_*_recr and tag is_recr_only so the load
+                                // path uses matched PARTIAL_ONLY flags (plus an attention
+                                // seq_rm at pos_max) instead of the full flags=0 restore.
+                                ckpt.is_recr_only = ckpt_is_recr_only;
+                                if (ckpt_is_recr_only) {
+                                    ckpt.data_tgt_recr = std::move(ckpt_tgt_data);
+                                    ckpt.data_dft_recr = std::move(ckpt_dft_data);
+                                } else {
+                                    ckpt.data_tgt = std::move(ckpt_tgt_data);
+                                    ckpt.data_dft = std::move(ckpt_dft_data);
+                                }
+                                SLT_INF(*slot, "STATE_PUT registered native checkpoint (pos_min=%d pos_max=%d n_tokens=%" PRId64 " tgt_sz=%zu recr_only=%d)\n",
+                                        ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, ckpt.size(), (int) ckpt.is_recr_only);
                             } else {
                                 create_checkpoint(*slot, 0, 0, (llama_pos)(hdr_n_tok - 1));
                             }
@@ -4998,7 +5051,7 @@ private:
                         slot->n_prompt_tokens_processed = 0;
                         slot->n_decoded = 0;
 
-                        // The coordinator may send the v2 blob (header + raw KV)
+                        // The coordinator may send the v2/v3 blob (header + raw KV)
                         // or just the raw KV data.  Parse the v2 header to extract
                         // the token list so update_slots()'s n_common decision can
                         // match incoming tokens against the restored KV — without
@@ -5014,11 +5067,15 @@ private:
                         int32_t         blob_n_past = 0;
                         int32_t         blob_n_tok  = 0;
                         bool            has_chkpt = false;
+                        bool            ckpt_is_recr_only = false;
                         int32_t         ckpt_pos_min_in = 0, ckpt_pos_max_in = 0;
                         int64_t         ckpt_n_tokens_in = 0;
                         std::vector<uint8_t> ckpt_tgt_data, ckpt_dft_data;
 
-                        const bool is_v2 = kv_len >= 1 && kv_ptr[0] == 0x02;
+                        // v2 (0x02) blobs carry a full checkpoint; v3 (0x03) blobs may carry
+                        // a recurrent-only checkpoint (hdr_flags bit 0x02). Both share the
+                        // header layout — the M2-stream double-write fix bumped the version.
+                        const bool is_v2 = kv_len >= 1 && (kv_ptr[0] == 0x02 || kv_ptr[0] == 0x03);
                         if (is_v2 && kv_len >= 9) {
                             memcpy(&blob_n_past, kv_ptr + 1, 4);
                             memcpy(&blob_n_tok,  kv_ptr + 5, 4);
@@ -5026,20 +5083,22 @@ private:
                             const size_t token_start = 9;
                             const size_t token_end   = token_start + (size_t)blob_n_tok * sizeof(llama_token);
                             if (blob_n_tok > 0 && token_end <= kv_len) {
-                                // Restore token list from v2 blob header
+                                // Restore token list from v2/v3 blob header
                                 slot->prompt.tokens.clear();
                                 const llama_token * tok_ptr = (const llama_token *)(kv_ptr + token_start);
                                 llama_tokens restored_tokens(tok_ptr, tok_ptr + (size_t)blob_n_tok);
                                 slot->prompt.tokens.insert(restored_tokens);
-                                SRV_INF("hydra: DECODE_APPLY slot=%d v2 blob: restored %d tokens from header\n",
+                                SRV_INF("hydra: DECODE_APPLY slot=%d v2/v3 blob: restored %d tokens from header\n",
                                         id_slot, blob_n_tok);
                             }
 
-                            // Skip past v2 header (version + n_past + n_tok + tokens + flags + optional checkpoint)
+                            // Skip past v2/v3 header (version + n_past + n_tok + tokens + flags + optional checkpoint)
                             size_t hdr_offset = token_end;
                             if (hdr_offset < kv_len) {
                                 const uint8_t flags = kv_ptr[hdr_offset];
                                 hdr_offset += 1; // past flags byte
+                                // bit 0x01 = has checkpoint; bit 0x02 = recurrent-only (PARTIAL_ONLY)
+                                ckpt_is_recr_only = (flags & 0x02) != 0;
                                 if (flags & 0x01) {
                                     // Capture checkpoint: 4B pos_min | 4B pos_max | 8B n_tokens | 8B tgt_sz | tgt_data | 8B dft_sz | dft_data
                                     // Mirrors the STATE_PUT sibling (~line 3343) — the native
@@ -5237,10 +5296,19 @@ private:
                                 ckpt.n_tokens = ckpt_n_tokens_in;
                                 ckpt.pos_min  = ckpt_pos_min_in;
                                 ckpt.pos_max  = ckpt_pos_max_in;
-                                ckpt.data_tgt = std::move(ckpt_tgt_data);
-                                ckpt.data_dft = std::move(ckpt_dft_data);
-                                SLT_INF(*slot, "DECODE_APPLY registered native checkpoint (pos_min=%d pos_max=%d n_tokens=%" PRId64 " tgt_sz=%zu)\n",
-                                        ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, ckpt.data_tgt.size());
+                                // New-format (v3) checkpoints carry a recurrent-only capture —
+                                // route into data_*_recr and tag is_recr_only so the load path
+                                // uses matched PARTIAL_ONLY flags (mirrors STATE_PUT).
+                                ckpt.is_recr_only = ckpt_is_recr_only;
+                                if (ckpt_is_recr_only) {
+                                    ckpt.data_tgt_recr = std::move(ckpt_tgt_data);
+                                    ckpt.data_dft_recr = std::move(ckpt_dft_data);
+                                } else {
+                                    ckpt.data_tgt = std::move(ckpt_tgt_data);
+                                    ckpt.data_dft = std::move(ckpt_dft_data);
+                                }
+                                SLT_INF(*slot, "DECODE_APPLY registered native checkpoint (pos_min=%d pos_max=%d n_tokens=%" PRId64 " tgt_sz=%zu recr_only=%d)\n",
+                                        ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, ckpt.size(), (int) ckpt.is_recr_only);
                             } else {
                                 create_checkpoint(*slot, 0, 0, (llama_pos)(n_past - 1));
                             }
@@ -7218,8 +7286,32 @@ private:
                                     if (!do_reset) {
                                         if (it != slot.prompt.checkpoints.rend()) {
                                             // restore the context checkpoint
-                                            it->load_tgt(ctx_tgt,       slot.id, 0);
-                                            it->load_dft(ctx_dft.get(), slot.id, 0);
+                                            if (it->is_recr_only) {
+                                                // Hydra M2 wire checkpoint (v3): the buffer holds a
+                                                // recurrent-only (PARTIAL_ONLY) capture. The recurrent
+                                                // (SSM) state is restored with matched PARTIAL_ONLY flags
+                                                // (flag symmetry — a PARTIAL_ONLY buffer physically lacks
+                                                // the mem_attn bytes). The attention cache must be trimmed
+                                                // at pos_max first: after the full live-state restore it
+                                                // still holds cells past the checkpoint position, and a
+                                                // full restore has no attention bytes to overwrite them.
+                                                // seq_rm is called on the ATTENTION cache directly — the
+                                                // blanket llama_memory_hybrid::seq_rm would wipe the
+                                                // recurrent cell first (n_rs_seq == 0 rollback path).
+                                                if (llama_model_is_hybrid(model_tgt)) {
+                                                    ((llama_memory_hybrid *) llama_get_memory(ctx_tgt))->get_mem_attn()->seq_rm(slot.id, it->pos_max, -1);
+                                                }
+                                                it->load_tgt_recr(ctx_tgt, slot.id);
+
+                                                // Mirror for the draft (MTP) context when enabled.
+                                                if (ctx_dft && llama_model_is_hybrid(model_tgt)) {
+                                                    ((llama_memory_hybrid *) llama_get_memory(ctx_dft.get()))->get_mem_attn()->seq_rm(slot.id, it->pos_max, -1);
+                                                }
+                                                it->load_dft_recr(ctx_dft.get(), slot.id);
+                                            } else {
+                                                it->load_tgt(ctx_tgt,       slot.id, 0);
+                                                it->load_dft(ctx_dft.get(), slot.id, 0);
+                                            }
 
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -10813,8 +10905,8 @@ static void hydra_handle_decode(int fd, int slot_id, uint64_t payload_len, const
             hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
             return;
         }
-        if (version_byte != 0x02) {
-            // Legacy non-v2 blob — buffered M1 path (pre-#470 behavior).
+        if (version_byte != 0x02 && version_byte != 0x03) {
+            // Legacy non-v2/v3 blob — buffered M1 path (pre-#470 behavior).
             // Replay the consumed version byte into the buffer.
             kv_data.resize((size_t)kv_len);
             kv_data[0] = version_byte;

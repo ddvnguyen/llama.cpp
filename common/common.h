@@ -1063,6 +1063,23 @@ struct common_prompt_checkpoint {
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
+    // Hydra M2-stream double-write fix (#470/#620): a SECOND, separate
+    // recurrent-only capture (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) used ONLY
+    // for the wire checkpoint. For hybrid/recurrent models these buffers hold
+    // the recurrent (SSM) state only — the attention portion scales with ctx
+    // and is redundant on the wire because the full live state already carries
+    // it. The flags=0 captures above (data_tgt/data_dft) are untouched and
+    // keep serving the local rewind path. A PARTIAL_ONLY-written buffer
+    // PHYSICALLY LACKS the mem_attn bytes, so write and read MUST use matched
+    // flags — is_recr_only checkpoints are only ever read via the *_recr
+    // helpers (never with flags=0).
+    std::vector<uint8_t> data_tgt_recr;
+    std::vector<uint8_t> data_dft_recr;
+
+    // true for checkpoints registered from a Hydra wire blob (v2 header
+    // version 0x03) whose tgt/dft sections are recurrent-only captures.
+    bool is_recr_only = false;
+
     size_t size() const;
 
     bool empty() const;
@@ -1092,6 +1109,22 @@ struct common_prompt_checkpoint {
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
+
+    void update_tgt_recr(
+            llama_context * ctx,
+            llama_seq_id seq_id);
+
+    void update_dft_recr(
+            llama_context * ctx,
+            llama_seq_id seq_id);
+
+    void load_tgt_recr(
+            llama_context * ctx,
+            llama_seq_id seq_id) const;
+
+    void load_dft_recr(
+            llama_context * ctx,
+            llama_seq_id seq_id) const;
 
     void clear_tgt();
     void clear_dft();
