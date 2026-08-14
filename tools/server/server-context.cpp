@@ -3513,7 +3513,7 @@ private:
                                 res->header_sent = true; // META + header + v2-hdr before payload
                             }
                              // Stream GPU state to fd (zero-copy from GPU memory)
-                             const size_t streamed = llama_state_seq_get_data_to_fd(snap_ctx, snap_seq_id, hydra_fd);
+                             const size_t streamed = llama_state_seq_get_data_to_fd(snap_ctx, snap_seq_id, hydra_fd, nullptr);
                              if (streamed != state_size) {
                                  // TOCTOU: state size changed between get_size (header already
                                  // promised state_size bytes) and the stream, or the stream
@@ -4498,6 +4498,41 @@ private:
                         // v2_hdr + KV state + logits, payload_len = the same
                         // total the coordinator computes from meta.
                         const size_t total_payload = v2_hdr.size() + state_size + (size_t)logits_size;
+
+                        // M2 (#470): pre-compute the wire hash of the whole kv
+                        // segment — v2 header, then [4B magic][4B seq_id] + KV
+                        // state (hash-only pass in wire order), then the logits
+                        // tail. The meta must carry it BEFORE the first payload
+                        // byte goes out (the coordinator forwards it into the
+                        // DECODE frame header, and DECODE_APPLY verifies the
+                        // streamed restore end-to-end). The slot is exclusively
+                        // held by this task, so the state cannot change between
+                        // the hash pass and the stream.
+                        XXH3_state_t * kv_hst = nullptr;
+                        if (hydra_fd >= 0) {
+                            kv_hst = XXH3_createState();
+                            XXH3_64bits_reset(kv_hst);
+                            XXH3_64bits_update(kv_hst, v2_hdr.data(), v2_hdr.size());
+                            const size_t hashed = llama_state_seq_hash(ctx_tgt, slot->id, kv_hst);
+                            if (hashed != sizeof(uint32_t) + sizeof(llama_seq_id) + state_size) {
+                                res->rpc_status = HYDRA_STATUS_ERROR;
+                                res->error      = "PREFILL M2: hash pre-pass hashed " +
+                                                  std::to_string(hashed) + " B, expected " +
+                                                  std::to_string(sizeof(uint32_t) + sizeof(llama_seq_id) + state_size) + " B";
+                            }
+                            if (!logits_buf.empty()) {
+                                XXH3_64bits_update(kv_hst, logits_buf.data(), logits_buf.size());
+                            }
+                            if (res->rpc_status == HYDRA_STATUS_OK) {
+                                const uint64_t kv_hash = XXH3_64bits_digest(kv_hst);
+                                char hash_hex[17];
+                                snprintf(hash_hex, sizeof(hash_hex), "%016" PRIx64, kv_hash);
+                                res->kv_hash_str = std::string("xxh3:") + hash_hex;
+                            }
+                            XXH3_freeState(kv_hst);
+                            kv_hst = nullptr;
+                        }
+
                         json meta_j = {
                             {"n_past",      res->n_past},
                             {"state_size",  res->state_size},
@@ -4512,6 +4547,7 @@ private:
                         meta_j["model_fallback"] = res->model_fallback;
                         if (res->prefill_ms > 0)     meta_j["prefill_ms"]     = res->prefill_ms;
                         if (res->model_load_ms > 0)  meta_j["model_load_ms"]  = res->model_load_ms;
+                        if (!res->kv_hash_str.empty()) meta_j["kv_hash_str"] = res->kv_hash_str;
                         const std::string meta_str = meta_j.dump();
                         const uint32_t meta_len = (uint32_t)meta_str.size();
 
@@ -4529,8 +4565,10 @@ private:
                             ::shutdown(hydra_fd, SHUT_RDWR);
                         } else {
                             res->header_sent = true; // META + header + v2-hdr before payload
-                            // Stream GPU state to fd (zero-copy from GPU memory)
-                            const size_t streamed = llama_state_seq_get_data_to_fd(ctx_tgt, slot->id, hydra_fd);
+                            // Stream GPU state to fd (zero-copy from GPU memory;
+                            // the wire hash was pre-computed above — pass no
+                            // hash state so the io does not double-feed it)
+                            const size_t streamed = llama_state_seq_get_data_to_fd(ctx_tgt, slot->id, hydra_fd, nullptr);
                             if (streamed != state_size) {
                                 // TOCTOU: state size changed between get_size
                                 // (above) and the stream, or the stream failed
@@ -4547,19 +4585,19 @@ private:
                                 // Logits tail after the state stream — PREFILL's
                                 // payload includes logits_size bytes at the end
                                 // (STATE_GET M2 does not send logits).
-                                if (!logits_buf.empty()) {
-                                    if (!hydra_send_all(hydra_fd, logits_buf.data(), logits_buf.size())) {
-                                        res->rpc_status = HYDRA_STATUS_ERROR;
-                                        res->error      = "PREFILL M2: logits tail send failed";
-                                        ::shutdown(hydra_fd, SHUT_RDWR);
-                                    }
-                                }
-                                if (res->rpc_status == HYDRA_STATUS_OK) {
-                                    res->streamed_bytes = (uint64_t)total_payload;
-                                }
-                            }
-                        }
-                    } else {
+                                 if (!logits_buf.empty()) {
+                                     if (!hydra_send_all(hydra_fd, logits_buf.data(), logits_buf.size())) {
+                                         res->rpc_status = HYDRA_STATUS_ERROR;
+                                         res->error      = "PREFILL M2: logits tail send failed";
+                                         ::shutdown(hydra_fd, SHUT_RDWR);
+                                     }
+                                 }
+                                 if (res->rpc_status == HYDRA_STATUS_OK) {
+                                     res->streamed_bytes = (uint64_t)total_payload;
+                                 }
+                             }
+                         }
+                     } else {
                         // M1 path: buffer the full blob in memory; the RPC thread
                         // sends header + meta + payload afterwards (unchanged).
                         // v2 blob format (0x02): [1B version][4B n_past][4B n_tok][n_tok*4B tokens]

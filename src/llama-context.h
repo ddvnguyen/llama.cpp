@@ -194,8 +194,17 @@ struct llama_context {
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
-    // Hydra M2: stream state directly to an open socket fd (zero-copy, no 800 MB buffer)
-    size_t state_seq_get_data_to_fd(llama_seq_id seq_id, int fd);
+    // Hydra M2: stream state directly to an open socket fd (zero-copy, no 800 MB buffer).
+    // Optional opaque XXH3_state_t* is updated with every byte written to the fd
+    // ([4B magic][4B seq_id] + KV state), so the caller can emit a wire hash of the
+    // whole kv segment (v2 header + stream + logits) for end-to-end verification.
+    size_t state_seq_get_data_to_fd(llama_seq_id seq_id, int fd, void * xxh3_state = nullptr);
+    // Hydra M2 (#470): hash-only pass over the state in wire order — feeds
+    // [4B magic][4B seq_id] + KV state into the caller's opaque XXH3_state_t*
+    // (exactly the bytes state_seq_get_data_to_fd writes). Used to pre-compute
+    // the wire hash before the response meta is emitted. Returns bytes fed
+    // (magic + seq_id + state), 0 on error.
+    size_t state_seq_hash(llama_seq_id seq_id, void * xxh3_state);
     // Hydra M2 decode side (#470): restore state directly from an open socket fd
     // (chunked, no full-blob buffer). Optional opaque XXH3_state_t* is updated with
     // every byte read from the fd so the caller can verify the wire hash post-restore.
@@ -382,6 +391,14 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+public:
+    // Resolve the backend owning a tensor (used by the M2 socket io classes to
+    // pipeline async GPU copies with socket I/O). Matches by buffer-type
+    // identity against this context's backends; returns nullptr when the
+    // buffer is unresolvable (callers fall back to the synchronous path).
+    ggml_backend_t tensor_backend(const ggml_tensor * tensor) const;
+
+private:
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 

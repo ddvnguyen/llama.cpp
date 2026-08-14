@@ -2996,9 +2996,22 @@ class llama_io_write_socket : public llama_io_write_i {
     // and at 256 KB that per-call overhead dominates over actual transfer
     // time (~4800 chunks for a 1.2 GB state). The 2 MiB default amortizes it ~8x.
 
+    const llama_context * ctx = nullptr;
     int    fd             = -1;
     size_t bytes_written  = 0;
     std::vector<uint8_t> staging;
+
+    // Optional xxh3-64 state updated with every byte written to the fd, so the
+    // caller can emit a wire hash of the streamed kv segment (v2 header +
+    // [magic][seq_id] + state + logits) for end-to-end verification on the
+    // decode side. nullptr = skip hashing.
+    XXH3_state_t * hash_state = nullptr;
+
+    void feed_hash(const void * buf, size_t n) {
+        if (hash_state != nullptr) {
+            XXH3_64bits_update(hash_state, buf, n);
+        }
+    }
 
     void send_all(const void * buf, size_t n) {
         const char * p = static_cast<const char *>(buf);
@@ -3013,23 +3026,67 @@ class llama_io_write_socket : public llama_io_write_i {
     }
 
 public:
-    llama_io_write_socket(int fd, size_t chunk_size) : fd(fd), staging(chunk_size) {}
+    llama_io_write_socket(const llama_context * ctx, int fd, size_t chunk_size)
+        : ctx(ctx), fd(fd), staging(chunk_size) {}
+
+    void set_hash_state(XXH3_state_t * st) { hash_state = st; }
 
     void write(const void * src, size_t size) override {
+        feed_hash(src, size);
         send_all(src, size);
         bytes_written += size;
     }
 
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        ggml_backend_t backend = ctx != nullptr ? ctx->tensor_backend(tensor) : nullptr;
+        if (backend == nullptr) {
+            // Synchronous fallback (backend unresolvable — e.g. multi-buffer
+            // tensors): copy then send per chunk (the original M2 path).
+            size_t rem = size;
+            size_t off = offset;
+            while (rem > 0) {
+                const size_t chunk = std::min(rem, staging.size());
+                ggml_backend_tensor_get(tensor, staging.data(), off, chunk);
+                feed_hash(staging.data(), chunk);
+                send_all(staging.data(), chunk);
+                bytes_written += chunk;
+                off += chunk;
+                rem -= chunk;
+            }
+            return;
+        }
+
+        // Pipelined path: double-buffer the GPU->host copies so the next
+        // cudaMemcpyAsync overlaps the current send(). The socket write is the
+        // long pole on every leg; hiding the per-chunk D2H copy (~150-200 us at
+        // 2 MiB) removes the copy/send serialization of the single-buffer loop.
+        if (size == 0) {
+            return;
+        }
+        const size_t chunk   = staging.size();
+        const size_t n_chunks = size / chunk + (size % chunk != 0 ? 1 : 0);
+        std::vector<uint8_t> bufs[2] = {
+            std::vector<uint8_t>(chunk), std::vector<uint8_t>(chunk)
+        };
         size_t rem = size;
         size_t off = offset;
-        while (rem > 0) {
-            const size_t chunk = std::min(rem, staging.size());
-            ggml_backend_tensor_get(tensor, staging.data(), off, chunk);
-            send_all(staging.data(), chunk);
-            bytes_written += chunk;
-            off += chunk;
-            rem -= chunk;
+        ggml_backend_tensor_get_async(backend, tensor, bufs[0].data(), off, std::min(rem, chunk));
+        ggml_backend_synchronize(backend); // copy(0) done (nothing to overlap it with)
+        for (size_t i = 0; i < n_chunks; i++) {
+            const size_t len = std::min(rem, chunk);
+            if (i + 1 < n_chunks) {
+                const size_t len_next = std::min(rem - len, chunk);
+                // Launch the next GPU copy; it runs while we send the current chunk.
+                ggml_backend_tensor_get_async(backend, tensor, bufs[(i + 1) % 2].data(), off + len, len_next);
+            }
+            // copy(i) is complete (synced at the end of the previous iteration).
+            feed_hash(bufs[i % 2].data(), len);
+            send_all(bufs[i % 2].data(), len); // overlaps copy(i+1) on the GPU
+            bytes_written += len;
+            off += len;
+            rem -= len;
+            // copy(i+1) must complete before bufs[(i+1)%2] is reused next iteration.
+            ggml_backend_synchronize(backend);
         }
     }
 
@@ -3044,6 +3101,7 @@ class llama_io_read_socket : public llama_io_read_i {
     // side: 256 KB was too small (per-hydra#334), 2 MiB default amortizes the
     // syscall + cudaMemcpy round trips.
 
+    const llama_context * ctx = nullptr;
     int    fd           = -1;
     size_t bytes_read   = 0;
     std::vector<uint8_t> staging;
@@ -3071,7 +3129,8 @@ class llama_io_read_socket : public llama_io_read_i {
     }
 
 public:
-    llama_io_read_socket(int fd, size_t chunk_size) : fd(fd), staging(chunk_size) {}
+    llama_io_read_socket(const llama_context * ctx, int fd, size_t chunk_size)
+        : ctx(ctx), fd(fd), staging(chunk_size) {}
 
     void set_hash_state(XXH3_state_t * st) { hash_state = st; }
 
@@ -3090,17 +3149,58 @@ public:
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        ggml_backend_t backend = ctx != nullptr ? ctx->tensor_backend(tensor) : nullptr;
+        if (backend == nullptr) {
+            // Synchronous fallback (original M2 path): recv then H2D copy per chunk.
+            size_t done = 0;
+            while (done < size) {
+                refill();
+                const size_t avail = staging_len - staging_pos;
+                const size_t take  = std::min(size - done, avail);
+                ggml_backend_tensor_set(tensor, staging.data() + staging_pos, offset + done, take);
+                staging_pos += take;
+                done        += take;
+            }
+            bytes_read += size;
+            return;
+        }
+
+        // Pipelined path: overlap the next recv() with the current H2D copy.
+        if (size == 0) {
+            return;
+        }
+        std::vector<uint8_t> other(staging.size());
+        size_t other_len = 0;
         size_t done = 0;
         while (done < size) {
-            refill();
+            if (staging_pos >= staging_len) {
+                refill(); // recv a chunk into staging
+            }
             const size_t avail = staging_len - staging_pos;
             const size_t take  = std::min(size - done, avail);
-            // Synchronous per-chunk host->device copy before the staging region
-            // is reused for the next recv (matches llama_io_write_socket's
-            // tensor_get pattern, which is proven on the production path).
-            ggml_backend_tensor_set(tensor, staging.data() + staging_pos, offset + done, take);
+            // Launch the H2D copy; the recv below runs concurrently with it.
+            ggml_backend_tensor_set_async(backend, tensor, staging.data() + staging_pos, offset + done, take);
             staging_pos += take;
             done        += take;
+            if (staging_pos >= staging_len && done < size) {
+                // recv the next chunk WHILE the H2D copy of the current one runs
+                ssize_t r = ::recv(fd, other.data(), other.size(), 0);
+                if (r <= 0) {
+                    throw std::runtime_error("hydra: socket recv failed during state restore");
+                }
+                other_len = (size_t)r;
+                if (hash_state != nullptr) {
+                    XXH3_64bits_update(hash_state, other.data(), other_len);
+                }
+            }
+            // The just-issued H2D copy must complete before `other` (which it may
+            // still be reading, if it held the previous chunk) is reused.
+            ggml_backend_synchronize(backend);
+            if (staging_pos >= staging_len && done < size) {
+                std::swap(staging, other);
+                staging_pos = 0;
+                staging_len = other_len;
+            }
         }
         bytes_read += size;
     }
@@ -3144,8 +3244,69 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
     }
 }
 
-size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
-    std::unique_ptr<llama_io_write_i> io;
+// Resolve the backend owning a tensor by matching its buffer type against this
+// context's backends (buffer->backend is not exposed by this ggml revision).
+// Returns nullptr when unresolvable (multi-buffer tensors, CPU-only buffers
+// created outside the context list) — callers fall back to the sync path.
+ggml_backend_t llama_context::tensor_backend(const ggml_tensor * tensor) const {
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buf == nullptr) {
+        return nullptr;
+    }
+    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    for (const auto & b : backends) {
+        if (b && ggml_backend_get_default_buffer_type(b.get()) == buft) {
+            return b.get();
+        }
+    }
+    return nullptr;
+}
+
+// Hash-only io sink: feeds every byte of the wire stream ([4B magic][4B seq_id]
+// + KV state, in state_seq_write_data order) into an XXH3 state without touching
+// the socket. Used by PREFILL M2 to pre-compute the segment hash so the response
+// meta can carry it before the first payload byte goes out.
+class llama_io_write_hash : public llama_io_write_i {
+    XXH3_state_t * hst = nullptr;
+    std::vector<uint8_t> staging;
+public:
+    llama_io_write_hash(XXH3_state_t * st, size_t chunk_size) : hst(st), staging(chunk_size) {}
+
+    void write(const void * src, size_t size) override {
+        XXH3_64bits_update(hst, src, size);
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        size_t rem = size;
+        size_t off = offset;
+        while (rem > 0) {
+            const size_t chunk = std::min(rem, staging.size());
+            ggml_backend_tensor_get(tensor, staging.data(), off, chunk);
+            XXH3_64bits_update(hst, staging.data(), chunk);
+            off += chunk;
+            rem -= chunk;
+        }
+    }
+
+    size_t n_bytes() override { return 0; }
+};
+
+size_t llama_context::state_seq_hash(llama_seq_id seq_id, void * xxh3_state) {
+    if (xxh3_state == nullptr) {
+        return 0;
+    }
+    llama_io_write_hash io(static_cast<XXH3_state_t *>(xxh3_state), cparams.hydra_state_chunk_size);
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+        return state_seq_write_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error hashing state for seq %d: %s\n", __func__, seq_id, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {    std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else {
@@ -3177,7 +3338,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 // Returns bytes read from the fd (magic + seq_id + state), 0 on error.
 size_t llama_context::state_seq_set_data_from_fd(llama_seq_id seq_id, int fd, void * xxh3_state) {
 #if !defined(_WIN32)
-    llama_io_read_socket io(fd, cparams.hydra_state_chunk_size);
+    llama_io_read_socket io(this, fd, cparams.hydra_state_chunk_size);
     io.set_hash_state(static_cast<XXH3_state_t *>(xxh3_state));
     try {
         uint32_t magic_read;
@@ -3205,9 +3366,10 @@ size_t llama_context::state_seq_set_data_from_fd(llama_seq_id seq_id, int fd, vo
 // No intermediate 800 MB buffer — GPU tensors are copied to a staging area
 // (size set by cparams.hydra_state_chunk_size, see CONFIGURE/0x40) and sent.
 // Returns bytes streamed (same as llama_state_seq_get_size would return), 0 on error.
-size_t llama_context::state_seq_get_data_to_fd(llama_seq_id seq_id, int fd) {
+size_t llama_context::state_seq_get_data_to_fd(llama_seq_id seq_id, int fd, void * xxh3_state) {
 #if !defined(_WIN32)
-    llama_io_write_socket io(fd, cparams.hydra_state_chunk_size);
+    llama_io_write_socket io(this, fd, cparams.hydra_state_chunk_size);
+    io.set_hash_state(static_cast<XXH3_state_t *>(xxh3_state));
     try {
         io.write(&io_magic, sizeof(io_magic));
         io.write(&seq_id,   sizeof(seq_id));
@@ -3217,7 +3379,7 @@ size_t llama_context::state_seq_get_data_to_fd(llama_seq_id seq_id, int fd) {
         return 0;
     }
 #else
-    (void)seq_id; (void)fd;
+    (void)seq_id; (void)fd; (void)xxh3_state;
     LLAMA_LOG_WARN("%s: not supported on Windows\n", __func__);
     return 0;
 #endif

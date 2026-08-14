@@ -739,6 +739,14 @@ struct server_task_result_hydra_engine : server_task_result {
     // double-write on error, mirrors server_task_result_hydra_state).
     bool     header_sent    = false;
 
+    // PREFILL M2 (#470): xxh3-64 wire hash of the whole kv segment
+    // (v2 header + [magic][seq_id] + KV state + logits), computed during the
+    // stream pass. Emitted in the response meta as "xxh3:HEX" so the
+    // coordinator can forward it into a DECODE frame's segments[].kv.hash and
+    // the decode side can verify the streamed restore end-to-end. Empty when
+    // hashing was not possible (M1 path, no fd).
+    std::string kv_hash_str;
+
     // M-Perf.9 #289 / #470: model identity for the slot the prefill was built on.
     // model_alias: the alias (or filename if no aliases) the engine reports.
     // model_path:  absolute path to the GGUF.

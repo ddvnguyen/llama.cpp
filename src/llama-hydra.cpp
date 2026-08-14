@@ -22,8 +22,12 @@
 #include <unistd.h>
 #endif
 
-size_t llama_state_seq_get_data_to_fd(struct llama_context * ctx, llama_seq_id seq_id, int fd) {
-    return ctx->state_seq_get_data_to_fd(seq_id, fd);
+size_t llama_state_seq_get_data_to_fd(struct llama_context * ctx, llama_seq_id seq_id, int fd, void * xxh3_state) {
+    return ctx->state_seq_get_data_to_fd(seq_id, fd, xxh3_state);
+}
+
+size_t llama_state_seq_hash(struct llama_context * ctx, llama_seq_id seq_id, void * xxh3_state) {
+    return ctx->state_seq_hash(seq_id, xxh3_state);
 }
 
 size_t llama_state_seq_set_data_from_fd(struct llama_context * ctx, llama_seq_id seq_id, int fd, void * xxh3_state) {

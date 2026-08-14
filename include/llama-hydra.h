@@ -13,10 +13,26 @@ extern "C" {
 // written to fd immediately.
 // Returns bytes written (== llama_state_seq_get_size for the same seq_id), or 0 on error.
 // Not supported on Windows (returns 0 with a log warning).
+//
+// xxh3_state: optional opaque XXH3_state_t* (see vendor/xxhash/xxhash.h).
+// When non-null, every byte written to the fd ([4B magic][4B seq_id] + KV state)
+// is fed to it so the caller can emit a wire hash of the whole kv segment
+// (v2 header + stream + logits) for end-to-end verification. nullptr skips.
 LLAMA_API size_t llama_state_seq_get_data_to_fd(
         struct llama_context * ctx,
                 llama_seq_id   seq_id,
-                         int   fd);
+                         int   fd,
+                        void * xxh3_state);
+
+// Hydra M2 (#470): hash-only pass over the seq state in wire order — feeds
+// [4B magic][4B seq_id] + KV state into the caller's opaque XXH3_state_t*
+// (exactly the bytes llama_state_seq_get_data_to_fd writes). Used to
+// pre-compute the wire hash before the response meta is emitted.
+// Returns bytes fed (magic + seq_id + state), 0 on error.
+LLAMA_API size_t llama_state_seq_hash(
+        struct llama_context * ctx,
+                llama_seq_id   seq_id,
+                        void * xxh3_state);
 
 // Hydra M2 decode side (#470): restore the KV state of a single sequence
 // directly from an open POSIX file descriptor (typically a TCP socket). No
