@@ -117,6 +117,10 @@ echo "=== [$ARCH/$BINARY] Build + push OCI image ==="
 # convention to the newest known-good patch tag for the base image.
 case "$CUDA_VERSION" in
   13.2) DOCKER_CUDA_VERSION="13.2.1" ;;
+  # CUDA 13.2.2 toolkit (nvcc V13.2.86): no nvidia/cuda docker tag exists
+  # for 13.2.2 (docker tags stop at 13.2.1) — the runtime base stays 13.2.1;
+  # the 13.2.2 toolkit path is only for the compile step (CUDA_PATH).
+  13.2.2) DOCKER_CUDA_VERSION="13.2.1" ;;
   12.9) DOCKER_CUDA_VERSION="12.9.2" ;;
   *) echo "::error::No known nvidia/cuda runtime tag mapped for CUDA_VERSION=$CUDA_VERSION"; exit 1 ;;
 esac
