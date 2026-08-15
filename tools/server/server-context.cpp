@@ -1488,14 +1488,22 @@ private:
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {
-                SRV_ERR("%s", "failed to create MTP context\n");
-                return false;
+                // The MTP draft context failed to build (e.g. device OOM for
+                // its KV + compute buffers under a tight tensor_split). This
+                // must NOT abort the model load — the draft is an optimization,
+                // not a requirement, and load_model() already released the
+                // previous model, so an abort leaves the engine without any
+                // model (T3 reload → 503 on every request). Fall back to
+                // non-speculative serving: common_speculative_init() below
+                // skips MTP when draft.ctx_dft == nullptr, so the engine
+                // degrades cleanly instead of failing the reload.
+                SRV_ERR("%s", "failed to create MTP draft context — continuing WITHOUT speculative decoding\n");
+            } else {
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft.get();
             }
-
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
-
-            params_base.speculative.draft.ctx_tgt = ctx_tgt;
-            params_base.speculative.draft.ctx_dft = ctx_dft.get();
         }
 
         if (has_mmproj) {
