@@ -945,6 +945,17 @@ static bool hydra_generic_value_to_string(const json & value, std::string & out)
     return false;
 }
 
+void hydra_clear_stale_draft_bindings(common_params & params) {
+    // #648 review: after a failed MTP draft-context build (or after destroy()
+    // freed the contexts), the ctx_tgt/ctx_dft bindings must be null so the
+    // common_speculative_init() MTP gate (ctx_dft != nullptr) degrades to
+    // non-speculative instead of dereferencing freed memory. On a T3
+    // reload-after-prior-MTP-success these pointers were carried over from the
+    // old params_base and are dangling by the time the MTP build fails.
+    params.speculative.draft.ctx_tgt = nullptr;
+    params.speculative.draft.ctx_dft = nullptr;
+}
+
 bool hydra_apply_generic_key(common_params & params, const std::string & key, const json & value) {
     if (hydra_classify_generic_key(key) != hydra_generic_key_status::APPLIABLE) {
         return false;
@@ -1209,6 +1220,12 @@ private:
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
+
+        // #648 review: the ctx_tgt/ctx_dft bindings held in params_base dangle
+        // once llama_init.reset() freed the contexts. Clear them so any later
+        // load_model() that fails to rebuild the MTP draft context degrades
+        // cleanly (null-gate) instead of dereferencing freed memory.
+        hydra_clear_stale_draft_bindings(params_base);
 
         mtmd_free(mctx);
         mctx = nullptr;
@@ -1498,6 +1515,15 @@ private:
                 // skips MTP when draft.ctx_dft == nullptr, so the engine
                 // degrades cleanly instead of failing the reload.
                 SRV_ERR("%s", "failed to create MTP draft context — continuing WITHOUT speculative decoding\n");
+
+                // #648 review (UAF): params_base may still carry the PREVIOUS
+                // load's ctx_tgt/ctx_dft bindings (copied through swapped_params
+                // on a T3 reload). destroy() freed those contexts, so the
+                // pointers are dangling-non-null — without clearing them the
+                // common_speculative_init() null-gate would activate the MTP
+                // impl and dereference freed memory (speculative.cpp:447).
+                // Clear them so the degradation gate actually fires.
+                hydra_clear_stale_draft_bindings(params_base);
             } else {
                 ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
 

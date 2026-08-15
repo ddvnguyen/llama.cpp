@@ -398,6 +398,44 @@ int main() {
         }
     }
 
+    // Case 14 (hydra#648 review): a T3 reload-after-prior-MTP-success that then
+    // FAILS to rebuild the MTP draft context must not leave stale ctx_tgt/ctx_dft
+    // dangling in params. On the reload, params_base carried the old (now freed)
+    // pointers; the common_speculative_init() MTP gate only checks
+    // ctx_dft != nullptr, so a dangling-non-null pointer would let the MTP impl
+    // dereference freed memory (use-after-free, speculative.cpp:447). The
+    // failure branch and destroy() both route through
+    // hydra_clear_stale_draft_bindings(); pin that sanitization AND the
+    // degradation gate it enables.
+    {
+        common_params p;
+        if (!hydra_apply_generic_key(p, "spec_type", json("draft-mtp"))) {
+            fprintf(stderr, "FAIL: spec_type apply returned false\n");
+            g_failures++;
+        }
+        // simulate the reload-after-success state: the previous load's MTP
+        // contexts have since been freed, so these bindings are dangling-non-null
+        p.speculative.draft.ctx_tgt = reinterpret_cast<llama_context *>(0x1);
+        p.speculative.draft.ctx_dft = reinterpret_cast<llama_context *>(0x2);
+
+        // this is what the MTP build-failure branch (and destroy()) must do
+        hydra_clear_stale_draft_bindings(p);
+
+        if (p.speculative.draft.ctx_tgt != nullptr || p.speculative.draft.ctx_dft != nullptr) {
+            fprintf(stderr, "FAIL: stale draft bindings not cleared after failed MTP build\n");
+            g_failures++;
+        }
+
+        // degradation gate: with types still draft-mtp but ctx_dft == nullptr,
+        // common_speculative_init must NOT activate the MTP impl
+        common_speculative * s = common_speculative_init(p.speculative, 1);
+        if (s != nullptr) {
+            fprintf(stderr, "FAIL: MTP activated despite ctx_dft == nullptr (use-after-free risk)\n");
+            common_speculative_free(s);
+            g_failures++;
+        }
+    }
+
     if (g_failures == 0) {
         printf("test-hydra-configure-tier: all checks passed\n");
         return 0;

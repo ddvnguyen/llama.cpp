@@ -62,6 +62,17 @@ hydra_generic_key_status hydra_classify_generic_key(const std::string & key);
 // JSON type cannot be converted (the failure is logged with SRV_WRN).
 bool hydra_apply_generic_key(common_params & params, const std::string & key, const json & value);
 
+// hydra#648 (review): clear the draft/MTP context bindings held in `params`.
+// On a T3 reload-after-prior-MTP-success, params_base carries the OLD
+// ctx_tgt/ctx_dft pointers into load_model(); if the new MTP draft context
+// then fails to build, those pointers are dangling-non-null and the
+// common_speculative_init() null-gate would let the MTP impl dereference
+// freed memory (use-after-free, speculative.cpp:447). Nulling them makes the
+// existing ctx_dft == nullptr degradation gate work. Called from the MTP
+// build-failure branch in load_model() and from destroy(). Exported so the
+// configure-tier test can pin the reload-after-success-then-fail bookkeeping.
+void hydra_clear_stale_draft_bindings(common_params & params);
+
 // hydra#470: a synchronous hydra_config apply whose highest tier is >= 3
 // may have rebuilt the slots (T3 statics or a T4-only generic config both
 // route through apply_t3_rebuild() → load_model() → slots.clear()). Callers
