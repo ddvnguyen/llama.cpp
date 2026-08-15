@@ -35,7 +35,41 @@ namespace fs = std::filesystem;
 // it by logging + returning the caller's error/fallback path, never here.
 #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
 
-// all RPC structures must be packed
+// All RPC structures must be packed
+// #470: mirrors MATRIX_ROW_PADDING in ggml-cuda/ggml-cuda.cu — the CUDA
+// backend allocates every quantized row on a 512-element boundary (MMQ
+// requirement), so a plain ggml_nbytes() fallback under-estimates the peer's
+// allocation and the peer's wide batched prefill reads out of bounds.
+static constexpr size_t GGML_RPC_QUANT_ROW_PADDING = 512;
+
+// #634/#470: SAFE over-estimate of what the peer will allocate for `tensor`,
+// used when RPC_CMD_GET_ALLOC_SIZE fails (peer died in the window between the
+// liveness probe and the send). Must NEVER return less than the peer's
+// ggml_backend_buft_get_alloc_size:
+//  - quantized types: peer pads rows to a 512-element boundary (MMQ), so
+//    ggml_nbytes alone under-allocates peer weight buffers → OOB read on
+//    wide batched prefill.
+//  - GGML_OP_FLASH_ATTN_EXT: peer reserves f16 K/V conversion scratch after
+//    the dst (ggml_cuda_flash_attn_ext_get_alloc_size); bound it by the
+//    source tensors' own bytes.
+size_t ggml_backend_rpc_get_alloc_size_fallback(const ggml_tensor * tensor) {
+    size_t estimate = ggml_nbytes(tensor);
+    if (ggml_is_quantized(tensor->type)) {
+        const int64_t ne0 = tensor->ne[0];
+        if (ne0 % GGML_RPC_QUANT_ROW_PADDING != 0) {
+            estimate += ggml_row_size(tensor->type, GGML_RPC_QUANT_ROW_PADDING - ne0 % GGML_RPC_QUANT_ROW_PADDING);
+        }
+    }
+    if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+        for (int i = 1; i < GGML_MAX_SRC; i++) {
+            if (tensor->src[i] != nullptr) {
+                estimate += ggml_nbytes(tensor->src[i]);
+            }
+        }
+    }
+    return estimate;
+}
+
 #pragma pack(push, 1)
 // ggml_tensor is serialized into rpc_tensor
 struct rpc_tensor {
@@ -236,7 +270,21 @@ struct ggml_backend_rpc_device_context {
     std::string name;
     std::string description;
     uint64_t    last_graph_uid;
+    // #470: the socket object this device context last computed a graph over.
+    // A different object means a reconnect — the peer's rpc_server is a NEW
+    // instance with an EMPTY stored-graph cache, so the recompute fast-path
+    // must be invalidated (next compute = full GRAPH_COMPUTE). Compared by
+    // identity at compute time (lock-free; get_socket never touches the
+    // registry mutex, so no lock-order inversion with ggml_backend_rpc_add_server).
+    std::weak_ptr<socket_t> last_sock;
 };
+
+// Forward declaration — defined after ggml_backend_rpc_reg_context (needs the
+// device list). Resets last_graph_uid on every device context bound to
+// `endpoint` when a buffer is freed (#470): the peer frees the memory its
+// stored graph points into, so the next compute with a recycled uid must be a
+// full GRAPH_COMPUTE (re-serialized with current data pointers).
+static void ggml_backend_rpc_invalidate_recompute(const std::string & endpoint);
 
 struct ggml_backend_rpc_buffer_type_context {
     std::string endpoint;
@@ -439,6 +487,12 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
+    // #470: freeing the buffer frees the peer memory the server's stored graph
+    // points into. Reset the recompute fast-path so the next compute with a
+    // recycled graph uid is a full GRAPH_COMPUTE (fresh data pointers), never
+    // a GRAPH_RECOMPUTE executed against freed buffers.
+    ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->buft->context;
+    ggml_backend_rpc_invalidate_recompute(buft_ctx->endpoint);
     delete ctx;
 }
 
@@ -684,9 +738,14 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         // same fallback this function already returns when rpc_get is false —
         // and let the graph allocator's existing path handle a mismatch.
         if (!status) {
-            GGML_LOG_ERROR("[%s] RPC_CMD_GET_ALLOC_SIZE failed for %s on %s, using local estimate (%zu bytes)\n",
-                           __func__, tensor->name, buft_ctx->endpoint.c_str(), ggml_nbytes(tensor));
-            return ggml_nbytes(tensor);
+            // #634/#470: never fall back to the naive local size — the peer's
+            // allocator pads quantized rows to 512 elements and reserves
+            // flash-attn scratch, so ggml_nbytes under-estimates and the peer
+            // weight buffer comes out too small → OOB read on wide prefill.
+            const size_t estimate = ggml_backend_rpc_get_alloc_size_fallback(tensor);
+            GGML_LOG_ERROR("[%s] RPC_CMD_GET_ALLOC_SIZE failed for %s on %s, using safe over-estimate (%zu bytes)\n",
+                           __func__, tensor->name, buft_ctx->endpoint.c_str(), estimate);
+            return estimate;
         }
 
         return response.alloc_size;
@@ -769,18 +828,25 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
+    auto sock = get_socket(rpc_ctx->endpoint);
+    // #470: a reconnect (new socket object) means the peer's rpc_server is a
+    // fresh instance with an empty stored-graph cache — a GRAPH_RECOMPUTE
+    // would be refused and the connection would churn. Detect it here (lock
+    // free, by socket identity) and fall back to a full GRAPH_COMPUTE.
+    if (rpc_dev_ctx->last_sock.lock() != sock) {
+        rpc_dev_ctx->last_graph_uid = 0;
+        rpc_dev_ctx->last_sock      = sock;
+    }
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
-        auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
-        auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         RPC_STATUS_ASSERT(status);
     }
@@ -1241,6 +1307,14 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
+    // #470: the freed buffer's memory may be referenced by a stored graph's
+    // deserialized tensors (absolute data pointers). Invalidate ALL stored
+    // graphs so the next compute re-serializes with current pointers instead
+    // of GRAPH_RECOMPUTE'ing stale ones against freed memory (batched GEMM
+    // dereferences an unmapped VA → Xid 13/31 on the peer).
+    for (auto & sg : stored_graphs) {
+        sg.graph = nullptr;
+    }
     return true;
 }
 
@@ -1670,6 +1744,44 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
+
+    // #470: re-validate that every stored tensor's buffer is still owned by
+    // this connection before re-executing the cached graph. A buffer freed
+    // behind the client's back (rpc_server teardown, model swap, head-side
+    // FREE_BUFFER on sched re-reserve) leaves the deserialized tensors
+    // pointing at unmapped VA — batched GEMM then faults (Xid 13 / Xid 31).
+    // Refuse here: the connection drops, the client reconnects (resetting its
+    // recompute fast-path) and re-sends a full GRAPH_COMPUTE with current
+    // data pointers.
+    auto buffer_valid = [this](const ggml_tensor * t) -> bool {
+        if (t == nullptr) {
+            return true;
+        }
+        if (t->buffer != nullptr && !is_known_buffer(t->buffer)) {
+            return false;
+        }
+        if (t->view_src != nullptr && t->view_src->buffer != nullptr && !is_known_buffer(t->view_src->buffer)) {
+            return false;
+        }
+        return true;
+    };
+    for (int i = 0; i < graph->n_nodes; i++) {
+        if (!buffer_valid(graph->nodes[i])) {
+            GGML_LOG_ERROR("[%s] device %u: stored graph node %d references a freed buffer — invalidating stored graph, forcing full GRAPH_COMPUTE\n",
+                           __func__, device, i);
+            stored_graphs[device].graph = nullptr;
+            return false;
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        if (!buffer_valid(graph->leafs[i])) {
+            GGML_LOG_ERROR("[%s] device %u: stored graph leaf %d references a freed buffer — invalidating stored graph, forcing full GRAPH_COMPUTE\n",
+                           __func__, device, i);
+            stored_graphs[device].graph = nullptr;
+            return false;
+        }
+    }
+
     ggml_backend_rpc_server_compute_lock(device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     ggml_backend_rpc_server_compute_unlock(device);
@@ -1734,6 +1846,12 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    // #470: drop stored-graph references before freeing the buffers they point
+    // into (defense in depth — graph_recompute also re-validates, but a stored
+    // graph must never outlive the memory its tensors reference).
+    for (auto & sg : stored_graphs) {
+        sg.graph = nullptr;
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -2417,6 +2535,25 @@ uint32_t & get_rpc_dev_id() {
 }
 } // anonymous namespace
 
+// #470: resets the GRAPH_RECOMPUTE fast-path (last_graph_uid) on every device
+// bound to `endpoint`. Called when a buffer is freed — the peer frees the
+// memory its stored graph points into, so the next compute with a recycled
+// uid must be a full GRAPH_COMPUTE with fresh data pointers. (Reconnects are
+// handled separately in ggml_backend_rpc_graph_compute via socket identity.)
+static void ggml_backend_rpc_invalidate_recompute(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(get_rpc_mutex());
+    for (auto & entry : get_rpc_reg_map()) {
+        if (entry.first != endpoint) {
+            continue;
+        }
+        ggml_backend_rpc_reg_context * reg_ctx = (ggml_backend_rpc_reg_context *)entry.second->context;
+        for (auto dev : reg_ctx->devices) {
+            ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
+            dev_ctx->last_graph_uid = 0;
+        }
+    }
+}
+
 ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     auto & reg_map = get_rpc_reg_map();
     auto & mutex   = get_rpc_mutex();
@@ -2440,6 +2577,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
             /* .name        = */    dev_name,
             /* .description = */    dev_desc,
             /* .last_graph_uid = */ 0,
+            /* .last_sock   = */    {},
         };
 
         ggml_backend_dev_t dev = new ggml_backend_device {

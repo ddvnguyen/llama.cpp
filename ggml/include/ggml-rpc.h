@@ -36,6 +36,13 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
 GGML_BACKEND_API void ggml_backend_rpc_start_server_with_backends(const char * endpoint, const char * cache_dir,
                                                     size_t n_threads, size_t n_backends, ggml_backend_t * backends);
 
+// #634/#470: local size estimate used when RPC_CMD_GET_ALLOC_SIZE fails (dead
+// peer). Guaranteed to be at least the peer's ggml_backend_buft_get_alloc_size:
+// adds the CUDA backend's 512-element MMQ row padding for quantized tensors
+// and f16 K/V scratch headroom for GGML_OP_FLASH_ATTN_EXT. Never under-allocates
+// the peer weight buffers (which would OOB on wide batched prefill).
+GGML_BACKEND_API size_t ggml_backend_rpc_get_alloc_size_fallback(const struct ggml_tensor * tensor);
+
 // Hydra #348: acquire/release the per-device mutex this RPC server holds
 // while computing a graph (rpc_server::graph_compute/graph_recompute). A
 // caller sharing the same backend instance for local inference (see
