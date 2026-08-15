@@ -94,6 +94,19 @@ PR_TAG=""
 [ -n "$PR_ID" ] && PR_TAG="-pr${PR_ID}"
 IMAGE_TAG="${ARCH}-${BINARY}-${FORK_VERSION}-${SHORT_SHA}${PR_TAG}"
 ALIAS_TAG="${ARCH}-${BINARY}-${SHORT_SHA}${PR_TAG}"
+
+# ── Same-hash skip gate ──────────────────────────────────────────────
+# The tag embeds the fork commit SHA: an unchanged commit produces the
+# SAME tag. Rebuilding + re-pushing an identical image wastes the whole
+# compile (tens of minutes). Check the registry for the exact tag via a
+# lightweight manifest HEAD (no blob download) and skip entirely if it
+# already exists.
+if podman manifest inspect "${IMAGE_REPO}:${IMAGE_TAG}" >/dev/null 2>&1; then
+  echo "=== [$ARCH/$BINARY] SKIP: ${IMAGE_REPO}:${IMAGE_TAG} already exists (same-hash rebuild) ==="
+  exit 0
+fi
+echo "=== [$ARCH/$BINARY] ${IMAGE_TAG} not in registry — building ==="
+
 mkdir -p "${STAGING_DIR}/bin"
 cp "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
 cp "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
