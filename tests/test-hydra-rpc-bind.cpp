@@ -15,6 +15,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-rpc.h"
+#include "ggml-impl.h" // #470: ggml_cgraph::uid is set directly by the regression test
 
 #include <chrono>
 #include <cstdio>
@@ -187,6 +188,140 @@ int main() {
                 epoch_post == epoch_pre);
     }
 
+    // =========================================================================
+    // #470: freed-buffer recompute refusal. The RPC graph-reuse protocol ties a
+    // process-global cross-context uid tracker (last_graph_uid, ggml-rpc.cpp)
+    // to a per-connection server-side stored graph holding deserialized
+    // ABSOLUTE data pointers. When a second context / rebuilt context / #634
+    // reconnect reuses a graph uid after the first context's buffers were
+    // freed, the peer used to re-execute the PREVIOUS context's stored graph
+    // against freed memory → batched GEMM dereferences an unmapped VA (Xid
+    // 13/31). Regression: after free_buffer, a same-uid compute must be a full
+    // GRAPH_COMPUTE re-serialized with the CURRENT buffer's data pointers.
+    {
+        ggml_backend_t rpc_backend = ggml_backend_rpc_init(endpoint, /*device=*/0);
+        expect("#470: rpc backend initialized", rpc_backend != nullptr);
+        if (rpc_backend == nullptr) {
+            g_failures++; // nothing else in this section is meaningful
+        } else {
+            // --- context 1: graph uid 0x470470, buffer freed afterwards ---
+            ggml_init_params c1_params = { /*.mem_size=*/ ggml_tensor_overhead() * 4, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+            ggml_context * c1 = ggml_init(c1_params);
+            ggml_tensor * a1 = ggml_new_tensor_1d(c1, GGML_TYPE_F32, 8);
+            ggml_tensor * b1 = ggml_new_tensor_1d(c1, GGML_TYPE_F32, 8);
+            ggml_tensor * r1 = ggml_add(c1, a1, b1);
+            ggml_backend_buffer_t buf1 = ggml_backend_alloc_ctx_tensors(c1, rpc_backend);
+            expect("#470: context-1 buffer allocated on rpc backend", buf1 != nullptr);
+            if (buf1 != nullptr) {
+                float a1v[8], b1v[8];
+                for (int i = 0; i < 8; i++) { a1v[i] = (float) i + 1.0f; b1v[i] = (float) i * 2.0f; }
+                ggml_backend_tensor_set(a1, a1v, 0, sizeof(a1v));
+                ggml_backend_tensor_set(b1, b1v, 0, sizeof(b1v));
+
+                ggml_cgraph * g1 = ggml_new_graph_custom(c1, 1, false);
+                g1->nodes[0] = r1;
+                g1->n_nodes  = 1;
+                g1->uid      = 0x470470u; // deterministic "recycled" uid (real uids come from ggml_graph_next_uid)
+                // mirrors what the scheduler does to graph nodes: without the
+                // COMPUTE flag the backend's compute loop skips the node.
+                r1->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
+                expect("#470: first compute (full GRAPH_COMPUTE) succeeds",
+                       ggml_backend_graph_compute(rpc_backend, g1) == GGML_STATUS_SUCCESS);
+                float got1[8] = {};
+                ggml_backend_tensor_get(r1, got1, 0, sizeof(got1));
+                bool ok1 = true;
+                for (int i = 0; i < 8; i++) { ok1 = ok1 && (got1[i] == a1v[i] + b1v[i]); }
+                expect("#470: context-1 result correct after first compute", ok1);
+
+                // same uid again → GRAPH_RECOMPUTE fast-path (stored graph)
+                expect("#470: second compute (GRAPH_RECOMPUTE path) succeeds",
+                       ggml_backend_graph_compute(rpc_backend, g1) == GGML_STATUS_SUCCESS);
+                float got1b[8] = {};
+                ggml_backend_tensor_get(r1, got1b, 0, sizeof(got1b));
+                bool ok1b = true;
+                for (int i = 0; i < 8; i++) { ok1b = ok1b && (got1b[i] == a1v[i] + b1v[i]); }
+                expect("#470: context-1 result correct after recompute", ok1b);
+
+                // free context-1's buffer: the peer frees the memory and must
+                // drop its stored graph; the client must reset its recompute
+                // fast-path so the next same-uid compute re-serializes.
+                ggml_backend_buffer_free(buf1);
+
+                // --- context 2: SAME graph uid against NEW buffers ---
+                ggml_init_params c2_params = { /*.mem_size=*/ ggml_tensor_overhead() * 4, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+                ggml_context * c2 = ggml_init(c2_params);
+                ggml_tensor * a2 = ggml_new_tensor_1d(c2, GGML_TYPE_F32, 8);
+                ggml_tensor * b2 = ggml_new_tensor_1d(c2, GGML_TYPE_F32, 8);
+                ggml_tensor * r2 = ggml_add(c2, a2, b2);
+                ggml_backend_buffer_t buf2 = ggml_backend_alloc_ctx_tensors(c2, rpc_backend);
+                expect("#470: context-2 buffer allocated after free", buf2 != nullptr);
+                if (buf2 != nullptr) {
+                    float a2v[8], b2v[8];
+                    for (int i = 0; i < 8; i++) { a2v[i] = (float) (i + 100); b2v[i] = (float) (i * 3 + 7); }
+                    ggml_backend_tensor_set(a2, a2v, 0, sizeof(a2v));
+                    ggml_backend_tensor_set(b2, b2v, 0, sizeof(b2v));
+
+                    // poison r2 so a stale recompute that writes nowhere (or
+                    // into the freed buffer) cannot accidentally pass.
+                    float poison[8];
+                    for (int i = 0; i < 8; i++) { poison[i] = -1.0f; }
+                    ggml_backend_tensor_set(r2, poison, 0, sizeof(poison));
+
+                    ggml_cgraph * g2 = ggml_new_graph_custom(c2, 1, false);
+                    g2->nodes[0] = r2;
+                    g2->n_nodes  = 1;
+                    g2->uid      = 0x470470u; // SAME uid as context 1
+                    r2->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
+                    expect("#470: same-uid compute after free (must be full GRAPH_COMPUTE) succeeds",
+                           ggml_backend_graph_compute(rpc_backend, g2) == GGML_STATUS_SUCCESS);
+                    float got2[8] = {};
+                    ggml_backend_tensor_get(r2, got2, 0, sizeof(got2));
+                    bool ok2 = true;
+                    for (int i = 0; i < 8; i++) { ok2 = ok2 && (got2[i] == a2v[i] + b2v[i]); }
+                    expect("#470: context-2 result correct (no stale-graph recompute against freed buffers)", ok2);
+
+                    ggml_backend_buffer_free(buf2);
+                }
+                ggml_free(c2);
+            }
+            ggml_free(c1);
+            ggml_backend_free(rpc_backend);
+        }
+    }
+
+    // #634/#470: the get_alloc_size fallback must NEVER under-estimate the
+    // peer's allocation (peer pads quantized rows to 512 elements for MMQ and
+    // reserves flash-attn scratch). Regression on the fallback formula itself.
+    {
+        ggml_init_params f_params = { /*.mem_size=*/ ggml_tensor_overhead() * 4, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+        ggml_context * fctx = ggml_init(f_params);
+        ggml_tensor * quant = ggml_new_tensor_1d(fctx, GGML_TYPE_Q8_0, 1000); // not a multiple of 512
+        ggml_tensor * plain = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, 1000);
+
+        const size_t quant_nbytes  = ggml_nbytes(quant);
+        const size_t fallback_quant = ggml_backend_rpc_get_alloc_size_fallback(quant);
+        const size_t fallback_plain = ggml_backend_rpc_get_alloc_size_fallback(plain);
+
+        expect("#470: quantized fallback strictly larger than ggml_nbytes (512-row MMQ padding)",
+               fallback_quant > quant_nbytes);
+        expect("#470: non-quantized fallback equals ggml_nbytes",
+               fallback_plain == ggml_nbytes(plain));
+
+        // Property that matters: the fallback must never be smaller than what
+        // the live peer's allocator reports for the same tensor.
+        ggml_backend_t rpc_backend2 = ggml_backend_rpc_init(endpoint, /*device=*/0);
+        if (rpc_backend2 != nullptr) {
+            ggml_backend_buffer_type_t rpc_buft2 = ggml_backend_get_default_buffer_type(rpc_backend2);
+            const size_t server_size = ggml_backend_buft_get_alloc_size(rpc_buft2, quant);
+            expect("#470: alloc-size fallback is never smaller than the live server's alloc_size",
+                   fallback_quant >= server_size);
+            ggml_backend_free(rpc_backend2);
+        }
+        ggml_free(fctx);
+    }
+
     ggml_free(client_ctx);
     ggml_backend_buffer_free(server_buf);
     ggml_free(server_ctx);
@@ -194,7 +329,8 @@ int main() {
 
     if (g_failures == 0) {
         printf("OK: zero-copy RESOLVE_TENSOR/bind_remote_tensor round-trips correctly "
-               "(incl. #368 epoch, ne-guard, fail-open, re-callable register)\n");
+               "(incl. #368 epoch, ne-guard, fail-open, re-callable register) "
+               "+ #470 freed-buffer recompute refusal + #634 alloc-size over-estimate fallback\n");
         return 0;
     }
     fprintf(stderr, "%d failure(s)\n", g_failures);

@@ -169,6 +169,9 @@ llama_build_and_test(test-hydra-checkpoint-policy.cpp)
 # doesn't have GGML_RPC enabled.
 llama_build_and_test(test-hydra-rpc-bind.cpp)
 target_link_libraries(test-hydra-rpc-bind PRIVATE ggml)
+# #470: test sets ggml_cgraph::uid directly (freed-buffer recompute refusal) —
+# the struct lives in ggml-impl.h.
+target_include_directories(test-hydra-rpc-bind PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
