@@ -38,6 +38,10 @@ CMAKE_ARGS=(
 
 if [ -x "${CUDA_PATH}/bin/nvcc" ]; then
   CMAKE_ARGS+=(-DCMAKE_CUDA_COMPILER="${CUDA_PATH}/bin/nvcc")
+  # CUDA_PATH may be a conda-installed toolkit (e.g. /opt/software/cuda/13.2.2)
+  # whose libs live under targets/x86_64-linux/lib — no lib64/. Point CMake
+  # at the toolkit root so its CUDAToolkit module finds include + libs.
+  CMAKE_ARGS+=(-DCUDAToolkit_ROOT="${CUDA_PATH}")
 fi
 
 case "$ARCH" in
