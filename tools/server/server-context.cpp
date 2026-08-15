@@ -3830,7 +3830,8 @@ private:
                                 SLT_INF(*slot, "STATE_PUT registered native checkpoint (pos_min=%d pos_max=%d n_tokens=%" PRId64 " tgt_sz=%zu recr_only=%d)\n",
                                         ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, ckpt.size(), (int) ckpt.is_recr_only);
                             } else {
-                                create_checkpoint(*slot, 0, 0, (llama_pos)(hdr_n_tok - 1));
+                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
+                                create_checkpoint(*slot, 0, (llama_pos)pos_min, (llama_pos)(hdr_n_tok - 1));
                             }
                             slot->just_restored = true;
                         }
@@ -4404,7 +4405,8 @@ private:
                     // its pos_max claim (n_tokens - 1) is honest. Moved up
                     // from after the full-prompt decode (see #469 above).
                     if (n_tokens > 0) {
-                        create_checkpoint(*slot, 0, 0, (llama_pos)(n_tokens - 1));
+                        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
+                        create_checkpoint(*slot, 0, (llama_pos)pos_min, (llama_pos)(n_tokens - 1));
                     }
 
                     // Decode the held-back final token (if any) now that the
@@ -5333,7 +5335,8 @@ private:
                                 SLT_INF(*slot, "DECODE_APPLY registered native checkpoint (pos_min=%d pos_max=%d n_tokens=%" PRId64 " tgt_sz=%zu recr_only=%d)\n",
                                         ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, ckpt.size(), (int) ckpt.is_recr_only);
                             } else {
-                                create_checkpoint(*slot, 0, 0, (llama_pos)(n_past - 1));
+                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
+                                create_checkpoint(*slot, 0, (llama_pos)pos_min, (llama_pos)(n_past - 1));
                             }
                         }
                         slot->just_restored = true;
