@@ -17,7 +17,7 @@ on:
         type: boolean
         default: false
       arch_sm86_sm120:
-        description: "Target sm86-sm120 (RTX 3060 + 5060 Ti, CUDA 13.2)"
+        description: "Target sm86-sm120 (RTX 3060 + 5060 Ti, CUDA 13.2.2)"
         type: boolean
         default: true
       arch_sm60:
@@ -125,10 +125,10 @@ jobs:
 
           if [ "${{ inputs.arch_sm86_sm120 }}" = "true" ]; then
             if [ "${{ inputs.build_llama_engine }}" = "true" ]; then
-              combos+=('{"arch":"sm86-sm120","binary":"llama-engine","cuda_version":"13.2","cuda_arch":"86;120"}')
+              combos+=('{"arch":"sm86-sm120","binary":"llama-engine","cuda_version":"13.2.2","cuda_arch":"86;120"}')
             fi
             if [ "${{ inputs.build_llama_server }}" = "true" ]; then
-              combos+=('{"arch":"sm86-sm120","binary":"llama-server","cuda_version":"13.2","cuda_arch":"86;120"}')
+              combos+=('{"arch":"sm86-sm120","binary":"llama-server","cuda_version":"13.2.2","cuda_arch":"86;120"}')
             fi
           fi
 
