@@ -8,6 +8,14 @@ ARG BINARY=llama-engine
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
+# Build-key for the same-hash skip gate (build-combo.sh): SHA + CUDA
+# toolkit version + arch + binary + runner target. Baked in at build time
+# so the gate can compare an existing image's inputs against the current
+# run without trusting local state. Images without this label (built
+# before it existed) never match a current build-key and are rebuilt.
+ARG BUILD_KEY=unknown
+LABEL org.hydra.build-key=${BUILD_KEY}
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 curl \
     && rm -rf /var/lib/apt/lists/*

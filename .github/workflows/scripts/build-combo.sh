@@ -68,6 +68,68 @@ case "$ARCH" in
     ;;
 esac
 
+FORK_VERSION=$(tr -d '[:space:]' < VERSION)
+# Canonical tag carries fork version + commit SHA + optional PR id. The
+# unversioned ALIAS_TAG mirrors what hydra-build.yml's resolve-outputs /
+# build-sequential construct for the caller, so the deploy flow's derived
+# refs always resolve.
+PR_TAG=""
+[ -n "$PR_ID" ] && PR_TAG="-pr${PR_ID}"
+IMAGE_TAG="${ARCH}-${BINARY}-${FORK_VERSION}-${SHORT_SHA}${PR_TAG}"
+ALIAS_TAG="${ARCH}-${BINARY}-${SHORT_SHA}${PR_TAG}"
+
+# ── Same-hash skip gate (runs BEFORE configure/build) ────────────────
+# The tag embeds the fork commit SHA (plus fork version, arch, binary and
+# optional PR id): an unchanged commit produces the SAME tag. Rebuilding +
+# re-pushing an identical image wastes the whole compile (tens of minutes),
+# so this gate runs before cmake configure/build and exits 0 — the compile
+# itself is skipped — when the registry already holds this tag AND it was
+# built from the exact same inputs as this run.
+#
+# Why not `podman manifest inspect` (the pre-fix gate)? Our engine images
+# are pushed as SINGLE-ARCH OCI manifests — not manifest lists — and
+# `podman manifest inspect` refuses those with "treating single images as
+# manifest lists" (exit 125). The old gate never fired (and sat after the
+# compile), so we rebuilt 10-15 min images 3+ times per SHA.
+#
+# Primitive: skopeo, which is registry-authoritative and handles both
+# single-arch manifests and manifest lists. `podman image inspect` is only
+# a fallback: on the persistent self-hosted runner it can read a stale
+# LOCAL copy of a tag, so its RepoDigests/labels may not reflect what the
+# registry actually holds.
+#
+# SKIP CONDITION (exact): the tag resolves in the registry AND the
+# existing image's org.hydra.build-key label (baked in by
+# hydra-build.Dockerfile at build time) equals this run's BUILD_KEY.
+# BUILD_KEY covers every input that changes the binary: SHA + CUDA
+# toolkit version + arch + binary + runner target (native / IPO builds
+# differ between local and cloud runners). Any deviation — tag absent,
+# label missing (images built before this label existed), or label
+# different (toolkit or build flags changed) — rebuilds. The gate can
+# therefore never falsely skip a build whose inputs differ, and never
+# skips based on stale local state.
+BUILD_KEY="sha=${SHORT_SHA};cuda=${CUDA_VERSION};arch=${ARCH};binary=${BINARY};runner=${RUNNER_TARGET}"
+
+EXISTING_DIGEST=""
+EXISTING_KEY=""
+if command -v skopeo >/dev/null 2>&1; then
+  EXISTING_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_REPO}:${IMAGE_TAG}" 2>/dev/null || true)
+  EXISTING_KEY=$(skopeo inspect --format '{{index .Labels "org.hydra.build-key"}}' "docker://${IMAGE_REPO}:${IMAGE_TAG}" 2>/dev/null || true)
+else
+  # Fallback only: podman image inspect reads LOCAL state when the tag is
+  # already present on the host (persistent runner) — safe because a
+  # stale local copy can only cause a rebuild, never a false skip, since
+  # the label comparison still applies to whatever it returns.
+  EXISTING_DIGEST=$(podman image inspect "${IMAGE_REPO}:${IMAGE_TAG}" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)
+  EXISTING_KEY=$(podman image inspect "${IMAGE_REPO}:${IMAGE_TAG}" --format '{{index .Labels "org.hydra.build-key"}}' 2>/dev/null || true)
+fi
+
+if [ -n "$EXISTING_DIGEST" ] && [ -n "$EXISTING_KEY" ] && [ "$EXISTING_KEY" = "$BUILD_KEY" ]; then
+  echo "=== [$ARCH/$BINARY] SKIP: ${IMAGE_REPO}:${IMAGE_TAG} already exists (${EXISTING_DIGEST}) with identical build-key — same-hash rebuild ==="
+  exit 0
+fi
+echo "=== [$ARCH/$BINARY] ${IMAGE_TAG} not in registry or build-key mismatch — building ==="
+
 echo "=== [$ARCH/$BINARY] CMake configure (CUDA $CUDA_VERSION @ $CUDA_PATH) ==="
 echo "CMake args: ${CMAKE_ARGS[*]}"
 cmake -B "$BUILD_DIR" -G Ninja "${CMAKE_ARGS[@]}" .
@@ -84,28 +146,6 @@ if echo "$VERSION_OUTPUT" | grep -q "\[shared\]"; then
 else
   echo "WARNING: expected [shared] in version output (see hydra_vortex#346) — may hang on RTX"
 fi
-
-FORK_VERSION=$(tr -d '[:space:]' < VERSION)
-# Canonical tag carries fork version + commit SHA + optional PR id. The
-# unversioned ALIAS_TAG mirrors what hydra-build.yml's resolve-outputs /
-# build-sequential construct for the caller, so the deploy flow's derived
-# refs always resolve.
-PR_TAG=""
-[ -n "$PR_ID" ] && PR_TAG="-pr${PR_ID}"
-IMAGE_TAG="${ARCH}-${BINARY}-${FORK_VERSION}-${SHORT_SHA}${PR_TAG}"
-ALIAS_TAG="${ARCH}-${BINARY}-${SHORT_SHA}${PR_TAG}"
-
-# ── Same-hash skip gate ──────────────────────────────────────────────
-# The tag embeds the fork commit SHA: an unchanged commit produces the
-# SAME tag. Rebuilding + re-pushing an identical image wastes the whole
-# compile (tens of minutes). Check the registry for the exact tag via a
-# lightweight manifest HEAD (no blob download) and skip entirely if it
-# already exists.
-if podman manifest inspect "${IMAGE_REPO}:${IMAGE_TAG}" >/dev/null 2>&1; then
-  echo "=== [$ARCH/$BINARY] SKIP: ${IMAGE_REPO}:${IMAGE_TAG} already exists (same-hash rebuild) ==="
-  exit 0
-fi
-echo "=== [$ARCH/$BINARY] ${IMAGE_TAG} not in registry — building ==="
 
 mkdir -p "${STAGING_DIR}/bin"
 cp "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
@@ -128,6 +168,7 @@ esac
 podman build \
   --build-arg CUDA_VERSION="${DOCKER_CUDA_VERSION}" \
   --build-arg BINARY="${BINARY}" \
+  --build-arg BUILD_KEY="${BUILD_KEY}" \
   -t "${IMAGE_REPO}:${IMAGE_TAG}" \
   -f .github/workflows/hydra-build.Dockerfile \
   "${STAGING_DIR}/"
