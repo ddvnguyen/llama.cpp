@@ -269,7 +269,10 @@ struct ggml_backend_rpc_device_context {
     uint32_t    device;
     std::string name;
     std::string description;
-    uint64_t    last_graph_uid;
+    // #470: atomic — written under get_rpc_mutex() by
+    // ggml_backend_rpc_invalidate_recompute (any thread freeing a buffer) and
+    // by the compute path, read lock-free by ggml_backend_rpc_graph_compute.
+    std::atomic<uint64_t> last_graph_uid;
     // #470: the socket object this device context last computed a graph over.
     // A different object means a reconnect — the peer's rpc_server is a NEW
     // instance with an EMPTY stored-graph cache, so the recompute fast-path
@@ -435,7 +438,6 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
 
     // smoke #8 (2026-08-12): the rtx engine (sm_120) crashed mid P/D-prefill
@@ -450,14 +452,17 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     // (same poll mechanism as tcp_peer_closed); if dead, evict it from the
     // cache, reconnect to the endpoint and re-negotiate the HELLO handshake
     // below. A dead peer is a recoverable condition — never GGML_ABORT here.
-    auto it = sockets.find(endpoint);
-    if (it != sockets.end()) {
-        if (auto sock = it->second.lock()) {
-            if (sock->is_peer_alive()) {
-                return sock;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = sockets.find(endpoint);
+        if (it != sockets.end()) {
+            if (auto sock = it->second.lock()) {
+                if (sock->is_peer_alive()) {
+                    return sock;
+                }
+                LOG_DBG("[%s] cached socket for %s is dead, reconnecting\n", __func__, endpoint.c_str());
+                it = sockets.erase(it);
             }
-            LOG_DBG("[%s] cached socket for %s is dead, reconnecting\n", __func__, endpoint.c_str());
-            it = sockets.erase(it);
         }
     }
     std::string host;
@@ -470,6 +475,16 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (!rpc_transport_init()) {
         return nullptr;
     }
+    // #470 (PR#98 deadlock): the connect + HELLO handshake below are blocking
+    // network operations with NO socket timeout (neither SO_RCVTIMEO nor a
+    // bounded connect), and this function runs on the decode hot path
+    // (ggml_backend_rpc_graph_compute) and under ggml_backend_rpc_add_server.
+    // They must NOT run while holding the cache mutex: a peer that stalls its
+    // HELLO response would hold the mutex forever and convoy every RPC user
+    // in the process into a single-mutex futex deadlock (the observed 42-
+    // thread wedge). The cache mutex is now scoped to the probe/evict/insert
+    // critical sections only; a stale duplicate connection is harmless (the
+    // peer sees a HELLO'd connection that never sends and closes it on idle).
     auto sock = socket_t::connect(host.c_str(), port);
     if (sock == nullptr) {
         return nullptr;
@@ -477,8 +492,21 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (!negotiate_hello(sock)) {
         return nullptr;
     }
-    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-    sockets[endpoint] = sock;
+    // Double-checked insert: another thread may have connected + cached a
+    // socket while we were blocked on the network. Prefer the cached one and
+    // let ours drop (its fd closes when the last refcount expires).
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = sockets.find(endpoint);
+        if (it != sockets.end()) {
+            if (auto existing = it->second.lock()) {
+                LOG_DBG("[%s] socket for %s appeared while connecting, using cached\n", __func__, endpoint.c_str());
+                return existing;
+            }
+        }
+        LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+        sockets[endpoint] = sock;
+    }
     return sock;
 }
 
@@ -2540,6 +2568,14 @@ uint32_t & get_rpc_dev_id() {
 // memory its stored graph points into, so the next compute with a recycled
 // uid must be a full GRAPH_COMPUTE with fresh data pointers. (Reconnects are
 // handled separately in ggml_backend_rpc_graph_compute via socket identity.)
+//
+// PR#98-deadlock note: this runs on the decode hot path (buffer free during
+// compute). It takes get_rpc_mutex() — safe ONLY because that mutex is now
+// never held across blocking network: ggml_backend_rpc_add_server performs its
+// device-count RPC outside the mutex (double-checked insert), so every
+// get_rpc_mutex() critical section is a bounded map access. If a future change
+// adds network under get_rpc_mutex() again, this function becomes a convoy
+// point for the whole compute path — do not do that.
 static void ggml_backend_rpc_invalidate_recompute(const std::string & endpoint) {
     std::lock_guard<std::mutex> lock(get_rpc_mutex());
     for (auto & entry : get_rpc_reg_map()) {
@@ -2558,13 +2594,35 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     auto & reg_map = get_rpc_reg_map();
     auto & mutex   = get_rpc_mutex();
     auto & dev_id  = get_rpc_dev_id();
-    std::lock_guard<std::mutex> lock(mutex);
-    if (reg_map.find(endpoint) != reg_map.end()) {
-        return reg_map[endpoint];
+    {
+        // fast path: already registered
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = reg_map.find(endpoint);
+        if (it != reg_map.end()) {
+            return it->second;
+        }
     }
+    // #470 (PR#98 deadlock): the device-count RPC below is a blocking
+    // round-trip (connect + HELLO handshake + request/response, no socket
+    // timeouts). It must NOT run while holding get_rpc_mutex() — that same
+    // process-global mutex is taken by ggml_backend_rpc_invalidate_recompute
+    // on the decode hot path (every RPC buffer free). A peer that stalls its
+    // HELLO/DEVICE_COUNT response (or is wedged by recompute-refusal churn)
+    // used to hold the mutex forever, convoying every buffer free during
+    // compute into a process-wide futex deadlock (the 42-thread wedge — the
+    // durable build served only when PR#98's invalidate was absent). The
+    // mutex now protects only the map's check-and-insert critical section.
     uint32_t dev_count = ggml_backend_rpc_get_device_count(endpoint);
     if (dev_count == 0) {
         return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    // Double-checked insert: another thread may have registered the endpoint
+    // while we were blocked on the network — return the existing reg instead
+    // of leaking a second registration for the same endpoint.
+    auto it = reg_map.find(endpoint);
+    if (it != reg_map.end()) {
+        return it->second;
     }
     ggml_backend_rpc_reg_context * ctx = new ggml_backend_rpc_reg_context;
     ctx->name = "RPC[" + std::string(endpoint) + "]";

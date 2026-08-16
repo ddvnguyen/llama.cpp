@@ -17,12 +17,19 @@
 #include "ggml-rpc.h"
 #include "ggml-impl.h" // #470: ggml_cgraph::uid is set directly by the regression test
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 static int g_failures = 0;
 
@@ -288,6 +295,109 @@ int main() {
             }
             ggml_free(c1);
             ggml_backend_free(rpc_backend);
+        }
+    }
+
+    // =========================================================================
+    // #470 (PR#98 deadlock): a buffer free must never block behind a concurrent
+    // registration stalled on a silent peer. PR#98's
+    // ggml_backend_rpc_invalidate_recompute (called from every RPC buffer free
+    // on the decode/prefill hot path) takes the process-global
+    // get_rpc_mutex(); the old ggml_backend_rpc_add_server held that SAME
+    // mutex across a blocking connect + HELLO handshake (client sockets have
+    // no SO_RCVTIMEO). A peer that stalls its HELLO response therefore held
+    // the mutex forever and convoyed every buffer free — while the decoder
+    // held the per-device compute mutex — into a process-wide futex deadlock
+    // (the 42-thread wedge on the durable build; the 13.2.1-line build served
+    // only because it predates PR#98's invalidate). Regression: with
+    // add_server blocked on a silent peer, a buffer free on the LIVE endpoint
+    // must still complete within a deadline.
+    {
+        // Stall peer: a listener that ACCEPTS connections but never answers
+        // the HELLO handshake (holds each connection open for 30s, then
+        // closes — long enough that the client's blocking HELLO recv is still
+        // parked for the whole test).
+        const char * stall_endpoint = "127.0.0.1:18766";
+        const int    stall_port     = 18766;
+        int stall_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        int so_opt = 1;
+        ::setsockopt(stall_fd, SOL_SOCKET, SO_REUSEADDR, &so_opt, sizeof(so_opt));
+        struct sockaddr_in saddr{};
+        saddr.sin_family      = AF_INET;
+        saddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        saddr.sin_port        = htons((uint16_t) stall_port);
+        const bool stall_bound = (stall_fd >= 0) &&
+            (::bind(stall_fd, (struct sockaddr *) &saddr, sizeof(saddr)) == 0) &&
+            (::listen(stall_fd, 8) == 0);
+        expect("deadlock test: stall-peer listener bound", stall_bound);
+        if (stall_bound) {
+            std::thread stall_server([stall_fd] {
+                for (;;) {
+                    int cfd = ::accept(stall_fd, nullptr, nullptr);
+                    if (cfd < 0) break;
+                    std::thread([cfd] {
+                        std::this_thread::sleep_for(std::chrono::seconds(30));
+                        ::close(cfd);
+                    }).detach();
+                }
+                ::close(stall_fd);
+            });
+            stall_server.detach();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // listener ready
+
+            // Prepare the LIVE-endpoint buffer BEFORE the stalled registration
+            // starts, so the main thread never touches get_rpc_mutex() during
+            // the deadline check (on the old code the mutex is held by the
+            // stalled thread, so any later registration would hang the test
+            // itself instead of failing its assertion).
+            ggml_backend_t rpc_backend = ggml_backend_rpc_init(endpoint, /*device=*/0);
+            ggml_init_params fb_params = { /*.mem_size=*/ ggml_tensor_overhead() * 2, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+            ggml_context * fb_ctx  = ggml_init(fb_params);
+            ggml_tensor *  fb_t    = ggml_new_tensor_1d(fb_ctx, GGML_TYPE_F32, 4);
+            ggml_backend_buffer_t fb_buf = (rpc_backend != nullptr)
+                ? ggml_backend_alloc_ctx_tensors(fb_ctx, rpc_backend) : nullptr;
+            expect("deadlock test: live-endpoint buffer allocated", fb_buf != nullptr);
+
+            // Thread A: register the stall endpoint — blocks in the HELLO recv.
+            // On the OLD code this thread holds get_rpc_mutex() while blocked;
+            // on the fixed code the connect + HELLO run without any mutex held.
+            std::thread stalled_reg([stall_endpoint] {
+                ggml_backend_rpc_add_server(stall_endpoint);  // expected to block
+            });
+            stalled_reg.detach();
+            std::this_thread::sleep_for(std::chrono::milliseconds(300)); // A is now in HELLO recv
+
+            // Main: free the LIVE buffer. The free sends FREE_BUFFER (peer
+            // answers promptly) then calls invalidate_recompute ->
+            // get_rpc_mutex(). OLD code: blocks forever (A holds the mutex).
+            // Fixed code: completes immediately (mutex never held across
+            // network). Bounded by a 5s deadline so a regression fails the
+            // assertion instead of hanging the whole test binary.
+            std::atomic<bool> freed{false};
+            std::thread freer([fb_buf, &freed] {
+                if (fb_buf != nullptr) {
+                    ggml_backend_buffer_free(fb_buf);
+                }
+                freed.store(true, std::memory_order_release);
+            });
+            for (int i = 0; i < 50 && !freed.load(std::memory_order_acquire); i++) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            const bool freed_ok = freed.load(std::memory_order_acquire);
+            expect("#470-PR98-deadlock: buffer free completes while add_server is stalled on a silent peer",
+                   freed_ok);
+            freer.detach(); // if still stuck (regression), never join it
+
+            ggml_free(fb_ctx);
+            ggml_backend_free(rpc_backend);
+
+            if (!freed_ok) {
+                // The old code is deadlocked at this point (the stalled
+                // add_server holds get_rpc_mutex() forever). Every subsequent
+                // registration / buffer op in this test would hang on the same
+                // mutex, so exit hard without touching the stuck threads.
+                std::_Exit(1);
+            }
         }
     }
 
