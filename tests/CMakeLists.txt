@@ -284,6 +284,11 @@ set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# hydra#470: pins llama_state_seq_hash byte count == llama_state_seq_get_size
+# byte count on a live ctx with seeded KV cells (PREFILL M2 hash pre-pass).
+llama_build_and_test(test-hydra-seq-state-hash.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-hydra-seq-state-hash PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)

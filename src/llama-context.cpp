@@ -3269,11 +3269,13 @@ ggml_backend_t llama_context::tensor_backend(const ggml_tensor * tensor) const {
 class llama_io_write_hash : public llama_io_write_i {
     XXH3_state_t * hst = nullptr;
     std::vector<uint8_t> staging;
+    size_t bytes_written = 0;
 public:
     llama_io_write_hash(XXH3_state_t * st, size_t chunk_size) : hst(st), staging(chunk_size) {}
 
     void write(const void * src, size_t size) override {
         XXH3_64bits_update(hst, src, size);
+        bytes_written += size;
     }
 
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
@@ -3285,10 +3287,11 @@ public:
             XXH3_64bits_update(hst, staging.data(), chunk);
             off += chunk;
             rem -= chunk;
+            bytes_written += chunk;
         }
     }
 
-    size_t n_bytes() override { return 0; }
+    size_t n_bytes() override { return bytes_written; }
 };
 
 size_t llama_context::state_seq_hash(llama_seq_id seq_id, void * xxh3_state) {
