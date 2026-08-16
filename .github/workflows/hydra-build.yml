@@ -80,6 +80,12 @@ on:
       p100-image:
         description: "OCI image ref pushed for P100 (sm60)"
         value: ${{ jobs.resolve-outputs.outputs.p100-image || jobs.build-sequential.outputs.p100-image }}
+      rtx-platform-digest:
+        description: "PLATFORM manifest digest of the pushed RTX (sm86-sm120) image — the digest the head's crane resolves (NOT RepoDigests[0], which is the manifest-LIST digest for multi-arch images)"
+        value: ${{ jobs.resolve-outputs.outputs.rtx-platform-digest || jobs.build-sequential.outputs.rtx-platform-digest }}
+      p100-platform-digest:
+        description: "PLATFORM manifest digest of the pushed P100 (sm60) image — see rtx-platform-digest"
+        value: ${{ jobs.resolve-outputs.outputs.p100-platform-digest || jobs.build-sequential.outputs.p100-platform-digest }}
 
 permissions:
   contents: read
@@ -295,6 +301,8 @@ jobs:
     outputs:
       rtx-image: ${{ steps.pick.outputs.rtx-image }}
       p100-image: ${{ steps.pick.outputs.p100-image }}
+      rtx-platform-digest: ${{ steps.platform-digest.outputs.rtx-platform-digest }}
+      p100-platform-digest: ${{ steps.platform-digest.outputs.p100-platform-digest }}
     steps:
       - name: Pick canonical image per arch
         id: pick
@@ -323,10 +331,32 @@ jobs:
                P100_IMAGE="$IMAGE"
              fi
           done
-          [ -n "$RTX_IMAGE" ] && echo "rtx-image=$RTX_IMAGE" >> "$GITHUB_OUTPUT"
-          [ -n "$P100_IMAGE" ] && echo "p100-image=$P100_IMAGE" >> "$GITHUB_OUTPUT"
-          echo "rtx-image: ${RTX_IMAGE:-'(none)'}"
-          echo "p100-image: ${P100_IMAGE:-'(none)'}"
+           [ -n "$RTX_IMAGE" ] && echo "rtx-image=$RTX_IMAGE" >> "$GITHUB_OUTPUT"
+           [ -n "$P100_IMAGE" ] && echo "p100-image=$P100_IMAGE" >> "$GITHUB_OUTPUT"
+           echo "rtx-image: ${RTX_IMAGE:-'(none)'}"
+           echo "p100-image: ${P100_IMAGE:-'(none)'}"
+
+      # Deploy pins the head's -llama-image-digest to the PLATFORM manifest
+      # digest — the digest the head's crane resolves. That is NOT
+      # RepoDigests[0]: for multi-arch (manifest-list) images RepoDigests[0]
+      # is the LIST digest, and pinning it fails the head's verification
+      # ("image digest mismatch: got <platform>, expected <list>") — a
+      # redeploy cycle. resolve-platform-digest.sh always emits the PLATFORM
+      # digest: for a single-arch manifest it is the manifest digest
+      # (skopeo inspect .Digest); for a manifest list it selects the
+      # linux/amd64 platform manifest (both our targets are x86_64).
+      - name: Emit platform digest for deploy pinning
+        id: platform-digest
+        run: |
+          if [ -n "$RTX_IMAGE" ]; then
+            bash .github/workflows/scripts/resolve-platform-digest.sh "$RTX_IMAGE" rtx-platform-digest "RTX (sm86-sm120)"
+          fi
+          if [ -n "$P100_IMAGE" ]; then
+            bash .github/workflows/scripts/resolve-platform-digest.sh "$P100_IMAGE" p100-platform-digest "P100 (sm60)"
+          fi
+        env:
+          RTX_IMAGE: ${{ steps.pick.outputs.rtx-image }}
+          P100_IMAGE: ${{ steps.pick.outputs.p100-image }}
 
   # ── Sequential: one job, loops over every selected combination ─────────
   build-sequential:
@@ -338,6 +368,8 @@ jobs:
     outputs:
       rtx-image: ${{ steps.set-outputs.outputs.rtx-image }}
       p100-image: ${{ steps.set-outputs.outputs.p100-image }}
+      rtx-platform-digest: ${{ steps.platform-digest.outputs.rtx-platform-digest }}
+      p100-platform-digest: ${{ steps.platform-digest.outputs.p100-platform-digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -454,8 +486,30 @@ jobs:
               P100_IMAGE="$IMAGE"
             fi
           done
-          [ -n "$RTX_IMAGE" ] && echo "rtx-image=$RTX_IMAGE" >> "$GITHUB_OUTPUT"
-          [ -n "$P100_IMAGE" ] && echo "p100-image=$P100_IMAGE" >> "$GITHUB_OUTPUT"
+           [ -n "$RTX_IMAGE" ] && echo "rtx-image=$RTX_IMAGE" >> "$GITHUB_OUTPUT"
+           [ -n "$P100_IMAGE" ] && echo "p100-image=$P100_IMAGE" >> "$GITHUB_OUTPUT"
+
+      # Deploy pins the head's -llama-image-digest to the PLATFORM manifest
+      # digest — the digest the head's crane resolves. That is NOT
+      # RepoDigests[0]: for multi-arch (manifest-list) images RepoDigests[0]
+      # is the LIST digest, and pinning it fails the head's verification
+      # ("image digest mismatch: got <platform>, expected <list>") — a
+      # redeploy cycle. resolve-platform-digest.sh always emits the PLATFORM
+      # digest: for a single-arch manifest it is the manifest digest
+      # (skopeo inspect .Digest); for a manifest list it selects the
+      # linux/amd64 platform manifest (both our targets are x86_64).
+      - name: Emit platform digest for deploy pinning
+        id: platform-digest
+        run: |
+          if [ -n "$RTX_IMAGE" ]; then
+            bash .github/workflows/scripts/resolve-platform-digest.sh "$RTX_IMAGE" rtx-platform-digest "RTX (sm86-sm120)"
+          fi
+          if [ -n "$P100_IMAGE" ]; then
+            bash .github/workflows/scripts/resolve-platform-digest.sh "$P100_IMAGE" p100-platform-digest "P100 (sm60)"
+          fi
+        env:
+          RTX_IMAGE: ${{ steps.set-outputs.outputs.rtx-image }}
+          P100_IMAGE: ${{ steps.set-outputs.outputs.p100-image }}
 
       - name: Deploy reminder
         run: |
