@@ -173,6 +173,15 @@ target_link_libraries(test-hydra-rpc-bind PRIVATE ggml)
 # the struct lives in ggml-impl.h.
 target_include_directories(test-hydra-rpc-bind PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+# #470 (COMBINED crash): ggml-RPC stale-socket in the buffer data path. All 7
+# data-path ops must re-resolve via get_socket after the peer connection dies
+# (reconnect, no abort); cpy_tensor fails open on a truly dead peer. CPU
+# backend only, no GPU/model needed. Skips itself at runtime without GGML_RPC.
+llama_build_and_test(test-hydra-rpc-stale-sock.cpp)
+target_link_libraries(test-hydra-rpc-stale-sock PRIVATE ggml)
+# #470: test uses ggml_backend_buffer_copy_tensor (declared in ggml-backend-impl.h).
+target_include_directories(test-hydra-rpc-stale-sock PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
