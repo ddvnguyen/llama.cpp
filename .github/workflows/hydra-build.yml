@@ -467,3 +467,5 @@ jobs:
           - \`infra/hydra-head/config/node-rtx.yaml\`
           - \`infra/hydra-head/config/node-p100.yaml\`
           EOF
+
+# no-op: force fresh build with CUDA 13.2 (2026-08-17T10:13:05Z)
