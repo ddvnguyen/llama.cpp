@@ -269,7 +269,10 @@ struct ggml_backend_rpc_device_context {
     uint32_t    device;
     std::string name;
     std::string description;
-    uint64_t    last_graph_uid;
+    // #470: atomic — written under get_rpc_mutex() by
+    // ggml_backend_rpc_invalidate_recompute (any thread freeing a buffer) and
+    // by the compute path, read lock-free by ggml_backend_rpc_graph_compute.
+    std::atomic<uint64_t> last_graph_uid;
     // #470: the socket object this device context last computed a graph over.
     // A different object means a reconnect — the peer's rpc_server is a NEW
     // instance with an EMPTY stored-graph cache, so the recompute fast-path
@@ -301,7 +304,16 @@ struct ggml_backend_rpc_context {
 };
 
 struct ggml_backend_rpc_buffer_context {
+    // #470 (COMBINED crash): `sock` is the socket captured ONCE at alloc
+    // time. The data-path ops below re-resolve it on EVERY call via
+    // get_socket(ctx->endpoint) instead of sending over this stored one —
+    // during a COMBINED teardown/re-attach the head-side connection drops
+    // while the peer stays up, leaving pre-existing buffers holding a dead
+    // fd whose first boundary send used to GGML_ABORT the engine. The
+    // re-resolve reuses get_socket's liveness probe + reconnect (smoke #8).
+    // `sock` is kept only for the same-server identity check in cpy_tensor.
     std::shared_ptr<socket_t> sock;
+    std::string endpoint;
     void * base_ptr;
     uint64_t remote_ptr;
 };
@@ -435,7 +447,6 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
 
     // smoke #8 (2026-08-12): the rtx engine (sm_120) crashed mid P/D-prefill
@@ -450,14 +461,17 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     // (same poll mechanism as tcp_peer_closed); if dead, evict it from the
     // cache, reconnect to the endpoint and re-negotiate the HELLO handshake
     // below. A dead peer is a recoverable condition — never GGML_ABORT here.
-    auto it = sockets.find(endpoint);
-    if (it != sockets.end()) {
-        if (auto sock = it->second.lock()) {
-            if (sock->is_peer_alive()) {
-                return sock;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = sockets.find(endpoint);
+        if (it != sockets.end()) {
+            if (auto sock = it->second.lock()) {
+                if (sock->is_peer_alive()) {
+                    return sock;
+                }
+                LOG_DBG("[%s] cached socket for %s is dead, reconnecting\n", __func__, endpoint.c_str());
+                it = sockets.erase(it);
             }
-            LOG_DBG("[%s] cached socket for %s is dead, reconnecting\n", __func__, endpoint.c_str());
-            it = sockets.erase(it);
         }
     }
     std::string host;
@@ -470,6 +484,16 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (!rpc_transport_init()) {
         return nullptr;
     }
+    // #470 (PR#98 deadlock): the connect + HELLO handshake below are blocking
+    // network operations with NO socket timeout (neither SO_RCVTIMEO nor a
+    // bounded connect), and this function runs on the decode hot path
+    // (ggml_backend_rpc_graph_compute) and under ggml_backend_rpc_add_server.
+    // They must NOT run while holding the cache mutex: a peer that stalls its
+    // HELLO response would hold the mutex forever and convoy every RPC user
+    // in the process into a single-mutex futex deadlock (the observed 42-
+    // thread wedge). The cache mutex is now scoped to the probe/evict/insert
+    // critical sections only; a stale duplicate connection is harmless (the
+    // peer sees a HELLO'd connection that never sends and closes it on idle).
     auto sock = socket_t::connect(host.c_str(), port);
     if (sock == nullptr) {
         return nullptr;
@@ -477,15 +501,37 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (!negotiate_hello(sock)) {
         return nullptr;
     }
-    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-    sockets[endpoint] = sock;
+    // Double-checked insert: another thread may have connected + cached a
+    // socket while we were blocked on the network. Prefer the cached one and
+    // let ours drop (its fd closes when the last refcount expires).
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = sockets.find(endpoint);
+        if (it != sockets.end()) {
+            if (auto existing = it->second.lock()) {
+                LOG_DBG("[%s] socket for %s appeared while connecting, using cached\n", __func__, endpoint.c_str());
+                return existing;
+            }
+        }
+        LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+        sockets[endpoint] = sock;
+    }
     return sock;
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    // #470: re-resolve — the free must ride the CURRENT connection, not the
+    // socket captured at alloc time (dead after a head teardown/re-attach).
+    // No error channel: a genuinely unreachable peer aborts loudly rather
+    // than silently leaking the peer allocation (correctness-preserving).
+    auto sock = get_socket(ctx->endpoint);
+    if (sock == nullptr) {
+        GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip FREE_BUFFER\n",
+                   __func__, ctx->endpoint.c_str());
+    }
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
+    bool status = send_rpc_cmd(sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
     // #470: freeing the buffer frees the peer memory the server's stored graph
     // points into. Reset the recompute fast-path so the next compute with a
@@ -501,9 +547,17 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     if (ctx->base_ptr != nullptr) {
         return ctx->base_ptr;
     }
+    // #470: re-resolve (see free_buffer) — a cached-dead sock would make the
+    // GET_BASE round trip abort; reconnecting here is safe and cheap on the
+    // happy path (mutex + map lookup, no network).
+    auto sock = get_socket(ctx->endpoint);
+    if (sock == nullptr) {
+        GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to return a stale base pointer\n",
+                   __func__, ctx->endpoint.c_str());
+    }
     rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
+    bool status = send_rpc_cmd(sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
     return ctx->base_ptr;
@@ -556,6 +610,9 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 
 static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    // #470: re-resolve — the stored sock may be dead after a head
+    // teardown/re-attach while this buffer predates it.
+    auto sock = get_socket(ctx->endpoint);
 
     // CUDA backend on the server pads everything to 512 due to CUDA limitations.
     // Due to bandwidth constraints, we only call the server init tensor functions if necessary.
@@ -565,7 +622,15 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
         request.tensor = serialize_tensor(tensor);
 
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+        if (sock == nullptr) {
+            // No error channel: abort loudly rather than silently skipping
+            // the server-side padding init (correctness-preserving). In
+            // practice get_socket's reconnect fixes the dead fd, so this
+            // only fires when the peer is genuinely unreachable.
+            GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip INIT_TENSOR\n",
+                       __func__, ctx->endpoint.c_str());
+        }
+        bool status = send_rpc_cmd(sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
@@ -573,6 +638,15 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    // #470: re-resolve — NEVER silently skip a set on a dead peer: an
+    // unwritten weight/KV while the engine reports healthy is silent data
+    // corruption. Only a genuinely unreachable peer aborts here; get_socket's
+    // reconnect fixes the dead fd in the COMBINED teardown/re-attach case.
+    auto sock = get_socket(ctx->endpoint);
+    if (sock == nullptr) {
+        GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip SET_TENSOR\n",
+                   __func__, ctx->endpoint.c_str());
+    }
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     if (size > HASH_THRESHOLD) {
         rpc_msg_set_tensor_hash_req request;
@@ -580,7 +654,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         request.offset = offset;
         request.hash = fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+        bool status = send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
         if (response.result) {
             // the server has the same data, no need to send it
@@ -593,17 +667,24 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    bool status = send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
     RPC_STATUS_ASSERT(status);
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    // #470: re-resolve (see set_tensor) — a dead cached sock must not abort
+    // the read; the reconnect rides the current connection instead.
+    auto sock = get_socket(ctx->endpoint);
+    if (sock == nullptr) {
+        GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to return garbage for GET_TENSOR\n",
+                   __func__, ctx->endpoint.c_str());
+    }
     rpc_msg_get_tensor_req request;
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
     request.size = size;
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    bool status = send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -614,16 +695,33 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *)src_buffer->context;
         ggml_backend_buffer_t dst_buffer = dst->buffer;
         ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *)dst_buffer->context;
+        ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+        // #470: re-resolve — the stored sock may be dead after a head
+        // teardown/re-attach; ride the CURRENT connection instead.
+        auto sock = get_socket(ctx->endpoint);
+        if (sock == nullptr) {
+            // Fail-open: ggml_backend_tensor_copy treats a false return as a
+            // normal miss and falls back to a host round-trip — never abort
+            // a copy on a merely-unreachable peer.
+            GGML_LOG_ERROR("[%s] cannot reach peer %s (reconnect failed) for copy — fail-open, returning false\n",
+                    __func__, ctx->endpoint.c_str());
+            return false;
+        }
         if (src_ctx->sock != dst_ctx->sock) {
             return false;
         }
-        ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
         rpc_msg_copy_tensor_req request;
         request.src = serialize_tensor(src);
         request.dst = serialize_tensor(dst);
         rpc_msg_copy_tensor_rsp response;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
+        bool status = send_rpc_cmd(sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
+        if (!status) {
+            // Fail-open (mirrors the bind path at ggml_backend_rpc_bind_remote_tensor):
+            // a copy failure must degrade to the host round-trip, not GGML_ABORT.
+            GGML_LOG_ERROR("[%s] RPC_CMD_COPY_TENSOR RPC failed for '%s' -> '%s' on %s — fail-open, returning false\n",
+                    __func__, src->name, dst->name, ctx->endpoint.c_str());
+            return false;
+        }
         return response.result;
     }
     return false;
@@ -631,8 +729,15 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    // #470: re-resolve (see set_tensor) — a clear on the CURRENT connection,
+    // never on a dead cached sock.
+    auto sock = get_socket(ctx->endpoint);
+    if (sock == nullptr) {
+        GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip BUFFER_CLEAR\n",
+                   __func__, ctx->endpoint.c_str());
+    }
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
+    bool status = send_rpc_cmd(sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -665,7 +770,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, buft_ctx->endpoint, nullptr, response.remote_ptr},
             response.remote_size);
         return buffer;
     } else {
@@ -1079,7 +1184,10 @@ struct ggml_tensor * ggml_backend_rpc_bind_remote_tensor(const char * endpoint, 
     ggml_backend_buffer_type_t buft = ggml_backend_rpc_buffer_type(endpoint, device);
     ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
         ggml_backend_rpc_buffer_interface,
-        new ggml_backend_rpc_buffer_context{sock, nullptr, response.buffer},
+        // #470: carry the endpoint so the data-path ops on this bound-tensor
+        // buffer can re-resolve via get_socket (COMBINED expert tensors are
+        // exactly the pre-re-attach buffers that used to hold the dead sock).
+        new ggml_backend_rpc_buffer_context{sock, endpoint, nullptr, response.buffer},
         response.buffer_size);
     // Every current caller binds a weight tensor (COMBINED expert tensors).
     // ggml_backend_buffer_init defaults usage to ANY; the scheduler's
@@ -1664,6 +1772,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t)) {
+        GGML_LOG_ERROR("[%s] #376: truncated graph header (%zu bytes)\n", __func__, input.size());
         return false;
     }
     const uint8_t * src = input.data();
@@ -1671,12 +1780,19 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     memcpy(&device, src, sizeof(device));
     src += sizeof(device);
     if (device >= backends.size()) {
+        // #376: prime suspect for COMBINE "peer closes connection" — the head
+        // serialized a device index this peer never enumerated. Log both sides.
+        GGML_LOG_ERROR("[%s] #376: device index %u out of range (peer has %zu backend(s)) — "
+                       "COMBINE layer-split device-index mismatch\n",
+                       __func__, device, backends.size());
         return false;
     }
     uint32_t n_nodes;
     memcpy(&n_nodes, src, sizeof(n_nodes));
     src += sizeof(n_nodes);
     if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
+        GGML_LOG_ERROR("[%s] #376: truncated graph (nodes section, n_nodes=%u, %zu bytes)\n",
+                       __func__, n_nodes, input.size());
         return false;
     }
     const uint64_t * nodes = (const uint64_t *)src;
@@ -1685,6 +1801,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     memcpy(&n_tensors, src, sizeof(n_tensors));
     src += sizeof(n_tensors);
     if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rpc_tensor)) {
+        GGML_LOG_ERROR("[%s] #376: truncated graph (tensors section, n_tensors=%u, %zu bytes)\n",
+                       __func__, n_tensors, input.size());
         return false;
     }
     const rpc_tensor * tensors = (const rpc_tensor *)src;
@@ -1729,7 +1847,14 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     ggml_backend_rpc_server_compute_lock(device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     ggml_backend_rpc_server_compute_unlock(device);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    // Hydra #376: was GGML_ASSERT — a peer-side abort on a failed compute killed
+    // the whole peer. Return false instead so the client sees a clean RPC error
+    // (fail-stop at the client) and can degrade-to-solo. Peer stays alive.
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] #376: graph compute returned status %d on device %u\n",
+                       __func__, (int)status, device);
+        return false;
+    }
     stored_graphs[device].graph = graph;
     return true;
 }
@@ -1785,7 +1910,12 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     ggml_backend_rpc_server_compute_lock(device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     ggml_backend_rpc_server_compute_unlock(device);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    // Hydra #376: was GGML_ASSERT — return false instead of aborting the peer.
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] #376: graph recompute returned status %d on device %u\n",
+                       __func__, (int)status, device);
+        return false;
+    }
     return true;
 }
 
@@ -2375,8 +2505,13 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
+    // #376: Flash-attn ops crash the peer when no CUDA kernel is available for
+    // the tensor config on the peer's GPU (e.g. sm_86 vs sm_120 differences).
+    // Short-term: reject FLASH_ATTN_EXT so the scheduler puts it on a local
+    // backend. TODO: forward the query to the remote backend and cache results.
+    if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
     return true;
 }
 
@@ -2540,6 +2675,14 @@ uint32_t & get_rpc_dev_id() {
 // memory its stored graph points into, so the next compute with a recycled
 // uid must be a full GRAPH_COMPUTE with fresh data pointers. (Reconnects are
 // handled separately in ggml_backend_rpc_graph_compute via socket identity.)
+//
+// PR#98-deadlock note: this runs on the decode hot path (buffer free during
+// compute). It takes get_rpc_mutex() — safe ONLY because that mutex is now
+// never held across blocking network: ggml_backend_rpc_add_server performs its
+// device-count RPC outside the mutex (double-checked insert), so every
+// get_rpc_mutex() critical section is a bounded map access. If a future change
+// adds network under get_rpc_mutex() again, this function becomes a convoy
+// point for the whole compute path — do not do that.
 static void ggml_backend_rpc_invalidate_recompute(const std::string & endpoint) {
     std::lock_guard<std::mutex> lock(get_rpc_mutex());
     for (auto & entry : get_rpc_reg_map()) {
@@ -2558,13 +2701,35 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     auto & reg_map = get_rpc_reg_map();
     auto & mutex   = get_rpc_mutex();
     auto & dev_id  = get_rpc_dev_id();
-    std::lock_guard<std::mutex> lock(mutex);
-    if (reg_map.find(endpoint) != reg_map.end()) {
-        return reg_map[endpoint];
+    {
+        // fast path: already registered
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = reg_map.find(endpoint);
+        if (it != reg_map.end()) {
+            return it->second;
+        }
     }
+    // #470 (PR#98 deadlock): the device-count RPC below is a blocking
+    // round-trip (connect + HELLO handshake + request/response, no socket
+    // timeouts). It must NOT run while holding get_rpc_mutex() — that same
+    // process-global mutex is taken by ggml_backend_rpc_invalidate_recompute
+    // on the decode hot path (every RPC buffer free). A peer that stalls its
+    // HELLO/DEVICE_COUNT response (or is wedged by recompute-refusal churn)
+    // used to hold the mutex forever, convoying every buffer free during
+    // compute into a process-wide futex deadlock (the 42-thread wedge — the
+    // durable build served only when PR#98's invalidate was absent). The
+    // mutex now protects only the map's check-and-insert critical section.
     uint32_t dev_count = ggml_backend_rpc_get_device_count(endpoint);
     if (dev_count == 0) {
         return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    // Double-checked insert: another thread may have registered the endpoint
+    // while we were blocked on the network — return the existing reg instead
+    // of leaking a second registration for the same endpoint.
+    auto it = reg_map.find(endpoint);
+    if (it != reg_map.end()) {
+        return it->second;
     }
     ggml_backend_rpc_reg_context * ctx = new ggml_backend_rpc_reg_context;
     ctx->name = "RPC[" + std::string(endpoint) + "]";

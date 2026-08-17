@@ -4626,11 +4626,17 @@ private:
                             XXH3_64bits_reset(kv_hst);
                             XXH3_64bits_update(kv_hst, v2_hdr.data(), v2_hdr.size());
                             const size_t hashed = llama_state_seq_hash(ctx_tgt, slot->id, kv_hst);
-                            if (hashed != sizeof(uint32_t) + sizeof(llama_seq_id) + state_size) {
+                            // state_size (from llama_state_seq_get_size) ALREADY includes the
+                            // [4B magic][4B seq_id] wire header — llama_io_write_dummy counts it.
+                            // llama_state_seq_hash hashes the same [4B magic][4B seq_id] + KV
+                            // bytes, so after the n_bytes() fix hashed == state_size exactly.
+                            // Adding sizeof(uint32_t) + sizeof(llama_seq_id) here double-counted
+                            // the header and killed every PREFILL M2 request (#470).
+                            if (hashed != state_size) {
                                 res->rpc_status = HYDRA_STATUS_ERROR;
                                 res->error      = "PREFILL M2: hash pre-pass hashed " +
                                                   std::to_string(hashed) + " B, expected " +
-                                                  std::to_string(sizeof(uint32_t) + sizeof(llama_seq_id) + state_size) + " B";
+                                                  std::to_string(state_size) + " B";
                             }
                             if (!logits_buf.empty()) {
                                 XXH3_64bits_update(kv_hst, logits_buf.data(), logits_buf.size());
