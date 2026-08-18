@@ -61,9 +61,15 @@ size_t ggml_backend_rpc_get_alloc_size_fallback(const ggml_tensor * tensor) {
         }
     }
     if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+        // Each K/V src is dequantized to F16 before the kernel processes it.
+        // Use the F16-converted size, not the quantized size, to avoid
+        // under-allocating and causing an OOB write in launch_fattn.
         for (int i = 1; i < GGML_MAX_SRC; i++) {
             if (tensor->src[i] != nullptr) {
-                estimate += ggml_nbytes(tensor->src[i]);
+                // ggml_half is 2 bytes (F16); use raw size to avoid header dependency
+                size_t f16_size = ggml_nelements(tensor->src[i]) * 2;
+                f16_size = GGML_PAD(f16_size, 128);
+                estimate += f16_size;
             }
         }
     }
