@@ -17,6 +17,7 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -121,8 +122,14 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
 
 #endif // GGML_RPC_RDMA && !GGML_RPC_RDMA_APPLE
 
+// Monotonic counter for connection identity. Each new socket_t::impl gets a
+// unique id so that ggml-rpc can detect when a buffer's captured connection
+// has been replaced (stale remote_ptr against a new peer).
+static std::atomic<uint64_t> g_next_connection_id{1};
+
 struct socket_t::impl {
-    impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
+    impl(sockfd_t fd) : use_rdma(false), fd(fd),
+        conn_id(g_next_connection_id.fetch_add(1, std::memory_order_relaxed)) {}
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
@@ -149,6 +156,7 @@ struct socket_t::impl {
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
     sockfd_t fd;
+    uint64_t conn_id;
 };
 
 socket_t::impl::~impl() {
@@ -610,6 +618,10 @@ bool socket_t::recv_data(void * data, size_t size) {
 
 bool socket_t::flush() {
     return pimpl->flush();
+}
+
+uint64_t socket_t::connection_id() const {
+    return pimpl->conn_id;
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {
