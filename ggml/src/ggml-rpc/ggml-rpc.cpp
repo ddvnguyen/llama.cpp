@@ -316,6 +316,11 @@ struct ggml_backend_rpc_buffer_context {
     std::string endpoint;
     void * base_ptr;
     uint64_t remote_ptr;
+    // Monotonic connection id captured at alloc time. Used by
+    // resolve_bound_socket to detect a stale remote_ptr: if the connection
+    // that allocated this buffer has been replaced (head teardown/re-attach),
+    // the remote_ptr is meaningless against the new peer.
+    uint64_t conn_id;
 };
 
 // RPC helper functions
@@ -519,13 +524,31 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     return sock;
 }
 
+// Guards against using a stale remote_ptr: if the connection that allocated
+// a buffer has been replaced (head teardown/re-attach), the remote_ptr is
+// meaningless against the new peer.  Returns the live socket on success,
+// nullptr when the peer is genuinely unreachable, or ABORTs on stale id.
+static std::shared_ptr<socket_t> resolve_bound_socket(ggml_backend_rpc_buffer_context * ctx) {
+    auto sock = get_socket(ctx->endpoint);
+    if (sock == nullptr) {
+        return nullptr;
+    }
+    if (sock->connection_id() != ctx->conn_id) {
+        GGML_ABORT("[%s] connection for %s was replaced since remote_ptr=0x%" PRIx64
+                   " was allocated (buffer outlived its connection) — refusing to use "
+                   "a stale remote pointer against a new peer connection\n",
+                   __func__, ctx->endpoint.c_str(), ctx->remote_ptr);
+    }
+    return sock;
+}
+
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     // #470: re-resolve — the free must ride the CURRENT connection, not the
     // socket captured at alloc time (dead after a head teardown/re-attach).
     // No error channel: a genuinely unreachable peer aborts loudly rather
     // than silently leaking the peer allocation (correctness-preserving).
-    auto sock = get_socket(ctx->endpoint);
+    auto sock = resolve_bound_socket(ctx);
     if (sock == nullptr) {
         GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip FREE_BUFFER\n",
                    __func__, ctx->endpoint.c_str());
@@ -550,7 +573,7 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     // #470: re-resolve (see free_buffer) — a cached-dead sock would make the
     // GET_BASE round trip abort; reconnecting here is safe and cheap on the
     // happy path (mutex + map lookup, no network).
-    auto sock = get_socket(ctx->endpoint);
+    auto sock = resolve_bound_socket(ctx);
     if (sock == nullptr) {
         GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to return a stale base pointer\n",
                    __func__, ctx->endpoint.c_str());
@@ -612,7 +635,7 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     // #470: re-resolve — the stored sock may be dead after a head
     // teardown/re-attach while this buffer predates it.
-    auto sock = get_socket(ctx->endpoint);
+    auto sock = resolve_bound_socket(ctx);
 
     // CUDA backend on the server pads everything to 512 due to CUDA limitations.
     // Due to bandwidth constraints, we only call the server init tensor functions if necessary.
@@ -642,7 +665,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     // unwritten weight/KV while the engine reports healthy is silent data
     // corruption. Only a genuinely unreachable peer aborts here; get_socket's
     // reconnect fixes the dead fd in the COMBINED teardown/re-attach case.
-    auto sock = get_socket(ctx->endpoint);
+    auto sock = resolve_bound_socket(ctx);
     if (sock == nullptr) {
         GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip SET_TENSOR\n",
                    __func__, ctx->endpoint.c_str());
@@ -675,7 +698,7 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     // #470: re-resolve (see set_tensor) — a dead cached sock must not abort
     // the read; the reconnect rides the current connection instead.
-    auto sock = get_socket(ctx->endpoint);
+    auto sock = resolve_bound_socket(ctx);
     if (sock == nullptr) {
         GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to return garbage for GET_TENSOR\n",
                    __func__, ctx->endpoint.c_str());
@@ -698,7 +721,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
         // #470: re-resolve — the stored sock may be dead after a head
         // teardown/re-attach; ride the CURRENT connection instead.
-        auto sock = get_socket(ctx->endpoint);
+        auto sock = resolve_bound_socket(ctx);
         if (sock == nullptr) {
             // Fail-open: ggml_backend_tensor_copy treats a false return as a
             // normal miss and falls back to a host round-trip — never abort
@@ -731,7 +754,7 @@ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     // #470: re-resolve (see set_tensor) — a clear on the CURRENT connection,
     // never on a dead cached sock.
-    auto sock = get_socket(ctx->endpoint);
+    auto sock = resolve_bound_socket(ctx);
     if (sock == nullptr) {
         GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip BUFFER_CLEAR\n",
                    __func__, ctx->endpoint.c_str());
@@ -768,9 +791,10 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     if (response.remote_ptr != 0) {
+        uint64_t conn_id = sock->connection_id();
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, buft_ctx->endpoint, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, buft_ctx->endpoint, nullptr, response.remote_ptr, conn_id},
             response.remote_size);
         return buffer;
     } else {
@@ -1187,7 +1211,7 @@ struct ggml_tensor * ggml_backend_rpc_bind_remote_tensor(const char * endpoint, 
         // #470: carry the endpoint so the data-path ops on this bound-tensor
         // buffer can re-resolve via get_socket (COMBINED expert tensors are
         // exactly the pre-re-attach buffers that used to hold the dead sock).
-        new ggml_backend_rpc_buffer_context{sock, endpoint, nullptr, response.buffer},
+        new ggml_backend_rpc_buffer_context{sock, endpoint, nullptr, response.buffer, sock->connection_id()},
         response.buffer_size);
     // Every current caller binds a weight tensor (COMBINED expert tensors).
     // ggml_backend_buffer_init defaults usage to ANY; the scheduler's
