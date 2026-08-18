@@ -23,6 +23,12 @@ struct socket_t {
     // instead of handing them out (issue #634, smoke #8).
     bool is_peer_alive() const;
 
+    // Monotonic connection identifier. Two socket_t instances from different
+    // TCP connections to the same endpoint always have different ids. Used by
+    // ggml-rpc to detect stale remote_ptr references (buffer outlived its
+    // connection).
+    uint64_t connection_id() const;
+
     socket_ptr accept();
 
     void get_caps(uint8_t * local_caps);
