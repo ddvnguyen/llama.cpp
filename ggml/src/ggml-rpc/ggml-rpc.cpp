@@ -293,6 +293,21 @@ struct ggml_backend_rpc_device_context {
 // full GRAPH_COMPUTE (re-serialized with current data pointers).
 static void ggml_backend_rpc_invalidate_recompute(const std::string & endpoint);
 
+// #470 Option B: helper to set peer_reconnected flag on the device that owns
+// a buffer, given the buffer's buffer_type. Used by fail-soft paths in buffer
+// functions when the peer restarts (RPC fails, stale pointers, etc.).
+static void rpc_set_reconnect_flag(ggml_backend_buffer_t buffer, const char * func) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buffer->buft);
+    if (dev) {
+        ggml_backend_rpc_device_context * dev_ctx =
+            (ggml_backend_rpc_device_context *)dev->context;
+        if (!dev_ctx->peer_reconnected.exchange(true, std::memory_order_acq_rel)) {
+            GGML_LOG_WARN("[%s] peer reconnection detected — "
+                          "engine will trigger T3 rebuild\n", func);
+        }
+    }
+}
+
 struct ggml_backend_rpc_buffer_type_context {
     std::string endpoint;
     uint32_t    device;
@@ -527,16 +542,17 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     // #470: re-resolve — the free must ride the CURRENT connection, not the
     // socket captured at alloc time (dead after a head teardown/re-attach).
-    // No error channel: a genuinely unreachable peer aborts loudly rather
-    // than silently leaking the peer allocation (correctness-preserving).
     auto sock = get_socket(ctx->endpoint);
     if (sock == nullptr) {
-        GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip FREE_BUFFER\n",
-                   __func__, ctx->endpoint.c_str());
+        // #470 Option B: fail-soft
+        rpc_set_reconnect_flag(buffer, __func__);
+        return;
     }
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_set_reconnect_flag(buffer, __func__);
+    }
     // #470: freeing the buffer frees the peer memory the server's stored graph
     // points into. Reset the recompute fast-path so the next compute with a
     // recycled graph uid is a full GRAPH_COMPUTE (fresh data pointers), never
@@ -556,13 +572,17 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     // happy path (mutex + map lookup, no network).
     auto sock = get_socket(ctx->endpoint);
     if (sock == nullptr) {
-        GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to return a stale base pointer\n",
-                   __func__, ctx->endpoint.c_str());
+        // #470 Option B: fail-soft
+        rpc_set_reconnect_flag(buffer, __func__);
+        return nullptr;
     }
     rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_set_reconnect_flag(buffer, __func__);
+        return nullptr;
+    }
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
     return ctx->base_ptr;
 }
@@ -627,15 +647,14 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
         request.tensor = serialize_tensor(tensor);
 
         if (sock == nullptr) {
-            // No error channel: abort loudly rather than silently skipping
-            // the server-side padding init (correctness-preserving). In
-            // practice get_socket's reconnect fixes the dead fd, so this
-            // only fires when the peer is genuinely unreachable.
-            GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip INIT_TENSOR\n",
-                       __func__, ctx->endpoint.c_str());
+            // #470 Option B: fail-soft
+            rpc_set_reconnect_flag(buffer, __func__);
+            return GGML_STATUS_SUCCESS;
         }
         bool status = send_rpc_cmd(sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
-        RPC_STATUS_ASSERT(status);
+        if (!status) {
+            rpc_set_reconnect_flag(buffer, __func__);
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -648,8 +667,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     // reconnect fixes the dead fd in the COMBINED teardown/re-attach case.
     auto sock = get_socket(ctx->endpoint);
     if (sock == nullptr) {
-        GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip SET_TENSOR\n",
-                   __func__, ctx->endpoint.c_str());
+        // #470 Option B: fail-soft
+        rpc_set_reconnect_flag(buffer, __func__);
+        return;
     }
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     if (size > HASH_THRESHOLD) {
@@ -659,7 +679,10 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         request.hash = fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
         bool status = send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
+        if (!status) {
+            rpc_set_reconnect_flag(buffer, __func__);
+            return;
+        }
         if (response.result) {
             // the server has the same data, no need to send it
             return;
@@ -672,7 +695,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
     bool status = send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_set_reconnect_flag(buffer, __func__);
+    }
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -681,15 +706,19 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     // the read; the reconnect rides the current connection instead.
     auto sock = get_socket(ctx->endpoint);
     if (sock == nullptr) {
-        GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to return garbage for GET_TENSOR\n",
-                   __func__, ctx->endpoint.c_str());
+        // #470 Option B: fail-soft
+        rpc_set_reconnect_flag(buffer, __func__);
+        return;
     }
     rpc_msg_get_tensor_req request;
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
     request.size = size;
     bool status = send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        // #470 Option B: fail-soft instead of RPC_STATUS_ASSERT crash
+        rpc_set_reconnect_flag(buffer, __func__);
+    }
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -737,12 +766,15 @@ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     // never on a dead cached sock.
     auto sock = get_socket(ctx->endpoint);
     if (sock == nullptr) {
-        GGML_ABORT("[%s] cannot reach peer %s (reconnect failed) — refusing to silently skip BUFFER_CLEAR\n",
-                   __func__, ctx->endpoint.c_str());
+        // #470 Option B: fail-soft
+        rpc_set_reconnect_flag(buffer, __func__);
+        return;
     }
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
     bool status = send_rpc_cmd(sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_set_reconnect_flag(buffer, __func__);
+    }
 }
 
 static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
