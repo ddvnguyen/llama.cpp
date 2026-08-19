@@ -6404,7 +6404,7 @@ private:
     // Falls through to load_model() for the actual unload+reload
     // cycle (which handles mmproj, MTP/draft, slot rebuild, etc.).
     // On failure: rollback by reloading the old params_base.
-    bool apply_t3_rebuild() {
+    bool apply_t3_rebuild(bool force = false) {
         bool is_first_load = !ctx_tgt;
 
         // Track the last override_tensor string that was actually
@@ -6585,7 +6585,7 @@ private:
                 swapped_params.split_mode == old_params.split_mode &&
                 ((cur_override == nullptr && old_override_applied.empty()) ||
                  (cur_override && old_override_applied == cur_override));
-            if (params_unchanged && reload_unchanged) {
+            if (params_unchanged && reload_unchanged && !force) {
                 // T3 overrides (override_tensor, split_mode) were staged by
                 // the COMPLETION hydra_config path. But the model reload is
                 // being skipped. Clear the staged override so the next decode
@@ -6711,6 +6711,19 @@ private:
                 } else if (!ctx_tgt && first_load_pending) {
                     SRV_INF("%s", "hydra: slot-free moment — first load (no context yet)\n");
                     apply_pending_hydra_config();
+                }
+
+                // #470 Option B: check if a peer reconnection was detected
+                // during graph_compute. If so, trigger a T3 rebuild to
+                // re-provision model layers on the fresh peer.
+                if (ctx_tgt && ctx_tgt->peer_reconnection_pending) {
+                    ctx_tgt->peer_reconnection_pending = false;
+                    SRV_WRN("%s", "hydra: peer reconnection detected — triggering T3 rebuild\n");
+                    // Force a T3 rebuild even if model config hasn't changed.
+                    // The peer's buffers are gone, so we need to re-push.
+                    if (!apply_t3_rebuild(true)) {
+                        SRV_ERR("%s", "hydra: T3 rebuild after peer reconnection failed\n");
+                    }
                 }
 
                 return;

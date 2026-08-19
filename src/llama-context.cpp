@@ -1466,6 +1466,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        // #470 Option B: after graph_compute failure, check if any RPC peer
+        // reconnected. If so, set the flag so the server can trigger a T3 rebuild.
+        ggml_backend_reg_t reg = ggml_backend_reg_get(0);
+        if (reg) {
+            for (uint32_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+                ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, i);
+                if (!dev) continue;
+                const char * dev_name = ggml_backend_dev_name(dev);
+                if (dev_name && strncmp(dev_name, "RPC", 3) == 0) {
+                    auto check_fn = (bool(*)(uint32_t)) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_rpc_check_peer_reconnection");
+                    if (check_fn && check_fn(i)) {
+                        LLAMA_LOG_WARN("%s: peer reconnection detected on device %u (%s) — "
+                                       "flagging T3 rebuild\n", __func__, i, dev_name);
+                        peer_reconnection_pending = true;
+                    }
+                }
+            }
+        }
         ret = status;
         return nullptr;
     }

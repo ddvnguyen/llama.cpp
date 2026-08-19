@@ -84,6 +84,12 @@ GGML_BACKEND_API void ggml_backend_rpc_clear_local_tensors(void);
 // must rebind (or fall back to solo). Cheap — reads one atomic.
 GGML_BACKEND_API uint32_t ggml_backend_rpc_get_registry_epoch(void);
 
+// #470 Option B: check if the peer for a given device reconnected since the
+// last call. Returns true once per reconnection event (flag is cleared on read).
+// The engine calls this after graph_compute fails to decide whether to trigger
+// a T3 rebuild (re-provision) or treat it as a transient error.
+GGML_BACKEND_API bool ggml_backend_rpc_check_peer_reconnection(uint32_t device_idx);
+
 // #368: fetch the peer's current registry epoch over RPC (uses
 // RPC_CMD_RESOLVE_TENSOR on a sentinel name and reads back the epoch).
 // Returns 0 on any failure (peer unreachable, RPC error, peer doesn't

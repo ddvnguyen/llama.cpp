@@ -280,6 +280,10 @@ struct ggml_backend_rpc_device_context {
     // identity at compute time (lock-free; get_socket never touches the
     // registry mutex, so no lock-order inversion with ggml_backend_rpc_add_server).
     std::weak_ptr<socket_t> last_sock;
+    // #470 Option B: set when a peer reconnection is detected (last_sock changed).
+    // The engine checks this after graph_compute and triggers a T3 rebuild to
+    // re-provision model layers on the fresh peer. Cleared by check function.
+    std::atomic<bool> peer_reconnected{false};
 };
 
 // Forward declaration — defined after ggml_backend_rpc_reg_context (needs the
@@ -941,6 +945,16 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     if (rpc_dev_ctx->last_sock.lock() != sock) {
         rpc_dev_ctx->last_graph_uid = 0;
         rpc_dev_ctx->last_sock      = sock;
+        // #470 Option B: signal that the peer reconnected — the engine
+        // must re-provision model layers (T3 rebuild) before compute can
+        // succeed on this peer again.
+        rpc_dev_ctx->peer_reconnected.store(true, std::memory_order_release);
+        GGML_LOG_WARN("[%s] peer %s reconnected — stale buffers, "
+                      "engine should trigger re-provision\n",
+                      __func__, rpc_ctx->endpoint.c_str());
+        // Return FAILED so the engine knows the peer needs re-provision.
+        // The caller (engine) will detect this and trigger T3 rebuild.
+        return GGML_STATUS_FAILED;
     }
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
     if (reuse) {
@@ -1084,6 +1098,37 @@ std::atomic<uint32_t> g_hydra_registry_epoch{0};
 
 uint32_t ggml_backend_rpc_get_registry_epoch(void) {
     return g_hydra_registry_epoch.load(std::memory_order_acquire);
+}
+
+// #470 Option B: check if the peer for a given device reconnected since the
+// last call. Returns true once per reconnection event (flag is cleared on read).
+// The engine calls this after graph_compute fails to decide whether to trigger
+// a T3 rebuild (re-provision) or treat it as a transient error.
+bool ggml_backend_rpc_check_peer_reconnection(uint32_t device_idx) {
+    // Get the RPC backend registry (index 0 is the first registered backend)
+    ggml_backend_reg_t reg = ggml_backend_reg_get(0);
+    if (!reg) {
+        return false;
+    }
+    // Check if the device index is valid
+    size_t dev_count = ggml_backend_reg_dev_count(reg);
+    if (device_idx >= dev_count) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, device_idx);
+    if (!dev) {
+        return false;
+    }
+    // Check if this is an RPC device by name
+    const char * name = ggml_backend_dev_name(dev);
+    if (!name || strncmp(name, "RPC", 3) != 0) {
+        return false;
+    }
+    // The device context is stored in dev->context — but we need to cast it
+    // to our specific context type. Since we know this is an RPC device
+    // (checked by name), we can safely cast.
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    return ctx->peer_reconnected.exchange(false, std::memory_order_acquire);
 }
 
 void ggml_backend_rpc_register_local_tensor(const char * name, struct ggml_tensor * tensor) {
@@ -2604,6 +2649,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_get_registry_epoch") == 0) {
         return (void *)ggml_backend_rpc_get_registry_epoch;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_check_peer_reconnection") == 0) {
+        return (void *)ggml_backend_rpc_check_peer_reconnection;
     }
     if (std::strcmp(name, "ggml_backend_rpc_get_remote_registry_epoch") == 0) {
         return (void *)ggml_backend_rpc_get_remote_registry_epoch;

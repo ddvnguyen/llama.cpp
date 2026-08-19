@@ -450,4 +450,10 @@ private:
     std::string hydra_pending_config_json;
     std::string hydra_pending_config_tier;
     time_t      hydra_pending_config_set_at = 0;
+
+public:
+    // #470 Option B: flag set by graph_compute when a peer reconnection is
+    // detected. The server checks this in update_slots() and triggers a
+    // T3 rebuild to re-provision model layers on the fresh peer.
+    bool peer_reconnection_pending = false;
 };
