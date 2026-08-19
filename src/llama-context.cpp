@@ -2534,6 +2534,26 @@ ggml_status llama_context::graph_compute(
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+        // #470 Option B: check if any RPC peer reconnected — if so, set the
+        // peer_reconnection_pending flag so the server triggers T3 rebuild.
+        ggml_backend_reg_t reg = ggml_backend_reg_get(0);
+        if (reg) {
+            for (uint32_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+                ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, i);
+                if (!dev) continue;
+                const char * dev_name = ggml_backend_dev_name(dev);
+                if (dev_name && strncmp(dev_name, "RPC", 3) == 0) {
+                    auto check_fn = (bool(*)(uint32_t)) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_rpc_check_peer_reconnection");
+                    if (check_fn && check_fn(i)) {
+                        LLAMA_LOG_WARN("%s: peer reconnection detected on device %u (%s) — "
+                                       "setting peer_reconnection_pending for T3 rebuild\n",
+                                       __func__, i, dev_name);
+                        peer_reconnection_pending = true;
+                    }
+                }
+            }
+        }
     } else {
         // Force completion before unlocking so a concurrent RPC-driven
         // compute on the shared backend can't start while this async
