@@ -3022,7 +3022,15 @@ private:
                     // takes effect. hydra_apply_t3_mutators() is a no-op
                     // when no T3 keys are staged.
                     hydra_apply_t3_mutators(ctx_tgt, result.t2t3_subset, result.deferred_keys);
-                    if (!apply_t3_rebuild()) {
+                    // #470: force rebuild if a peer reconnection was detected
+                    // during a prior graph_compute — the peer's buffers are gone
+                    // even though model/params haven't changed.
+                    const bool reconn_force = (ctx_tgt && ctx_tgt->peer_reconnection_pending);
+                    if (reconn_force) {
+                        ctx_tgt->peer_reconnection_pending = false;
+                        SRV_WRN("%s", "hydra: PREFILL handler: peer reconnection pending — forcing T3 rebuild\n");
+                    }
+                    if (!apply_t3_rebuild(reconn_force)) {
                         result.ok = false;
                         result.error = "T3 rebuild failed";
                         return result;
@@ -4168,6 +4176,18 @@ private:
                     // T1 keys (sampling, n_predict, etc.) are applied in-place.
                     // T2/T3 keys (n_ctx, cache_type, model_path, split_mode, etc.)
                     // trigger immediate rebuilds on this task-queue thread.
+
+                    // #470: Before applying config, probe all RPC peers for
+                    // reconnection. If a peer restarted since the last request,
+                    // its buffers are gone even though model/params haven't
+                    // changed. Without this probe, the T3 rebuild in
+                    // hydra_apply_config → apply_t3_rebuild would skip (params
+                    // unchanged) and the subsequent graph_compute would fail.
+                    if (ctx_tgt && ggml_backend_rpc_check_any_peer_reconnection()) {
+                        SRV_WRN("%s", "hydra: PREFILL: RPC peer reconnected — forcing T3 rebuild\n");
+                        ctx_tgt->peer_reconnection_pending = true;
+                    }
+
                     if (has_hydra_config) {
                         SRV_INF("hydra: PREFILL slot=%d applying hydra_config (%zu keys)\n",
                                 id_slot, hydra_cfg.size());
@@ -5970,7 +5990,13 @@ private:
         //    the only apply that makes EVERY generic key take effect
         //    (speculative types need load_model's MTP/draft setup).
         if (tier == "T3" || tier == "T4") {
-            if (!apply_t3_rebuild()) {
+            // #470: force rebuild if a peer reconnection was detected
+            const bool reconn_force = (ctx_tgt && ctx_tgt->peer_reconnection_pending);
+            if (reconn_force) {
+                ctx_tgt->peer_reconnection_pending = false;
+                SRV_WRN("%s", "hydra: apply_pending: peer reconnection pending — forcing T3 rebuild\n");
+            }
+            if (!apply_t3_rebuild(reconn_force)) {
                 SRV_ERR("%s", "hydra: T3 rebuild failed; engine continues with old model\n");
                 ok = false;
             } else {

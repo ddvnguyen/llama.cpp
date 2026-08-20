@@ -1163,6 +1163,27 @@ bool ggml_backend_rpc_check_peer_reconnection(uint32_t device_idx) {
     return ctx->peer_reconnected.exchange(false, std::memory_order_acquire);
 }
 
+// #470: Check if ANY RPC peer has reconnected. Called from the PREFILL
+// handler to detect peer restarts before graph_compute runs.
+bool ggml_backend_rpc_check_any_peer_reconnection() {
+    ggml_backend_reg_t reg = ggml_backend_reg_get(0);
+    if (!reg) {
+        return false;
+    }
+    size_t dev_count = ggml_backend_reg_dev_count(reg);
+    for (size_t i = 0; i < dev_count; i++) {
+        ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, i);
+        if (!dev) continue;
+        const char * name = ggml_backend_dev_name(dev);
+        if (!name || strncmp(name, "RPC", 3) != 0) continue;
+        ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+        if (ctx && ctx->peer_reconnected.exchange(false, std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void ggml_backend_rpc_register_local_tensor(const char * name, struct ggml_tensor * tensor) {
     if (!tensor || !tensor->buffer || !tensor->data) {
         return;
@@ -2684,6 +2705,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_check_peer_reconnection") == 0) {
         return (void *)ggml_backend_rpc_check_peer_reconnection;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_check_any_peer_reconnection") == 0) {
+        return (void *)ggml_backend_rpc_check_any_peer_reconnection;
     }
     if (std::strcmp(name, "ggml_backend_rpc_get_remote_registry_epoch") == 0) {
         return (void *)ggml_backend_rpc_get_remote_registry_epoch;

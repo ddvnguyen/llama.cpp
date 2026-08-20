@@ -90,6 +90,10 @@ GGML_BACKEND_API uint32_t ggml_backend_rpc_get_registry_epoch(void);
 // a T3 rebuild (re-provision) or treat it as a transient error.
 GGML_BACKEND_API bool ggml_backend_rpc_check_peer_reconnection(uint32_t device_idx);
 
+// #470: check if ANY RPC peer has reconnected (used by PREFILL handler
+// to detect peer restarts before graph_compute runs)
+GGML_BACKEND_API bool ggml_backend_rpc_check_any_peer_reconnection();
+
 // #368: fetch the peer's current registry epoch over RPC (uses
 // RPC_CMD_RESOLVE_TENSOR on a sentinel name and reads back the epoch).
 // Returns 0 on any failure (peer unreachable, RPC error, peer doesn't
