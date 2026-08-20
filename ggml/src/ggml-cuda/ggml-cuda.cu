@@ -766,6 +766,87 @@ static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     return ctx->dev_ptr;
 }
 
+static bool ggml_backend_cuda_buffer_set_preferred_device(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buffer_is_cuda(buffer) || getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") == nullptr) {
+        return false;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    cudaMemLocation location = {};
+    location.type = cudaMemLocationTypeDevice;
+    location.id = ggml_cuda_get_physical_device(ctx->device);
+
+    ggml_cuda_set_device(ctx->device);
+    const cudaError_t err = cudaMemAdvise(
+        ctx->dev_ptr,
+        ggml_backend_buffer_get_size(buffer),
+        cudaMemAdviseSetPreferredLocation,
+        location);
+
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("failed to set GPU-preferred placement for %.2f MiB CUDA buffer: %s\n",
+            ggml_backend_buffer_get_size(buffer) / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return false;
+    }
+
+    GGML_LOG_INFO("set GPU-preferred placement for %.2f MiB model-weight buffer on device %d\n",
+        ggml_backend_buffer_get_size(buffer) / 1024.0 / 1024.0, ctx->device);
+    return true;
+}
+
+
+
+static bool ggml_backend_cuda_buffer_set_preferred_host(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buffer_is_cuda(buffer) || getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") == nullptr) {
+        return false;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    cudaMemLocation location = {};
+    location.type = cudaMemLocationTypeHost;
+
+    ggml_cuda_set_device(ctx->device);
+    cudaError_t err = cudaMemAdvise(
+        ctx->dev_ptr,
+        ggml_backend_buffer_get_size(buffer),
+        cudaMemAdviseSetPreferredLocation,
+        location);
+
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("failed to set host-preferred placement for %.2f MiB KV buffer: %s\n",
+            ggml_backend_buffer_get_size(buffer) / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return false;
+    }
+
+    if (getenv("GGML_CUDA_KV_ACCESSED_BY_GPU") != nullptr) {
+        cudaMemLocation gpu_location = {};
+        gpu_location.type = cudaMemLocationTypeDevice;
+        gpu_location.id = ggml_cuda_get_physical_device(ctx->device);
+
+        err = cudaMemAdvise(
+            ctx->dev_ptr,
+            ggml_backend_buffer_get_size(buffer),
+            cudaMemAdviseSetAccessedBy,
+            gpu_location);
+
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            GGML_LOG_WARN("failed to set GPU AccessedBy mapping for %.2f MiB KV buffer: %s\n",
+                ggml_backend_buffer_get_size(buffer) / 1024.0 / 1024.0, cudaGetErrorString(err));
+            return false;
+        }
+
+        GGML_LOG_INFO("set GPU AccessedBy mapping for %.2f MiB KV buffer on device %d\n",
+            ggml_backend_buffer_get_size(buffer) / 1024.0 / 1024.0, ctx->device);
+    }
+
+    GGML_LOG_INFO("set host-preferred placement for %.2f MiB KV buffer on device %d\n",
+        ggml_backend_buffer_get_size(buffer) / 1024.0 / 1024.0, ctx->device);
+    return true;
+}
+
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
