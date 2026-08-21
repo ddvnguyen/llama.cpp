@@ -136,7 +136,9 @@ static int64_t kv_stream_block_tokens(const ggml_tensor * dst, size_t stage_byte
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const size_t bytes_per_token = K->nb[1]*K->ne[2] + V->nb[1]*V->ne[2];
+    const size_t k_row_bytes = ggml_row_size(K->type, K->ne[0]);
+    const size_t v_row_bytes = ggml_row_size(V->type, V->ne[0]);
+    const size_t bytes_per_token = k_row_bytes*K->ne[2] + v_row_bytes*V->ne[2];
     if (bytes_per_token == 0) {
         return 0;
     }
@@ -144,9 +146,9 @@ static int64_t kv_stream_block_tokens(const ggml_tensor * dst, size_t stage_byte
     int64_t tokens = std::min<int64_t>(K->ne[1], stage_bytes/bytes_per_token);
     tokens = tokens/FATTN_KQ_STRIDE*FATTN_KQ_STRIDE;
     while (tokens > 0) {
-        const size_t k_bytes = K->nb[1]*tokens*K->ne[2];
+        const size_t k_bytes = k_row_bytes*tokens*K->ne[2];
         const size_t v_offset = GGML_PAD(k_bytes, 128);
-        const size_t v_bytes = V->nb[1]*tokens*V->ne[2];
+        const size_t v_bytes = v_row_bytes*tokens*V->ne[2];
         if (v_offset <= stage_bytes && v_bytes <= stage_bytes - v_offset) {
             return tokens;
         }
@@ -261,7 +263,9 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
         Q->ne[1] >= 1 && Q->ne[1] <= 2 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
         K->ne[1] == V->ne[1] && K->ne[2] == V->ne[2] &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 &&
-        ggml_is_contiguous(K) && ggml_is_contiguous(V) &&
+        K->nb[0] == ggml_element_size(K) && V->nb[0] == ggml_element_size(V) &&
+        K->nb[1] >= ggml_row_size(K->type, K->ne[0]) &&
+        V->nb[1] >= ggml_row_size(V->type, V->ne[0]) &&
         (mask == nullptr || (mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask))) &&
         sinks == nullptr && kv_stream_block_tokens(dst, stage_bytes) > 0;
 }
@@ -287,31 +291,39 @@ void ggml_cuda_flash_attn_ext_streamed(
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         const int64_t token_begin = chunk*block_tokens;
         const int64_t token_count = std::min<int64_t>(block_tokens, K->ne[1] - token_begin);
-        const size_t k_head_bytes = K->nb[1]*token_count;
+        const size_t k_row_bytes = ggml_row_size(K->type, K->ne[0]);
+        const size_t v_row_bytes = ggml_row_size(V->type, V->ne[0]);
+        const size_t k_head_bytes = k_row_bytes*token_count;
         const size_t k_bytes = k_head_bytes*K->ne[2];
         const size_t v_offset = GGML_PAD(k_bytes, 128);
-        const size_t v_head_bytes = V->nb[1]*token_count;
+        const size_t v_head_bytes = v_row_bytes*token_count;
         const size_t v_bytes = v_head_bytes*V->ne[2];
         GGML_ASSERT(v_offset <= stage_bytes && v_bytes <= stage_bytes - v_offset);
 
         char * stage = static_cast<char *>(stage_data);
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            stage, k_head_bytes,
-            static_cast<const char *>(K->data) + token_begin*K->nb[1], K->nb[2],
-            k_head_bytes, K->ne[2], cudaMemcpyHostToDevice, ctx.stream()));
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            stage + v_offset, v_head_bytes,
-            static_cast<const char *>(V->data) + token_begin*V->nb[1], V->nb[2],
-            v_head_bytes, V->ne[2], cudaMemcpyHostToDevice, ctx.stream()));
+        for (int64_t head = 0; head < K->ne[2]; ++head) {
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                stage + head*k_head_bytes, k_row_bytes,
+                static_cast<const char *>(K->data) + head*K->nb[2] + token_begin*K->nb[1], K->nb[1],
+                k_row_bytes, token_count, cudaMemcpyHostToDevice, ctx.stream()));
+        }
+        for (int64_t head = 0; head < V->ne[2]; ++head) {
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                stage + v_offset + head*v_head_bytes, v_row_bytes,
+                static_cast<const char *>(V->data) + head*V->nb[2] + token_begin*V->nb[1], V->nb[1],
+                v_row_bytes, token_count, cudaMemcpyHostToDevice, ctx.stream()));
+        }
 
         ggml_tensor staged_k = *K;
         ggml_tensor staged_v = *V;
         staged_k.data = stage;
         staged_k.ne[1] = token_count;
+        staged_k.nb[1] = k_row_bytes;
         staged_k.nb[2] = k_head_bytes;
         staged_k.nb[3] = k_bytes;
         staged_v.data = stage + v_offset;
         staged_v.ne[1] = token_count;
+        staged_v.nb[1] = v_row_bytes;
         staged_v.nb[2] = v_head_bytes;
         staged_v.nb[3] = v_bytes;
 

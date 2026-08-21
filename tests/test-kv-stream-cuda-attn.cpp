@@ -29,12 +29,15 @@ std::vector<uint8_t> pack_token_block(
         int64_t token_begin,
         int64_t token_count) {
     const size_t row_bytes = ggml_row_size(type, HEAD_DIM);
-    const size_t head_bytes = row_bytes*N_KV;
+    const size_t token_bytes = row_bytes*N_KV_HEAD;
     std::vector<uint8_t> result(row_bytes*token_count*N_KV_HEAD);
     for (int64_t head = 0; head < N_KV_HEAD; ++head) {
-        const uint8_t * src = source.data() + head*head_bytes + token_begin*row_bytes;
-        uint8_t * dst = result.data() + head*token_count*row_bytes;
-        std::copy_n(src, token_count*row_bytes, dst);
+        for (int64_t token = 0; token < token_count; ++token) {
+            const uint8_t * src = source.data() +
+                (token_begin + token)*token_bytes + head*row_bytes;
+            uint8_t * dst = result.data() + (head*token_count + token)*row_bytes;
+            std::copy_n(src, row_bytes, dst);
+        }
     }
     return result;
 }
@@ -106,10 +109,22 @@ std::vector<float> run_attention(
         compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, N_BATCH, N_Q_HEAD, 1);
     ggml_tensor * mask = ggml_new_tensor_4d(
         compute_ctx.get(), GGML_TYPE_F16, N_KV, N_BATCH, 1, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(
-        kv_ctx.get(), GGML_TYPE_Q8_0, HEAD_DIM, N_KV, N_KV_HEAD, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(
-        kv_ctx.get(), GGML_TYPE_Q4_0, HEAD_DIM, N_KV, N_KV_HEAD, 1);
+    ggml_tensor * k_storage = ggml_new_tensor_2d(
+        kv_ctx.get(), GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD, N_KV);
+    ggml_tensor * v_storage = ggml_new_tensor_2d(
+        kv_ctx.get(), GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD, N_KV);
+    ggml_tensor * k_cache = ggml_view_4d(
+        kv_ctx.get(), k_storage, HEAD_DIM, N_KV_HEAD, N_KV, 1,
+        ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM),
+        ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD),
+        ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD)*N_KV, 0);
+    ggml_tensor * v_cache = ggml_view_4d(
+        kv_ctx.get(), v_storage, HEAD_DIM, N_KV_HEAD, N_KV, 1,
+        ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM),
+        ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD),
+        ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD)*N_KV, 0);
+    ggml_tensor * k = ggml_permute(kv_ctx.get(), k_cache, 0, 2, 1, 3);
+    ggml_tensor * v = ggml_permute(kv_ctx.get(), v_cache, 0, 2, 1, 3);
 
     ggml_tensor * out = ggml_flash_attn_ext(
         compute_ctx.get(), q, k, v, mask, 1.0f/std::sqrt(float(HEAD_DIM)), 0.0f, 0.0f);
@@ -123,8 +138,8 @@ std::vector<float> run_attention(
     GGML_ASSERT(kv_buffer && compute_buffer);
 
     ggml_backend_tensor_set(q, inputs.q.data(), 0, inputs.q.size()*sizeof(float));
-    ggml_backend_tensor_set(k, inputs.k.data(), 0, inputs.k.size());
-    ggml_backend_tensor_set(v, inputs.v.data(), 0, inputs.v.size());
+    ggml_backend_tensor_set(k_storage, inputs.k.data(), 0, inputs.k.size());
+    ggml_backend_tensor_set(v_storage, inputs.v.data(), 0, inputs.v.size());
     ggml_backend_tensor_set(mask, inputs.mask.data(), 0, inputs.mask.size()*sizeof(uint16_t));
 
     ggml_cgraph * graph = ggml_new_graph_custom(compute_ctx.get(), N_TENSORS, false);
@@ -142,7 +157,7 @@ std::vector<float> run_attention(
 int main() {
     testing t;
 
-    t.test("two streamed Q8/Q4 blocks and query rows match ordinary CUDA attention", [](testing & t) {
+    t.test("real cache views stream two Q8/Q4 blocks and query rows exactly", [](testing & t) {
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
