@@ -1512,6 +1512,52 @@ uint32_t ggml_backend_cuda_kv_stream_stage_slots(ggml_backend_cuda_kv_stream_run
     return runtime == nullptr ? 0 : runtime->stage_slots;
 }
 
+bool ggml_backend_cuda_kv_stream_stage_upload(
+        ggml_backend_cuda_kv_stream_runtime_t runtime,
+        uint32_t slot,
+        size_t offset,
+        const void * source,
+        size_t size) {
+    if (runtime == nullptr || slot >= runtime->stage_slots ||
+        offset > runtime->stage_bytes || size > runtime->stage_bytes - offset ||
+        (size > 0 && source == nullptr)) {
+        return false;
+    }
+
+    ggml_cuda_set_device(runtime->device);
+    void * destination = static_cast<char *>(runtime->stage_data) + slot*runtime->stage_bytes + offset;
+    const cudaError_t error = cudaMemcpy(destination, source, size, cudaMemcpyHostToDevice);
+    if (error != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: staging upload failed: %s\n", __func__, cudaGetErrorString(error));
+        return false;
+    }
+    return true;
+}
+
+bool ggml_backend_cuda_kv_stream_stage_download(
+        ggml_backend_cuda_kv_stream_runtime_t runtime,
+        uint32_t slot,
+        size_t offset,
+        void * destination,
+        size_t size) {
+    if (runtime == nullptr || slot >= runtime->stage_slots ||
+        offset > runtime->stage_bytes || size > runtime->stage_bytes - offset ||
+        (size > 0 && destination == nullptr)) {
+        return false;
+    }
+
+    ggml_cuda_set_device(runtime->device);
+    const void * source = static_cast<const char *>(runtime->stage_data) + slot*runtime->stage_bytes + offset;
+    const cudaError_t error = cudaMemcpy(destination, source, size, cudaMemcpyDeviceToHost);
+    if (error != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: staging download failed: %s\n", __func__, cudaGetErrorString(error));
+        return false;
+    }
+    return true;
+}
+
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}

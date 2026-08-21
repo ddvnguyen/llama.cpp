@@ -2,6 +2,7 @@
 #include "testing.h"
 
 #include <cstdint>
+#include <vector>
 
 int main() {
     testing t;
@@ -115,6 +116,39 @@ int main() {
         t.assert_true("fill from streamed storage is rejected", !ggml_backend_dev_supports_op(device, &fill));
 
         ggml_backend_buffer_free(buffer);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+    });
+
+    t.test("stage slots round-trip bounded byte ranges", [](testing & t) {
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device      = 0;
+        params.stage_bytes = 64*1024;
+        params.stage_slots = 2;
+
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("runtime allocation succeeds", runtime != nullptr)) {
+            return;
+        }
+
+        std::vector<uint8_t> source(8192);
+        for (size_t i = 0; i < source.size(); ++i) {
+            source[i] = uint8_t((i*37 + 11) & 0xff);
+        }
+        std::vector<uint8_t> destination(source.size(), 0);
+
+        t.assert_true("bounded upload succeeds", ggml_backend_cuda_kv_stream_stage_upload(
+            runtime, 1, 123, source.data(), source.size()));
+        t.assert_true("bounded download succeeds", ggml_backend_cuda_kv_stream_stage_download(
+            runtime, 1, 123, destination.data(), destination.size()));
+        t.assert_true("round-trip bytes are exact", source == destination);
+
+        t.assert_true("invalid slot is rejected", !ggml_backend_cuda_kv_stream_stage_upload(
+            runtime, 2, 0, source.data(), source.size()));
+        t.assert_true("cross-slot range is rejected", !ggml_backend_cuda_kv_stream_stage_upload(
+            runtime, 0, params.stage_bytes - 16, source.data(), source.size()));
+        t.assert_true("null source is rejected", !ggml_backend_cuda_kv_stream_stage_upload(
+            runtime, 0, 0, nullptr, source.size()));
+
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
     });
 
