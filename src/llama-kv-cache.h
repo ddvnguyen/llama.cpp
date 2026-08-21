@@ -114,7 +114,8 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+                         size_t kv_stream_stage_bytes = 0);
 
     ~llama_kv_cache() = default;
 
@@ -289,6 +290,20 @@ private:
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
+    struct kv_stream_runtime_owner {
+        void * runtime = nullptr;
+        void (*free_fn)(void *) = nullptr;
+
+        ~kv_stream_runtime_owner() {
+            if (runtime != nullptr) {
+                free_fn(runtime);
+            }
+        }
+    };
+
+    // Declared before ctxs_bufs so the custom buffers release their runtime
+    // references before this owner releases the initial reference.
+    kv_stream_runtime_owner kv_stream_runtime;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())

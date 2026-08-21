@@ -79,7 +79,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                     size_t kv_stream_stage_bytes) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -162,6 +163,9 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    ggml_backend_dev_t kv_stream_dev = nullptr;
+    ggml_backend_buffer_type_t kv_stream_buft = nullptr;
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -218,6 +222,45 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            if (kv_stream_stage_bytes != 0 && !hparams.no_alloc) {
+                if (kv_stream_dev != nullptr && kv_stream_dev != dev) {
+                    throw std::runtime_error("block KV streaming requires every attention layer on one CUDA device");
+                }
+
+                if (kv_stream_runtime.runtime == nullptr) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    using runtime_new_fn_t = void * (*)(ggml_backend_dev_t, size_t, uint32_t);
+                    using runtime_free_fn_t = void (*)(void *);
+                    using buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
+
+                    auto * runtime_new_fn = (runtime_new_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_runtime_new_for_device");
+                    auto * runtime_free_fn = (runtime_free_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_runtime_free");
+                    auto * buffer_type_fn = (buffer_type_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_buffer_type");
+
+                    if (runtime_new_fn == nullptr || runtime_free_fn == nullptr || buffer_type_fn == nullptr) {
+                        throw std::runtime_error("block KV streaming requires the CUDA backend");
+                    }
+
+                    kv_stream_runtime.runtime = runtime_new_fn(dev, kv_stream_stage_bytes, 1);
+                    kv_stream_runtime.free_fn = runtime_free_fn;
+                    if (kv_stream_runtime.runtime == nullptr) {
+                        throw std::runtime_error("failed to create CUDA block KV streaming runtime");
+                    }
+
+                    kv_stream_buft = buffer_type_fn(kv_stream_runtime.runtime);
+                    if (kv_stream_buft == nullptr) {
+                        throw std::runtime_error("failed to obtain CUDA block KV streaming buffer type");
+                    }
+                    kv_stream_dev = dev;
+                }
+
+                buft = kv_stream_buft;
+                dev_name = ggml_backend_buft_name(buft);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -291,6 +334,19 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
         ggml_backend_buffer_clear(buf, 0);
+        if (kv_stream_stage_bytes == 0 && getenv("GGML_CUDA_PREFER_KV_HOST") != nullptr && ggml_backend_buffer_get_size(buf) > 0) {
+            ggml_backend_dev_t dev_kv = ggml_backend_buft_get_device(buft);
+            if (dev_kv != nullptr) {
+                ggml_backend_reg_t reg_kv = ggml_backend_dev_backend_reg(dev_kv);
+                using prefer_host_fn_t = bool (*)(ggml_backend_buffer_t);
+                auto * prefer_host_fn = (prefer_host_fn_t) ggml_backend_reg_get_proc_address(
+                    reg_kv, "ggml_backend_cuda_buffer_set_preferred_host");
+                if (prefer_host_fn != nullptr) {
+                    (void) prefer_host_fn(buf);
+                }
+            }
+        }
+
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 

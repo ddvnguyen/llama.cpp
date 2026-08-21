@@ -291,6 +291,8 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-kv-stream-plan.cpp)
 target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-kv-stream-config.cpp)
+target_include_directories(test-kv-stream-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-kv-stream-softmax.cpp)
 target_include_directories(test-kv-stream-softmax PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(
