@@ -163,6 +163,7 @@ struct kv_stream_graph_request {
     bool eligible = false;
     bool scheduled = false;
     bool consumed = false;
+    bool deadline_sample = false;
 };
 
 } // namespace
@@ -174,10 +175,18 @@ struct ggml_cuda_kv_stream_transfer_ring {
     uint32_t active_slots = 0;
     cudaStream_t copy_stream = nullptr;
     cudaEvent_t producer_ready = nullptr;
+    cudaEvent_t eval_start = nullptr;
+    cudaEvent_t eval_end = nullptr;
+    cudaEvent_t copy_sample_start = nullptr;
+    cudaEvent_t copy_sample_end = nullptr;
     std::vector<cudaEvent_t> ready;
     std::vector<cudaEvent_t> consumed;
     std::vector<uint8_t> slot_used;
     std::vector<size_t> slot_request;
+    uint32_t * ready_flags_host = nullptr;
+    uint32_t * ready_flags_device = nullptr;
+    uint64_t * deadline_counters_host = nullptr;
+    uint64_t * deadline_counters_device = nullptr;
 
     bool graph_active = false;
     uint32_t graph_layer_count = 0;
@@ -192,6 +201,15 @@ struct ggml_cuda_kv_stream_transfer_ring {
     uint64_t compute_stream_waits = 0;
     uint64_t stage_slot_reuses = 0;
     uint64_t cross_layer_prefetches = 0;
+    uint32_t current_occupancy = 0;
+    uint32_t ring_peak_occupancy = 0;
+    uint32_t current_ring_peak_occupancy = 0;
+    uint32_t last_ring_peak_occupancy = 0;
+    uint64_t current_epoch_uploads = 0;
+    double last_copy_engine_busy_ratio = 0.0;
+    bool timing_pending = false;
+    bool timing_current = false;
+    bool copy_sample_recorded = false;
 };
 
 ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
@@ -224,14 +242,51 @@ ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
         if (ring->producer_ready != nullptr) {
             (void) cudaEventDestroy(ring->producer_ready);
         }
+        if (ring->eval_start != nullptr) {
+            (void) cudaEventDestroy(ring->eval_start);
+        }
+        if (ring->eval_end != nullptr) {
+            (void) cudaEventDestroy(ring->eval_end);
+        }
+        if (ring->copy_sample_start != nullptr) {
+            (void) cudaEventDestroy(ring->copy_sample_start);
+        }
+        if (ring->copy_sample_end != nullptr) {
+            (void) cudaEventDestroy(ring->copy_sample_end);
+        }
         if (ring->copy_stream != nullptr) {
             (void) cudaStreamDestroy(ring->copy_stream);
+        }
+        if (ring->ready_flags_host != nullptr) {
+            (void) cudaFreeHost(ring->ready_flags_host);
+        }
+        if (ring->deadline_counters_host != nullptr) {
+            (void) cudaFreeHost(ring->deadline_counters_host);
         }
         delete ring;
     };
 
+    if (cudaHostAlloc(reinterpret_cast<void **>(&ring->ready_flags_host),
+            stage_slots*sizeof(uint32_t), cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer(reinterpret_cast<void **>(&ring->ready_flags_device),
+            ring->ready_flags_host, 0) != cudaSuccess ||
+        cudaHostAlloc(reinterpret_cast<void **>(&ring->deadline_counters_host),
+            2*sizeof(uint64_t), cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer(reinterpret_cast<void **>(&ring->deadline_counters_device),
+            ring->deadline_counters_host, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        cleanup();
+        return nullptr;
+    }
+    std::fill_n(ring->ready_flags_host, stage_slots, 0u);
+    std::fill_n(ring->deadline_counters_host, 2, uint64_t(0));
+
     if (cudaStreamCreateWithFlags(&ring->copy_stream, cudaStreamNonBlocking) != cudaSuccess ||
-        cudaEventCreateWithFlags(&ring->producer_ready, cudaEventDisableTiming) != cudaSuccess) {
+        cudaEventCreateWithFlags(&ring->producer_ready, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreate(&ring->eval_start) != cudaSuccess ||
+        cudaEventCreate(&ring->eval_end) != cudaSuccess ||
+        cudaEventCreate(&ring->copy_sample_start) != cudaSuccess ||
+        cudaEventCreate(&ring->copy_sample_end) != cudaSuccess) {
         (void) cudaGetLastError();
         cleanup();
         return nullptr;
@@ -259,7 +314,13 @@ void ggml_cuda_kv_stream_transfer_ring_free(ggml_cuda_kv_stream_transfer_ring * 
         CUDA_CHECK(cudaEventDestroy(event));
     }
     CUDA_CHECK(cudaEventDestroy(ring->producer_ready));
+    CUDA_CHECK(cudaEventDestroy(ring->eval_start));
+    CUDA_CHECK(cudaEventDestroy(ring->eval_end));
+    CUDA_CHECK(cudaEventDestroy(ring->copy_sample_start));
+    CUDA_CHECK(cudaEventDestroy(ring->copy_sample_end));
     CUDA_CHECK(cudaStreamDestroy(ring->copy_stream));
+    CUDA_CHECK(cudaFreeHost(ring->ready_flags_host));
+    CUDA_CHECK(cudaFreeHost(ring->deadline_counters_host));
     delete ring;
 }
 
@@ -282,6 +343,9 @@ ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
         ring->compute_stream_waits,
         ring->stage_slot_reuses,
         ring->cross_layer_prefetches,
+        ring->deadline_counters_host[0],
+        ring->deadline_counters_host[1],
+        ring->ring_peak_occupancy,
     };
 }
 
@@ -418,11 +482,13 @@ static __global__ void kv_stream_combine_chunk_results(
         float * dst,
         int nrows,
         int nchunks) {
+    ggml_cuda_pdl_lc();
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     if (row >= nrows || tid >= D) {
         return;
     }
+    ggml_cuda_pdl_sync();
 
     float maximum = -FLT_MAX;
     for (int chunk = 0; chunk < nchunks; ++chunk) {
@@ -526,6 +592,44 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
 
 namespace {
 
+static __global__ void kv_stream_record_deadline(
+        const uint32_t * ready_flag,
+        uint64_t * samples,
+        uint64_t * misses) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        atomicAdd(reinterpret_cast<unsigned long long *>(samples), 1ULL);
+        if (*ready_flag == 0) {
+            atomicAdd(reinterpret_cast<unsigned long long *>(misses), 1ULL);
+        }
+    }
+}
+
+static bool kv_stream_collect_timing(ggml_cuda_kv_stream_transfer_ring * ring) {
+    if (!ring->timing_pending) {
+        return true;
+    }
+    const cudaError_t status = cudaEventQuery(ring->eval_end);
+    if (status == cudaErrorNotReady) {
+        return false;
+    }
+    CUDA_CHECK(status);
+
+    float eval_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&eval_ms, ring->eval_start, ring->eval_end));
+    double busy_ratio = 0.0;
+    if (ring->copy_sample_recorded && eval_ms > 0.0f && ring->current_epoch_uploads > 0) {
+        float copy_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(
+            &copy_ms, ring->copy_sample_start, ring->copy_sample_end));
+        busy_ratio = std::min(1.0,
+            double(copy_ms)*double(ring->current_epoch_uploads)/double(eval_ms));
+    }
+    ring->last_copy_engine_busy_ratio = busy_ratio;
+    ring->last_ring_peak_occupancy = ring->current_ring_peak_occupancy;
+    ring->timing_pending = false;
+    return true;
+}
+
 static void kv_stream_graph_upload(
         ggml_cuda_kv_stream_transfer_ring * ring,
         kv_stream_graph_request & request,
@@ -534,6 +638,13 @@ static void kv_stream_graph_upload(
     if (ring->slot_used[slot]) {
         CUDA_CHECK(cudaStreamWaitEvent(ring->copy_stream, ring->consumed[slot], 0));
         ++ring->stage_slot_reuses;
+    }
+    if (request.deadline_sample) {
+        CUDA_CHECK(cudaMemsetAsync(
+            ring->ready_flags_device + slot, 0, sizeof(uint32_t), ring->copy_stream));
+    }
+    if (ring->timing_current && !ring->copy_sample_recorded) {
+        CUDA_CHECK(cudaEventRecord(ring->copy_sample_start, ring->copy_stream));
     }
     for (int64_t head = 0; head < request.n_head_kv; ++head) {
         CUDA_CHECK(cudaMemcpy2DAsync(
@@ -551,12 +662,26 @@ static void kv_stream_graph_upload(
             request.v_row_bytes, request.token_count,
             cudaMemcpyHostToDevice, ring->copy_stream));
     }
+    if (request.deadline_sample) {
+        CUDA_CHECK(cudaMemsetAsync(
+            ring->ready_flags_device + slot, 1, sizeof(uint32_t), ring->copy_stream));
+    }
+    if (ring->timing_current && !ring->copy_sample_recorded) {
+        CUDA_CHECK(cudaEventRecord(ring->copy_sample_end, ring->copy_stream));
+        ring->copy_sample_recorded = true;
+    }
     CUDA_CHECK(cudaEventRecord(ring->ready[slot], ring->copy_stream));
     request.slot = slot;
     request.scheduled = true;
     ring->slot_used[slot] = 1;
     ring->slot_request[slot] = size_t(&request - ring->graph_requests.data());
+    ++ring->current_occupancy;
+    ring->ring_peak_occupancy = std::max(
+        ring->ring_peak_occupancy, ring->current_occupancy);
+    ring->current_ring_peak_occupancy = std::max(
+        ring->current_ring_peak_occupancy, ring->current_occupancy);
     ++ring->asynchronous_page_uploads;
+    ++ring->current_epoch_uploads;
     if (ring->graph_resident_cache != nullptr) {
         ring->graph_resident_cache->stats.host_to_device_bytes +=
             request.k_bytes + request.v_bytes;
@@ -638,6 +763,8 @@ static void kv_stream_graph_release(
     CUDA_CHECK(cudaEventRecord(ring->consumed[slot], compute_stream));
     request.consumed = true;
     ring->slot_request[slot] = KV_STREAM_NO_REQUEST;
+    GGML_ASSERT(ring->current_occupancy > 0);
+    --ring->current_occupancy;
     (void) kv_stream_graph_schedule_slot(ring, slot);
 }
 
@@ -645,6 +772,7 @@ static void kv_stream_graph_release(
 
 void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
     GGML_ASSERT(ring != nullptr);
+    const bool timing_available = kv_stream_collect_timing(ring);
     ring->graph_active = true;
     ring->graph_layer_count = 0;
     ring->current_layer = KV_STREAM_NO_LAYER;
@@ -653,6 +781,13 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
     ring->graph_requests.clear();
     ring->graph_layer_by_k.clear();
     ring->graph_request_by_k_page.clear();
+    ring->current_occupancy = 0;
+    if (timing_available) {
+        ring->current_ring_peak_occupancy = 0;
+        ring->current_epoch_uploads = 0;
+        ring->copy_sample_recorded = false;
+    }
+    ring->timing_current = timing_available;
     std::fill(ring->slot_request.begin(), ring->slot_request.end(), KV_STREAM_NO_REQUEST);
 }
 
@@ -661,15 +796,25 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         ggml_cuda_kv_stream_resident_cache * resident_cache,
         const ggml_tensor * dst) {
     GGML_ASSERT(ring != nullptr);
-    if (resident_cache == nullptr || dst == nullptr || dst->src[0]->ne[1] != 1 ||
+    if (resident_cache == nullptr || dst == nullptr ||
             !ggml_cuda_flash_attn_ext_streamed_supported(dst, ring->page_bytes)) {
         return false;
     }
     if (ring->graph_resident_cache != nullptr && ring->graph_resident_cache != resident_cache) {
         return false;
     }
+    if (dst->src[0]->ne[1] != 1) {
+        // Graphs are rebuilt across warmup, prompt chunks, and slot reuse.
+        // Relearn pointer-to-layer identity once per prefill graph while the
+        // resident page contents are refreshed by the local multi-token path.
+        if (ring->graph_resident_cache == nullptr) {
+            resident_cache->layer_by_k.clear();
+            resident_cache->next_layer = 0;
+            ring->graph_resident_cache = resident_cache;
+        }
+        return false;
+    }
     ring->graph_resident_cache = resident_cache;
-
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     // Resident placement is stable across evaluations, while deadlines must
@@ -683,6 +828,7 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     auto & page_requests = ring->graph_request_by_k_page[K->data];
     page_requests.assign(nchunks, KV_STREAM_NO_REQUEST);
 
+    bool sampled_first_streamed_page = false;
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         const uint32_t page = uint32_t(chunk);
         if (page < resident_cache->resident_pages_per_layer) {
@@ -713,6 +859,8 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         request.layer = layer;
         request.mutable_tail = chunk == nchunks - 1;
         request.eligible = !request.mutable_tail;
+        request.deadline_sample = !sampled_first_streamed_page || request.mutable_tail;
+        sampled_first_streamed_page = true;
         GGML_ASSERT(request.v_offset + request.v_bytes == ring->page_bytes);
 
         page_requests[page] = ring->graph_requests.size();
@@ -721,9 +869,37 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     return true;
 }
 
-void ggml_cuda_kv_stream_graph_finalize(ggml_cuda_kv_stream_transfer_ring * ring) {
+void ggml_cuda_kv_stream_graph_finalize(
+        ggml_cuda_kv_stream_transfer_ring * ring, cudaStream_t compute_stream) {
     GGML_ASSERT(ring != nullptr);
+    if (ring->timing_current) {
+        CUDA_CHECK(cudaEventRecord(ring->eval_start, compute_stream));
+    }
     kv_stream_graph_fill_free_slots(ring);
+}
+
+void ggml_cuda_kv_stream_graph_end(
+        ggml_cuda_kv_stream_transfer_ring * ring, cudaStream_t compute_stream) {
+    GGML_ASSERT(ring != nullptr);
+    if (ring->timing_current) {
+        CUDA_CHECK(cudaEventRecord(ring->eval_end, compute_stream));
+        ring->timing_pending = true;
+        ring->timing_current = false;
+    }
+}
+
+double ggml_cuda_kv_stream_copy_engine_busy_ratio(
+        ggml_cuda_kv_stream_transfer_ring * ring) {
+    if (ring == nullptr) {
+        return 0.0;
+    }
+    (void) kv_stream_collect_timing(ring);
+    return ring->last_copy_engine_busy_ratio;
+}
+
+uint32_t ggml_cuda_kv_stream_last_ring_peak_occupancy(
+        const ggml_cuda_kv_stream_transfer_ring * ring) {
+    return ring == nullptr ? 0 : ring->last_ring_peak_occupancy;
 }
 
 void ggml_cuda_flash_attn_ext_streamed(
@@ -812,7 +988,11 @@ void ggml_cuda_flash_attn_ext_streamed(
                 if (resident_cache->loaded[resident_index]) {
                     ++resident_cache->stats.resident_hits;
                     // The final page contains the rows most recently changed by SET_ROWS.
-                    desc.upload = chunk == nchunks - 1;
+                    // Multi-token SET_ROWS may change any page covered by the
+                    // prefill batch. Refresh resident pages after its producer
+                    // event; only decode can safely treat non-tail pages as
+                    // immutable without explicit dirty-page tracking.
+                    desc.upload = dst->src[0]->ne[1] > 1 || chunk == nchunks - 1;
                 } else {
                     ++resident_cache->stats.resident_misses;
                     resident_cache->loaded[resident_index] = 1;
@@ -898,6 +1078,13 @@ void ggml_cuda_flash_attn_ext_streamed(
                 desc.slot = request.slot;
                 desc.stage = transfer_ring->pool_data +
                     size_t(desc.slot)*transfer_ring->page_bytes;
+                if (request.deadline_sample) {
+                    kv_stream_record_deadline<<<1, 1, 0, ctx.stream()>>>(
+                        transfer_ring->ready_flags_device + desc.slot,
+                        transfer_ring->deadline_counters_device + 0,
+                        transfer_ring->deadline_counters_device + 1);
+                    CUDA_CHECK(cudaGetLastError());
+                }
             }
             CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), transfer_ring->ready[desc.slot], 0));
             ++transfer_ring->compute_stream_waits;

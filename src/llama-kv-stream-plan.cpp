@@ -427,3 +427,29 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
     result.valid = true;
     return result;
 }
+
+llama_kv_stream_feedback_delta llama_kv_stream_feedback_delta_make(
+        const llama_kv_stream_feedback_counters & current,
+        const llama_kv_stream_feedback_counters & previous) {
+    llama_kv_stream_feedback_delta result;
+    if (current.deadline_samples < previous.deadline_samples ||
+            current.deadline_misses < previous.deadline_misses) {
+        result.error = "KV stream feedback counters moved backwards";
+        return result;
+    }
+
+    result.deadline_samples = current.deadline_samples - previous.deadline_samples;
+    result.deadline_misses = current.deadline_misses - previous.deadline_misses;
+    if (result.deadline_misses > result.deadline_samples) {
+        result.error = "KV stream deadline misses exceed samples";
+        return result;
+    }
+
+    result.valid = true;
+    result.has_evaluation = result.deadline_samples != 0;
+    if (result.has_evaluation) {
+        result.deadline_miss_ratio =
+            double(result.deadline_misses)/double(result.deadline_samples);
+    }
+    return result;
+}

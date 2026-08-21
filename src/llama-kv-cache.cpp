@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-stream-plan.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -241,6 +242,8 @@ llama_kv_cache::llama_kv_cache(
                     using runtime_new_fn_t = void * (*)(ggml_backend_dev_t, size_t, size_t, uint32_t);
                     using runtime_free_fn_t = void (*)(void *);
                     using buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
+                    using feedback_fn_t = kv_stream_runtime_owner::feedback_fn_t;
+                    using repartition_fn_t = kv_stream_runtime_owner::repartition_fn_t;
 
                     auto * runtime_new_fn = (runtime_new_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_runtime_new_for_device");
@@ -248,8 +251,14 @@ llama_kv_cache::llama_kv_cache(
                         reg, "ggml_backend_cuda_kv_stream_runtime_free");
                     auto * buffer_type_fn = (buffer_type_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_buffer_type");
+                    auto * feedback_fn = (feedback_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_feedback");
+                    auto * repartition_fn = (repartition_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_repartition");
 
-                    if (runtime_new_fn == nullptr || runtime_free_fn == nullptr || buffer_type_fn == nullptr) {
+                    if (runtime_new_fn == nullptr || runtime_free_fn == nullptr ||
+                            buffer_type_fn == nullptr || feedback_fn == nullptr ||
+                            repartition_fn == nullptr) {
                         throw std::runtime_error("block KV streaming requires the CUDA backend");
                     }
 
@@ -259,6 +268,9 @@ llama_kv_cache::llama_kv_cache(
                     kv_stream_runtime.runtime = runtime_new_fn(
                         dev, kv_stream_stage_bytes, page_bytes, kv_stream_layer_count);
                     kv_stream_runtime.free_fn = runtime_free_fn;
+                    kv_stream_runtime.feedback_fn = feedback_fn;
+                    kv_stream_runtime.repartition_fn = repartition_fn;
+                    kv_stream_runtime.layer_count = kv_stream_layer_count;
                     if (kv_stream_runtime.runtime == nullptr) {
                         throw std::runtime_error("failed to create CUDA block KV streaming runtime");
                     }
@@ -1272,6 +1284,92 @@ uint32_t llama_kv_cache::get_size() const {
 
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
+}
+
+bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens) {
+    auto & owner = kv_stream_runtime;
+    if (owner.runtime == nullptr || owner.feedback_fn == nullptr ||
+            owner.repartition_fn == nullptr || owner.layer_count == 0) {
+        return false;
+    }
+
+    uint64_t deadline_samples = 0;
+    uint64_t deadline_misses = 0;
+    double copy_busy_ratio = 0.0;
+    uint32_t peak_occupancy = 0;
+    uint32_t ring_slots = 0;
+    uint32_t resident_pages = 0;
+    uint32_t controlled_pages = 0;
+    if (!owner.feedback_fn(owner.runtime,
+            &deadline_samples, &deadline_misses, &copy_busy_ratio,
+            &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages)) {
+        return false;
+    }
+
+    const auto delta = llama_kv_stream_feedback_delta_make(
+        { deadline_samples, deadline_misses },
+        { owner.previous_deadline_samples, owner.previous_deadline_misses });
+    owner.previous_deadline_samples = deadline_samples;
+    owner.previous_deadline_misses = deadline_misses;
+    if (!delta.valid) {
+        owner.starved_evaluations = 0;
+        owner.overprovisioned_evaluations = 0;
+        LLAMA_LOG_WARN("%s: ignoring invalid CUDA feedback: %s\n",
+            __func__, delta.error.c_str());
+        return false;
+    }
+    if (!delta.has_evaluation || ring_slots == 0) {
+        return false;
+    }
+    if (owner.minimum_ring_slots == 0) {
+        owner.minimum_ring_slots = ring_slots;
+    }
+
+    const uint32_t active_pages = (active_tokens + 255)/256;
+    // No streaming pressure exists while every active page fits in the
+    // resident partition; preserve the current boundary without churn.
+    if (active_pages <= resident_pages) {
+        owner.starved_evaluations = 0;
+        owner.overprovisioned_evaluations = 0;
+        return false;
+    }
+
+    llama_kv_stream_partition_params params;
+    params.total_pool_pages = controlled_pages;
+    params.layer_count = owner.layer_count;
+    params.active_pages_per_layer = active_pages;
+    params.minimum_ring_slots = owner.minimum_ring_slots;
+    params.previous_resident_pages_per_layer = resident_pages;
+    params.previous_ring_slots = ring_slots;
+    params.deadline_miss_ratio = delta.deadline_miss_ratio;
+    params.copy_engine_busy_ratio = copy_busy_ratio;
+    params.ring_peak_occupancy_ratio =
+        std::min(1.0, double(peak_occupancy)/double(ring_slots));
+    params.starved_evaluations = owner.starved_evaluations;
+    params.overprovisioned_evaluations = owner.overprovisioned_evaluations;
+
+    const auto partition = llama_kv_stream_partition_adapt(params);
+    if (!partition.valid) {
+        LLAMA_LOG_WARN("%s: ignoring invalid partition feedback: %s\n",
+            __func__, partition.error.c_str());
+        return false;
+    }
+    owner.starved_evaluations = partition.starved_evaluations;
+    owner.overprovisioned_evaluations = partition.overprovisioned_evaluations;
+    if (!partition.changed) {
+        return false;
+    }
+    if (!owner.repartition_fn(owner.runtime, partition.ring_slots)) {
+        LLAMA_LOG_WARN("%s: failed to move KV resident/ring boundary to %u slots\n",
+            __func__, partition.ring_slots);
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: adaptive KV partition: resident pages/layer %u -> %u, ring slots %u -> %u, miss %.1f%%, copy busy %.1f%%\n",
+        __func__, resident_pages, partition.resident_pages_per_layer,
+        ring_slots, partition.ring_slots,
+        100.0*delta.deadline_miss_ratio, 100.0*copy_busy_ratio);
+    return true;
 }
 
 bool llama_kv_cache::get_has_shift() const {

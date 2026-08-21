@@ -21,6 +21,9 @@ struct ggml_cuda_kv_stream_transfer_stats {
     uint64_t compute_stream_waits = 0;
     uint64_t stage_slot_reuses = 0;
     uint64_t cross_layer_prefetches = 0;
+    uint64_t deadline_samples = 0;
+    uint64_t deadline_misses = 0;
+    uint32_t ring_peak_occupancy = 0;
 };
 
 ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
@@ -47,7 +50,14 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     ggml_cuda_kv_stream_transfer_ring * ring,
     ggml_cuda_kv_stream_resident_cache * resident_cache,
     const ggml_tensor * dst);
-void ggml_cuda_kv_stream_graph_finalize(ggml_cuda_kv_stream_transfer_ring * ring);
+void ggml_cuda_kv_stream_graph_finalize(
+    ggml_cuda_kv_stream_transfer_ring * ring, cudaStream_t compute_stream);
+void ggml_cuda_kv_stream_graph_end(
+    ggml_cuda_kv_stream_transfer_ring * ring, cudaStream_t compute_stream);
+double ggml_cuda_kv_stream_copy_engine_busy_ratio(
+    ggml_cuda_kv_stream_transfer_ring * ring);
+uint32_t ggml_cuda_kv_stream_last_ring_peak_occupancy(
+    const ggml_cuda_kv_stream_transfer_ring * ring);
 
 bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes);
 

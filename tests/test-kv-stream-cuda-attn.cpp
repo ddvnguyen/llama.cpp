@@ -47,7 +47,7 @@ struct attention_inputs {
     std::vector<uint16_t> mask;
 };
 
-attention_inputs make_inputs(int64_t n_kv, int64_t n_batch) {
+attention_inputs make_inputs(int64_t n_kv, int64_t n_batch, int64_t query_start = 0) {
     attention_inputs result;
 
     result.q.resize(HEAD_DIM*n_batch*N_Q_HEAD);
@@ -80,7 +80,7 @@ attention_inputs make_inputs(int64_t n_kv, int64_t n_batch) {
             // Vary both token blocks and both query rows. This catches a
             // streamed implementation that offsets the first mask row but
             // accidentally uses the compact block width as the next-row pitch.
-            const float bias = token <= batch ?
+            const float bias = token <= query_start + batch ?
                 -0.015625f*float((token + 73*batch) % 127) : -INFINITY;
             result.mask[batch*n_kv + token] = ggml_fp32_to_fp16(bias);
         }
@@ -94,7 +94,9 @@ std::vector<float> run_attention(
         ggml_backend_buffer_type_t kv_buft,
         int64_t n_kv,
         int64_t n_batch,
-        int repeats = 1) {
+        int repeats = 1,
+        int64_t update_rows = 1,
+        bool change_updates = false) {
     constexpr size_t N_TENSORS = 32;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
 
@@ -129,10 +131,10 @@ std::vector<float> run_attention(
     ggml_tensor * v = ggml_permute(kv_ctx.get(), v_cache, 0, 2, 1, 3);
 
     ggml_tensor * k_update = ggml_new_tensor_2d(
-        compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM*N_KV_HEAD, 1);
+        compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM*N_KV_HEAD, update_rows);
     ggml_tensor * v_update = ggml_new_tensor_2d(
-        compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM*N_KV_HEAD, 1);
-    ggml_tensor * update_index = ggml_new_tensor_1d(compute_ctx.get(), GGML_TYPE_I32, 1);
+        compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM*N_KV_HEAD, update_rows);
+    ggml_tensor * update_index = ggml_new_tensor_1d(compute_ctx.get(), GGML_TYPE_I32, update_rows);
     ggml_tensor * updated_k = ggml_set_rows(compute_ctx.get(), k_storage, k_update, update_index);
     ggml_tensor * updated_v = ggml_set_rows(compute_ctx.get(), v_storage, v_update, update_index);
 
@@ -152,16 +154,19 @@ std::vector<float> run_attention(
     ggml_backend_tensor_set(v_storage, inputs.v.data(), 0, inputs.v.size());
     ggml_backend_tensor_set(mask, inputs.mask.data(), 0, inputs.mask.size()*sizeof(uint16_t));
 
-    std::vector<float> k_update_data(HEAD_DIM*N_KV_HEAD);
-    std::vector<float> v_update_data(HEAD_DIM*N_KV_HEAD);
+    std::vector<float> k_update_data(HEAD_DIM*N_KV_HEAD*update_rows);
+    std::vector<float> v_update_data(HEAD_DIM*N_KV_HEAD*update_rows);
     for (size_t i = 0; i < k_update_data.size(); ++i) {
         k_update_data[i] = 0.6f*std::sin(float(i)*0.0234375f);
         v_update_data[i] = 0.4f*std::cos(float(i)*0.017578125f);
     }
-    const int32_t update_row = 1;
+    std::vector<int32_t> update_index_data(update_rows);
+    for (int64_t row = 0; row < update_rows; ++row) {
+        update_index_data[row] = int32_t(row);
+    }
     ggml_backend_tensor_set(k_update, k_update_data.data(), 0, k_update_data.size()*sizeof(float));
     ggml_backend_tensor_set(v_update, v_update_data.data(), 0, v_update_data.size()*sizeof(float));
-    ggml_backend_tensor_set(update_index, &update_row, 0, sizeof(update_row));
+    ggml_backend_tensor_set(update_index, update_index_data.data(), 0, update_index_data.size()*sizeof(int32_t));
 
     ggml_cgraph * graph = ggml_new_graph_custom(compute_ctx.get(), N_TENSORS, false);
     ggml_build_forward_expand(graph, updated_k);
@@ -171,6 +176,12 @@ std::vector<float> run_attention(
     GGML_ASSERT(ggml_backend_supports_op(backend, updated_v));
     GGML_ASSERT(ggml_backend_supports_op(backend, out));
     for (int repeat = 0; repeat < repeats; ++repeat) {
+        if (repeat > 0 && change_updates) {
+            for (float & value : k_update_data) { value = -2.0f*value; }
+            for (float & value : v_update_data) { value = -2.0f*value; }
+            ggml_backend_tensor_set(k_update, k_update_data.data(), 0, k_update_data.size()*sizeof(float));
+            ggml_backend_tensor_set(v_update, v_update_data.data(), 0, v_update_data.size()*sizeof(float));
+        }
         GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
     }
 
@@ -186,7 +197,7 @@ std::vector<float> run_attention_layers(
         int64_t n_kv,
         int64_t n_batch,
         int repeats = 1) {
-    constexpr size_t N_TENSORS = 128;
+    constexpr size_t N_TENSORS = 256;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS +
         ggml_graph_overhead_custom(N_TENSORS, false);
 
@@ -306,22 +317,30 @@ std::vector<float> run_attention_layers(
 int main() {
     testing t;
 
-    t.test("real cache views pipeline three Q8/Q4 blocks through two slots", [](testing & t) {
-        constexpr int64_t n_kv = 768;
-        constexpr int64_t n_batch = 256;
+    t.test("server-shaped causal prefill pipelines four Q8/Q4 blocks through two slots", [](testing & t) {
+        constexpr int64_t n_kv = 1024;
+        constexpr int64_t n_batch = 83;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
 
-        const attention_inputs inputs = make_inputs(n_kv, n_batch);
+        // Exercise the final causal block. With query_start == 0, every block
+        // after the first is masked and corrupted streamed pages are invisible.
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv - 256);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch, 2, 256, true);
 
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
-        params.device      = 0;
-        params.stage_bytes = 512*1024;
-        params.stage_slots = 2;
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.pool_bytes           = 3*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
         if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
             return;
@@ -332,12 +351,12 @@ int main() {
             runtime, 0, 0, cleared.data(), cleared.size()));
 
         const std::vector<float> actual = run_attention(
-            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch, 2, 256, true);
 
         const std::vector<uint8_t> expected_k = pack_token_block(
-            inputs.k, GGML_TYPE_Q8_0, 512, 256);
+            inputs.k, GGML_TYPE_Q8_0, 768, 256);
         const std::vector<uint8_t> expected_v = pack_token_block(
-            inputs.v, GGML_TYPE_Q4_0, 512, 256);
+            inputs.v, GGML_TYPE_Q4_0, 768, 256);
         const size_t v_offset = align_up(expected_k.size(), 128);
         std::vector<uint8_t> staged(v_offset + expected_v.size());
         GGML_ASSERT(ggml_backend_cuda_kv_stream_stage_download(
@@ -350,9 +369,9 @@ int main() {
             std::equal(expected_v.begin(), expected_v.end(), staged.begin() + v_offset));
 
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
-        t.assert_equal(uint64_t(3), stats.asynchronous_page_uploads);
-        t.assert_equal(uint64_t(3), stats.compute_stream_waits);
-        t.assert_equal(uint64_t(1), stats.stage_slot_reuses);
+        t.assert_equal(uint64_t(6), stats.asynchronous_page_uploads);
+        t.assert_equal(uint64_t(6), stats.compute_stream_waits);
+        t.assert_equal(uint64_t(4), stats.stage_slot_reuses);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
         if (!t.assert_equal(expected.size(), actual.size())) {
@@ -402,6 +421,50 @@ int main() {
         t.assert_true("one-page outputs are bit-identical", expected == actual);
     });
 
+    t.test("four-query page-boundary prefill remains finite and equivalent", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 4;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, 340);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.pool_bytes           = 3*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        bool all_finite = true;
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            all_finite = all_finite && std::isfinite(actual[i]);
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr, "four-query page-boundary max_abs=%g\n", max_abs);
+        t.assert_true("page-boundary output remains finite", all_finite);
+        t.assert_true("page-boundary output remains equivalent", max_abs <= 3e-4f);
+    });
     t.test("resident pages survive between evaluations while the tail is refreshed", [](testing & t) {
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
@@ -432,7 +495,7 @@ int main() {
         t.assert_equal(uint64_t(2), stats.resident_misses);
         t.assert_equal(uint64_t(2), stats.resident_hits);
         t.assert_equal(uint64_t(0), stats.streamed_pages);
-        t.assert_equal(uint64_t(3*page_bytes), stats.host_to_device_bytes);
+        t.assert_equal(uint64_t(4*page_bytes), stats.host_to_device_bytes);
 
         t.assert_true("one resident page is demoted into the ring",
             ggml_backend_cuda_kv_stream_repartition(runtime, 5));
@@ -447,6 +510,53 @@ int main() {
         t.assert_equal(uint64_t(1), repartitioned.asynchronous_page_uploads);
 
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
+    });
+
+    t.test("sixteen attention layers share one resident/ring pool during causal prefill", [](testing & t) {
+        constexpr int64_t n_kv = 1024;
+        constexpr int64_t n_batch = 83;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        std::vector<attention_inputs> inputs(16, make_inputs(n_kv, n_batch, n_kv - 256));
+        for (size_t layer = 1; layer < inputs.size(); ++layer) {
+            for (size_t i = 0; i < inputs[layer].q.size(); ++i) {
+                inputs[layer].q[i] += 0.025f*layer*std::sin(float(i)*0.015625f);
+            }
+        }
+        const std::vector<float> expected = run_attention_layers(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 8;
+        params.pool_bytes           = 24*page_bytes;
+        params.resident_layer_count = 16;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("shared runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention_layers(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        t.assert_equal(uint64_t(48), stats.asynchronous_page_uploads);
+        t.assert_equal(uint64_t(48), stats.compute_stream_waits);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(expected.size(), actual.size());
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        t.assert_true("sixteen-layer prefill remains equivalent", max_abs <= 3e-4f);
     });
 
     t.test("one shared ring prefetches across attention layers", [](testing & t) {
@@ -494,6 +604,40 @@ int main() {
         t.assert_equal(uint64_t(12), stats.asynchronous_page_uploads);
         t.assert_equal(uint64_t(12), stats.compute_stream_waits);
         t.assert_equal(uint64_t(4), stats.cross_layer_prefetches);
+        t.assert_equal(uint64_t(12), stats.deadline_samples);
+        t.assert_true("deadline misses cannot exceed samples",
+            stats.deadline_misses <= stats.deadline_samples);
+        t.assert_equal(uint32_t(2), stats.ring_peak_occupancy);
+
+        using feedback_fn_t = bool (*)(
+            void *, uint64_t *, uint64_t *, double *, uint32_t *,
+            uint32_t *, uint32_t *, uint32_t *);
+        ggml_backend_dev_t device = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        auto feedback_fn = reinterpret_cast<feedback_fn_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_cuda_kv_stream_feedback"));
+        if (!t.assert_true("dynamic feedback API is exported", feedback_fn != nullptr)) {
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+            return;
+        }
+        uint64_t deadline_samples = 0;
+        uint64_t deadline_misses = 0;
+        double copy_busy_ratio = -1.0;
+        uint32_t peak_occupancy = 0;
+        uint32_t ring_slots = 0;
+        uint32_t resident_pages = 0;
+        uint32_t controlled_pages = 0;
+        t.assert_true("dynamic feedback is readable", feedback_fn(
+            runtime, &deadline_samples, &deadline_misses, &copy_busy_ratio,
+            &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages));
+        t.assert_equal(uint64_t(12), deadline_samples);
+        t.assert_true("copy busy ratio is normalized",
+            copy_busy_ratio >= 0.0 && copy_busy_ratio <= 1.0);
+        t.assert_equal(uint32_t(2), peak_occupancy);
+        t.assert_equal(uint32_t(2), ring_slots);
+        t.assert_equal(uint32_t(1), resident_pages);
+        t.assert_equal(uint32_t(5), controlled_pages);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
         if (!t.assert_equal(expected.size(), actual.size())) {

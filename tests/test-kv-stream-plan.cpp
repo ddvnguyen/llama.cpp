@@ -400,6 +400,31 @@ int main() {
         t.assert_equal(uint32_t(0), partition.overprovisioned_evaluations);
     });
 
+    t.test("cumulative CUDA feedback becomes one bounded evaluation delta", [](testing & t) {
+        const auto delta = llama_kv_stream_feedback_delta_make(
+            { 145, 17 }, { 120, 12 });
+        t.assert_true("feedback delta is valid", delta.valid);
+        t.assert_true("feedback contains a new evaluation", delta.has_evaluation);
+        t.assert_equal(uint64_t(25), delta.deadline_samples);
+        t.assert_equal(uint64_t(5), delta.deadline_misses);
+        t.assert_true("deadline ratio is exact",
+            std::abs(delta.deadline_miss_ratio - 0.20) < 1e-12);
+
+        const auto unchanged = llama_kv_stream_feedback_delta_make(
+            { 145, 17 }, { 145, 17 });
+        t.assert_true("unchanged counters are valid", unchanged.valid);
+        t.assert_true("unchanged counters do not invent an evaluation",
+            !unchanged.has_evaluation);
+
+        const auto reset = llama_kv_stream_feedback_delta_make(
+            { 3, 1 }, { 145, 17 });
+        t.assert_true("counter reset is rejected", !reset.valid);
+
+        const auto impossible = llama_kv_stream_feedback_delta_make(
+            { 150, 30 }, { 145, 17 });
+        t.assert_true("more misses than samples are rejected", !impossible.valid);
+    });
+
     t.test("duplicate logical regions are rejected", [](testing & t) {
         llama_kv_stream_plan_params params;
         params.pool_bytes       = 64*MIB;

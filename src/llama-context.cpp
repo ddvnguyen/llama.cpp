@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-kv-stream-config.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -1371,6 +1372,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // Consume feedback from the previous completed decode before building the
+    // next graph. Repartition itself synchronizes only when hysteresis selects
+    // a new boundary, so steady-state token generation stays asynchronous.
+    if (auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        if (auto * hybrid_context = dynamic_cast<llama_memory_hybrid_context *>(mctx)) {
+            const llama_kv_cache_context * attn_context = hybrid_context->get_attn();
+            if (attn_context != nullptr) {
+                (void) hybrid_memory->get_mem_attn()->kv_stream_adapt(
+                    attn_context->get_n_kv());
+            }
+        }
     }
 
     auto * res = gf_res_prev.get();

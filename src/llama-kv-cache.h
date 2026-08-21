@@ -159,6 +159,8 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    bool kv_stream_adapt(uint32_t active_tokens);
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -291,8 +293,21 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     struct kv_stream_runtime_owner {
+        using feedback_fn_t = bool (*)(
+            void *, uint64_t *, uint64_t *, double *, uint32_t *,
+            uint32_t *, uint32_t *, uint32_t *);
+        using repartition_fn_t = bool (*)(void *, uint32_t);
+
         void * runtime = nullptr;
         void (*free_fn)(void *) = nullptr;
+        feedback_fn_t feedback_fn = nullptr;
+        repartition_fn_t repartition_fn = nullptr;
+        uint32_t layer_count = 0;
+        uint32_t minimum_ring_slots = 0;
+        uint32_t starved_evaluations = 0;
+        uint32_t overprovisioned_evaluations = 0;
+        uint64_t previous_deadline_samples = 0;
+        uint64_t previous_deadline_misses = 0;
 
         ~kv_stream_runtime_owner() {
             if (runtime != nullptr) {
