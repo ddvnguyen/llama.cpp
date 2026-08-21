@@ -277,3 +277,74 @@ llama_kv_stream_regions llama_kv_stream_regions_make(const llama_kv_stream_regio
     result.valid = true;
     return result;
 }
+
+llama_kv_stream_prefetch_dispatch_result llama_kv_stream_prefetch_dispatch(
+        const llama_kv_stream_prefetch_params & params) {
+    llama_kv_stream_prefetch_dispatch_result result;
+
+    auto fail_dispatch = [&](const char * message) {
+        result.valid = false;
+        result.error = message;
+        result.assignments.clear();
+        return result;
+    };
+
+    if (params.stage_slot_bytes == 0) {
+        return fail_dispatch("KV prefetch stage slot size must be non-zero");
+    }
+    if (params.states.size() != params.requests.size()) {
+        return fail_dispatch("KV prefetch request states do not match requests");
+    }
+
+    std::vector<uint32_t> slots = params.free_slots;
+    std::sort(slots.begin(), slots.end());
+    if (std::adjacent_find(slots.begin(), slots.end()) != slots.end()) {
+        return fail_dispatch("KV prefetch free slot list contains duplicates");
+    }
+
+    const uint64_t window_end = uint64_t(params.current_attention) + params.lookahead_layers;
+    std::vector<size_t> eligible;
+    eligible.reserve(params.requests.size());
+
+    for (size_t index = 0; index < params.requests.size(); ++index) {
+        const auto & request = params.requests[index];
+        if (request.layer_id < 0 || request.bytes == 0) {
+            return fail_dispatch("KV prefetch request is invalid");
+        }
+        if (request.bytes > params.stage_slot_bytes) {
+            return fail_dispatch("KV prefetch request exceeds a stage slot");
+        }
+        if (params.states[index] != llama_kv_stream_prefetch_state::pending) {
+            continue;
+        }
+        if (request.attention_index < params.current_attention ||
+            uint64_t(request.attention_index) > window_end) {
+            continue;
+        }
+
+        if (request.producer_attention_index >= 0) {
+            const uint32_t producer = uint32_t(request.producer_attention_index);
+            if (producer > params.current_attention ||
+                (producer == params.current_attention && !params.current_producer_complete)) {
+                continue;
+            }
+        }
+        eligible.push_back(index);
+    }
+
+    std::sort(eligible.begin(), eligible.end(), [&](size_t a, size_t b) {
+        const auto & lhs = params.requests[a];
+        const auto & rhs = params.requests[b];
+        return std::tie(lhs.attention_index, lhs.page_index, lhs.layer_id, a) <
+               std::tie(rhs.attention_index, rhs.page_index, rhs.layer_id, b);
+    });
+
+    const size_t count = std::min(slots.size(), eligible.size());
+    result.assignments.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        result.assignments.push_back({ eligible[i], slots[i] });
+    }
+
+    result.valid = true;
+    return result;
+}

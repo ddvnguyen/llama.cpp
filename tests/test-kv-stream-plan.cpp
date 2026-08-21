@@ -206,6 +206,105 @@ int main() {
         }
     });
 
+    t.test("prefetch window prioritizes imminent pages and stops at lookahead", [](testing & t) {
+        llama_kv_stream_prefetch_params params;
+        params.current_attention = 4;
+        params.lookahead_layers  = 3;
+        params.stage_slot_bytes  = 4096;
+        params.free_slots        = { 2, 0, 1, 3, 4, 5, 6, 7 };
+
+        for (uint32_t attention = 4; attention <= 8; ++attention) {
+            for (uint32_t page = 0; page < 2; ++page) {
+                llama_kv_stream_prefetch_request request;
+                request.layer_id        = int32_t(3 + 4*attention);
+                request.attention_index = attention;
+                request.page_index      = page;
+                request.bytes           = 4096;
+                params.requests.push_back(request);
+            }
+        }
+        params.states.resize(params.requests.size(), llama_kv_stream_prefetch_state::pending);
+
+        const auto dispatch = llama_kv_stream_prefetch_dispatch(params);
+        t.assert_true("dispatch is valid", dispatch.valid);
+        t.assert_equal(size_t(8), dispatch.assignments.size());
+        t.assert_true("free slots are normalized", dispatch.assignments[0].slot == 0);
+        t.assert_true("current attention is first", dispatch.assignments[0].request_index == 0);
+        t.assert_true("x+3 is inside the window", dispatch.assignments.back().request_index == 7);
+        t.assert_true("x+4 is outside the window", std::none_of(
+            dispatch.assignments.begin(), dispatch.assignments.end(), [](const auto & assignment) {
+                return assignment.request_index >= 8;
+            }));
+    });
+
+    t.test("prefetch slot reuse waits for release and selects the earliest deadline", [](testing & t) {
+        llama_kv_stream_prefetch_params params;
+        params.current_attention = 0;
+        params.lookahead_layers  = 3;
+        params.stage_slot_bytes  = 4096;
+        params.free_slots        = { 0, 1 };
+
+        for (uint32_t attention = 0; attention < 4; ++attention) {
+            llama_kv_stream_prefetch_request request;
+            request.layer_id        = int32_t(3 + 4*attention);
+            request.attention_index = attention;
+            request.page_index      = 0;
+            request.bytes           = 4096;
+            params.requests.push_back(request);
+        }
+        params.states.resize(params.requests.size(), llama_kv_stream_prefetch_state::pending);
+
+        auto dispatch = llama_kv_stream_prefetch_dispatch(params);
+        t.assert_equal(size_t(2), dispatch.assignments.size());
+        t.assert_equal(size_t(0), dispatch.assignments[0].request_index);
+        t.assert_equal(size_t(1), dispatch.assignments[1].request_index);
+
+        params.states[0] = llama_kv_stream_prefetch_state::consumed;
+        params.states[1] = llama_kv_stream_prefetch_state::scheduled;
+        params.free_slots = { dispatch.assignments[0].slot };
+        dispatch = llama_kv_stream_prefetch_dispatch(params);
+        t.assert_equal(size_t(1), dispatch.assignments.size());
+        t.assert_equal(size_t(2), dispatch.assignments[0].request_index);
+        t.assert_equal(uint32_t(0), dispatch.assignments[0].slot);
+    });
+
+    t.test("future mutable tails are not prefetched before their SET_ROWS producer", [](testing & t) {
+        llama_kv_stream_prefetch_params params;
+        params.current_attention = 2;
+        params.lookahead_layers  = 3;
+        params.stage_slot_bytes  = 4096;
+        params.free_slots        = { 0, 1, 2 };
+
+        llama_kv_stream_prefetch_request current_tail;
+        current_tail.layer_id                 = 11;
+        current_tail.attention_index          = 2;
+        current_tail.page_index               = 9;
+        current_tail.bytes                    = 4096;
+        current_tail.producer_attention_index = 2;
+
+        auto future_tail = current_tail;
+        future_tail.layer_id                 = 15;
+        future_tail.attention_index          = 3;
+        future_tail.producer_attention_index = 3;
+
+        auto future_stable = future_tail;
+        future_stable.page_index               = 8;
+        future_stable.producer_attention_index = -1;
+
+        params.requests = { current_tail, future_tail, future_stable };
+        params.states.resize(params.requests.size(), llama_kv_stream_prefetch_state::pending);
+
+        auto dispatch = llama_kv_stream_prefetch_dispatch(params);
+        t.assert_equal(size_t(1), dispatch.assignments.size());
+        t.assert_equal(size_t(2), dispatch.assignments[0].request_index);
+
+        params.current_producer_complete = true;
+        dispatch = llama_kv_stream_prefetch_dispatch(params);
+        t.assert_equal(size_t(2), dispatch.assignments.size());
+        t.assert_equal(size_t(0), dispatch.assignments[0].request_index);
+        t.assert_equal(size_t(2), dispatch.assignments[1].request_index);
+    });
+
     t.test("duplicate logical regions are rejected", [](testing & t) {
         llama_kv_stream_plan_params params;
         params.pool_bytes       = 64*MIB;

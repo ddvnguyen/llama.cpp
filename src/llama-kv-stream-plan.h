@@ -104,3 +104,50 @@ struct llama_kv_stream_regions {
 };
 
 llama_kv_stream_regions llama_kv_stream_regions_make(const llama_kv_stream_regions_params & params);
+
+enum class llama_kv_stream_prefetch_state : uint8_t {
+    pending,
+    scheduled,
+    consumed,
+};
+
+struct llama_kv_stream_prefetch_request {
+    int32_t  layer_id        = -1;
+    uint32_t attention_index = 0;
+    uint32_t page_index      = 0;
+    uint64_t bytes           = 0;
+
+    // -1 means immutable at graph start. A non-negative value identifies the
+    // attention step whose SET_ROWS operation must finish before this page may
+    // be copied (normally the mutable tail page).
+    int32_t producer_attention_index = -1;
+};
+
+struct llama_kv_stream_prefetch_assignment {
+    size_t request_index = 0;
+    uint32_t slot        = 0;
+};
+
+struct llama_kv_stream_prefetch_params {
+    uint32_t current_attention = 0;
+    uint32_t lookahead_layers  = 0;
+    uint64_t stage_slot_bytes  = 0;
+
+    bool current_producer_complete = false;
+
+    std::vector<uint32_t> free_slots;
+    std::vector<llama_kv_stream_prefetch_request> requests;
+    std::vector<llama_kv_stream_prefetch_state> states;
+};
+
+struct llama_kv_stream_prefetch_dispatch_result {
+    bool valid = false;
+    std::string error;
+    std::vector<llama_kv_stream_prefetch_assignment> assignments;
+};
+
+// Selects work for the currently free transfer slots. The caller owns the
+// asynchronous lifecycle and changes request states only after recording the
+// corresponding CUDA ready/consumed events.
+llama_kv_stream_prefetch_dispatch_result llama_kv_stream_prefetch_dispatch(
+    const llama_kv_stream_prefetch_params & params);
