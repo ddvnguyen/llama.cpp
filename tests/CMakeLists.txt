@@ -182,6 +182,13 @@ target_link_libraries(test-hydra-rpc-stale-sock PRIVATE ggml)
 # #470: test uses ggml_backend_buffer_copy_tensor (declared in ggml-backend-impl.h).
 target_include_directories(test-hydra-rpc-stale-sock PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+# epic #610 WS1: hermetic A/B seam checks (HYDRA_EXT_MODE parsing + the WS1
+# no-op factory). Needs the server-context TU so hydra_create_extension() and
+# the inline mode parser are visible.
+llama_build_and_test(test-hydra-ext-ab.cpp)
+target_link_libraries(test-hydra-ext-ab PRIVATE server-context)
+target_include_directories(test-hydra-ext-ab PRIVATE ${CMAKE_SOURCE_DIR}/tools/server)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
