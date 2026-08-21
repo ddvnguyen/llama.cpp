@@ -1558,6 +1558,64 @@ bool ggml_backend_cuda_kv_stream_stage_download(
     return true;
 }
 
+static ggml_backend_cuda_kv_stream_runtime_t ggml_cuda_kv_stream_runtime_from_tensor(
+        const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr ||
+            !ggml_backend_buft_is_cuda_kv_stream(tensor->buffer->buft)) {
+        return nullptr;
+    }
+
+    auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(tensor->buffer->context);
+    return context->runtime;
+}
+
+static bool ggml_cuda_kv_stream_fattn_fits(const ggml_tensor * dst) {
+    GGML_ASSERT(dst != nullptr && dst->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    auto * k_runtime = ggml_cuda_kv_stream_runtime_from_tensor(k);
+    auto * v_runtime = ggml_cuda_kv_stream_runtime_from_tensor(v);
+    if (k_runtime == nullptr || v_runtime == nullptr || k_runtime != v_runtime) {
+        return false;
+    }
+    if (!ggml_is_contiguous(k) || !ggml_is_contiguous(v)) {
+        return false;
+    }
+
+    const size_t v_offset = GGML_PAD(ggml_nbytes(k), 128);
+    return v_offset <= k_runtime->stage_bytes &&
+        ggml_nbytes(v) <= k_runtime->stage_bytes - v_offset;
+}
+
+static void ggml_cuda_kv_stream_fattn_one_block(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_kv_stream_fattn_fits(dst));
+
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(k);
+    GGML_ASSERT(runtime->device == ctx.device);
+
+    char * stage = static_cast<char *>(runtime->stage_data);
+    const size_t v_offset = GGML_PAD(ggml_nbytes(k), 128);
+
+    // Deliberately ordered on the compute stream for the first correctness
+    // slice. Double-buffered copies and events come after multi-block merge.
+    CUDA_CHECK(cudaMemcpyAsync(stage, k->data, ggml_nbytes(k), cudaMemcpyHostToDevice, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(stage + v_offset, v->data, ggml_nbytes(v), cudaMemcpyHostToDevice, ctx.stream()));
+
+    ggml_tensor staged_k = *k;
+    ggml_tensor staged_v = *v;
+    staged_k.data = stage;
+    staged_v.data = stage + v_offset;
+
+    ggml_tensor staged_dst = *dst;
+    staged_dst.src[1] = &staged_k;
+    staged_dst.src[2] = &staged_v;
+    ggml_cuda_flash_attn_ext(ctx, &staged_dst);
+}
+
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
@@ -2592,7 +2650,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            ggml_cuda_flash_attn_ext(ctx, dst);
+            if (ggml_cuda_kv_stream_runtime_from_tensor(dst->src[1]) != nullptr ||
+                    ggml_cuda_kv_stream_runtime_from_tensor(dst->src[2]) != nullptr) {
+                ggml_cuda_kv_stream_fattn_one_block(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext(ctx, dst);
+            }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
@@ -2792,6 +2855,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
+        }
+
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j] != nullptr && ggml_cuda_kv_stream_runtime_from_tensor(node->src[j]) != nullptr) {
+                // Stream uploads and stage ownership are not represented in
+                // GGML's CUDA graph property key yet.
+                use_cuda_graph = false;
+                break;
+            }
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -4571,6 +4643,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                               ggml_backend_buft_is_cuda_kv_stream(node->src[j]->buffer->buft) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
@@ -5309,7 +5382,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
-    if (uses_streamed_kv && op->op != GGML_OP_SET_ROWS && op->op != GGML_OP_FLASH_ATTN_EXT) {
+    if (uses_streamed_kv && op->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
 
@@ -5740,6 +5813,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
+            if (uses_streamed_kv && !ggml_cuda_kv_stream_fattn_fits(op)) {
+                return false;
+            }
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
