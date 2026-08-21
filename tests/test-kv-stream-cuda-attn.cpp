@@ -93,7 +93,7 @@ std::vector<float> run_attention(
         ggml_backend_t backend,
         const attention_inputs & inputs,
         ggml_backend_buffer_type_t kv_buft) {
-    constexpr size_t N_TENSORS = 16;
+    constexpr size_t N_TENSORS = 32;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
 
     ggml_init_params params{
@@ -126,6 +126,14 @@ std::vector<float> run_attention(
     ggml_tensor * k = ggml_permute(kv_ctx.get(), k_cache, 0, 2, 1, 3);
     ggml_tensor * v = ggml_permute(kv_ctx.get(), v_cache, 0, 2, 1, 3);
 
+    ggml_tensor * k_update = ggml_new_tensor_2d(
+        compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM*N_KV_HEAD, 1);
+    ggml_tensor * v_update = ggml_new_tensor_2d(
+        compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM*N_KV_HEAD, 1);
+    ggml_tensor * update_index = ggml_new_tensor_1d(compute_ctx.get(), GGML_TYPE_I32, 1);
+    ggml_tensor * updated_k = ggml_set_rows(compute_ctx.get(), k_storage, k_update, update_index);
+    ggml_tensor * updated_v = ggml_set_rows(compute_ctx.get(), v_storage, v_update, update_index);
+
     ggml_tensor * out = ggml_flash_attn_ext(
         compute_ctx.get(), q, k, v, mask, 1.0f/std::sqrt(float(HEAD_DIM)), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
@@ -142,8 +150,23 @@ std::vector<float> run_attention(
     ggml_backend_tensor_set(v_storage, inputs.v.data(), 0, inputs.v.size());
     ggml_backend_tensor_set(mask, inputs.mask.data(), 0, inputs.mask.size()*sizeof(uint16_t));
 
+    std::vector<float> k_update_data(HEAD_DIM*N_KV_HEAD);
+    std::vector<float> v_update_data(HEAD_DIM*N_KV_HEAD);
+    for (size_t i = 0; i < k_update_data.size(); ++i) {
+        k_update_data[i] = 0.6f*std::sin(float(i)*0.0234375f);
+        v_update_data[i] = 0.4f*std::cos(float(i)*0.017578125f);
+    }
+    const int32_t update_row = 1;
+    ggml_backend_tensor_set(k_update, k_update_data.data(), 0, k_update_data.size()*sizeof(float));
+    ggml_backend_tensor_set(v_update, v_update_data.data(), 0, v_update_data.size()*sizeof(float));
+    ggml_backend_tensor_set(update_index, &update_row, 0, sizeof(update_row));
+
     ggml_cgraph * graph = ggml_new_graph_custom(compute_ctx.get(), N_TENSORS, false);
+    ggml_build_forward_expand(graph, updated_k);
+    ggml_build_forward_expand(graph, updated_v);
     ggml_build_forward_expand(graph, out);
+    GGML_ASSERT(ggml_backend_supports_op(backend, updated_k));
+    GGML_ASSERT(ggml_backend_supports_op(backend, updated_v));
     GGML_ASSERT(ggml_backend_supports_op(backend, out));
     GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
 

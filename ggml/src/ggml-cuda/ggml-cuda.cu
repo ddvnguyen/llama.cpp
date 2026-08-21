@@ -4614,6 +4614,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // node's output on the host-visible buffer, which the compute path
                 // handles. Allow that here, mirroring the src-tensor check below.
                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                       ggml_backend_buft_is_cuda_kv_stream(node->buffer->buft) ||
                        (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
@@ -5358,7 +5359,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
-    if (uses_streamed_kv && op->op != GGML_OP_FLASH_ATTN_EXT) {
+    if (uses_streamed_kv && op->op != GGML_OP_SET_ROWS && op->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
 
