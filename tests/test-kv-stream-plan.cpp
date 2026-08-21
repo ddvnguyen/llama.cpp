@@ -266,5 +266,92 @@ int main() {
         t.assert_true("overflowing plan is rejected", !plan.valid);
     });
 
+    t.test("extent includes pending speculative positions and page padding", [](testing & t) {
+        llama_kv_stream_extent_params params;
+        params.live_tokens    = 196607;
+        params.reserve_tokens = 3;
+        params.page_tokens    = PAGE_TOKENS;
+        params.maximum_tokens = 262144;
+
+        const auto extent = llama_kv_stream_extent_make(params);
+        t.assert_true("extent is valid", extent.valid);
+        t.assert_equal(uint32_t(196864), extent.tokens);
+        t.assert_true("initial extent is growth", extent.grew);
+        t.assert_true("initial extent is not shrink", !extent.shrunk);
+    });
+
+    t.test("growth is immediate", [](testing & t) {
+        llama_kv_stream_extent_params params;
+        params.live_tokens              = 131072;
+        params.reserve_tokens           = 3;
+        params.page_tokens              = PAGE_TOKENS;
+        params.previous_extent          = 131072;
+        params.shrink_hysteresis_tokens = 4096;
+        params.maximum_tokens           = 262144;
+
+        const auto extent = llama_kv_stream_extent_make(params);
+        t.assert_true("extent is valid", extent.valid);
+        t.assert_equal(uint32_t(131328), extent.tokens);
+        t.assert_true("extent grew", extent.grew);
+    });
+
+    t.test("small rollback retains the previous extent", [](testing & t) {
+        llama_kv_stream_extent_params params;
+        params.live_tokens              = 196605;
+        params.reserve_tokens           = 3;
+        params.page_tokens              = PAGE_TOKENS;
+        params.previous_extent          = 196864;
+        params.shrink_hysteresis_tokens = 4096;
+        params.maximum_tokens           = 262144;
+
+        const auto extent = llama_kv_stream_extent_make(params);
+        t.assert_true("extent is valid", extent.valid);
+        t.assert_equal(uint32_t(196864), extent.tokens);
+        t.assert_true("extent did not shrink", !extent.shrunk);
+    });
+
+    t.test("large shrink and forced reset release residency", [](testing & t) {
+        llama_kv_stream_extent_params params;
+        params.live_tokens              = 180000;
+        params.page_tokens              = PAGE_TOKENS;
+        params.previous_extent          = 196864;
+        params.shrink_hysteresis_tokens = 4096;
+        params.maximum_tokens           = 262144;
+
+        auto extent = llama_kv_stream_extent_make(params);
+        t.assert_true("large-shrink extent is valid", extent.valid);
+        t.assert_equal(uint32_t(180224), extent.tokens);
+        t.assert_true("large shrink is reported", extent.shrunk);
+
+        params.live_tokens     = 0;
+        params.force_shrink    = true;
+        extent = llama_kv_stream_extent_make(params);
+        t.assert_true("reset extent is valid", extent.valid);
+        t.assert_equal(uint32_t(0), extent.tokens);
+        t.assert_true("reset shrink is reported", extent.shrunk);
+    });
+
+    t.test("extent rejects invalid alignment and capacity overflow", [](testing & t) {
+        llama_kv_stream_extent_params params;
+        params.live_tokens    = 262143;
+        params.reserve_tokens = 3;
+        params.page_tokens    = PAGE_TOKENS;
+        params.maximum_tokens = 262144;
+
+        auto extent = llama_kv_stream_extent_make(params);
+        t.assert_true("capacity overflow is rejected", !extent.valid);
+
+        params.live_tokens    = 1024;
+        params.reserve_tokens = 0;
+        params.page_tokens    = 0;
+        extent = llama_kv_stream_extent_make(params);
+        t.assert_true("zero page size is rejected", !extent.valid);
+
+        params.page_tokens      = PAGE_TOKENS;
+        params.maximum_tokens   = 262143;
+        extent = llama_kv_stream_extent_make(params);
+        t.assert_true("unaligned maximum is rejected", !extent.valid);
+    });
+
     return t.summary();
 }

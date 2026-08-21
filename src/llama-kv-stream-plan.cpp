@@ -163,3 +163,54 @@ llama_kv_stream_plan llama_kv_stream_plan_make(const llama_kv_stream_plan_params
     result.valid = true;
     return result;
 }
+
+llama_kv_stream_extent llama_kv_stream_extent_make(const llama_kv_stream_extent_params & params) {
+    llama_kv_stream_extent result;
+
+    auto fail_extent = [&](const char * message) {
+        result.valid = false;
+        result.error = message;
+        return result;
+    };
+
+    if (params.page_tokens == 0) {
+        return fail_extent("KV stream page size must be non-zero");
+    }
+
+    if (params.maximum_tokens == 0 || params.maximum_tokens%params.page_tokens != 0) {
+        return fail_extent("KV stream maximum must be non-zero and page aligned");
+    }
+
+    if (params.previous_extent > params.maximum_tokens ||
+        params.previous_extent%params.page_tokens != 0) {
+        return fail_extent("previous KV stream extent is invalid");
+    }
+
+    const uint64_t requested_tokens = uint64_t(params.live_tokens) + params.reserve_tokens;
+    if (requested_tokens > params.maximum_tokens) {
+        return fail_extent("live and reserved KV tokens exceed the configured maximum");
+    }
+
+    uint64_t desired_tokens = 0;
+    if (requested_tokens > 0) {
+        desired_tokens = ((requested_tokens + params.page_tokens - 1)/params.page_tokens)*params.page_tokens;
+    }
+
+    if (desired_tokens > params.maximum_tokens) {
+        return fail_extent("padded KV stream extent exceeds the configured maximum");
+    }
+
+    uint32_t selected_tokens = uint32_t(desired_tokens);
+    if (!params.force_shrink && params.previous_extent > selected_tokens) {
+        const uint32_t released_tokens = params.previous_extent - selected_tokens;
+        if (released_tokens < params.shrink_hysteresis_tokens) {
+            selected_tokens = params.previous_extent;
+        }
+    }
+
+    result.valid  = true;
+    result.tokens = selected_tokens;
+    result.grew   = selected_tokens > params.previous_extent;
+    result.shrunk = selected_tokens < params.previous_extent;
+    return result;
+}

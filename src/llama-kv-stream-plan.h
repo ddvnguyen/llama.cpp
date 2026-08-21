@@ -53,3 +53,25 @@ struct llama_kv_stream_plan {
 };
 
 llama_kv_stream_plan llama_kv_stream_plan_make(const llama_kv_stream_plan_params & params);
+
+struct llama_kv_stream_extent_params {
+    uint32_t live_tokens              = 0;
+    uint32_t reserve_tokens           = 0;
+    uint32_t page_tokens              = 256;
+    uint32_t previous_extent          = 0;
+    uint32_t shrink_hysteresis_tokens = 0;
+    uint32_t maximum_tokens           = 0;
+
+    bool force_shrink = false;
+};
+
+struct llama_kv_stream_extent {
+    bool valid = false;
+    std::string error;
+
+    uint32_t tokens = 0;
+    bool grew   = false;
+    bool shrunk = false;
+};
+
+llama_kv_stream_extent llama_kv_stream_extent_make(const llama_kv_stream_extent_params & params);
