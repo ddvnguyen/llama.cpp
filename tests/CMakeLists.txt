@@ -297,6 +297,9 @@ llama_build_and_test(
     test-kv-stream-bench-config.cpp
     ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench/kv-stream-bench-config.cpp)
 target_include_directories(test-kv-stream-bench-config PRIVATE ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench)
+if (GGML_CUDA)
+    llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
+endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
