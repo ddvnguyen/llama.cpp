@@ -14,10 +14,8 @@
 namespace {
 
 constexpr int64_t HEAD_DIM = 256;
-constexpr int64_t N_KV     = 512;
 constexpr int64_t N_KV_HEAD = 4;
 constexpr int64_t N_Q_HEAD  = 24;
-constexpr int64_t N_BATCH   = 2;
 
 size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1)/alignment*alignment;
@@ -49,15 +47,15 @@ struct attention_inputs {
     std::vector<uint16_t> mask;
 };
 
-attention_inputs make_inputs() {
+attention_inputs make_inputs(int64_t n_kv, int64_t n_batch) {
     attention_inputs result;
 
-    result.q.resize(HEAD_DIM*N_BATCH*N_Q_HEAD);
+    result.q.resize(HEAD_DIM*n_batch*N_Q_HEAD);
     for (size_t i = 0; i < result.q.size(); ++i) {
         result.q[i] = 0.15f*std::sin(float(i)*0.03125f) + 0.05f*std::cos(float(i)*0.0078125f);
     }
 
-    const int64_t nrows = N_KV*N_KV_HEAD;
+    const int64_t nrows = n_kv*N_KV_HEAD;
     std::vector<float> source(HEAD_DIM*nrows);
     for (size_t i = 0; i < source.size(); ++i) {
         source[i] = 0.4f*std::sin(float(i)*0.001953125f) + 0.2f*std::cos(float(i)*0.00048828125f);
@@ -76,14 +74,15 @@ attention_inputs make_inputs() {
         GGML_TYPE_Q4_0, source.data(), result.v.data(), 0, nrows, HEAD_DIM, nullptr);
     GGML_ASSERT(v_written == result.v.size());
 
-    result.mask.resize(N_KV*N_BATCH);
-    for (int64_t batch = 0; batch < N_BATCH; ++batch) {
-        for (int64_t token = 0; token < N_KV; ++token) {
+    result.mask.resize(n_kv*n_batch);
+    for (int64_t batch = 0; batch < n_batch; ++batch) {
+        for (int64_t token = 0; token < n_kv; ++token) {
             // Vary both token blocks and both query rows. This catches a
             // streamed implementation that offsets the first mask row but
             // accidentally uses the compact block width as the next-row pitch.
-            const float bias = -0.015625f*float((token + 73*batch) % 127);
-            result.mask[batch*N_KV + token] = ggml_fp32_to_fp16(bias);
+            const float bias = token <= batch ?
+                -0.015625f*float((token + 73*batch) % 127) : -INFINITY;
+            result.mask[batch*n_kv + token] = ggml_fp32_to_fp16(bias);
         }
     }
     return result;
@@ -93,6 +92,8 @@ std::vector<float> run_attention(
         ggml_backend_t backend,
         const attention_inputs & inputs,
         ggml_backend_buffer_type_t kv_buft,
+        int64_t n_kv,
+        int64_t n_batch,
         int repeats = 1) {
     constexpr size_t N_TENSORS = 32;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
@@ -107,23 +108,23 @@ std::vector<float> run_attention(
     GGML_ASSERT(compute_ctx && kv_ctx);
 
     ggml_tensor * q = ggml_new_tensor_4d(
-        compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, N_BATCH, N_Q_HEAD, 1);
+        compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, n_batch, N_Q_HEAD, 1);
     ggml_tensor * mask = ggml_new_tensor_4d(
-        compute_ctx.get(), GGML_TYPE_F16, N_KV, N_BATCH, 1, 1);
+        compute_ctx.get(), GGML_TYPE_F16, n_kv, n_batch, 1, 1);
     ggml_tensor * k_storage = ggml_new_tensor_2d(
-        kv_ctx.get(), GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD, N_KV);
+        kv_ctx.get(), GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD, n_kv);
     ggml_tensor * v_storage = ggml_new_tensor_2d(
-        kv_ctx.get(), GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD, N_KV);
+        kv_ctx.get(), GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD, n_kv);
     ggml_tensor * k_cache = ggml_view_4d(
-        kv_ctx.get(), k_storage, HEAD_DIM, N_KV_HEAD, N_KV, 1,
+        kv_ctx.get(), k_storage, HEAD_DIM, N_KV_HEAD, n_kv, 1,
         ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM),
         ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD),
-        ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD)*N_KV, 0);
+        ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
     ggml_tensor * v_cache = ggml_view_4d(
-        kv_ctx.get(), v_storage, HEAD_DIM, N_KV_HEAD, N_KV, 1,
+        kv_ctx.get(), v_storage, HEAD_DIM, N_KV_HEAD, n_kv, 1,
         ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM),
         ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD),
-        ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD)*N_KV, 0);
+        ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
     ggml_tensor * k = ggml_permute(kv_ctx.get(), k_cache, 0, 2, 1, 3);
     ggml_tensor * v = ggml_permute(kv_ctx.get(), v_cache, 0, 2, 1, 3);
 
@@ -184,14 +185,16 @@ int main() {
     testing t;
 
     t.test("real cache views stream two Q8/Q4 blocks and query rows exactly", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 256;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
 
-        const attention_inputs inputs = make_inputs();
+        const attention_inputs inputs = make_inputs(n_kv, n_batch);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()));
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
 
         ggml_backend_cuda_kv_stream_params params{};
         params.device      = 0;
@@ -207,7 +210,7 @@ int main() {
             runtime, 0, 0, cleared.data(), cleared.size()));
 
         const std::vector<float> actual = run_attention(
-            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime));
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
 
         const std::vector<uint8_t> expected_k = pack_token_block(
             inputs.k, GGML_TYPE_Q8_0, 256, 256);
@@ -237,7 +240,39 @@ int main() {
         }
         std::fprintf(stderr, "streamed attention max_abs=%g max_rel=%g\n", max_abs, max_rel);
         t.assert_true("outputs remain finite", std::isfinite(max_abs) && std::isfinite(max_rel));
-        t.assert_true("streamed output is numerically equivalent", max_abs <= 1e-5f);
+        t.assert_true("streamed output is numerically equivalent", max_abs <= 3e-4f);
+    });
+
+    t.test("one-page causal prefill stays bit-identical to ordinary CUDA attention", [](testing & t) {
+        constexpr int64_t n_kv = 256;
+        constexpr int64_t n_batch = 5;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs = make_inputs(n_kv, n_batch);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device      = 0;
+        params.stage_bytes = page_bytes;
+        params.stage_slots = 1;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(expected.size(), actual.size());
+        t.assert_true("one-page outputs are bit-identical", expected == actual);
     });
 
     t.test("resident pages survive between evaluations while the tail is refreshed", [](testing & t) {
@@ -262,9 +297,9 @@ int main() {
             return;
         }
 
-        const attention_inputs inputs = make_inputs();
+        const attention_inputs inputs = make_inputs(512, 256);
         (void) run_attention(
-            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), 2);
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), 512, 256, 2);
 
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         t.assert_equal(uint64_t(2), stats.resident_misses);

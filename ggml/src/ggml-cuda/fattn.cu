@@ -326,7 +326,7 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
     return Q != nullptr && K != nullptr && V != nullptr &&
         Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 &&
         Q->ne[0] == KV_STREAM_HEAD_DIM && V->ne[0] == KV_STREAM_HEAD_DIM &&
-        Q->ne[1] >= 1 && Q->ne[1] <= 2 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
+        Q->ne[1] >= 1 && Q->ne[1] <= 256 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
         K->ne[1] == V->ne[1] && K->ne[2] == V->ne[2] &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 &&
         K->nb[0] == ggml_element_size(K) && V->nb[0] == ggml_element_size(V) &&
@@ -443,6 +443,15 @@ void ggml_cuda_flash_attn_ext_streamed(
         staged_dst.src[1] = &staged_k;
         staged_dst.src[2] = &staged_v;
         staged_dst.src[3] = staged_mask_ptr;
+
+        // Preserve the normal CUDA flash-attention path when the active cache
+        // fits in a single page. Besides avoiding an unnecessary partial
+        // reduction, this keeps short-context logits numerically identical to
+        // a non-streamed cache.
+        if (nchunks == 1) {
+            ggml_cuda_flash_attn_ext(ctx, &staged_dst);
+            return;
+        }
 
         float * chunk_parts = parts.ptr + size_t(chunk)*KV_STREAM_PARTS_PER_CHUNK*ggml_nelements(dst);
         float2 * chunk_meta = meta.ptr + size_t(chunk)*KV_STREAM_PARTS_PER_CHUNK*nrows;
