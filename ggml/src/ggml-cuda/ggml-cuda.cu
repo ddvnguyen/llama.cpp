@@ -1579,41 +1579,17 @@ static bool ggml_cuda_kv_stream_fattn_fits(const ggml_tensor * dst) {
     if (k_runtime == nullptr || v_runtime == nullptr || k_runtime != v_runtime) {
         return false;
     }
-    if (!ggml_is_contiguous(k) || !ggml_is_contiguous(v)) {
-        return false;
-    }
-
-    const size_t v_offset = GGML_PAD(ggml_nbytes(k), 128);
-    return v_offset <= k_runtime->stage_bytes &&
-        ggml_nbytes(v) <= k_runtime->stage_bytes - v_offset;
+    return ggml_cuda_flash_attn_ext_streamed_supported(dst, k_runtime->stage_bytes);
 }
 
-static void ggml_cuda_kv_stream_fattn_one_block(
+static void ggml_cuda_kv_stream_fattn(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_kv_stream_fattn_fits(dst));
 
     const ggml_tensor * k = dst->src[1];
-    const ggml_tensor * v = dst->src[2];
     auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(k);
     GGML_ASSERT(runtime->device == ctx.device);
-
-    char * stage = static_cast<char *>(runtime->stage_data);
-    const size_t v_offset = GGML_PAD(ggml_nbytes(k), 128);
-
-    // Deliberately ordered on the compute stream for the first correctness
-    // slice. Double-buffered copies and events come after multi-block merge.
-    CUDA_CHECK(cudaMemcpyAsync(stage, k->data, ggml_nbytes(k), cudaMemcpyHostToDevice, ctx.stream()));
-    CUDA_CHECK(cudaMemcpyAsync(stage + v_offset, v->data, ggml_nbytes(v), cudaMemcpyHostToDevice, ctx.stream()));
-
-    ggml_tensor staged_k = *k;
-    ggml_tensor staged_v = *v;
-    staged_k.data = stage;
-    staged_v.data = stage + v_offset;
-
-    ggml_tensor staged_dst = *dst;
-    staged_dst.src[1] = &staged_k;
-    staged_dst.src[2] = &staged_v;
-    ggml_cuda_flash_attn_ext(ctx, &staged_dst);
+    ggml_cuda_flash_attn_ext_streamed(ctx, dst, runtime->stage_data, runtime->stage_bytes);
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
@@ -2652,7 +2628,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_EXT:
             if (ggml_cuda_kv_stream_runtime_from_tensor(dst->src[1]) != nullptr ||
                     ggml_cuda_kv_stream_runtime_from_tensor(dst->src[2]) != nullptr) {
-                ggml_cuda_kv_stream_fattn_one_block(ctx, dst);
+                ggml_cuda_kv_stream_fattn(ctx, dst);
             } else {
                 ggml_cuda_flash_attn_ext(ctx, dst);
             }

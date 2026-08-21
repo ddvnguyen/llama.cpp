@@ -127,6 +127,225 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+namespace {
+
+constexpr int KV_STREAM_HEAD_DIM = 256;
+constexpr int KV_STREAM_PARTS_PER_CHUNK = 2;
+
+static int64_t kv_stream_block_tokens(const ggml_tensor * dst, size_t stage_bytes) {
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const size_t bytes_per_token = K->nb[1]*K->ne[2] + V->nb[1]*V->ne[2];
+    if (bytes_per_token == 0) {
+        return 0;
+    }
+
+    int64_t tokens = std::min<int64_t>(K->ne[1], stage_bytes/bytes_per_token);
+    tokens = tokens/FATTN_KQ_STRIDE*FATTN_KQ_STRIDE;
+    while (tokens > 0) {
+        const size_t k_bytes = K->nb[1]*tokens*K->ne[2];
+        const size_t v_offset = GGML_PAD(k_bytes, 128);
+        const size_t v_bytes = V->nb[1]*tokens*V->ne[2];
+        if (v_offset <= stage_bytes && v_bytes <= stage_bytes - v_offset) {
+            return tokens;
+        }
+        tokens -= FATTN_KQ_STRIDE;
+    }
+    return 0;
+}
+
+template<int D>
+static __global__ void kv_stream_combine_chunk_results(
+        const float * parts,
+        const float2 * meta,
+        float * dst,
+        int nrows,
+        int nchunks) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (row >= nrows || tid >= D) {
+        return;
+    }
+
+    float maximum = -FLT_MAX;
+    for (int chunk = 0; chunk < nchunks; ++chunk) {
+        const int base = (chunk*nrows + row)*KV_STREAM_PARTS_PER_CHUNK;
+        for (int part = 0; part < KV_STREAM_PARTS_PER_CHUNK; ++part) {
+            maximum = fmaxf(maximum, meta[base + part].x);
+        }
+    }
+
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+    for (int chunk = 0; chunk < nchunks; ++chunk) {
+        const int base = (chunk*nrows + row)*KV_STREAM_PARTS_PER_CHUNK;
+        for (int part = 0; part < KV_STREAM_PARTS_PER_CHUNK; ++part) {
+            const float weight = expf(meta[base + part].x - maximum);
+            numerator += weight*parts[(base + part)*D + tid];
+            denominator += weight*meta[base + part].y;
+        }
+    }
+    dst[row*D + tid] = numerator/denominator;
+}
+
+template<bool use_logit_softcap>
+static void kv_stream_launch_q8_q4_partial(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        float * parts,
+        float2 * meta) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    constexpr int ncols = 1;
+    constexpr int nthreads = 128;
+    constexpr int nwarps = nthreads/WARP_SIZE;
+    fattn_kernel_t kernel = flash_attn_ext_vec<
+        KV_STREAM_HEAD_DIM, ncols, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, use_logit_softcap>;
+
+    float scale = 1.0f;
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head = Q->ne[2];
+    const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
+    const float m0 = powf(2.0f, -(max_bias       )/n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias/2.0f)/n_head_log2);
+    const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
+
+    const dim3 blocks(Q->ne[1], KV_STREAM_PARTS_PER_CHUNK, Q->ne[2]*Q->ne[3]);
+    const dim3 threads(WARP_SIZE, nwarps, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(kernel, launch_params,
+        (const char *) Q->data,
+        (const char *) K->data,
+        (const char *) V->data,
+        mask ? (const char *) mask->data : nullptr,
+        nullptr,
+        nullptr,
+        parts,
+        meta,
+        scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+        Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+        K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
+        V->nb[1], V->nb[2], V->nb[3],
+        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes) {
+    if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    return Q != nullptr && K != nullptr && V != nullptr &&
+        Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 &&
+        Q->ne[0] == KV_STREAM_HEAD_DIM && V->ne[0] == KV_STREAM_HEAD_DIM &&
+        Q->ne[1] >= 1 && Q->ne[1] <= 2 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
+        K->ne[1] == V->ne[1] && K->ne[2] == V->ne[2] &&
+        K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        ggml_is_contiguous(K) && ggml_is_contiguous(V) &&
+        (mask == nullptr || (mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask))) &&
+        sinks == nullptr && kv_stream_block_tokens(dst, stage_bytes) > 0;
+}
+
+void ggml_cuda_flash_attn_ext_streamed(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        void * stage_data,
+        size_t stage_bytes) {
+    GGML_ASSERT(ggml_cuda_flash_attn_ext_streamed_supported(dst, stage_bytes));
+
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const int64_t block_tokens = kv_stream_block_tokens(dst, stage_bytes);
+    const int nchunks = (K->ne[1] + block_tokens - 1)/block_tokens;
+    const int nrows = ggml_nrows(dst);
+
+    ggml_cuda_pool & pool = ctx.pool();
+    ggml_cuda_pool_alloc<float> parts(pool, size_t(nchunks)*KV_STREAM_PARTS_PER_CHUNK*ggml_nelements(dst));
+    ggml_cuda_pool_alloc<float2> meta(pool, size_t(nchunks)*KV_STREAM_PARTS_PER_CHUNK*nrows);
+
+    for (int chunk = 0; chunk < nchunks; ++chunk) {
+        const int64_t token_begin = chunk*block_tokens;
+        const int64_t token_count = std::min<int64_t>(block_tokens, K->ne[1] - token_begin);
+        const size_t k_head_bytes = K->nb[1]*token_count;
+        const size_t k_bytes = k_head_bytes*K->ne[2];
+        const size_t v_offset = GGML_PAD(k_bytes, 128);
+        const size_t v_head_bytes = V->nb[1]*token_count;
+        const size_t v_bytes = v_head_bytes*V->ne[2];
+        GGML_ASSERT(v_offset <= stage_bytes && v_bytes <= stage_bytes - v_offset);
+
+        char * stage = static_cast<char *>(stage_data);
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            stage, k_head_bytes,
+            static_cast<const char *>(K->data) + token_begin*K->nb[1], K->nb[2],
+            k_head_bytes, K->ne[2], cudaMemcpyHostToDevice, ctx.stream()));
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            stage + v_offset, v_head_bytes,
+            static_cast<const char *>(V->data) + token_begin*V->nb[1], V->nb[2],
+            v_head_bytes, V->ne[2], cudaMemcpyHostToDevice, ctx.stream()));
+
+        ggml_tensor staged_k = *K;
+        ggml_tensor staged_v = *V;
+        staged_k.data = stage;
+        staged_k.ne[1] = token_count;
+        staged_k.nb[2] = k_head_bytes;
+        staged_k.nb[3] = k_bytes;
+        staged_v.data = stage + v_offset;
+        staged_v.ne[1] = token_count;
+        staged_v.nb[2] = v_head_bytes;
+        staged_v.nb[3] = v_bytes;
+
+        ggml_tensor staged_mask{};
+        ggml_tensor * staged_mask_ptr = nullptr;
+        if (mask != nullptr) {
+            staged_mask = *mask;
+            staged_mask.data = static_cast<char *>(mask->data) + token_begin*mask->nb[0];
+            staged_mask.ne[0] = token_count;
+            staged_mask_ptr = &staged_mask;
+        }
+
+        ggml_tensor staged_dst = *dst;
+        staged_dst.src[1] = &staged_k;
+        staged_dst.src[2] = &staged_v;
+        staged_dst.src[3] = staged_mask_ptr;
+
+        float * chunk_parts = parts.ptr + size_t(chunk)*KV_STREAM_PARTS_PER_CHUNK*ggml_nelements(dst);
+        float2 * chunk_meta = meta.ptr + size_t(chunk)*KV_STREAM_PARTS_PER_CHUNK*nrows;
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+        if (logit_softcap == 0.0f) {
+            kv_stream_launch_q8_q4_partial<false>(ctx, &staged_dst, chunk_parts, chunk_meta);
+        } else {
+            kv_stream_launch_q8_q4_partial<true>(ctx, &staged_dst, chunk_parts, chunk_meta);
+        }
+    }
+
+    const dim3 blocks(nrows, 1, 1);
+    const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(kv_stream_combine_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
+        parts.ptr, meta.ptr, static_cast<float *>(dst->data), nrows, nchunks);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 template <int DKQ, int DV, int ncols2>
