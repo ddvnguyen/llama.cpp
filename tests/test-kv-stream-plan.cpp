@@ -17,31 +17,29 @@ constexpr uint32_t STAGE_TOKENS    = 16*1024;
 constexpr uint64_t BYTES_PER_TOKEN = 1664;
 
 std::vector<llama_kv_stream_region> make_qwen38_regions(uint32_t n_kv) {
-    std::vector<llama_kv_stream_region> result;
-
-    auto append_layer = [&](llama_kv_stream_region_role role, int32_t layer_id, bool pinned) {
-        for (uint32_t token_begin = 0; token_begin < n_kv; token_begin += PAGE_TOKENS) {
-            const uint32_t token_count = std::min(PAGE_TOKENS, n_kv - token_begin);
-
-            llama_kv_stream_region region;
-            region.role               = role;
-            region.layer_id           = layer_id;
-            region.token_begin        = token_begin;
-            region.token_count        = token_count;
-            region.bytes              = uint64_t(token_count)*BYTES_PER_TOKEN;
-            region.residency_priority = uint64_t(layer_id)*1'000'000ULL + token_begin/PAGE_TOKENS;
-            region.pinned             = pinned;
-            result.push_back(region);
-        }
-    };
+    llama_kv_stream_regions_params params;
+    params.page_tokens = PAGE_TOKENS;
 
     for (uint32_t il = 0; il < N_TARGET_LAYERS; ++il) {
-        append_layer(llama_kv_stream_region_role::target, 3 + 4*il, false);
+        llama_kv_stream_layer_layout layer;
+        layer.role            = llama_kv_stream_region_role::target;
+        layer.layer_id        = 3 + 4*il;
+        layer.n_tokens        = n_kv;
+        layer.bytes_per_token = BYTES_PER_TOKEN;
+        layer.layer_priority  = il;
+        layer.pin_tail        = true;
+        params.layers.push_back(layer);
     }
 
-    append_layer(llama_kv_stream_region_role::mtp, 64, true);
+    llama_kv_stream_layer_layout mtp;
+    mtp.role            = llama_kv_stream_region_role::mtp;
+    mtp.layer_id        = 64;
+    mtp.n_tokens        = n_kv;
+    mtp.bytes_per_token = BYTES_PER_TOKEN;
+    mtp.pin_all         = true;
+    params.layers.push_back(mtp);
 
-    return result;
+    return llama_kv_stream_regions_make(params).regions;
 }
 
 llama_kv_stream_plan_params make_params(uint32_t n_kv, uint64_t pool_mib = 2526) {
@@ -351,6 +349,128 @@ int main() {
         params.maximum_tokens   = 262143;
         extent = llama_kv_stream_extent_make(params);
         t.assert_true("unaligned maximum is rejected", !extent.valid);
+    });
+
+    t.test("region builder reproduces exact Qwen3.8 maximum-context geometry", [](testing & t) {
+        llama_kv_stream_regions_params params;
+        params.page_tokens = PAGE_TOKENS;
+
+        for (uint32_t il = 0; il < N_TARGET_LAYERS; ++il) {
+            llama_kv_stream_layer_layout layer;
+            layer.role            = llama_kv_stream_region_role::target;
+            layer.layer_id        = 3 + 4*il;
+            layer.n_tokens        = 262144;
+            layer.bytes_per_token = BYTES_PER_TOKEN;
+            layer.layer_priority  = il;
+            layer.pin_tail        = true;
+            params.layers.push_back(layer);
+        }
+
+        llama_kv_stream_layer_layout mtp;
+        mtp.role            = llama_kv_stream_region_role::mtp;
+        mtp.layer_id        = 64;
+        mtp.n_tokens        = 262144;
+        mtp.bytes_per_token = BYTES_PER_TOKEN;
+        mtp.pin_all         = true;
+        params.layers.push_back(mtp);
+
+        const auto built = llama_kv_stream_regions_make(params);
+        t.assert_true("regions are valid", built.valid);
+        t.assert_equal(size_t(17*1024), built.regions.size());
+        t.assert_equal(uint64_t(7072)*MIB, built.total_bytes);
+
+        const size_t pinned = std::count_if(built.regions.begin(), built.regions.end(), [](const auto & region) {
+            return region.pinned;
+        });
+        t.assert_equal(size_t(1024 + N_TARGET_LAYERS), pinned);
+        t.assert_true("every full page has exact bytes", std::all_of(
+            built.regions.begin(), built.regions.end(), [](const auto & region) {
+                return region.token_count == PAGE_TOKENS &&
+                       region.bytes == PAGE_TOKENS*BYTES_PER_TOKEN;
+            }));
+    });
+
+    t.test("region builder represents a partial tail without reserving a full page", [](testing & t) {
+        llama_kv_stream_regions_params params;
+        params.page_tokens = PAGE_TOKENS;
+
+        llama_kv_stream_layer_layout layer;
+        layer.layer_id        = 3;
+        layer.n_tokens        = 196609;
+        layer.bytes_per_token = BYTES_PER_TOKEN;
+        layer.pin_tail        = true;
+        params.layers.push_back(layer);
+
+        const auto built = llama_kv_stream_regions_make(params);
+        if (!t.assert_true("regions are valid", built.valid)) {
+            return;
+        }
+        t.assert_equal(size_t(769), built.regions.size());
+
+        if (built.regions.empty()) {
+            return;
+        }
+
+        const auto & tail = built.regions.back();
+        t.assert_equal(uint32_t(196608), tail.token_begin);
+        t.assert_equal(uint32_t(1), tail.token_count);
+        t.assert_equal(uint64_t(BYTES_PER_TOKEN), tail.bytes);
+        t.assert_true("tail is pinned", tail.pinned);
+    });
+
+    t.test("region priority spreads the same context page across layers", [](testing & t) {
+        llama_kv_stream_regions_params params;
+        params.page_tokens = PAGE_TOKENS;
+
+        for (uint32_t il = 0; il < 4; ++il) {
+            llama_kv_stream_layer_layout layer;
+            layer.layer_id        = 3 + 4*il;
+            layer.n_tokens        = 2*PAGE_TOKENS;
+            layer.bytes_per_token = BYTES_PER_TOKEN;
+            layer.layer_priority  = il;
+            params.layers.push_back(layer);
+        }
+
+        const auto built = llama_kv_stream_regions_make(params);
+        t.assert_true("regions are valid", built.valid);
+
+        uint64_t maximum_page_zero_priority = 0;
+        uint64_t minimum_page_one_priority = std::numeric_limits<uint64_t>::max();
+        for (const auto & region : built.regions) {
+            if (region.token_begin == 0) {
+                maximum_page_zero_priority = std::max(maximum_page_zero_priority, region.residency_priority);
+            } else {
+                minimum_page_one_priority = std::min(minimum_page_one_priority, region.residency_priority);
+            }
+        }
+
+        t.assert_true(
+            "all layers of one context page are preferred before the next page",
+            maximum_page_zero_priority < minimum_page_one_priority);
+    });
+
+    t.test("region builder rejects invalid and overflowing layouts", [](testing & t) {
+        llama_kv_stream_regions_params params;
+        params.page_tokens = 0;
+        auto built = llama_kv_stream_regions_make(params);
+        t.assert_true("zero page size is rejected", !built.valid);
+
+        params.page_tokens = PAGE_TOKENS;
+        llama_kv_stream_layer_layout layer;
+        layer.layer_id        = 3;
+        layer.n_tokens        = 2;
+        layer.bytes_per_token = std::numeric_limits<uint64_t>::max();
+        params.layers.push_back(layer);
+        built = llama_kv_stream_regions_make(params);
+        t.assert_true("byte overflow is rejected", !built.valid);
+
+        params.layers.clear();
+        layer.n_tokens        = PAGE_TOKENS;
+        layer.bytes_per_token = BYTES_PER_TOKEN;
+        params.layers.push_back(layer);
+        params.layers.push_back(layer);
+        built = llama_kv_stream_regions_make(params);
+        t.assert_true("duplicate logical layers are rejected", !built.valid);
     });
 
     return t.summary();

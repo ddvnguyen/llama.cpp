@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <set>
 #include <tuple>
 
 namespace {
@@ -212,5 +213,67 @@ llama_kv_stream_extent llama_kv_stream_extent_make(const llama_kv_stream_extent_
     result.tokens = selected_tokens;
     result.grew   = selected_tokens > params.previous_extent;
     result.shrunk = selected_tokens < params.previous_extent;
+    return result;
+}
+
+llama_kv_stream_regions llama_kv_stream_regions_make(const llama_kv_stream_regions_params & params) {
+    llama_kv_stream_regions result;
+
+    auto fail_regions = [&](const char * message) {
+        result.valid = false;
+        result.error = message;
+        result.regions.clear();
+        result.total_bytes = 0;
+        return result;
+    };
+
+    if (params.page_tokens == 0) {
+        return fail_regions("KV stream region page size must be non-zero");
+    }
+
+    std::set<std::pair<llama_kv_stream_region_role, int32_t>> logical_layers;
+
+    for (const auto & layer : params.layers) {
+        if (layer.layer_id < 0) {
+            return fail_regions("KV stream layer layout has an invalid layer id");
+        }
+
+        if (!logical_layers.emplace(layer.role, layer.layer_id).second) {
+            return fail_regions("KV stream layer layout is duplicated");
+        }
+
+        if (layer.n_tokens > 0 && layer.bytes_per_token == 0) {
+            return fail_regions("non-empty KV stream layer must have a non-zero token size");
+        }
+
+        for (uint64_t token_begin = 0; token_begin < layer.n_tokens; token_begin += params.page_tokens) {
+            const uint32_t token_count = uint32_t(std::min<uint64_t>(
+                params.page_tokens, uint64_t(layer.n_tokens) - token_begin));
+
+            llama_kv_stream_region region;
+            region.role        = layer.role;
+            region.layer_id    = layer.layer_id;
+            region.token_begin = uint32_t(token_begin);
+            region.token_count = token_count;
+            region.pinned      = layer.pin_all ||
+                (layer.pin_tail && token_begin + token_count == layer.n_tokens);
+
+            if (!checked_mul(token_count, layer.bytes_per_token, region.bytes)) {
+                return fail_regions("KV stream region byte size overflow");
+            }
+
+            uint64_t total_bytes = 0;
+            if (!checked_add(result.total_bytes, region.bytes, total_bytes)) {
+                return fail_regions("KV stream layout total byte size overflow");
+            }
+            result.total_bytes = total_bytes;
+
+            const uint64_t page_index = token_begin/params.page_tokens;
+            region.residency_priority = (page_index << 32) | layer.layer_priority;
+            result.regions.push_back(region);
+        }
+    }
+
+    result.valid = true;
     return result;
 }

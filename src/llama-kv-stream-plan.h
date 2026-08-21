@@ -75,3 +75,32 @@ struct llama_kv_stream_extent {
 };
 
 llama_kv_stream_extent llama_kv_stream_extent_make(const llama_kv_stream_extent_params & params);
+
+struct llama_kv_stream_layer_layout {
+    llama_kv_stream_region_role role = llama_kv_stream_region_role::target;
+
+    int32_t  layer_id        = -1;
+    uint32_t n_tokens        = 0;
+    uint64_t bytes_per_token = 0;
+
+    // Lower values spread residency preference within the same token page.
+    uint32_t layer_priority = 0;
+
+    bool pin_all  = false;
+    bool pin_tail = false;
+};
+
+struct llama_kv_stream_regions_params {
+    uint32_t page_tokens = 256;
+    std::vector<llama_kv_stream_layer_layout> layers;
+};
+
+struct llama_kv_stream_regions {
+    bool valid = false;
+    std::string error;
+
+    uint64_t total_bytes = 0;
+    std::vector<llama_kv_stream_region> regions;
+};
+
+llama_kv_stream_regions llama_kv_stream_regions_make(const llama_kv_stream_regions_params & params);
