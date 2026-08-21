@@ -41,6 +41,16 @@ struct ggml_backend_cuda_kv_stream_params {
     int device;
     size_t stage_bytes;
     uint32_t stage_slots;
+    size_t pool_bytes;
+    uint32_t resident_layer_count;
+    uint32_t page_tokens;
+};
+
+struct ggml_backend_cuda_kv_stream_stats {
+    uint64_t resident_hits;
+    uint64_t resident_misses;
+    uint64_t streamed_pages;
+    uint64_t host_to_device_bytes;
 };
 
 GGML_BACKEND_API ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
@@ -52,6 +62,8 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_kv_stream_buffer_t
 GGML_BACKEND_API size_t ggml_backend_cuda_kv_stream_stage_bytes(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API uint32_t ggml_backend_cuda_kv_stream_stage_slots(
+    ggml_backend_cuda_kv_stream_runtime_t runtime);
+GGML_BACKEND_API struct ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_stage_upload(
     ggml_backend_cuda_kv_stream_runtime_t runtime,

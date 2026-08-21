@@ -165,6 +165,14 @@ llama_kv_cache::llama_kv_cache(
 
     ggml_backend_dev_t kv_stream_dev = nullptr;
     ggml_backend_buffer_type_t kv_stream_buft = nullptr;
+    uint32_t kv_stream_layer_count = 0;
+    if (kv_stream_stage_bytes != 0) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (hparams.has_kv(il) && (!filter || filter(il))) {
+                ++kv_stream_layer_count;
+            }
+        }
+    }
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -230,7 +238,7 @@ llama_kv_cache::llama_kv_cache(
 
                 if (kv_stream_runtime.runtime == nullptr) {
                     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                    using runtime_new_fn_t = void * (*)(ggml_backend_dev_t, size_t, uint32_t);
+                    using runtime_new_fn_t = void * (*)(ggml_backend_dev_t, size_t, size_t, uint32_t);
                     using runtime_free_fn_t = void (*)(void *);
                     using buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
 
@@ -245,7 +253,11 @@ llama_kv_cache::llama_kv_cache(
                         throw std::runtime_error("block KV streaming requires the CUDA backend");
                     }
 
-                    kv_stream_runtime.runtime = runtime_new_fn(dev, kv_stream_stage_bytes, 1);
+                    const size_t page_bytes = 256ULL*(
+                        ggml_row_size(type_k, n_embd_k_gqa) +
+                        ggml_row_size(type_v, n_embd_v_gqa));
+                    kv_stream_runtime.runtime = runtime_new_fn(
+                        dev, kv_stream_stage_bytes, page_bytes, kv_stream_layer_count);
                     kv_stream_runtime.free_fn = runtime_free_fn;
                     if (kv_stream_runtime.runtime == nullptr) {
                         throw std::runtime_error("failed to create CUDA block KV streaming runtime");

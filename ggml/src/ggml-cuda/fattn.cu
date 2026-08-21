@@ -5,6 +5,10 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <algorithm>
+#include <unordered_map>
+#include <vector>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
@@ -127,6 +131,68 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+struct ggml_cuda_kv_stream_resident_cache {
+    char * pool_data = nullptr;
+    size_t pool_bytes = 0;
+    size_t scratch_bytes = 0;
+    size_t page_bytes = 0;
+    uint32_t layer_count = 0;
+    uint32_t page_tokens = 0;
+    uint32_t resident_pages_per_layer = 0;
+    uint32_t next_layer = 0;
+
+    std::unordered_map<const void *, uint32_t> layer_by_k;
+    std::vector<uint8_t> loaded;
+    ggml_cuda_kv_stream_resident_stats stats;
+};
+
+ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
+        void * pool_data, size_t pool_bytes, size_t scratch_bytes,
+        uint32_t layer_count, uint32_t page_tokens) {
+    if (pool_data == nullptr || scratch_bytes == 0 || scratch_bytes >= pool_bytes ||
+            layer_count == 0 || page_tokens != 256) {
+        return nullptr;
+    }
+
+    const size_t page_bytes = scratch_bytes;
+    const size_t resident_pages = (pool_bytes - scratch_bytes)/(page_bytes*layer_count);
+    if (resident_pages == 0 || resident_pages > UINT32_MAX) {
+        return nullptr;
+    }
+
+    auto * cache = new ggml_cuda_kv_stream_resident_cache;
+    cache->pool_data = static_cast<char *>(pool_data);
+    cache->pool_bytes = pool_bytes;
+    cache->scratch_bytes = scratch_bytes;
+    cache->page_bytes = page_bytes;
+    cache->layer_count = layer_count;
+    cache->page_tokens = page_tokens;
+    cache->resident_pages_per_layer = resident_pages;
+    cache->loaded.resize(size_t(layer_count)*resident_pages, 0);
+    return cache;
+}
+
+void ggml_cuda_kv_stream_resident_cache_free(ggml_cuda_kv_stream_resident_cache * cache) {
+    delete cache;
+}
+
+void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache * cache) {
+    if (cache == nullptr) {
+        return;
+    }
+    std::fill(cache->loaded.begin(), cache->loaded.end(), 0);
+    cache->layer_by_k.clear();
+    cache->next_layer = 0;
+    cache->stats = {};
+}
+
+ggml_cuda_kv_stream_resident_stats ggml_cuda_kv_stream_resident_cache_get_stats(
+        const ggml_cuda_kv_stream_resident_cache * cache) {
+    return cache == nullptr ? ggml_cuda_kv_stream_resident_stats{} : cache->stats;
+}
+
 namespace {
 
 constexpr int KV_STREAM_HEAD_DIM = 256;
@@ -274,13 +340,15 @@ void ggml_cuda_flash_attn_ext_streamed(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
         void * stage_data,
-        size_t stage_bytes) {
+        size_t stage_bytes,
+        ggml_cuda_kv_stream_resident_cache * resident_cache) {
     GGML_ASSERT(ggml_cuda_flash_attn_ext_streamed_supported(dst, stage_bytes));
 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
-    const int64_t block_tokens = kv_stream_block_tokens(dst, stage_bytes);
+    const int64_t block_tokens = resident_cache != nullptr ?
+        resident_cache->page_tokens : kv_stream_block_tokens(dst, stage_bytes);
     const int nchunks = (K->ne[1] + block_tokens - 1)/block_tokens;
     const int nrows = ggml_nrows(dst);
 
@@ -301,17 +369,52 @@ void ggml_cuda_flash_attn_ext_streamed(
         GGML_ASSERT(v_offset <= stage_bytes && v_bytes <= stage_bytes - v_offset);
 
         char * stage = static_cast<char *>(stage_data);
-        for (int64_t head = 0; head < K->ne[2]; ++head) {
-            CUDA_CHECK(cudaMemcpy2DAsync(
-                stage + head*k_head_bytes, k_row_bytes,
-                static_cast<const char *>(K->data) + head*K->nb[2] + token_begin*K->nb[1], K->nb[1],
-                k_row_bytes, token_count, cudaMemcpyHostToDevice, ctx.stream()));
+        bool upload = true;
+        if (resident_cache != nullptr) {
+            GGML_ASSERT(token_count == resident_cache->page_tokens);
+            GGML_ASSERT(v_offset + v_bytes == resident_cache->page_bytes);
+
+            auto [it, inserted] = resident_cache->layer_by_k.emplace(K->data, resident_cache->next_layer);
+            if (inserted) {
+                GGML_ASSERT(resident_cache->next_layer < resident_cache->layer_count);
+                ++resident_cache->next_layer;
+            }
+
+            const uint32_t layer = it->second;
+            const uint32_t page = token_begin/resident_cache->page_tokens;
+            if (page < resident_cache->resident_pages_per_layer) {
+                const size_t resident_index = size_t(layer)*resident_cache->resident_pages_per_layer + page;
+                stage = resident_cache->pool_data + resident_cache->scratch_bytes +
+                    resident_index*resident_cache->page_bytes;
+                if (resident_cache->loaded[resident_index]) {
+                    ++resident_cache->stats.resident_hits;
+                    // The final page contains the rows most recently changed by SET_ROWS.
+                    upload = chunk == nchunks - 1;
+                } else {
+                    ++resident_cache->stats.resident_misses;
+                    resident_cache->loaded[resident_index] = 1;
+                }
+            } else {
+                ++resident_cache->stats.streamed_pages;
+            }
         }
-        for (int64_t head = 0; head < V->ne[2]; ++head) {
-            CUDA_CHECK(cudaMemcpy2DAsync(
-                stage + v_offset + head*v_head_bytes, v_row_bytes,
-                static_cast<const char *>(V->data) + head*V->nb[2] + token_begin*V->nb[1], V->nb[1],
-                v_row_bytes, token_count, cudaMemcpyHostToDevice, ctx.stream()));
+
+        if (upload) {
+            for (int64_t head = 0; head < K->ne[2]; ++head) {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    stage + head*k_head_bytes, k_row_bytes,
+                    static_cast<const char *>(K->data) + head*K->nb[2] + token_begin*K->nb[1], K->nb[1],
+                    k_row_bytes, token_count, cudaMemcpyHostToDevice, ctx.stream()));
+            }
+            for (int64_t head = 0; head < V->ne[2]; ++head) {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    stage + v_offset + head*v_head_bytes, v_row_bytes,
+                    static_cast<const char *>(V->data) + head*V->nb[2] + token_begin*V->nb[1], V->nb[1],
+                    v_row_bytes, token_count, cudaMemcpyHostToDevice, ctx.stream()));
+            }
+            if (resident_cache != nullptr) {
+                resident_cache->stats.host_to_device_bytes += k_bytes + v_bytes;
+            }
         }
 
         ggml_tensor staged_k = *K;

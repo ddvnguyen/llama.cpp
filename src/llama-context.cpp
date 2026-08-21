@@ -414,7 +414,7 @@ llama_context::llama_context(
             throw std::runtime_error(stream_validation.error);
         }
         if (stream_validation.enabled) {
-            LLAMA_LOG_INFO("%s: experimental block KV streaming enabled, stage = %.2f MiB\n",
+            LLAMA_LOG_INFO("%s: experimental block KV streaming enabled, pool = %.2f MiB\n",
                     __func__, kv_stream_stage_bytes/1024.0/1024.0);
         }
 

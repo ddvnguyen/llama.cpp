@@ -2422,7 +2422,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
         {"--kv-stream-stage-mib"}, "N",
-        string_format("block-streaming KV staging budget in MiB; 0 disables it (default: %u)", params.kv_stream_stage_mib),
+        string_format("block-streaming KV resident + staging pool in MiB; 0 disables it (default: %u)", params.kv_stream_stage_mib),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("KV stream stage size must be non-negative");

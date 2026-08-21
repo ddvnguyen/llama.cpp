@@ -92,7 +92,8 @@ attention_inputs make_inputs() {
 std::vector<float> run_attention(
         ggml_backend_t backend,
         const attention_inputs & inputs,
-        ggml_backend_buffer_type_t kv_buft) {
+        ggml_backend_buffer_type_t kv_buft,
+        int repeats = 1) {
     constexpr size_t N_TENSORS = 32;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
 
@@ -168,7 +169,9 @@ std::vector<float> run_attention(
     GGML_ASSERT(ggml_backend_supports_op(backend, updated_k));
     GGML_ASSERT(ggml_backend_supports_op(backend, updated_v));
     GGML_ASSERT(ggml_backend_supports_op(backend, out));
-    GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    }
 
     std::vector<float> result(ggml_nelements(out));
     ggml_backend_tensor_get(out, result.data(), 0, result.size()*sizeof(float));
@@ -235,6 +238,41 @@ int main() {
         std::fprintf(stderr, "streamed attention max_abs=%g max_rel=%g\n", max_abs, max_rel);
         t.assert_true("outputs remain finite", std::isfinite(max_abs) && std::isfinite(max_rel));
         t.assert_true("streamed output is numerically equivalent", max_abs <= 1e-5f);
+    });
+
+    t.test("resident pages survive between evaluations while the tail is refreshed", [](testing & t) {
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 1;
+        params.pool_bytes           = 3*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs = make_inputs();
+        (void) run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), 2);
+
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        t.assert_equal(uint64_t(2), stats.resident_misses);
+        t.assert_equal(uint64_t(2), stats.resident_hits);
+        t.assert_equal(uint64_t(0), stats.streamed_pages);
+        t.assert_equal(uint64_t(3*page_bytes), stats.host_to_device_bytes);
+
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
     });
 
     ggml_quantize_free();
