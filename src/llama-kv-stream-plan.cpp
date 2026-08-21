@@ -302,7 +302,9 @@ llama_kv_stream_prefetch_dispatch_result llama_kv_stream_prefetch_dispatch(
         return fail_dispatch("KV prefetch free slot list contains duplicates");
     }
 
-    const uint64_t window_end = uint64_t(params.current_attention) + params.lookahead_layers;
+    const uint64_t window_end = params.adaptive_lookahead ?
+        std::numeric_limits<uint32_t>::max() :
+        uint64_t(params.current_attention) + params.lookahead_layers;
     std::vector<size_t> eligible;
     eligible.reserve(params.requests.size());
 
@@ -343,6 +345,83 @@ llama_kv_stream_prefetch_dispatch_result llama_kv_stream_prefetch_dispatch(
     result.assignments.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         result.assignments.push_back({ eligible[i], slots[i] });
+    }
+
+    result.valid = true;
+    return result;
+}
+
+llama_kv_stream_partition llama_kv_stream_partition_adapt(
+        const llama_kv_stream_partition_params & params) {
+    llama_kv_stream_partition result;
+    result.resident_pages_per_layer = params.previous_resident_pages_per_layer;
+    result.ring_slots = params.previous_ring_slots;
+
+    auto fail_partition = [&](const char * message) {
+        result.valid = false;
+        result.error = message;
+        return result;
+    };
+
+    if (params.total_pool_pages == 0 || params.layer_count == 0) {
+        return fail_partition("KV stream partition geometry must be non-zero");
+    }
+    if (params.grow_hysteresis_evaluations == 0 ||
+        params.shrink_hysteresis_evaluations == 0) {
+        return fail_partition("KV stream partition hysteresis must be non-zero");
+    }
+    const auto ratio_valid = [](double value) {
+        return value >= 0.0 && value <= 1.0;
+    };
+    if (!ratio_valid(params.deadline_miss_ratio) ||
+        !ratio_valid(params.copy_engine_busy_ratio) ||
+        !ratio_valid(params.ring_peak_occupancy_ratio)) {
+        return fail_partition("KV stream partition metrics must be ratios");
+    }
+    if (params.previous_resident_pages_per_layer > params.active_pages_per_layer) {
+        return fail_partition("resident KV pages exceed active pages");
+    }
+
+    uint64_t resident_pages = 0;
+    if (!checked_mul(params.previous_resident_pages_per_layer, params.layer_count, resident_pages) ||
+        resident_pages + params.previous_ring_slots != params.total_pool_pages) {
+        return fail_partition("previous KV stream partition does not cover the fixed pool");
+    }
+    if (params.previous_ring_slots < params.minimum_ring_slots) {
+        return fail_partition("previous KV stream ring is below its minimum");
+    }
+
+    constexpr double MISS_THRESHOLD = 0.01;
+    constexpr double COPY_SATURATED  = 0.95;
+    constexpr double COPY_LIGHT      = 0.50;
+    constexpr double RING_LIGHT      = 0.50;
+
+    const bool starved = params.deadline_miss_ratio > MISS_THRESHOLD &&
+        params.copy_engine_busy_ratio < COPY_SATURATED;
+    const bool overprovisioned = params.deadline_miss_ratio <= MISS_THRESHOLD &&
+        params.copy_engine_busy_ratio < COPY_LIGHT &&
+        params.ring_peak_occupancy_ratio < RING_LIGHT;
+
+    result.starved_evaluations = starved ? params.starved_evaluations + 1 : 0;
+    result.overprovisioned_evaluations = overprovisioned ?
+        params.overprovisioned_evaluations + 1 : 0;
+
+    if (starved && result.starved_evaluations >= params.grow_hysteresis_evaluations &&
+        result.resident_pages_per_layer > 0) {
+        --result.resident_pages_per_layer;
+        result.ring_slots += params.layer_count;
+        result.starved_evaluations = 0;
+        result.overprovisioned_evaluations = 0;
+        result.changed = true;
+    } else if (overprovisioned &&
+            result.overprovisioned_evaluations >= params.shrink_hysteresis_evaluations &&
+            result.resident_pages_per_layer < params.active_pages_per_layer &&
+            result.ring_slots >= params.minimum_ring_slots + params.layer_count) {
+        ++result.resident_pages_per_layer;
+        result.ring_slots -= params.layer_count;
+        result.starved_evaluations = 0;
+        result.overprovisioned_evaluations = 0;
+        result.changed = true;
     }
 
     result.valid = true;

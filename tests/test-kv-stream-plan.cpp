@@ -305,6 +305,101 @@ int main() {
         t.assert_equal(size_t(2), dispatch.assignments[1].request_index);
     });
 
+    t.test("adaptive prefetch considers every future attention deadline", [](testing & t) {
+        llama_kv_stream_prefetch_params params;
+        params.current_attention = 0;
+        params.adaptive_lookahead = true;
+        params.stage_slot_bytes  = 4096;
+        params.free_slots        = { 0, 1, 2, 3 };
+
+        for (uint32_t attention = 0; attention < N_TARGET_LAYERS; ++attention) {
+            llama_kv_stream_prefetch_request request;
+            request.layer_id        = int32_t(3 + 4*attention);
+            request.attention_index = attention;
+            request.page_index      = 7;
+            request.bytes           = 4096;
+            params.requests.push_back(request);
+        }
+        params.states.resize(params.requests.size(), llama_kv_stream_prefetch_state::pending);
+
+        auto dispatch = llama_kv_stream_prefetch_dispatch(params);
+        t.assert_true("dispatch is valid", dispatch.valid);
+        t.assert_equal(size_t(4), dispatch.assignments.size());
+        t.assert_equal(size_t(3), dispatch.assignments.back().request_index);
+
+        params.states[0] = llama_kv_stream_prefetch_state::consumed;
+        for (size_t i = 1; i < 4; ++i) {
+            params.states[i] = llama_kv_stream_prefetch_state::scheduled;
+        }
+        params.free_slots = { 0 };
+        dispatch = llama_kv_stream_prefetch_dispatch(params);
+        t.assert_equal(size_t(1), dispatch.assignments.size());
+        t.assert_equal(size_t(4), dispatch.assignments[0].request_index);
+    });
+
+    t.test("repeated deadline misses grow the ring by one balanced layer epoch", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                 = 160;
+        params.layer_count                      = N_TARGET_LAYERS;
+        params.active_pages_per_layer           = 12;
+        params.minimum_ring_slots               = 16;
+        params.previous_resident_pages_per_layer = 9;
+        params.previous_ring_slots              = 16;
+        params.deadline_miss_ratio               = 0.12;
+        params.copy_engine_busy_ratio            = 0.70;
+        params.starved_evaluations               = 2;
+        params.grow_hysteresis_evaluations       = 3;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("partition changed", partition.changed);
+        t.assert_equal(uint32_t(8), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(32), partition.ring_slots);
+        t.assert_equal(uint32_t(0), partition.starved_evaluations);
+    });
+
+    t.test("PCIe saturation does not sacrifice more resident pages", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 160;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 12;
+        params.minimum_ring_slots                = 16;
+        params.previous_resident_pages_per_layer = 9;
+        params.previous_ring_slots               = 16;
+        params.deadline_miss_ratio                = 0.20;
+        params.copy_engine_busy_ratio             = 0.99;
+        params.starved_evaluations                = 10;
+        params.grow_hysteresis_evaluations        = 3;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("partition remains stable", !partition.changed);
+        t.assert_equal(uint32_t(9), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(16), partition.ring_slots);
+    });
+
+    t.test("sustained overprovision promotes one balanced resident epoch", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 160;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 12;
+        params.minimum_ring_slots                = 16;
+        params.previous_resident_pages_per_layer = 8;
+        params.previous_ring_slots               = 32;
+        params.deadline_miss_ratio                = 0.0;
+        params.copy_engine_busy_ratio             = 0.25;
+        params.ring_peak_occupancy_ratio          = 0.20;
+        params.overprovisioned_evaluations        = 7;
+        params.shrink_hysteresis_evaluations      = 8;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("partition changed", partition.changed);
+        t.assert_equal(uint32_t(9), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(16), partition.ring_slots);
+        t.assert_equal(uint32_t(0), partition.overprovisioned_evaluations);
+    });
+
     t.test("duplicate logical regions are rejected", [](testing & t) {
         llama_kv_stream_plan_params params;
         params.pool_bytes       = 64*MIB;

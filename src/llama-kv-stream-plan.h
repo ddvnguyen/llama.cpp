@@ -133,6 +133,7 @@ struct llama_kv_stream_prefetch_params {
     uint32_t lookahead_layers  = 0;
     uint64_t stage_slot_bytes  = 0;
 
+    bool adaptive_lookahead = false;
     bool current_producer_complete = false;
 
     std::vector<uint32_t> free_slots;
@@ -151,3 +152,39 @@ struct llama_kv_stream_prefetch_dispatch_result {
 // corresponding CUDA ready/consumed events.
 llama_kv_stream_prefetch_dispatch_result llama_kv_stream_prefetch_dispatch(
     const llama_kv_stream_prefetch_params & params);
+
+struct llama_kv_stream_partition_params {
+    uint32_t total_pool_pages       = 0;
+    uint32_t layer_count            = 0;
+    uint32_t active_pages_per_layer = 0;
+    uint32_t minimum_ring_slots     = 0;
+
+    uint32_t previous_resident_pages_per_layer = 0;
+    uint32_t previous_ring_slots               = 0;
+
+    double deadline_miss_ratio       = 0.0;
+    double copy_engine_busy_ratio    = 0.0;
+    double ring_peak_occupancy_ratio = 0.0;
+
+    uint32_t starved_evaluations        = 0;
+    uint32_t overprovisioned_evaluations = 0;
+    uint32_t grow_hysteresis_evaluations = 3;
+    uint32_t shrink_hysteresis_evaluations = 8;
+};
+
+struct llama_kv_stream_partition {
+    bool valid = false;
+    std::string error;
+    bool changed = false;
+
+    uint32_t resident_pages_per_layer = 0;
+    uint32_t ring_slots               = 0;
+    uint32_t starved_evaluations      = 0;
+    uint32_t overprovisioned_evaluations = 0;
+};
+
+// Adjusts the boundary inside a fixed page pool. A growth step demotes exactly
+// one page from every layer, turning those addresses into immediately reusable
+// ring slots. Promotion performs the inverse operation after longer hysteresis.
+llama_kv_stream_partition llama_kv_stream_partition_adapt(
+    const llama_kv_stream_partition_params & params);
