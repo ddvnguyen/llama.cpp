@@ -184,8 +184,8 @@ std::vector<float> run_attention(
 int main() {
     testing t;
 
-    t.test("real cache views stream two Q8/Q4 blocks and query rows exactly", [](testing & t) {
-        constexpr int64_t n_kv = 512;
+    t.test("real cache views pipeline three Q8/Q4 blocks through two slots", [](testing & t) {
+        constexpr int64_t n_kv = 768;
         constexpr int64_t n_batch = 256;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
@@ -199,7 +199,7 @@ int main() {
         ggml_backend_cuda_kv_stream_params params{};
         params.device      = 0;
         params.stage_bytes = 512*1024;
-        params.stage_slots = 1;
+        params.stage_slots = 2;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
         if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
             return;
@@ -213,9 +213,9 @@ int main() {
             backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
 
         const std::vector<uint8_t> expected_k = pack_token_block(
-            inputs.k, GGML_TYPE_Q8_0, 256, 256);
+            inputs.k, GGML_TYPE_Q8_0, 512, 256);
         const std::vector<uint8_t> expected_v = pack_token_block(
-            inputs.v, GGML_TYPE_Q4_0, 256, 256);
+            inputs.v, GGML_TYPE_Q4_0, 512, 256);
         const size_t v_offset = align_up(expected_k.size(), 128);
         std::vector<uint8_t> staged(v_offset + expected_v.size());
         GGML_ASSERT(ggml_backend_cuda_kv_stream_stage_download(
@@ -226,6 +226,11 @@ int main() {
         t.assert_true(
             "final V token block was packed into the managed stage",
             std::equal(expected_v.begin(), expected_v.end(), staged.begin() + v_offset));
+
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        t.assert_equal(uint64_t(3), stats.asynchronous_page_uploads);
+        t.assert_equal(uint64_t(3), stats.compute_stream_waits);
+        t.assert_equal(uint64_t(1), stats.stage_slot_reuses);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
         if (!t.assert_equal(expected.size(), actual.size())) {
@@ -288,8 +293,8 @@ int main() {
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
         params.stage_bytes          = page_bytes;
-        params.stage_slots          = 1;
-        params.pool_bytes           = 3*page_bytes;
+        params.stage_slots          = 4;
+        params.pool_bytes           = 6*page_bytes;
         params.resident_layer_count = 1;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);

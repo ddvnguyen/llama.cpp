@@ -7,6 +7,7 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst);
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst);
 
 struct ggml_cuda_kv_stream_resident_cache;
+struct ggml_cuda_kv_stream_transfer_ring;
 
 struct ggml_cuda_kv_stream_resident_stats {
     uint64_t resident_hits = 0;
@@ -15,19 +16,30 @@ struct ggml_cuda_kv_stream_resident_stats {
     uint64_t host_to_device_bytes = 0;
 };
 
+struct ggml_cuda_kv_stream_transfer_stats {
+    uint64_t asynchronous_page_uploads = 0;
+    uint64_t compute_stream_waits = 0;
+    uint64_t stage_slot_reuses = 0;
+};
+
 ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
-    void * pool_data, size_t pool_bytes, size_t scratch_bytes,
+    void * pool_data, size_t pool_bytes, size_t scratch_bytes, size_t page_bytes,
     uint32_t layer_count, uint32_t page_tokens);
 void ggml_cuda_kv_stream_resident_cache_free(ggml_cuda_kv_stream_resident_cache * cache);
 void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache * cache);
 ggml_cuda_kv_stream_resident_stats ggml_cuda_kv_stream_resident_cache_get_stats(
     const ggml_cuda_kv_stream_resident_cache * cache);
 
+ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
+    void * pool_data, size_t page_bytes, uint32_t stage_slots);
+void ggml_cuda_kv_stream_transfer_ring_free(ggml_cuda_kv_stream_transfer_ring * ring);
+ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
+    const ggml_cuda_kv_stream_transfer_ring * ring);
+
 bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes);
 
 void ggml_cuda_flash_attn_ext_streamed(
     ggml_backend_cuda_context & ctx,
     ggml_tensor * dst,
-    void * stage_data,
-    size_t stage_bytes,
+    ggml_cuda_kv_stream_transfer_ring * transfer_ring,
     ggml_cuda_kv_stream_resident_cache * resident_cache);

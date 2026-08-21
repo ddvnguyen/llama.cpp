@@ -132,6 +132,98 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
         K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
+struct ggml_cuda_kv_stream_transfer_ring {
+    char * pool_data = nullptr;
+    size_t page_bytes = 0;
+    uint32_t stage_slots = 0;
+    cudaStream_t copy_stream = nullptr;
+    cudaEvent_t producer_ready = nullptr;
+    std::vector<cudaEvent_t> ready;
+    std::vector<cudaEvent_t> consumed;
+    std::vector<uint8_t> slot_used;
+    uint64_t asynchronous_page_uploads = 0;
+    uint64_t compute_stream_waits = 0;
+    uint64_t stage_slot_reuses = 0;
+};
+
+ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
+        void * pool_data, size_t page_bytes, uint32_t stage_slots) {
+    if (pool_data == nullptr || page_bytes == 0 || stage_slots == 0) {
+        return nullptr;
+    }
+
+    auto * ring = new ggml_cuda_kv_stream_transfer_ring;
+    ring->pool_data = static_cast<char *>(pool_data);
+    ring->page_bytes = page_bytes;
+    ring->stage_slots = stage_slots;
+    ring->ready.resize(stage_slots, nullptr);
+    ring->consumed.resize(stage_slots, nullptr);
+    ring->slot_used.resize(stage_slots, 0);
+
+    auto cleanup = [&]() {
+        for (cudaEvent_t event : ring->ready) {
+            if (event != nullptr) {
+                (void) cudaEventDestroy(event);
+            }
+        }
+        for (cudaEvent_t event : ring->consumed) {
+            if (event != nullptr) {
+                (void) cudaEventDestroy(event);
+            }
+        }
+        if (ring->producer_ready != nullptr) {
+            (void) cudaEventDestroy(ring->producer_ready);
+        }
+        if (ring->copy_stream != nullptr) {
+            (void) cudaStreamDestroy(ring->copy_stream);
+        }
+        delete ring;
+    };
+
+    if (cudaStreamCreateWithFlags(&ring->copy_stream, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ring->producer_ready, cudaEventDisableTiming) != cudaSuccess) {
+        (void) cudaGetLastError();
+        cleanup();
+        return nullptr;
+    }
+    for (uint32_t slot = 0; slot < stage_slots; ++slot) {
+        if (cudaEventCreateWithFlags(&ring->ready[slot], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ring->consumed[slot], cudaEventDisableTiming) != cudaSuccess) {
+            (void) cudaGetLastError();
+            cleanup();
+            return nullptr;
+        }
+    }
+    return ring;
+}
+
+void ggml_cuda_kv_stream_transfer_ring_free(ggml_cuda_kv_stream_transfer_ring * ring) {
+    if (ring == nullptr) {
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ring->copy_stream));
+    for (cudaEvent_t event : ring->ready) {
+        CUDA_CHECK(cudaEventDestroy(event));
+    }
+    for (cudaEvent_t event : ring->consumed) {
+        CUDA_CHECK(cudaEventDestroy(event));
+    }
+    CUDA_CHECK(cudaEventDestroy(ring->producer_ready));
+    CUDA_CHECK(cudaStreamDestroy(ring->copy_stream));
+    delete ring;
+}
+
+ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
+        const ggml_cuda_kv_stream_transfer_ring * ring) {
+    if (ring == nullptr) {
+        return {};
+    }
+    return {
+        ring->asynchronous_page_uploads,
+        ring->compute_stream_waits,
+        ring->stage_slot_reuses,
+    };
+}
 
 struct ggml_cuda_kv_stream_resident_cache {
     char * pool_data = nullptr;
@@ -149,14 +241,14 @@ struct ggml_cuda_kv_stream_resident_cache {
 };
 
 ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
-        void * pool_data, size_t pool_bytes, size_t scratch_bytes,
+        void * pool_data, size_t pool_bytes, size_t scratch_bytes, size_t page_bytes,
         uint32_t layer_count, uint32_t page_tokens) {
     if (pool_data == nullptr || scratch_bytes == 0 || scratch_bytes >= pool_bytes ||
+            page_bytes == 0 || scratch_bytes%page_bytes != 0 ||
             layer_count == 0 || page_tokens != 256) {
         return nullptr;
     }
 
-    const size_t page_bytes = scratch_bytes;
     const size_t resident_pages = (pool_bytes - scratch_bytes)/(page_bytes*layer_count);
     if (resident_pages == 0 || resident_pages > UINT32_MAX) {
         return nullptr;
@@ -339,9 +431,11 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
 void ggml_cuda_flash_attn_ext_streamed(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
-        void * stage_data,
-        size_t stage_bytes,
+        ggml_cuda_kv_stream_transfer_ring * transfer_ring,
         ggml_cuda_kv_stream_resident_cache * resident_cache) {
+    GGML_ASSERT(transfer_ring != nullptr);
+    void * stage_data = transfer_ring->pool_data;
+    const size_t stage_bytes = transfer_ring->page_bytes;
     GGML_ASSERT(ggml_cuda_flash_attn_ext_streamed_supported(dst, stage_bytes));
 
     const ggml_tensor * K = dst->src[1];
@@ -356,7 +450,38 @@ void ggml_cuda_flash_attn_ext_streamed(
     ggml_cuda_pool_alloc<float> parts(pool, size_t(nchunks)*KV_STREAM_PARTS_PER_CHUNK*ggml_nelements(dst));
     ggml_cuda_pool_alloc<float2> meta(pool, size_t(nchunks)*KV_STREAM_PARTS_PER_CHUNK*nrows);
 
+    struct chunk_descriptor {
+        int64_t token_begin = 0;
+        int64_t token_count = 0;
+        size_t k_row_bytes = 0;
+        size_t v_row_bytes = 0;
+        size_t k_head_bytes = 0;
+        size_t k_bytes = 0;
+        size_t v_offset = 0;
+        size_t v_head_bytes = 0;
+        size_t v_bytes = 0;
+        char * stage = nullptr;
+        bool upload = true;
+        bool streamed = false;
+        uint32_t slot = 0;
+    };
+
+    uint32_t resident_layer = 0;
+    if (resident_cache != nullptr) {
+        auto [it, inserted] = resident_cache->layer_by_k.emplace(K->data, resident_cache->next_layer);
+        if (inserted) {
+            GGML_ASSERT(resident_cache->next_layer < resident_cache->layer_count);
+            ++resident_cache->next_layer;
+        }
+        resident_layer = it->second;
+    }
+
+    std::vector<chunk_descriptor> chunks(nchunks);
+    std::vector<size_t> streamed_chunks;
+    streamed_chunks.reserve(nchunks);
+
     for (int chunk = 0; chunk < nchunks; ++chunk) {
+        auto & desc = chunks[chunk];
         const int64_t token_begin = chunk*block_tokens;
         const int64_t token_count = std::min<int64_t>(block_tokens, K->ne[1] - token_begin);
         const size_t k_row_bytes = ggml_row_size(K->type, K->ne[0]);
@@ -368,74 +493,128 @@ void ggml_cuda_flash_attn_ext_streamed(
         const size_t v_bytes = v_head_bytes*V->ne[2];
         GGML_ASSERT(v_offset <= stage_bytes && v_bytes <= stage_bytes - v_offset);
 
-        char * stage = static_cast<char *>(stage_data);
-        bool upload = true;
+        desc.token_begin = token_begin;
+        desc.token_count = token_count;
+        desc.k_row_bytes = k_row_bytes;
+        desc.v_row_bytes = v_row_bytes;
+        desc.k_head_bytes = k_head_bytes;
+        desc.k_bytes = k_bytes;
+        desc.v_offset = v_offset;
+        desc.v_head_bytes = v_head_bytes;
+        desc.v_bytes = v_bytes;
+        desc.stage = static_cast<char *>(stage_data);
+
         if (resident_cache != nullptr) {
             GGML_ASSERT(token_count == resident_cache->page_tokens);
             GGML_ASSERT(v_offset + v_bytes == resident_cache->page_bytes);
 
-            auto [it, inserted] = resident_cache->layer_by_k.emplace(K->data, resident_cache->next_layer);
-            if (inserted) {
-                GGML_ASSERT(resident_cache->next_layer < resident_cache->layer_count);
-                ++resident_cache->next_layer;
-            }
-
-            const uint32_t layer = it->second;
             const uint32_t page = token_begin/resident_cache->page_tokens;
             if (page < resident_cache->resident_pages_per_layer) {
-                const size_t resident_index = size_t(layer)*resident_cache->resident_pages_per_layer + page;
-                stage = resident_cache->pool_data + resident_cache->scratch_bytes +
+                const size_t resident_index = size_t(resident_layer)*resident_cache->resident_pages_per_layer + page;
+                desc.stage = resident_cache->pool_data + resident_cache->scratch_bytes +
                     resident_index*resident_cache->page_bytes;
                 if (resident_cache->loaded[resident_index]) {
                     ++resident_cache->stats.resident_hits;
                     // The final page contains the rows most recently changed by SET_ROWS.
-                    upload = chunk == nchunks - 1;
+                    desc.upload = chunk == nchunks - 1;
                 } else {
                     ++resident_cache->stats.resident_misses;
                     resident_cache->loaded[resident_index] = 1;
                 }
             } else {
                 ++resident_cache->stats.streamed_pages;
+                desc.streamed = true;
             }
+        } else {
+            desc.streamed = true;
         }
 
-        if (upload) {
-            for (int64_t head = 0; head < K->ne[2]; ++head) {
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    stage + head*k_head_bytes, k_row_bytes,
-                    static_cast<const char *>(K->data) + head*K->nb[2] + token_begin*K->nb[1], K->nb[1],
-                    k_row_bytes, token_count, cudaMemcpyHostToDevice, ctx.stream()));
-            }
-            for (int64_t head = 0; head < V->ne[2]; ++head) {
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    stage + v_offset + head*v_head_bytes, v_row_bytes,
-                    static_cast<const char *>(V->data) + head*V->nb[2] + token_begin*V->nb[1], V->nb[1],
-                    v_row_bytes, token_count, cudaMemcpyHostToDevice, ctx.stream()));
-            }
-            if (resident_cache != nullptr) {
-                resident_cache->stats.host_to_device_bytes += k_bytes + v_bytes;
-            }
+        if (desc.streamed) {
+            const size_t stream_index = streamed_chunks.size();
+            desc.slot = uint32_t(stream_index%transfer_ring->stage_slots);
+            desc.stage = transfer_ring->pool_data + size_t(desc.slot)*transfer_ring->page_bytes;
+            streamed_chunks.push_back(chunk);
+        }
+    }
+
+    auto upload = [&](const chunk_descriptor & desc, cudaStream_t stream) {
+        if (!desc.upload) {
+            return;
+        }
+        for (int64_t head = 0; head < K->ne[2]; ++head) {
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                desc.stage + head*desc.k_head_bytes, desc.k_row_bytes,
+                static_cast<const char *>(K->data) + head*K->nb[2] + desc.token_begin*K->nb[1], K->nb[1],
+                desc.k_row_bytes, desc.token_count, cudaMemcpyHostToDevice, stream));
+        }
+        for (int64_t head = 0; head < V->ne[2]; ++head) {
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                desc.stage + desc.v_offset + head*desc.v_head_bytes, desc.v_row_bytes,
+                static_cast<const char *>(V->data) + head*V->nb[2] + desc.token_begin*V->nb[1], V->nb[1],
+                desc.v_row_bytes, desc.token_count, cudaMemcpyHostToDevice, stream));
+        }
+        if (resident_cache != nullptr) {
+            resident_cache->stats.host_to_device_bytes += desc.k_bytes + desc.v_bytes;
+        }
+    };
+
+    auto schedule_streamed = [&](size_t stream_index) {
+        auto & desc = chunks[streamed_chunks[stream_index]];
+        const uint32_t slot = desc.slot;
+        if (transfer_ring->slot_used[slot]) {
+            CUDA_CHECK(cudaStreamWaitEvent(
+                transfer_ring->copy_stream, transfer_ring->consumed[slot], 0));
+            ++transfer_ring->stage_slot_reuses;
+        }
+        upload(desc, transfer_ring->copy_stream);
+        CUDA_CHECK(cudaEventRecord(transfer_ring->ready[slot], transfer_ring->copy_stream));
+        transfer_ring->slot_used[slot] = 1;
+        ++transfer_ring->asynchronous_page_uploads;
+    };
+
+    if (!streamed_chunks.empty()) {
+        // SET_ROWS and all other producers for this layer are ordered before
+        // this marker on the compute stream. The copy stream may then run
+        // independently while attention consumes previously prepared pages.
+        CUDA_CHECK(cudaEventRecord(transfer_ring->producer_ready, ctx.stream()));
+        CUDA_CHECK(cudaStreamWaitEvent(
+            transfer_ring->copy_stream, transfer_ring->producer_ready, 0));
+        const size_t initial = std::min<size_t>(
+            transfer_ring->stage_slots, streamed_chunks.size());
+        for (size_t i = 0; i < initial; ++i) {
+            schedule_streamed(i);
+        }
+    }
+
+    size_t stream_index = 0;
+    for (int chunk = 0; chunk < nchunks; ++chunk) {
+        auto & desc = chunks[chunk];
+        if (desc.streamed) {
+            CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), transfer_ring->ready[desc.slot], 0));
+            ++transfer_ring->compute_stream_waits;
+        } else if (desc.upload) {
+            upload(desc, ctx.stream());
         }
 
         ggml_tensor staged_k = *K;
         ggml_tensor staged_v = *V;
-        staged_k.data = stage;
-        staged_k.ne[1] = token_count;
-        staged_k.nb[1] = k_row_bytes;
-        staged_k.nb[2] = k_head_bytes;
-        staged_k.nb[3] = k_bytes;
-        staged_v.data = stage + v_offset;
-        staged_v.ne[1] = token_count;
-        staged_v.nb[1] = v_row_bytes;
-        staged_v.nb[2] = v_head_bytes;
-        staged_v.nb[3] = v_bytes;
+        staged_k.data = desc.stage;
+        staged_k.ne[1] = desc.token_count;
+        staged_k.nb[1] = desc.k_row_bytes;
+        staged_k.nb[2] = desc.k_head_bytes;
+        staged_k.nb[3] = desc.k_bytes;
+        staged_v.data = desc.stage + desc.v_offset;
+        staged_v.ne[1] = desc.token_count;
+        staged_v.nb[1] = desc.v_row_bytes;
+        staged_v.nb[2] = desc.v_head_bytes;
+        staged_v.nb[3] = desc.v_bytes;
 
         ggml_tensor staged_mask{};
         ggml_tensor * staged_mask_ptr = nullptr;
         if (mask != nullptr) {
             staged_mask = *mask;
-            staged_mask.data = static_cast<char *>(mask->data) + token_begin*mask->nb[0];
-            staged_mask.ne[0] = token_count;
+            staged_mask.data = static_cast<char *>(mask->data) + desc.token_begin*mask->nb[0];
+            staged_mask.ne[0] = desc.token_count;
             staged_mask_ptr = &staged_mask;
         }
 
@@ -450,6 +629,9 @@ void ggml_cuda_flash_attn_ext_streamed(
         // a non-streamed cache.
         if (nchunks == 1) {
             ggml_cuda_flash_attn_ext(ctx, &staged_dst);
+            if (desc.streamed) {
+                CUDA_CHECK(cudaEventRecord(transfer_ring->consumed[desc.slot], ctx.stream()));
+            }
             return;
         }
 
@@ -461,6 +643,15 @@ void ggml_cuda_flash_attn_ext_streamed(
             kv_stream_launch_q8_q4_partial<false>(ctx, &staged_dst, chunk_parts, chunk_meta);
         } else {
             kv_stream_launch_q8_q4_partial<true>(ctx, &staged_dst, chunk_parts, chunk_meta);
+        }
+
+        if (desc.streamed) {
+            CUDA_CHECK(cudaEventRecord(transfer_ring->consumed[desc.slot], ctx.stream()));
+            const size_t next = stream_index + transfer_ring->stage_slots;
+            if (next < streamed_chunks.size()) {
+                schedule_streamed(next);
+            }
+            ++stream_index;
         }
     }
 
