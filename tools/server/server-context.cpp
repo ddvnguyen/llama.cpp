@@ -4326,6 +4326,403 @@ void hydra_repad_tensor_buft_overrides(common_params & p, const char * ctx_label
     server_response_reader get_response_reader() {
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
+
+    void process_single_task(server_task && task) {
+        // epic #610 WS1: in seam mode the extension may claim Hydra tasks.
+        // WS1 impl is a no-op (returns false), so this is a pure A/B switch —
+        // both modes run the inline dispatch below.
+        if (hydra_ext_active && hydra_ext && hydra_ext->handle_task(*this, task)) {
+            return;
+        }
+        switch (task.type) {
+            case SERVER_TASK_TYPE_COMPLETION:
+            case SERVER_TASK_TYPE_INFILL:
+            case SERVER_TASK_TYPE_EMBEDDING:
+            case SERVER_TASK_TYPE_RERANK:
+                {
+                    // special case: if input is provided via CLI, tokenize it first
+                    // otherwise, no need to tokenize as it's already done inside the HTTP thread
+                    if (task.cli) {
+                        if (!tokenize_cli_input(task)) {
+                            break;
+                        }
+                    }
+
+                    // Hydra config from HTTP decode path: apply synchronously
+                    // on the task-queue thread before any slot scheduling or
+                    // generation work. This is safe because we own this thread;
+                    // the previous attempt applied on the httplib worker thread
+                    // and raced the main queue (reverted in ebbbe1116).
+                    if (!task.hydra_config_json.empty()) {
+                        json hydra_cfg;
+                        try {
+                            hydra_cfg = json::parse(task.hydra_config_json);
+                        } catch (const std::exception & e) {
+                            SRV_WRN("hydra: COMPLETION hydra_config parse failed: %s\n", e.what());
+                        }
+                        if (!hydra_cfg.is_null() && hydra_cfg.is_object()) {
+                            SRV_INF("hydra: COMPLETION applying hydra_config (%zu keys)\n",
+                                    hydra_cfg.size());
+                            hydra_config_result cfg_result = hydra_apply_config(hydra_cfg, /*sync=*/true);
+                            if (!cfg_result.ok) {
+                                SRV_WRN("hydra: COMPLETION hydra_config apply failed: %s\n",
+                                        cfg_result.error.c_str());
+                            }
+                            // After T3 rebuild, model/slots are reset.
+                            // The slot lookup below will pick up the new state.
+                        }
+                    }
+
+                    const int id_slot = task.id_slot;
+                    const int id_task = task.id;
+
+                    server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
+
+                    //
+                    // slot scheduling logic
+                    //
+
+                    if (slot == nullptr) {
+                        // if no slot is available, we defer this task for processing later
+                        SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    if (slot->is_processing() || slot->hydra_transferring->load()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    if (task.is_parent()) {
+                        // try getting free slots for all child tasks
+                        size_t n_child_tasks = task.child_tasks.size();
+                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
+                        if (child_slots.size() < n_child_tasks) {
+                            SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                        if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
+                            SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
+                            break; // drop the task
+                        }
+                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
+                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                        break; // drop the task
+                    }
+
+                    if (params_base.cache_idle_slots) {
+                        for (auto & s : slots) {
+                            if (!s.is_processing() && !s.hydra_transferring->load()) {
+                                slot_save_and_clear(s);
+                            }
+                        }
+                    }
+                } break;
+            case SERVER_TASK_TYPE_CANCEL:
+                {
+                    // release slot linked with the task id
+                    for (auto & slot : slots) {
+                        if (slot.task && slot.task->id == task.id_target) {
+                            slot.release();
+                            break;
+                        }
+                    }
+                } break;
+            case SERVER_TASK_TYPE_CONTROL:
+                {
+                    auto res = std::make_unique<server_task_result_control>();
+                    res->id = task.id;
+
+                    server_slot * slot = get_slot_by_cmpl_id(task.params.control_cmpl_id);
+                    if (slot == nullptr) {
+                        res->success = false;
+                        res->message = "no active completion for this id";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    if (task.params.control_action == "reasoning_end") {
+                        // the budget sampler only exists when reasoning control was armed
+                        if (!slot->task->params.sampling.reasoning_control) {
+                            res->success = false;
+                            res->message = "reasoning control not enabled for this completion";
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                        // act on the live slot mid generation, never defer
+                        common_sampler_reasoning_budget_force(slot->smpl.get());
+                        res->success = true;
+                    } else {
+                        res->success = false;
+                        res->message = "unknown control action";
+                    }
+
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_NEXT_RESPONSE:
+                {
+                    // do nothing
+                } break;
+            case SERVER_TASK_TYPE_METRICS:
+                {
+                    json slots_data = json::array();
+
+                    int n_idle_slots       = 0;
+                    int n_processing_slots = 0;
+
+                    for (server_slot & slot : slots) {
+                        json slot_data = slot.to_json(slots_debug == 0);
+
+                        if (slot.is_processing() || slot.hydra_transferring->load()) {
+                            n_processing_slots++;
+                        } else {
+                            n_idle_slots++;
+                        }
+
+                        slots_data.push_back(slot_data);
+                    }
+                    SRV_DBG("n_idle_slots = %d, n_processing_slots = %d\n", n_idle_slots, n_processing_slots);
+
+                    auto res = std::make_unique<server_task_result_metrics>();
+                    res->id                  = task.id;
+                    res->slots_data          = std::move(slots_data);
+                    res->n_idle_slots        = n_idle_slots;
+                    res->n_processing_slots  = n_processing_slots;
+                    res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    res->t_start             = metrics.t_start;
+
+                    res->n_prompt_tokens_processed_total = metrics.n_prompt_tokens_processed_total;
+                    res->t_prompt_processing_total       = metrics.t_prompt_processing_total;
+                    res->n_tokens_predicted_total        = metrics.n_tokens_predicted_total;
+                    res->t_tokens_generation_total       = metrics.t_tokens_generation_total;
+
+                    res->n_tokens_max = metrics.n_tokens_max;
+
+                    res->n_prompt_tokens_processed = metrics.n_prompt_tokens_processed;
+                    res->t_prompt_processing       = metrics.t_prompt_processing;
+                    res->n_tokens_predicted        = metrics.n_tokens_predicted;
+                    res->t_tokens_generation       = metrics.t_tokens_generation;
+
+                    res->n_decode_total          = metrics.n_decode_total;
+                    res->n_busy_slots_total      = metrics.n_busy_slots_total;
+
+                    if (task.metrics_reset_bucket) {
+                        metrics.reset_bucket();
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_SAVE:
+                {
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const size_t token_count = slot->prompt.tokens.size();
+                    const int64_t t_start = ggml_time_us();
+
+                    std::string filename = task.slot_action.filename;
+                    std::string filepath = task.slot_action.filepath;
+
+                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
+                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+
+                    const int64_t t_end = ggml_time_us();
+                    const double t_save_ms = (t_end - t_start) / 1000.0;
+
+                    auto res = std::make_unique<server_task_result_slot_save_load>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->filename = filename;
+                    res->is_save  = true;
+                    res->n_tokens = token_count;
+                    res->n_bytes  = nwrite;
+                    res->t_ms     = t_save_ms;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_RESTORE:
+                {
+                    if (!check_no_mtmd(task.id)) break;
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    std::string filename = task.slot_action.filename;
+                    std::string filepath = task.slot_action.filepath;
+
+                    llama_tokens tokens;
+                    tokens.resize(slot->n_ctx);
+                    size_t token_count = 0;
+                    size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
+                    if (nread == 0) {
+                        slot->prompt.tokens.clear(); // KV may already been invalidated?
+                        send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    tokens.resize(token_count);
+                    slot->prompt.tokens.clear();
+                    slot->prompt.tokens.insert(tokens);
+
+                    const int64_t t_end = ggml_time_us();
+                    const double t_restore_ms = (t_end - t_start) / 1000.0;
+
+                    auto res = std::make_unique<server_task_result_slot_save_load>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->filename = filename;
+                    res->is_save  = false;
+                    res->n_tokens = token_count;
+                    res->n_bytes  = nread;
+                    res->t_ms     = t_restore_ms;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_ERASE:
+                {
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing() || slot->hydra_transferring->load()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    // Erase token cache
+                    const size_t n_erased = slot->prompt.tokens.size();
+
+                    slot->prompt_clear(false);
+
+                    auto res = std::make_unique<server_task_result_slot_erase>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->n_erased = n_erased;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_GET_LORA:
+                {
+                    // TODO @ngxson : make lora_adapters a dedicated member of server_context
+                    auto & loras = params_base.lora_adapters;
+                    auto res = std::make_unique<server_task_result_get_lora>();
+                    res->id = task.id;
+                    for (size_t i = 0; i < loras.size(); ++i) {
+                        auto & lora = loras[i];
+                        std::string alora_invocation_string = "";
+                        const uint64_t n_alora_tokens = llama_adapter_get_alora_n_invocation_tokens(lora.ptr);
+                        llama_tokens alora_invocation_tokens;
+                        if (n_alora_tokens) {
+                            const llama_token * alora_tokens = llama_adapter_get_alora_invocation_tokens(lora.ptr);
+                            for (uint64_t j = 0; j < n_alora_tokens; ++j) {
+                                alora_invocation_string += common_token_to_piece(vocab, alora_tokens[j]);
+                                alora_invocation_tokens.push_back(alora_tokens[j]);
+                            }
+                        }
+                        res->loras.push_back(server_task_result_get_lora::lora{
+                            lora,
+                            alora_invocation_string,
+                            alora_invocation_tokens,
+                        });
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SET_LORA:
+                {
+                    auto new_loras = construct_lora_list(task.set_lora);
+                    // logging
+                    for (size_t i = 0; i < new_loras.size(); ++i) {
+                        SRV_INF("set lora adapter idx=%zu scale=%f\n", i, new_loras[i].scale);
+                    }
+                    // TODO @ngxson : make lora_adapters a dedicated member of server_context
+                    params_base.lora_adapters = new_loras;
+                    auto res = std::make_unique<server_task_result_apply_lora>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+
+            // epic #610 WS2: HYDRA task dispatch moved to hydra_process_task()
+            // (defined in hydra-server-context.cpp). In seam mode the extension
+            // claims these via handle_task(); in legacy mode this fall-through
+            // calls the same method. Both modes run identical code.
+            case SERVER_TASK_TYPE_HYDRA_STATE_GET:
+            case SERVER_TASK_TYPE_HYDRA_STATE_PUT:
+            case SERVER_TASK_TYPE_HYDRA_STATE_META:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_CONFIGURE:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_INFO:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_PREFILL:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_DECODE:
+            case SERVER_TASK_TYPE_HYDRA_DECODE_APPLY:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_SET_EXPERT_MODE:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_SWAP_QUANT:
+            case SERVER_TASK_TYPE_HYDRA_ENGINE_PIPELINE_ATTACH:
+                hydra_process_task(task);
+                break;
+
+        }
+    }
+
+    // epic #610 WS3.5: Hydra helper functions — defined in hydra-server-context.cpp
+    // (same TU via bottom #include). Declarations here so the compiler resolves
+    // the out-of-class definitions.
+    static int hydra_classify_config_key(const std::string & key);
+    static const char * hydra_tier_label(int tier);
+
+    bool hydra_apply_t1_config(common_params & params, llama_context * ctx,
+                               const json & cfg,
+                               std::map<std::string, json> & params_applied);
+
+    void hydra_apply_t3_mutators(llama_context * ctx, const json & cfg,
+                                 std::vector<std::string> & deferred_keys);
+
+    struct hydra_config_result {
+        int highest_tier = 0;
+        std::map<std::string, json> params_applied;
+        std::vector<std::string> deferred_keys;
+        json t2t3_subset = json::object();
+        bool ok = true;
+        std::string error;
+        uint64_t state_chunk_size_applied = 0;
+        std::vector<std::string> unrecognized_keys;
+        std::vector<std::string> rejected_keys;
+    };
+
+    hydra_config_result hydra_apply_config(const json & cfg, bool sync);
+
+    bool apply_pending_hydra_config();
+    bool apply_t2_rebuild(const std::string & pending_json);
+    bool apply_t3_rebuild(bool force = false);
 };
 
 //

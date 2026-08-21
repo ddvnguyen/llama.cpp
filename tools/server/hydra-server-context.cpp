@@ -2519,6 +2519,169 @@
 
 
 // ---------------------------------------------------------------------------
+    server_context_impl::hydra_config_result server_context_impl::hydra_apply_config(const json & cfg, bool sync) {
+        server_context_impl::hydra_config_result result;
+
+        // 1. Classify every top-level key. T1 → apply now; T2/T3/T4 →
+        //    defer (stage) or apply synchronously depending on `sync`.
+        //    T4 (generic) keys are additionally validated against the
+        //    llama.cpp arg table here so the CONFIGURE response can report
+        //    unrecognized/rejected keys before the deferred apply runs.
+        //    T2 + appliable-T4 keys are staged together into the reload
+        //    config (g_pending_reload_config) so neither the context-reload
+        //    path nor the model-reload path strands them.
+        json t1_subset = json::object();
+        json reload_subset = json::object();
+        for (auto it = cfg.begin(); it != cfg.end(); ++it) {
+            const std::string key = it.key();
+            int tier = hydra_classify_config_key(key);
+            if (tier == 1) {
+                t1_subset[key] = it.value();
+            } else if (tier == 2) {
+                result.t2t3_subset[key] = it.value();
+                result.deferred_keys.push_back(key);
+                reload_subset[key] = it.value();
+            } else if (tier == 3) {
+                result.t2t3_subset[key] = it.value();
+                result.deferred_keys.push_back(key);
+                // T3 keys are staged via hydra_apply_t3_mutators() statics,
+                // not the reload-config JSON.
+            } else {
+                // T4: generic-arg pass-through. Classify against the arg
+                // table; only appliable keys are staged for the deferred
+                // slot-free moment. The rest are reported loudly.
+                const hydra_generic_key_status st = hydra_classify_generic_key(key);
+                if (st == hydra_generic_key_status::APPLIABLE) {
+                    result.t2t3_subset[key] = it.value();
+                    result.deferred_keys.push_back(key);
+                    reload_subset[key] = it.value();
+                } else if (st == hydra_generic_key_status::DENIED) {
+                    SRV_WRN("hydra: CONFIGURE key '%s' cannot change at reload (startup-only/flag arg) — rejected\n",
+                            key.c_str());
+                    result.rejected_keys.push_back(key);
+                } else {
+                    SRV_WRN("hydra: CONFIGURE key '%s' is not a known llama.cpp argument — unrecognized, value ignored\n",
+                            key.c_str());
+                    result.unrecognized_keys.push_back(key);
+                }
+            }
+            if (tier > result.highest_tier) result.highest_tier = tier;
+        }
+        // Stage the reload config (T2 + appliable-T4 keys) for the deferred
+        // slot-free moment. Unconditional overwrite = absolute state: a
+        // superseding CONFIGURE without T2/T4 keys must clear whatever an
+        // earlier CONFIGURE staged, or the stale keys would be applied on
+        // the next unrelated reload.
+        g_pending_reload_config = reload_subset.dump();
+        // The "sampling" object may contain unlisted nested keys
+        // (e.g. penalty_last_n, mirostat) — route the whole object
+        // through T1 when present.
+        if (cfg.contains("sampling") && cfg["sampling"].is_object()) {
+            t1_subset["sampling"] = cfg["sampling"];
+            if (result.highest_tier < 1) result.highest_tier = 1;
+        }
+        // model.path is nested — the legacy {"model": {...}} form
+        // is recognized by hydra_classify_config_key returning 3
+        // for the bare "model" key. If the bare "model" is set
+        // and is an object with a "path", route it as T3.
+        if (cfg.contains("model")) {
+            if (cfg["model"].is_object()) {
+                result.t2t3_subset["model"] = cfg["model"];
+                if (std::find(result.deferred_keys.begin(), result.deferred_keys.end(), "model")
+                    == result.deferred_keys.end()) {
+                    result.deferred_keys.push_back("model");
+                }
+                if (result.highest_tier < 3) result.highest_tier = 3;
+            } else if (cfg["model"].is_string()) {
+                result.t2t3_subset["model"] = cfg["model"];
+                if (std::find(result.deferred_keys.begin(), result.deferred_keys.end(), "model")
+                    == result.deferred_keys.end()) {
+                    result.deferred_keys.push_back("model");
+                }
+                if (result.highest_tier < 3) result.highest_tier = 3;
+            }
+        }
+
+        if (result.highest_tier == 0) {
+            // No recognized keys — caller decides whether to treat as
+            // a no-op or surface an error.
+            return result;
+        }
+
+        // 2. Apply T1 keys in-place.
+        if (!t1_subset.empty()) {
+            if (!hydra_apply_t1_config(params_base, ctx_tgt, t1_subset, result.params_applied)) {
+                result.ok = false;
+                result.error = "T1 key has wrong type (see log)";
+                return result;
+            }
+            // Capture state_chunk_size for callers that need it (CONFIGURE).
+            auto it = result.params_applied.find("state_chunk_size");
+            if (it != result.params_applied.end() && it->second.is_number_unsigned()) {
+                result.state_chunk_size_applied = it->second.get<uint64_t>();
+            }
+        }
+
+        // 3. T2/T3/T4 handling — diverges based on sync flag.
+        if (!result.t2t3_subset.empty()) {
+            if (sync) {
+                // Synchronous mode (PREFILL / HTTP decode): apply now
+                // on the task-queue thread. The caller owns this thread
+                // context so blocking is safe.
+                if (result.highest_tier >= 3) {
+                    // T3 (model reload) also covers a T4-only config:
+                    // load_model() recreates the context and the
+                    // speculative/draft state, so every generic key
+                    // takes effect. hydra_apply_t3_mutators() is a no-op
+                    // when no T3 keys are staged.
+                    hydra_apply_t3_mutators(ctx_tgt, result.t2t3_subset, result.deferred_keys);
+                    // #470: force rebuild if a peer reconnection was detected
+                    // during a prior graph_compute — the peer's buffers are gone
+                    // even though model/params haven't changed.
+                    const bool reconn_force = (ctx_tgt && ctx_tgt->peer_reconnection_pending);
+                    if (reconn_force) {
+                        ctx_tgt->peer_reconnection_pending = false;
+                        SRV_WRN("%s", "hydra: PREFILL handler: peer reconnection pending — forcing T3 rebuild\n");
+                    }
+                    if (!apply_t3_rebuild(reconn_force)) {
+                        result.ok = false;
+                        result.error = "T3 rebuild failed";
+                        return result;
+                    }
+                } else if (result.highest_tier == 2) {
+                    if (!apply_t2_rebuild(result.t2t3_subset.dump())) {
+                        result.ok = false;
+                        result.error = "T2 rebuild failed";
+                        return result;
+                    }
+                }
+                // Clear T3 staged statics — they were consumed by the
+                // sync apply and must not leak into a later deferred path.
+                llama_hydra_clear_pending_t3();
+            } else {
+                // Stage mode (CONFIGURE): record the mutators and store
+                // pending_config for application at the next slot-free moment.
+                if (result.highest_tier >= 3) {
+                    hydra_apply_t3_mutators(ctx_tgt, result.t2t3_subset, result.deferred_keys);
+                }
+                if (ctx_tgt) {
+                    ctx_tgt->hydra_set_pending_config(
+                        result.t2t3_subset.dump(), hydra_tier_label(result.highest_tier));
+                } else {
+                    // First load: ctx_tgt is null, so apply_pending_hydra_config()
+                    // and update_slots() can't trigger. Set the flag so the
+                    // task-queue thread runs apply_t3_rebuild() at the next
+                    // slot-free moment.
+                    first_load_pending = true;
+                    SRV_INF("%s", "hydra: config staged for first load (no context yet)\n");
+                }
+            }
+        }
+
+        return result;
+    }
+
+
 // WS1/WS2: the extension object. handle_task() routes HYDRA tasks to the same
 // hydra_process_task() method the legacy switch calls — seam == legacy behavior.
 // ---------------------------------------------------------------------------
@@ -3739,7 +3902,7 @@ void server_context::start_rpc_server(int port, std::vector<ggml_backend *>) {
 
 // --- WS3.5 moved helper methods ---
 
-    bool server_context_impl::apply_t3_rebuild() {
+    bool server_context_impl::apply_t3_rebuild(bool force) {
         bool is_first_load = !ctx_tgt;
 
         // Track the last override_tensor string that was actually
