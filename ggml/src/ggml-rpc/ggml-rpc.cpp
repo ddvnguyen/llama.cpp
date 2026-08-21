@@ -974,19 +974,27 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     // fresh instance with an empty stored-graph cache — a GRAPH_RECOMPUTE
     // would be refused and the connection would churn. Detect it here (lock
     // free, by socket identity) and fall back to a full GRAPH_COMPUTE.
-    if (rpc_dev_ctx->last_sock.lock() != sock) {
+    auto prev_sock = rpc_dev_ctx->last_sock.lock();
+    if (prev_sock != sock) {
         rpc_dev_ctx->last_graph_uid = 0;
         rpc_dev_ctx->last_sock      = sock;
-        // #470 Option B: signal that the peer reconnected — the engine
-        // must re-provision model layers (T3 rebuild) before compute can
-        // succeed on this peer again.
-        rpc_dev_ctx->peer_reconnected.store(true, std::memory_order_release);
-        GGML_LOG_WARN("[%s] peer %s reconnected — stale buffers, "
-                      "engine should trigger re-provision\n",
-                      __func__, rpc_ctx->endpoint.c_str());
-        // Return FAILED so the engine knows the peer needs re-provision.
-        // The caller (engine) will detect this and trigger T3 rebuild.
-        return GGML_STATUS_FAILED;
+        // #470 Option B: a GENUINE peer reconnection means we previously held a
+        // live socket (prev_sock != nullptr) that now differs from the new one.
+        // On a fresh context (engine start, or right after a T3 rebuild which
+        // recreates the device context with an empty last_sock) prev_sock is
+        // nullptr — that is the FIRST connect, NOT a reconnection, and must
+        // proceed normally. Without this guard every engine start (and every
+        // post-rebuild compute) would spuriously return FAILED and loop on
+        // T3 rebuilds, so the engine could never serve.
+        if (prev_sock != nullptr) {
+            rpc_dev_ctx->peer_reconnected.store(true, std::memory_order_release);
+            GGML_LOG_WARN("[%s] peer %s reconnected — stale buffers, "
+                          "engine should trigger re-provision\n",
+                          __func__, rpc_ctx->endpoint.c_str());
+            // Return FAILED so the engine knows the peer needs re-provision.
+            // The caller (engine) will detect this and trigger T3 rebuild.
+            return GGML_STATUS_FAILED;
+        }
     }
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
     if (reuse) {
