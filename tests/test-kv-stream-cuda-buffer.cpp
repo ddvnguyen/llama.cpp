@@ -152,5 +152,32 @@ int main() {
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
     });
 
+    t.test("fixed pool moves pages from balanced residency into the active ring", [](testing & t) {
+        constexpr size_t page_bytes = 64*1024;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.pool_bytes           = 6*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("runtime allocation succeeds", runtime != nullptr)) {
+            return;
+        }
+
+        t.assert_equal(uint32_t(2), ggml_backend_cuda_kv_stream_stage_slots(runtime));
+        t.assert_equal(uint32_t(4), ggml_backend_cuda_kv_stream_resident_pages_per_layer(runtime));
+        t.assert_true("ring grows inside the existing pool",
+            ggml_backend_cuda_kv_stream_repartition(runtime, 3));
+        t.assert_equal(uint32_t(3), ggml_backend_cuda_kv_stream_stage_slots(runtime));
+        t.assert_equal(uint32_t(3), ggml_backend_cuda_kv_stream_resident_pages_per_layer(runtime));
+        t.assert_true("ring cannot exceed the fixed pool",
+            !ggml_backend_cuda_kv_stream_repartition(runtime, 7));
+
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+    });
+
     return t.summary();
 }

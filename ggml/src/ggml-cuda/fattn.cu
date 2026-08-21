@@ -135,7 +135,8 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
 struct ggml_cuda_kv_stream_transfer_ring {
     char * pool_data = nullptr;
     size_t page_bytes = 0;
-    uint32_t stage_slots = 0;
+    uint32_t capacity_slots = 0;
+    uint32_t active_slots = 0;
     cudaStream_t copy_stream = nullptr;
     cudaEvent_t producer_ready = nullptr;
     std::vector<cudaEvent_t> ready;
@@ -155,7 +156,8 @@ ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
     auto * ring = new ggml_cuda_kv_stream_transfer_ring;
     ring->pool_data = static_cast<char *>(pool_data);
     ring->page_bytes = page_bytes;
-    ring->stage_slots = stage_slots;
+    ring->capacity_slots = stage_slots;
+    ring->active_slots = stage_slots;
     ring->ready.resize(stage_slots, nullptr);
     ring->consumed.resize(stage_slots, nullptr);
     ring->slot_used.resize(stage_slots, 0);
@@ -211,6 +213,15 @@ void ggml_cuda_kv_stream_transfer_ring_free(ggml_cuda_kv_stream_transfer_ring * 
     CUDA_CHECK(cudaEventDestroy(ring->producer_ready));
     CUDA_CHECK(cudaStreamDestroy(ring->copy_stream));
     delete ring;
+}
+
+bool ggml_cuda_kv_stream_transfer_ring_set_active_slots(
+        ggml_cuda_kv_stream_transfer_ring * ring, uint32_t stage_slots) {
+    if (ring == nullptr || stage_slots == 0 || stage_slots > ring->capacity_slots) {
+        return false;
+    }
+    ring->active_slots = stage_slots;
+    return true;
 }
 
 ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
@@ -278,6 +289,31 @@ void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache
     cache->layer_by_k.clear();
     cache->next_layer = 0;
     cache->stats = {};
+}
+
+bool ggml_cuda_kv_stream_resident_cache_repartition(
+        ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes) {
+    if (cache == nullptr || scratch_bytes > cache->pool_bytes ||
+        scratch_bytes%cache->page_bytes != 0) {
+        return false;
+    }
+    const size_t pages = (cache->pool_bytes - scratch_bytes)/
+        (cache->page_bytes*cache->layer_count);
+    if (pages > UINT32_MAX) {
+        return false;
+    }
+    cache->scratch_bytes = scratch_bytes;
+    cache->resident_pages_per_layer = uint32_t(pages);
+    cache->loaded.assign(size_t(cache->layer_count)*pages, 0);
+    cache->layer_by_k.clear();
+    cache->next_layer = 0;
+    cache->stats = {};
+    return true;
+}
+
+uint32_t ggml_cuda_kv_stream_resident_cache_pages_per_layer(
+        const ggml_cuda_kv_stream_resident_cache * cache) {
+    return cache == nullptr ? 0 : cache->resident_pages_per_layer;
 }
 
 ggml_cuda_kv_stream_resident_stats ggml_cuda_kv_stream_resident_cache_get_stats(
@@ -531,7 +567,7 @@ void ggml_cuda_flash_attn_ext_streamed(
 
         if (desc.streamed) {
             const size_t stream_index = streamed_chunks.size();
-            desc.slot = uint32_t(stream_index%transfer_ring->stage_slots);
+            desc.slot = uint32_t(stream_index%transfer_ring->active_slots);
             desc.stage = transfer_ring->pool_data + size_t(desc.slot)*transfer_ring->page_bytes;
             streamed_chunks.push_back(chunk);
         }
@@ -580,7 +616,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         CUDA_CHECK(cudaStreamWaitEvent(
             transfer_ring->copy_stream, transfer_ring->producer_ready, 0));
         const size_t initial = std::min<size_t>(
-            transfer_ring->stage_slots, streamed_chunks.size());
+            transfer_ring->active_slots, streamed_chunks.size());
         for (size_t i = 0; i < initial; ++i) {
             schedule_streamed(i);
         }
@@ -647,7 +683,7 @@ void ggml_cuda_flash_attn_ext_streamed(
 
         if (desc.streamed) {
             CUDA_CHECK(cudaEventRecord(transfer_ring->consumed[desc.slot], ctx.stream()));
-            const size_t next = stream_index + transfer_ring->stage_slots;
+            const size_t next = stream_index + transfer_ring->active_slots;
             if (next < streamed_chunks.size()) {
                 schedule_streamed(next);
             }

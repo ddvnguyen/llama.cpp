@@ -27,12 +27,18 @@ ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
     uint32_t layer_count, uint32_t page_tokens);
 void ggml_cuda_kv_stream_resident_cache_free(ggml_cuda_kv_stream_resident_cache * cache);
 void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache * cache);
+bool ggml_cuda_kv_stream_resident_cache_repartition(
+    ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes);
+uint32_t ggml_cuda_kv_stream_resident_cache_pages_per_layer(
+    const ggml_cuda_kv_stream_resident_cache * cache);
 ggml_cuda_kv_stream_resident_stats ggml_cuda_kv_stream_resident_cache_get_stats(
     const ggml_cuda_kv_stream_resident_cache * cache);
 
 ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
     void * pool_data, size_t page_bytes, uint32_t stage_slots);
 void ggml_cuda_kv_stream_transfer_ring_free(ggml_cuda_kv_stream_transfer_ring * ring);
+bool ggml_cuda_kv_stream_transfer_ring_set_active_slots(
+    ggml_cuda_kv_stream_transfer_ring * ring, uint32_t stage_slots);
 ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
     const ggml_cuda_kv_stream_transfer_ring * ring);
 

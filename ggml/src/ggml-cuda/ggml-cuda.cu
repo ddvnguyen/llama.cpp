@@ -1514,14 +1514,24 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
         }
     }
 
+    const size_t ring_capacity = resident_enabled ?
+        runtime->pool_bytes/runtime->stage_bytes : runtime->stage_slots;
+    if (ring_capacity == 0 || ring_capacity > UINT32_MAX) {
+        ggml_cuda_kv_stream_resident_cache_free(runtime->resident_cache);
+        CUDA_CHECK(cudaFree(runtime->stage_data));
+        delete runtime;
+        return nullptr;
+    }
     runtime->transfer_ring = ggml_cuda_kv_stream_transfer_ring_new(
-        runtime->stage_data, runtime->stage_bytes, runtime->stage_slots);
+        runtime->stage_data, runtime->stage_bytes, uint32_t(ring_capacity));
     if (runtime->transfer_ring == nullptr) {
         ggml_cuda_kv_stream_resident_cache_free(runtime->resident_cache);
         CUDA_CHECK(cudaFree(runtime->stage_data));
         delete runtime;
         return nullptr;
     }
+    GGML_ASSERT(ggml_cuda_kv_stream_transfer_ring_set_active_slots(
+        runtime->transfer_ring, runtime->stage_slots));
 
     runtime->buffer_type = {
         /* .iface   = */ ggml_backend_cuda_kv_stream_buffer_type_interface,
@@ -1546,6 +1556,34 @@ size_t ggml_backend_cuda_kv_stream_stage_bytes(ggml_backend_cuda_kv_stream_runti
 
 uint32_t ggml_backend_cuda_kv_stream_stage_slots(ggml_backend_cuda_kv_stream_runtime_t runtime) {
     return runtime == nullptr ? 0 : runtime->stage_slots;
+}
+
+uint32_t ggml_backend_cuda_kv_stream_resident_pages_per_layer(
+        ggml_backend_cuda_kv_stream_runtime_t runtime) {
+    return runtime == nullptr ? 0 :
+        ggml_cuda_kv_stream_resident_cache_pages_per_layer(runtime->resident_cache);
+}
+
+bool ggml_backend_cuda_kv_stream_repartition(
+        ggml_backend_cuda_kv_stream_runtime_t runtime, uint32_t stage_slots) {
+    if (runtime == nullptr || runtime->resident_cache == nullptr || stage_slots == 0 ||
+        runtime->stage_bytes > std::numeric_limits<size_t>::max()/stage_slots) {
+        return false;
+    }
+
+    const size_t scratch_bytes = runtime->stage_bytes*stage_slots;
+    if (scratch_bytes > runtime->pool_bytes) {
+        return false;
+    }
+
+    ggml_cuda_set_device(runtime->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (!ggml_cuda_kv_stream_transfer_ring_set_active_slots(runtime->transfer_ring, stage_slots) ||
+        !ggml_cuda_kv_stream_resident_cache_repartition(runtime->resident_cache, scratch_bytes)) {
+        return false;
+    }
+    runtime->stage_slots = stage_slots;
+    return true;
 }
 
 ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(

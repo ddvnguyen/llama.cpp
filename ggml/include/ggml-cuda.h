@@ -66,6 +66,11 @@ GGML_BACKEND_API size_t ggml_backend_cuda_kv_stream_stage_bytes(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API uint32_t ggml_backend_cuda_kv_stream_stage_slots(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
+GGML_BACKEND_API uint32_t ggml_backend_cuda_kv_stream_resident_pages_per_layer(
+    ggml_backend_cuda_kv_stream_runtime_t runtime);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_repartition(
+    ggml_backend_cuda_kv_stream_runtime_t runtime,
+    uint32_t stage_slots);
 GGML_BACKEND_API struct ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_stage_upload(
