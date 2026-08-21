@@ -179,6 +179,128 @@ std::vector<float> run_attention(
     return result;
 }
 
+std::vector<float> run_attention_layers(
+        ggml_backend_t backend,
+        const std::vector<attention_inputs> & layers,
+        ggml_backend_buffer_type_t kv_buft,
+        int64_t n_kv,
+        int64_t n_batch,
+        int repeats = 1) {
+    constexpr size_t N_TENSORS = 128;
+    const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS +
+        ggml_graph_overhead_custom(N_TENSORS, false);
+
+    ggml_init_params params{
+        /* .mem_size   = */ context_bytes,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr compute_ctx(ggml_init(params));
+    ggml_context_ptr kv_ctx(ggml_init(params));
+    GGML_ASSERT(compute_ctx && kv_ctx);
+
+    struct layer_tensors {
+        ggml_tensor * q;
+        ggml_tensor * mask;
+        ggml_tensor * k_storage;
+        ggml_tensor * v_storage;
+        ggml_tensor * k_update;
+        ggml_tensor * v_update;
+        ggml_tensor * update_index;
+        ggml_tensor * updated_k;
+        ggml_tensor * updated_v;
+        ggml_tensor * out;
+    };
+    std::vector<layer_tensors> tensors;
+    tensors.reserve(layers.size());
+
+    for (size_t layer = 0; layer < layers.size(); ++layer) {
+        layer_tensors current{};
+        current.q = ggml_new_tensor_4d(
+            compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, n_batch, N_Q_HEAD, 1);
+        current.mask = ggml_new_tensor_4d(
+            compute_ctx.get(), GGML_TYPE_F16, n_kv, n_batch, 1, 1);
+        current.k_storage = ggml_new_tensor_2d(
+            kv_ctx.get(), GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD, n_kv);
+        current.v_storage = ggml_new_tensor_2d(
+            kv_ctx.get(), GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD, n_kv);
+        ggml_tensor * k_cache = ggml_view_4d(
+            kv_ctx.get(), current.k_storage, HEAD_DIM, N_KV_HEAD, n_kv, 1,
+            ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM),
+            ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD),
+            ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
+        ggml_tensor * v_cache = ggml_view_4d(
+            kv_ctx.get(), current.v_storage, HEAD_DIM, N_KV_HEAD, n_kv, 1,
+            ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM),
+            ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD),
+            ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
+        ggml_tensor * k = ggml_permute(kv_ctx.get(), k_cache, 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(kv_ctx.get(), v_cache, 0, 2, 1, 3);
+
+        current.k_update = ggml_new_tensor_2d(
+            compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM*N_KV_HEAD, 1);
+        current.v_update = ggml_new_tensor_2d(
+            compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM*N_KV_HEAD, 1);
+        current.update_index = ggml_new_tensor_1d(compute_ctx.get(), GGML_TYPE_I32, 1);
+        current.updated_k = ggml_set_rows(
+            compute_ctx.get(), current.k_storage, current.k_update, current.update_index);
+        current.updated_v = ggml_set_rows(
+            compute_ctx.get(), current.v_storage, current.v_update, current.update_index);
+        current.out = ggml_flash_attn_ext(
+            compute_ctx.get(), current.q, k, v, current.mask,
+            1.0f/std::sqrt(float(HEAD_DIM)), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(current.out, GGML_PREC_F32);
+        tensors.push_back(current);
+    }
+
+    ggml_backend_buffer_ptr kv_buffer(
+        ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx.get(), kv_buft));
+    ggml_backend_buffer_ptr compute_buffer(
+        ggml_backend_alloc_ctx_tensors(compute_ctx.get(), backend));
+    GGML_ASSERT(kv_buffer && compute_buffer);
+
+    const int32_t update_row = 1;
+    for (size_t layer = 0; layer < layers.size(); ++layer) {
+        const auto & input = layers[layer];
+        auto & current = tensors[layer];
+        ggml_backend_tensor_set(current.q, input.q.data(), 0, input.q.size()*sizeof(float));
+        ggml_backend_tensor_set(current.k_storage, input.k.data(), 0, input.k.size());
+        ggml_backend_tensor_set(current.v_storage, input.v.data(), 0, input.v.size());
+        ggml_backend_tensor_set(current.mask, input.mask.data(), 0, input.mask.size()*sizeof(uint16_t));
+
+        std::vector<float> k_update_data(HEAD_DIM*N_KV_HEAD);
+        std::vector<float> v_update_data(HEAD_DIM*N_KV_HEAD);
+        for (size_t i = 0; i < k_update_data.size(); ++i) {
+            k_update_data[i] = (0.5f + 0.03f*layer)*std::sin(float(i)*0.0234375f);
+            v_update_data[i] = (0.3f + 0.02f*layer)*std::cos(float(i)*0.017578125f);
+        }
+        ggml_backend_tensor_set(current.k_update, k_update_data.data(), 0,
+            k_update_data.size()*sizeof(float));
+        ggml_backend_tensor_set(current.v_update, v_update_data.data(), 0,
+            v_update_data.size()*sizeof(float));
+        ggml_backend_tensor_set(current.update_index, &update_row, 0, sizeof(update_row));
+    }
+
+    ggml_cgraph * graph = ggml_new_graph_custom(compute_ctx.get(), N_TENSORS, false);
+    for (auto & current : tensors) {
+        ggml_build_forward_expand(graph, current.updated_k);
+        ggml_build_forward_expand(graph, current.updated_v);
+        ggml_build_forward_expand(graph, current.out);
+    }
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    }
+
+    std::vector<float> result;
+    for (auto & current : tensors) {
+        const size_t begin = result.size();
+        result.resize(begin + ggml_nelements(current.out));
+        ggml_backend_tensor_get(current.out, result.data() + begin, 0,
+            ggml_nbytes(current.out));
+    }
+    return result;
+}
+
 } // namespace
 
 int main() {
@@ -325,6 +447,64 @@ int main() {
         t.assert_equal(uint64_t(1), repartitioned.asynchronous_page_uploads);
 
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
+    });
+
+    t.test("one shared ring prefetches across attention layers", [](testing & t) {
+        constexpr int64_t n_kv = 768;
+        // Cross-layer prefetch is a decode optimization. A one-token batch
+        // also guarantees that only the mutable tail page is changed by the
+        // SET_ROWS producers in this graph.
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        std::vector<attention_inputs> inputs{
+            make_inputs(n_kv, n_batch),
+            make_inputs(n_kv, n_batch),
+            make_inputs(n_kv, n_batch),
+        };
+        for (size_t layer = 1; layer < inputs.size(); ++layer) {
+            for (size_t i = 0; i < inputs[layer].q.size(); ++i) {
+                inputs[layer].q[i] += 0.025f*layer*std::sin(float(i)*0.015625f);
+            }
+        }
+        const std::vector<float> expected = run_attention_layers(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.pool_bytes           = 5*page_bytes;
+        params.resident_layer_count = 3;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("shared runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention_layers(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch, 2);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        t.assert_equal(uint64_t(12), stats.asynchronous_page_uploads);
+        t.assert_equal(uint64_t(12), stats.compute_stream_waits);
+        t.assert_equal(uint64_t(4), stats.cross_layer_prefetches);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr, "multi-layer streamed attention max_abs=%g\n", max_abs);
+        t.assert_true("multi-layer streamed logits remain equivalent", max_abs <= 3e-4f);
     });
 
     ggml_quantize_free();

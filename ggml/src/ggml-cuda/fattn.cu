@@ -6,6 +6,7 @@
 #include "fattn.cuh"
 
 #include <algorithm>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -132,6 +133,40 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
         K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
+struct ggml_cuda_kv_stream_resident_cache;
+
+namespace {
+
+constexpr size_t KV_STREAM_NO_REQUEST = std::numeric_limits<size_t>::max();
+constexpr uint32_t KV_STREAM_NO_LAYER = std::numeric_limits<uint32_t>::max();
+
+struct kv_stream_graph_request {
+    const char * k_data = nullptr;
+    const char * v_data = nullptr;
+    size_t k_nb1 = 0;
+    size_t k_nb2 = 0;
+    size_t v_nb1 = 0;
+    size_t v_nb2 = 0;
+    int64_t n_head_kv = 0;
+    int64_t token_begin = 0;
+    int64_t token_count = 0;
+    size_t k_row_bytes = 0;
+    size_t v_row_bytes = 0;
+    size_t k_head_bytes = 0;
+    size_t k_bytes = 0;
+    size_t v_offset = 0;
+    size_t v_head_bytes = 0;
+    size_t v_bytes = 0;
+    uint32_t layer = 0;
+    uint32_t slot = 0;
+    bool mutable_tail = false;
+    bool eligible = false;
+    bool scheduled = false;
+    bool consumed = false;
+};
+
+} // namespace
+
 struct ggml_cuda_kv_stream_transfer_ring {
     char * pool_data = nullptr;
     size_t page_bytes = 0;
@@ -142,9 +177,21 @@ struct ggml_cuda_kv_stream_transfer_ring {
     std::vector<cudaEvent_t> ready;
     std::vector<cudaEvent_t> consumed;
     std::vector<uint8_t> slot_used;
+    std::vector<size_t> slot_request;
+
+    bool graph_active = false;
+    uint32_t graph_layer_count = 0;
+    uint32_t current_layer = KV_STREAM_NO_LAYER;
+    size_t next_request = 0;
+    ggml_cuda_kv_stream_resident_cache * graph_resident_cache = nullptr;
+    std::vector<kv_stream_graph_request> graph_requests;
+    std::unordered_map<const void *, uint32_t> graph_layer_by_k;
+    std::unordered_map<const void *, std::vector<size_t>> graph_request_by_k_page;
+
     uint64_t asynchronous_page_uploads = 0;
     uint64_t compute_stream_waits = 0;
     uint64_t stage_slot_reuses = 0;
+    uint64_t cross_layer_prefetches = 0;
 };
 
 ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
@@ -161,6 +208,7 @@ ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
     ring->ready.resize(stage_slots, nullptr);
     ring->consumed.resize(stage_slots, nullptr);
     ring->slot_used.resize(stage_slots, 0);
+    ring->slot_request.resize(stage_slots, KV_STREAM_NO_REQUEST);
 
     auto cleanup = [&]() {
         for (cudaEvent_t event : ring->ready) {
@@ -233,6 +281,7 @@ ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
         ring->asynchronous_page_uploads,
         ring->compute_stream_waits,
         ring->stage_slot_reuses,
+        ring->cross_layer_prefetches,
     };
 }
 
@@ -319,6 +368,17 @@ uint32_t ggml_cuda_kv_stream_resident_cache_pages_per_layer(
 ggml_cuda_kv_stream_resident_stats ggml_cuda_kv_stream_resident_cache_get_stats(
         const ggml_cuda_kv_stream_resident_cache * cache) {
     return cache == nullptr ? ggml_cuda_kv_stream_resident_stats{} : cache->stats;
+}
+
+static uint32_t kv_stream_resident_layer(
+        ggml_cuda_kv_stream_resident_cache * cache, const void * k_key) {
+    GGML_ASSERT(cache != nullptr);
+    auto [it, inserted] = cache->layer_by_k.emplace(k_key, cache->next_layer);
+    if (inserted) {
+        GGML_ASSERT(cache->next_layer < cache->layer_count);
+        ++cache->next_layer;
+    }
+    return it->second;
 }
 
 namespace {
@@ -464,6 +524,208 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
         sinks == nullptr && kv_stream_block_tokens(dst, stage_bytes) > 0;
 }
 
+namespace {
+
+static void kv_stream_graph_upload(
+        ggml_cuda_kv_stream_transfer_ring * ring,
+        kv_stream_graph_request & request,
+        uint32_t slot) {
+    char * stage = ring->pool_data + size_t(slot)*ring->page_bytes;
+    if (ring->slot_used[slot]) {
+        CUDA_CHECK(cudaStreamWaitEvent(ring->copy_stream, ring->consumed[slot], 0));
+        ++ring->stage_slot_reuses;
+    }
+    for (int64_t head = 0; head < request.n_head_kv; ++head) {
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            stage + head*request.k_head_bytes, request.k_row_bytes,
+            request.k_data + head*request.k_nb2 + request.token_begin*request.k_nb1,
+            request.k_nb1,
+            request.k_row_bytes, request.token_count,
+            cudaMemcpyHostToDevice, ring->copy_stream));
+    }
+    for (int64_t head = 0; head < request.n_head_kv; ++head) {
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            stage + request.v_offset + head*request.v_head_bytes, request.v_row_bytes,
+            request.v_data + head*request.v_nb2 + request.token_begin*request.v_nb1,
+            request.v_nb1,
+            request.v_row_bytes, request.token_count,
+            cudaMemcpyHostToDevice, ring->copy_stream));
+    }
+    CUDA_CHECK(cudaEventRecord(ring->ready[slot], ring->copy_stream));
+    request.slot = slot;
+    request.scheduled = true;
+    ring->slot_used[slot] = 1;
+    ring->slot_request[slot] = size_t(&request - ring->graph_requests.data());
+    ++ring->asynchronous_page_uploads;
+    if (ring->graph_resident_cache != nullptr) {
+        ring->graph_resident_cache->stats.host_to_device_bytes +=
+            request.k_bytes + request.v_bytes;
+    }
+    if (ring->current_layer != KV_STREAM_NO_LAYER && request.layer > ring->current_layer) {
+        ++ring->cross_layer_prefetches;
+    }
+}
+
+static bool kv_stream_graph_schedule_slot(
+        ggml_cuda_kv_stream_transfer_ring * ring, uint32_t slot) {
+    if (!ring->graph_active || slot >= ring->active_slots ||
+            ring->next_request >= ring->graph_requests.size()) {
+        return false;
+    }
+    auto & request = ring->graph_requests[ring->next_request];
+    if (!request.eligible) {
+        return false;
+    }
+    GGML_ASSERT(!request.scheduled && !request.consumed);
+    ++ring->next_request;
+    kv_stream_graph_upload(ring, request, slot);
+    return true;
+}
+
+static void kv_stream_graph_fill_free_slots(ggml_cuda_kv_stream_transfer_ring * ring) {
+    for (uint32_t slot = 0; slot < ring->active_slots; ++slot) {
+        if (ring->slot_request[slot] == KV_STREAM_NO_REQUEST &&
+                !kv_stream_graph_schedule_slot(ring, slot)) {
+            break;
+        }
+    }
+}
+
+static bool kv_stream_graph_layer_begin(
+        ggml_cuda_kv_stream_transfer_ring * ring,
+        const void * k_key,
+        cudaStream_t compute_stream) {
+    if (!ring->graph_active) {
+        return false;
+    }
+    const auto layer_it = ring->graph_layer_by_k.find(k_key);
+    if (layer_it == ring->graph_layer_by_k.end()) {
+        return false;
+    }
+
+    ring->current_layer = layer_it->second;
+    CUDA_CHECK(cudaEventRecord(ring->producer_ready, compute_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(ring->copy_stream, ring->producer_ready, 0));
+    for (auto & request : ring->graph_requests) {
+        if (request.layer == ring->current_layer && request.mutable_tail) {
+            request.eligible = true;
+        }
+    }
+    kv_stream_graph_fill_free_slots(ring);
+    return true;
+}
+
+static size_t kv_stream_graph_request_index(
+        const ggml_cuda_kv_stream_transfer_ring * ring,
+        const void * k_key,
+        uint32_t page) {
+    const auto it = ring->graph_request_by_k_page.find(k_key);
+    if (it == ring->graph_request_by_k_page.end() || page >= it->second.size()) {
+        return KV_STREAM_NO_REQUEST;
+    }
+    return it->second[page];
+}
+
+static void kv_stream_graph_release(
+        ggml_cuda_kv_stream_transfer_ring * ring,
+        size_t request_index,
+        cudaStream_t compute_stream) {
+    GGML_ASSERT(request_index < ring->graph_requests.size());
+    auto & request = ring->graph_requests[request_index];
+    GGML_ASSERT(request.scheduled && !request.consumed);
+    const uint32_t slot = request.slot;
+    GGML_ASSERT(ring->slot_request[slot] == request_index);
+    CUDA_CHECK(cudaEventRecord(ring->consumed[slot], compute_stream));
+    request.consumed = true;
+    ring->slot_request[slot] = KV_STREAM_NO_REQUEST;
+    (void) kv_stream_graph_schedule_slot(ring, slot);
+}
+
+} // namespace
+
+void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
+    GGML_ASSERT(ring != nullptr);
+    ring->graph_active = true;
+    ring->graph_layer_count = 0;
+    ring->current_layer = KV_STREAM_NO_LAYER;
+    ring->next_request = 0;
+    ring->graph_resident_cache = nullptr;
+    ring->graph_requests.clear();
+    ring->graph_layer_by_k.clear();
+    ring->graph_request_by_k_page.clear();
+    std::fill(ring->slot_request.begin(), ring->slot_request.end(), KV_STREAM_NO_REQUEST);
+}
+
+bool ggml_cuda_kv_stream_graph_add_attention(
+        ggml_cuda_kv_stream_transfer_ring * ring,
+        ggml_cuda_kv_stream_resident_cache * resident_cache,
+        const ggml_tensor * dst) {
+    GGML_ASSERT(ring != nullptr);
+    if (resident_cache == nullptr || dst == nullptr || dst->src[0]->ne[1] != 1 ||
+            !ggml_cuda_flash_attn_ext_streamed_supported(dst, ring->page_bytes)) {
+        return false;
+    }
+    if (ring->graph_resident_cache != nullptr && ring->graph_resident_cache != resident_cache) {
+        return false;
+    }
+    ring->graph_resident_cache = resident_cache;
+
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    // Resident placement is stable across evaluations, while deadlines must
+    // follow this graph's finalized execution order.
+    (void) kv_stream_resident_layer(resident_cache, K->data);
+    const uint32_t layer = ring->graph_layer_count++;
+    ring->graph_layer_by_k[K->data] = layer;
+
+    const int64_t block_tokens = resident_cache->page_tokens;
+    const int nchunks = int((K->ne[1] + block_tokens - 1)/block_tokens);
+    auto & page_requests = ring->graph_request_by_k_page[K->data];
+    page_requests.assign(nchunks, KV_STREAM_NO_REQUEST);
+
+    for (int chunk = 0; chunk < nchunks; ++chunk) {
+        const uint32_t page = uint32_t(chunk);
+        if (page < resident_cache->resident_pages_per_layer) {
+            continue;
+        }
+        const int64_t token_begin = chunk*block_tokens;
+        const int64_t token_count = std::min<int64_t>(block_tokens, K->ne[1] - token_begin);
+        const size_t k_row_bytes = ggml_row_size(K->type, K->ne[0]);
+        const size_t v_row_bytes = ggml_row_size(V->type, V->ne[0]);
+
+        kv_stream_graph_request request;
+        request.k_data = static_cast<const char *>(K->data);
+        request.v_data = static_cast<const char *>(V->data);
+        request.k_nb1 = K->nb[1];
+        request.k_nb2 = K->nb[2];
+        request.v_nb1 = V->nb[1];
+        request.v_nb2 = V->nb[2];
+        request.n_head_kv = K->ne[2];
+        request.token_begin = token_begin;
+        request.token_count = token_count;
+        request.k_row_bytes = k_row_bytes;
+        request.v_row_bytes = v_row_bytes;
+        request.k_head_bytes = k_row_bytes*token_count;
+        request.k_bytes = request.k_head_bytes*K->ne[2];
+        request.v_offset = GGML_PAD(request.k_bytes, 128);
+        request.v_head_bytes = v_row_bytes*token_count;
+        request.v_bytes = request.v_head_bytes*V->ne[2];
+        request.layer = layer;
+        request.mutable_tail = chunk == nchunks - 1;
+        request.eligible = !request.mutable_tail;
+        GGML_ASSERT(request.v_offset + request.v_bytes == ring->page_bytes);
+
+        page_requests[page] = ring->graph_requests.size();
+        ring->graph_requests.push_back(request);
+    }
+    return true;
+}
+
+void ggml_cuda_kv_stream_graph_finalize(ggml_cuda_kv_stream_transfer_ring * ring) {
+    GGML_ASSERT(ring != nullptr);
+    kv_stream_graph_fill_free_slots(ring);
+}
+
 void ggml_cuda_flash_attn_ext_streamed(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
@@ -500,17 +762,15 @@ void ggml_cuda_flash_attn_ext_streamed(
         bool upload = true;
         bool streamed = false;
         uint32_t slot = 0;
+        size_t request_index = KV_STREAM_NO_REQUEST;
     };
 
     uint32_t resident_layer = 0;
     if (resident_cache != nullptr) {
-        auto [it, inserted] = resident_cache->layer_by_k.emplace(K->data, resident_cache->next_layer);
-        if (inserted) {
-            GGML_ASSERT(resident_cache->next_layer < resident_cache->layer_count);
-            ++resident_cache->next_layer;
-        }
-        resident_layer = it->second;
+        resident_layer = kv_stream_resident_layer(resident_cache, K->data);
     }
+    const bool graph_planned = kv_stream_graph_layer_begin(
+        transfer_ring, K->data, ctx.stream());
 
     std::vector<chunk_descriptor> chunks(nchunks);
     std::vector<size_t> streamed_chunks;
@@ -567,8 +827,14 @@ void ggml_cuda_flash_attn_ext_streamed(
 
         if (desc.streamed) {
             const size_t stream_index = streamed_chunks.size();
-            desc.slot = uint32_t(stream_index%transfer_ring->active_slots);
-            desc.stage = transfer_ring->pool_data + size_t(desc.slot)*transfer_ring->page_bytes;
+            if (graph_planned) {
+                desc.request_index = kv_stream_graph_request_index(
+                    transfer_ring, K->data, uint32_t(chunk));
+                GGML_ASSERT(desc.request_index != KV_STREAM_NO_REQUEST);
+            } else {
+                desc.slot = uint32_t(stream_index%transfer_ring->active_slots);
+                desc.stage = transfer_ring->pool_data + size_t(desc.slot)*transfer_ring->page_bytes;
+            }
             streamed_chunks.push_back(chunk);
         }
     }
@@ -608,7 +874,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         ++transfer_ring->asynchronous_page_uploads;
     };
 
-    if (!streamed_chunks.empty()) {
+    if (!graph_planned && !streamed_chunks.empty()) {
         // SET_ROWS and all other producers for this layer are ordered before
         // this marker on the compute stream. The copy stream may then run
         // independently while attention consumes previously prepared pages.
@@ -626,6 +892,13 @@ void ggml_cuda_flash_attn_ext_streamed(
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         auto & desc = chunks[chunk];
         if (desc.streamed) {
+            if (graph_planned) {
+                auto & request = transfer_ring->graph_requests[desc.request_index];
+                GGML_ASSERT(request.scheduled && !request.consumed);
+                desc.slot = request.slot;
+                desc.stage = transfer_ring->pool_data +
+                    size_t(desc.slot)*transfer_ring->page_bytes;
+            }
             CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), transfer_ring->ready[desc.slot], 0));
             ++transfer_ring->compute_stream_waits;
         } else if (desc.upload) {
@@ -666,7 +939,11 @@ void ggml_cuda_flash_attn_ext_streamed(
         if (nchunks == 1) {
             ggml_cuda_flash_attn_ext(ctx, &staged_dst);
             if (desc.streamed) {
-                CUDA_CHECK(cudaEventRecord(transfer_ring->consumed[desc.slot], ctx.stream()));
+                if (graph_planned) {
+                    kv_stream_graph_release(transfer_ring, desc.request_index, ctx.stream());
+                } else {
+                    CUDA_CHECK(cudaEventRecord(transfer_ring->consumed[desc.slot], ctx.stream()));
+                }
             }
             return;
         }
@@ -682,10 +959,14 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
 
         if (desc.streamed) {
-            CUDA_CHECK(cudaEventRecord(transfer_ring->consumed[desc.slot], ctx.stream()));
-            const size_t next = stream_index + transfer_ring->active_slots;
-            if (next < streamed_chunks.size()) {
-                schedule_streamed(next);
+            if (graph_planned) {
+                kv_stream_graph_release(transfer_ring, desc.request_index, ctx.stream());
+            } else {
+                CUDA_CHECK(cudaEventRecord(transfer_ring->consumed[desc.slot], ctx.stream()));
+                const size_t next = stream_index + transfer_ring->active_slots;
+                if (next < streamed_chunks.size()) {
+                    schedule_streamed(next);
+                }
             }
             ++stream_index;
         }

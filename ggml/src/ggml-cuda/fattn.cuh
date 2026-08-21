@@ -20,6 +20,7 @@ struct ggml_cuda_kv_stream_transfer_stats {
     uint64_t asynchronous_page_uploads = 0;
     uint64_t compute_stream_waits = 0;
     uint64_t stage_slot_reuses = 0;
+    uint64_t cross_layer_prefetches = 0;
 };
 
 ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
@@ -41,6 +42,12 @@ bool ggml_cuda_kv_stream_transfer_ring_set_active_slots(
     ggml_cuda_kv_stream_transfer_ring * ring, uint32_t stage_slots);
 ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
     const ggml_cuda_kv_stream_transfer_ring * ring);
+void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring);
+bool ggml_cuda_kv_stream_graph_add_attention(
+    ggml_cuda_kv_stream_transfer_ring * ring,
+    ggml_cuda_kv_stream_resident_cache * resident_cache,
+    const ggml_tensor * dst);
+void ggml_cuda_kv_stream_graph_finalize(ggml_cuda_kv_stream_transfer_ring * ring);
 
 bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes);
 

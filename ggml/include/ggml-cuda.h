@@ -54,6 +54,7 @@ struct ggml_backend_cuda_kv_stream_stats {
     uint64_t asynchronous_page_uploads;
     uint64_t compute_stream_waits;
     uint64_t stage_slot_reuses;
+    uint64_t cross_layer_prefetches;
 };
 
 GGML_BACKEND_API ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(

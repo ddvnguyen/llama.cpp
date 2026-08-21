@@ -89,6 +89,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -1601,6 +1602,7 @@ ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
         transfer_stats.asynchronous_page_uploads,
         transfer_stats.compute_stream_waits,
         transfer_stats.stage_slot_reuses,
+        transfer_stats.cross_layer_prefetches,
     };
 }
 
@@ -1683,6 +1685,38 @@ static void ggml_cuda_kv_stream_fattn(
     GGML_ASSERT(runtime->device == ctx.device);
     ggml_cuda_flash_attn_ext_streamed(
         ctx, dst, runtime->transfer_ring, runtime->resident_cache);
+}
+
+static void ggml_cuda_kv_stream_prepare_graph(const ggml_cgraph * cgraph) {
+    std::vector<ggml_backend_cuda_kv_stream_runtime_t> runtimes;
+    std::unordered_set<ggml_backend_cuda_kv_stream_runtime_t> seen;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+        auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(node->src[1]);
+        if (runtime != nullptr && runtime == ggml_cuda_kv_stream_runtime_from_tensor(node->src[2]) &&
+                seen.insert(runtime).second) {
+            ggml_cuda_kv_stream_graph_begin(runtime->transfer_ring);
+            runtimes.push_back(runtime);
+        }
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_FLASH_ATTN_EXT || !ggml_cuda_kv_stream_fattn_fits(node)) {
+            continue;
+        }
+        auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(node->src[1]);
+        (void) ggml_cuda_kv_stream_graph_add_attention(
+            runtime->transfer_ring, runtime->resident_cache, node);
+    }
+
+    for (auto * runtime : runtimes) {
+        ggml_cuda_kv_stream_graph_finalize(runtime->transfer_ring);
+    }
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
@@ -4647,6 +4681,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             } else {
                 stream_ctx.concurrent_events.clear();
             }
+
+            // The graph order is now final. Build one shared deadline queue
+            // per KV runtime before issuing any attention work.
+            ggml_cuda_kv_stream_prepare_graph(cgraph);
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
