@@ -51,7 +51,24 @@ int main() {
 
         t.assert_true("buffer reports host accessibility", ggml_backend_buffer_is_host(buffer));
         t.assert_equal(size_t(256*1024), ggml_backend_buffer_get_size(buffer));
-        t.assert_true("buffer base exists", ggml_backend_buffer_get_base(buffer) != nullptr);
+        void * base = ggml_backend_buffer_get_base(buffer);
+        t.assert_true("buffer base exists", base != nullptr);
+
+        using query_fn_t = bool (*)(const void *, bool *);
+        ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        auto query_fn = reinterpret_cast<query_fn_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_cuda_kv_stream_host_is_write_combined"));
+        if (!t.assert_true("host allocation query is exported", query_fn != nullptr)) {
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+            ggml_backend_buffer_free(buffer);
+            return;
+        }
+        bool write_combined = false;
+        t.assert_true("host allocation flags are readable",
+            query_fn(base, &write_combined));
+        t.assert_true("authoritative KV storage is write-combined", write_combined);
 
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
         ggml_backend_buffer_free(buffer);

@@ -1436,7 +1436,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_kv_stream_buffer_alloc(
     ggml_cuda_set_device(runtime->device);
 
     void * host_data = nullptr;
-    const cudaError_t error = cudaMallocHost(&host_data, size);
+    const cudaError_t error = cudaHostAlloc(
+        &host_data, size,
+        cudaHostAllocMapped | cudaHostAllocWriteCombined);
     if (error != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_ERROR("%s: allocating %.2f MiB pinned KV storage failed: %s\n",
@@ -6214,6 +6216,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
                 return false;
             }
             *controlled_pool_pages = uint32_t(controlled);
+            return true;
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_host_is_write_combined") == 0) {
+        return (void *) +[](const void * pointer, bool * write_combined) -> bool {
+            if (pointer == nullptr || write_combined == nullptr) {
+                return false;
+            }
+            unsigned int flags = 0;
+            const cudaError_t error = cudaHostGetFlags(&flags, const_cast<void *>(pointer));
+            if (error != cudaSuccess) {
+                (void) cudaGetLastError();
+                return false;
+            }
+            *write_combined = (flags & cudaHostAllocWriteCombined) != 0;
             return true;
         };
     }
