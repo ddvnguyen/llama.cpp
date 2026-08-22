@@ -496,6 +496,8 @@ int main() {
         t.assert_equal(uint64_t(2), stats.resident_hits);
         t.assert_equal(uint64_t(0), stats.streamed_pages);
         t.assert_equal(uint64_t(4*page_bytes), stats.host_to_device_bytes);
+        t.assert_equal(uint64_t(2), stats.resident_attention_spans);
+        t.assert_equal(uint64_t(4), stats.resident_pages_attended);
 
         t.assert_true("one resident page is demoted into the ring",
             ggml_backend_cuda_kv_stream_repartition(runtime, 5));
@@ -508,6 +510,8 @@ int main() {
         t.assert_equal(uint64_t(1), repartitioned.resident_misses);
         t.assert_equal(uint64_t(1), repartitioned.streamed_pages);
         t.assert_equal(uint64_t(1), repartitioned.asynchronous_page_uploads);
+        t.assert_equal(uint64_t(1), repartitioned.resident_attention_spans);
+        t.assert_equal(uint64_t(1), repartitioned.resident_pages_attended);
 
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
     });

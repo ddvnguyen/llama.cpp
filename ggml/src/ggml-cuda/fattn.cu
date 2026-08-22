@@ -964,7 +964,10 @@ void ggml_cuda_flash_attn_ext_streamed(
         size_t v_offset = 0;
         size_t v_head_bytes = 0;
         size_t v_bytes = 0;
-        char * stage = nullptr;
+        char * k_stage = nullptr;
+        char * v_stage = nullptr;
+        size_t k_stage_head_stride = 0;
+        size_t v_stage_head_stride = 0;
         bool upload = true;
         bool streamed = false;
         uint32_t slot = 0;
@@ -1004,7 +1007,10 @@ void ggml_cuda_flash_attn_ext_streamed(
         desc.v_offset = v_offset;
         desc.v_head_bytes = v_head_bytes;
         desc.v_bytes = v_bytes;
-        desc.stage = static_cast<char *>(stage_data);
+        desc.k_stage = static_cast<char *>(stage_data);
+        desc.v_stage = desc.k_stage + v_offset;
+        desc.k_stage_head_stride = k_head_bytes;
+        desc.v_stage_head_stride = v_head_bytes;
 
         if (resident_cache != nullptr) {
             GGML_ASSERT(token_count == resident_cache->page_tokens);
@@ -1013,8 +1019,20 @@ void ggml_cuda_flash_attn_ext_streamed(
             const uint32_t page = token_begin/resident_cache->page_tokens;
             if (page < resident_cache->resident_pages_per_layer) {
                 const size_t resident_index = size_t(resident_layer)*resident_cache->resident_pages_per_layer + page;
-                desc.stage = resident_cache->pool_data + resident_cache->scratch_bytes +
-                    resident_index*resident_cache->page_bytes;
+                // Keep each layer's resident K and V in separate, head-major
+                // planes. A page remains the upload/dirty-tracking unit, but
+                // all resident pages can now be consumed as one tensor span.
+                char * layer_base = resident_cache->pool_data + resident_cache->scratch_bytes +
+                    size_t(resident_layer)*resident_cache->resident_pages_per_layer*
+                        resident_cache->page_bytes;
+                const size_t resident_k_plane_bytes =
+                    size_t(resident_cache->resident_pages_per_layer)*k_bytes;
+                desc.k_stage = layer_base + size_t(page)*k_head_bytes;
+                desc.v_stage = layer_base + resident_k_plane_bytes + size_t(page)*v_head_bytes;
+                desc.k_stage_head_stride =
+                    size_t(resident_cache->resident_pages_per_layer)*k_head_bytes;
+                desc.v_stage_head_stride =
+                    size_t(resident_cache->resident_pages_per_layer)*v_head_bytes;
                 if (resident_cache->loaded[resident_index]) {
                     ++resident_cache->stats.resident_hits;
                     // The final page contains the rows most recently changed by SET_ROWS.
@@ -1043,7 +1061,8 @@ void ggml_cuda_flash_attn_ext_streamed(
                 GGML_ASSERT(desc.request_index != KV_STREAM_NO_REQUEST);
             } else {
                 desc.slot = uint32_t(stream_index%transfer_ring->active_slots);
-                desc.stage = transfer_ring->pool_data + size_t(desc.slot)*transfer_ring->page_bytes;
+                desc.k_stage = transfer_ring->pool_data + size_t(desc.slot)*transfer_ring->page_bytes;
+                desc.v_stage = desc.k_stage + desc.v_offset;
             }
             streamed_chunks.push_back(chunk);
         }
@@ -1055,13 +1074,13 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
         for (int64_t head = 0; head < K->ne[2]; ++head) {
             CUDA_CHECK(cudaMemcpy2DAsync(
-                desc.stage + head*desc.k_head_bytes, desc.k_row_bytes,
+                desc.k_stage + head*desc.k_stage_head_stride, desc.k_row_bytes,
                 static_cast<const char *>(K->data) + head*K->nb[2] + desc.token_begin*K->nb[1], K->nb[1],
                 desc.k_row_bytes, desc.token_count, cudaMemcpyHostToDevice, stream));
         }
         for (int64_t head = 0; head < V->ne[2]; ++head) {
             CUDA_CHECK(cudaMemcpy2DAsync(
-                desc.stage + desc.v_offset + head*desc.v_head_bytes, desc.v_row_bytes,
+                desc.v_stage + head*desc.v_stage_head_stride, desc.v_row_bytes,
                 static_cast<const char *>(V->data) + head*V->nb[2] + desc.token_begin*V->nb[1], V->nb[1],
                 desc.v_row_bytes, desc.token_count, cudaMemcpyHostToDevice, stream));
         }
@@ -1106,8 +1125,9 @@ void ggml_cuda_flash_attn_ext_streamed(
                 auto & request = transfer_ring->graph_requests[desc.request_index];
                 GGML_ASSERT(request.scheduled && !request.consumed);
                 desc.slot = request.slot;
-                desc.stage = transfer_ring->pool_data +
+                desc.k_stage = transfer_ring->pool_data +
                     size_t(desc.slot)*transfer_ring->page_bytes;
+                desc.v_stage = desc.k_stage + desc.v_offset;
                 if (request.deadline_sample) {
                     kv_stream_record_deadline<<<1, 1, 0, ctx.stream()>>>(
                         transfer_ring->ready_flags_device + desc.slot,
@@ -1118,22 +1138,39 @@ void ggml_cuda_flash_attn_ext_streamed(
             }
             CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), transfer_ring->ready[desc.slot], 0));
             ++transfer_ring->compute_stream_waits;
-        } else if (desc.upload) {
-            upload(desc, ctx.stream());
+        } else {
+            // Resident pages form one contiguous head-major K/V prefix. Upload
+            // dirty pages separately, then execute the whole prefix once.
+            if (chunk > 0) {
+                continue;
+            }
+            const uint32_t resident_span_pages = std::min<uint32_t>(
+                uint32_t(nchunks), resident_cache->resident_pages_per_layer);
+            GGML_ASSERT(resident_span_pages > 0);
+            for (uint32_t page = 0; page < resident_span_pages; ++page) {
+                upload(chunks[page], ctx.stream());
+            }
+            desc.token_count = int64_t(resident_span_pages)*block_tokens;
+            desc.k_head_bytes = desc.k_row_bytes*desc.token_count;
+            desc.k_bytes = desc.k_head_bytes*K->ne[2];
+            desc.v_head_bytes = desc.v_row_bytes*desc.token_count;
+            desc.v_bytes = desc.v_head_bytes*V->ne[2];
+            ++resident_cache->stats.resident_attention_spans;
+            resident_cache->stats.resident_pages_attended += resident_span_pages;
         }
 
         ggml_tensor staged_k = *K;
         ggml_tensor staged_v = *V;
-        staged_k.data = desc.stage;
+        staged_k.data = desc.k_stage;
         staged_k.ne[1] = desc.token_count;
         staged_k.nb[1] = desc.k_row_bytes;
-        staged_k.nb[2] = desc.k_head_bytes;
-        staged_k.nb[3] = desc.k_bytes;
-        staged_v.data = desc.stage + desc.v_offset;
+        staged_k.nb[2] = desc.k_stage_head_stride;
+        staged_k.nb[3] = desc.k_stage_head_stride*K->ne[2];
+        staged_v.data = desc.v_stage;
         staged_v.ne[1] = desc.token_count;
         staged_v.nb[1] = desc.v_row_bytes;
-        staged_v.nb[2] = desc.v_head_bytes;
-        staged_v.nb[3] = desc.v_bytes;
+        staged_v.nb[2] = desc.v_stage_head_stride;
+        staged_v.nb[3] = desc.v_stage_head_stride*V->ne[2];
 
         ggml_tensor staged_mask{};
         ggml_tensor * staged_mask_ptr = nullptr;
