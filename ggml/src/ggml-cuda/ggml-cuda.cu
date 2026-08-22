@@ -2484,6 +2484,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_get_rows_back(ctx, dst);
             break;
         case GGML_OP_SET_ROWS:
+            if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(dst);
+                    runtime != nullptr && runtime->resident_cache != nullptr) {
+                ggml_cuda_kv_stream_resident_cache_mark_dirty(
+                    runtime->resident_cache, dst, dst->src[1]);
+            }
             ggml_cuda_op_set_rows(ctx, dst);
             break;
         case GGML_OP_SET:
