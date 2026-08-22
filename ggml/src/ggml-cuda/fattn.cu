@@ -139,7 +139,6 @@ namespace {
 
 constexpr size_t KV_STREAM_NO_REQUEST = std::numeric_limits<size_t>::max();
 constexpr uint32_t KV_STREAM_NO_LAYER = std::numeric_limits<uint32_t>::max();
-constexpr uint32_t KV_STREAM_MAX_ATTENTION_SPAN_PAGES = 8;
 
 struct kv_stream_graph_request {
     const char * k_data = nullptr;
@@ -1149,8 +1148,7 @@ void ggml_cuda_flash_attn_ext_streamed(
             // Coalesce ready pages that occupy consecutive plane slots. The
             // head stride remains the full active-ring plane width, while the
             // tensor's token extent grows across adjacent slots.
-            while (streamed_span_pages < KV_STREAM_MAX_ATTENTION_SPAN_PAGES &&
-                    chunk + int(streamed_span_pages) < nchunks) {
+            while (chunk + int(streamed_span_pages) < nchunks) {
                 auto & candidate = chunks[chunk + streamed_span_pages];
                 if (!candidate.streamed) {
                     break;
