@@ -378,6 +378,100 @@ int main() {
         t.assert_equal(uint32_t(16), partition.ring_slots);
     });
 
+    t.test("undersized ring jumps to one-layer overlap target despite copy pressure", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 630;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 257;
+        params.minimum_ring_slots                = 22;
+        params.previous_resident_pages_per_layer = 38;
+        params.previous_ring_slots               = 22;
+        params.deadline_miss_ratio                = 0.40;
+        params.copy_engine_busy_ratio             = 0.99;
+        params.starved_evaluations                = 2;
+        params.grow_hysteresis_evaluations        = 3;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("partition changed", partition.changed);
+        t.assert_equal(uint32_t(23), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(262), partition.ring_slots);
+    });
+
+    t.test("copy pressure stops demotion after overlap target is reached", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 630;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 257;
+        params.minimum_ring_slots                = 22;
+        params.previous_resident_pages_per_layer = 23;
+        params.previous_ring_slots               = 262;
+        params.deadline_miss_ratio                = 0.20;
+        params.copy_engine_busy_ratio             = 0.90;
+        params.starved_evaluations                = 10;
+        params.grow_hysteresis_evaluations        = 3;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("partition remains stable", !partition.changed);
+        t.assert_equal(uint32_t(23), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(262), partition.ring_slots);
+    });
+
+    t.test("light utilization does not promote above overlap target", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 630;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 257;
+        params.minimum_ring_slots                = 22;
+        params.previous_resident_pages_per_layer = 23;
+        params.previous_ring_slots               = 262;
+        params.deadline_miss_ratio                = 0.0;
+        params.copy_engine_busy_ratio             = 0.25;
+        params.ring_peak_occupancy_ratio          = 0.20;
+        params.overprovisioned_evaluations        = 7;
+        params.shrink_hysteresis_evaluations      = 8;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("partition remains at target", !partition.changed);
+        t.assert_equal(uint32_t(23), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(262), partition.ring_slots);
+    });
+
+    t.test("constrained pool demotes all resident pages when target is unreachable", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 39;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 65;
+        params.minimum_ring_slots                = 23;
+        params.previous_resident_pages_per_layer = 1;
+        params.previous_ring_slots               = 23;
+        params.deadline_miss_ratio                = 0.50;
+        params.copy_engine_busy_ratio             = 0.99;
+        params.starved_evaluations                = 2;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("partition changed", partition.changed);
+        t.assert_equal(uint32_t(0), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(39), partition.ring_slots);
+    });
+
+    t.test("non-positive overlap target is rejected", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 160;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 12;
+        params.minimum_ring_slots                = 16;
+        params.previous_resident_pages_per_layer = 9;
+        params.previous_ring_slots               = 16;
+        params.target_ring_working_set_ratio      = 0.0;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is rejected", !partition.valid);
+    });
+
     t.test("partition cooldown accumulates pressure without repeatedly resetting residency", [](testing & t) {
         llama_kv_stream_partition_params params;
         params.total_pool_pages                  = 160;

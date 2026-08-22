@@ -6233,8 +6233,20 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
                 return nullptr;
             }
             const size_t pool_pages = pool_bytes/page_bytes;
-            const size_t minimum_slots = std::min<size_t>(
+            size_t minimum_slots = std::min<size_t>(
                 8, pool_pages - resident_layer_count);
+            // Diagnostic override for reproducible resident:ring sweeps. The
+            // llama-layer controller treats its presence as a fixed boundary.
+            if (const char * fixed_slots = getenv("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS")) {
+                char * end = nullptr;
+                const unsigned long requested = strtoul(fixed_slots, &end, 10);
+                if (end == fixed_slots || *end != '\0' || requested == 0 || requested >= pool_pages) {
+                    GGML_LOG_ERROR("%s: invalid GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS=%s for %zu pool pages\n",
+                            __func__, fixed_slots, pool_pages);
+                    return nullptr;
+                }
+                minimum_slots = size_t(requested);
+            }
             const size_t resident_pages_per_layer =
                 (pool_pages - minimum_slots)/resident_layer_count;
             const size_t stage_slots_wide =

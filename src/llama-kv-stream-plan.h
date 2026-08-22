@@ -166,6 +166,10 @@ struct llama_kv_stream_partition_params {
     double copy_engine_busy_ratio    = 0.0;
     double ring_peak_occupancy_ratio = 0.0;
 
+    // Ring slots relative to the streamed pages consumed by one attention
+    // layer. A value above one leaves room to begin the next layer early.
+    double target_ring_working_set_ratio = 1.10;
+
     uint32_t starved_evaluations        = 0;
     uint32_t overprovisioned_evaluations = 0;
     uint32_t grow_hysteresis_evaluations = 3;

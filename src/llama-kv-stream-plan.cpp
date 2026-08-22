@@ -1,6 +1,7 @@
 #include "llama-kv-stream-plan.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <set>
 #include <tuple>
@@ -379,6 +380,10 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
         !ratio_valid(params.ring_peak_occupancy_ratio)) {
         return fail_partition("KV stream partition metrics must be ratios");
     }
+    if (!std::isfinite(params.target_ring_working_set_ratio) ||
+            params.target_ring_working_set_ratio <= 0.0) {
+        return fail_partition("KV stream target working-set ratio must be positive");
+    }
     if (params.previous_resident_pages_per_layer > params.active_pages_per_layer) {
         return fail_partition("resident KV pages exceed active pages");
     }
@@ -393,12 +398,32 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
     }
 
     constexpr double MISS_THRESHOLD = 0.01;
-    constexpr double COPY_SATURATED  = 0.95;
+    constexpr double COPY_SATURATED  = 0.85;
     constexpr double COPY_LIGHT      = 0.50;
     constexpr double RING_LIGHT      = 0.50;
 
-    const bool starved = params.deadline_miss_ratio > MISS_THRESHOLD &&
+    uint32_t target_resident_pages = 0;
+    const uint32_t maximum_resident_pages = std::min(
+        params.active_pages_per_layer,
+        (params.total_pool_pages - params.minimum_ring_slots)/params.layer_count);
+    for (uint32_t resident = maximum_resident_pages;; --resident) {
+        const uint32_t ring = params.total_pool_pages - resident*params.layer_count;
+        const uint32_t streamed = params.active_pages_per_layer - resident;
+        if (streamed == 0 || double(ring) >=
+                params.target_ring_working_set_ratio*double(streamed)) {
+            target_resident_pages = resident;
+            break;
+        }
+        if (resident == 0) {
+            break;
+        }
+    }
+
+    const bool below_overlap_target =
+        params.previous_resident_pages_per_layer > target_resident_pages;
+    const bool feedback_starved = params.deadline_miss_ratio > MISS_THRESHOLD &&
         params.copy_engine_busy_ratio < COPY_SATURATED;
+    const bool starved = below_overlap_target || feedback_starved;
     const bool overprovisioned = params.deadline_miss_ratio <= MISS_THRESHOLD &&
         params.copy_engine_busy_ratio < COPY_LIGHT &&
         params.ring_peak_occupancy_ratio < RING_LIGHT;
@@ -411,14 +436,16 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
         params.repartition_cooldown_evaluations;
     if (cooldown_complete && starved && result.starved_evaluations >= params.grow_hysteresis_evaluations &&
         result.resident_pages_per_layer > 0) {
-        --result.resident_pages_per_layer;
-        result.ring_slots += params.layer_count;
+        result.resident_pages_per_layer = below_overlap_target ?
+            target_resident_pages : result.resident_pages_per_layer - 1;
+        result.ring_slots = params.total_pool_pages -
+            result.resident_pages_per_layer*params.layer_count;
         result.starved_evaluations = 0;
         result.overprovisioned_evaluations = 0;
         result.changed = true;
     } else if (cooldown_complete && overprovisioned &&
             result.overprovisioned_evaluations >= params.shrink_hysteresis_evaluations &&
-            result.resident_pages_per_layer < params.active_pages_per_layer &&
+            result.resident_pages_per_layer < target_resident_pages &&
             result.ring_slots >= params.minimum_ring_slots + params.layer_count) {
         ++result.resident_pages_per_layer;
         result.ring_slots -= params.layer_count;
