@@ -179,5 +179,38 @@ int main() {
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
     });
 
+    t.test("device factory assigns unusable resident remainder pages to the ring", [](testing & t) {
+        constexpr size_t page_bytes = 64*1024;
+        constexpr size_t pool_pages = 160;
+        constexpr uint32_t layers = 16;
+        using new_fn_t = void * (*)(ggml_backend_dev_t, size_t, size_t, uint32_t);
+
+        ggml_backend_t backend = ggml_backend_cuda_init(0);
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        ggml_backend_dev_t device = ggml_backend_get_device(backend);
+        auto new_fn = reinterpret_cast<new_fn_t>(ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(device),
+            "ggml_backend_cuda_kv_stream_runtime_new_for_device"));
+        if (!t.assert_true("device factory is exported", new_fn != nullptr)) {
+            ggml_backend_free(backend);
+            return;
+        }
+        auto runtime = static_cast<ggml_backend_cuda_kv_stream_runtime_t>(
+            new_fn(device, pool_pages*page_bytes, page_bytes, layers));
+        if (!t.assert_true("factory runtime initializes", runtime != nullptr)) {
+            ggml_backend_free(backend);
+            return;
+        }
+
+        t.assert_equal(uint32_t(16), ggml_backend_cuda_kv_stream_stage_slots(runtime));
+        t.assert_equal(uint32_t(9),
+            ggml_backend_cuda_kv_stream_resident_pages_per_layer(runtime));
+
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+        ggml_backend_free(backend);
+    });
+
     return t.summary();
 }

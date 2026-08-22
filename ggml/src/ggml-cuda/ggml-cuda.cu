@@ -6148,8 +6148,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
             if (page_bytes == 0 || pool_bytes/page_bytes <= resident_layer_count) {
                 return nullptr;
             }
-            const uint32_t stage_slots = uint32_t(std::min<size_t>(
-                8, pool_bytes/page_bytes - resident_layer_count));
+            const size_t pool_pages = pool_bytes/page_bytes;
+            const size_t minimum_slots = std::min<size_t>(
+                8, pool_pages - resident_layer_count);
+            const size_t resident_pages_per_layer =
+                (pool_pages - minimum_slots)/resident_layer_count;
+            const size_t stage_slots_wide =
+                pool_pages - resident_pages_per_layer*resident_layer_count;
+            if (stage_slots_wide == 0 || stage_slots_wide > UINT32_MAX) {
+                return nullptr;
+            }
+            const uint32_t stage_slots = uint32_t(stage_slots_wide);
             ggml_backend_cuda_kv_stream_params params{};
             params.device               = dev_ctx->device;
             params.stage_bytes          = page_bytes;
