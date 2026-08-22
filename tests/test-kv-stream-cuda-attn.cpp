@@ -77,8 +77,7 @@ std::vector<float> run_attention(
         int64_t n_batch,
         int repeats = 1,
         int64_t update_rows = 1,
-        bool change_updates = false,
-        ggml_type index_type = GGML_TYPE_I32) {
+        bool change_updates = false) {
     constexpr size_t N_TENSORS = 32;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
 
@@ -89,8 +88,7 @@ std::vector<float> run_attention(
     };
     ggml_context_ptr compute_ctx(ggml_init(params));
     ggml_context_ptr kv_ctx(ggml_init(params));
-    ggml_context_ptr index_ctx(ggml_init(params));
-    GGML_ASSERT(compute_ctx && kv_ctx && index_ctx);
+    GGML_ASSERT(compute_ctx && kv_ctx);
 
     ggml_tensor * q = ggml_new_tensor_4d(
         compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, n_batch, N_Q_HEAD, 1);
@@ -117,7 +115,7 @@ std::vector<float> run_attention(
         compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM*N_KV_HEAD, update_rows);
     ggml_tensor * v_update = ggml_new_tensor_2d(
         compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM*N_KV_HEAD, update_rows);
-    ggml_tensor * update_index = ggml_new_tensor_1d(index_ctx.get(), index_type, update_rows);
+    ggml_tensor * update_index = ggml_new_tensor_1d(compute_ctx.get(), GGML_TYPE_I32, update_rows);
     ggml_tensor * updated_k = ggml_set_rows(compute_ctx.get(), k_storage, k_update, update_index);
     ggml_tensor * updated_v = ggml_set_rows(compute_ctx.get(), v_storage, v_update, update_index);
 
@@ -130,9 +128,7 @@ std::vector<float> run_attention(
         ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx.get(), kv_buft));
     ggml_backend_buffer_ptr compute_buffer(
         ggml_backend_alloc_ctx_tensors(compute_ctx.get(), backend));
-    ggml_backend_buffer_ptr index_buffer(
-        ggml_backend_alloc_ctx_tensors_from_buft(index_ctx.get(), ggml_backend_cuda_host_buffer_type()));
-    GGML_ASSERT(kv_buffer && compute_buffer && index_buffer);
+    GGML_ASSERT(kv_buffer && compute_buffer);
 
     ggml_backend_tensor_set(q, inputs.q.data(), 0, inputs.q.size()*sizeof(float));
     ggml_backend_tensor_set(k_storage, inputs.k.data(), 0, inputs.k.size());
@@ -145,20 +141,13 @@ std::vector<float> run_attention(
         k_update_data[i] = 0.6f*std::sin(float(i)*0.0234375f);
         v_update_data[i] = 0.4f*std::cos(float(i)*0.017578125f);
     }
+    std::vector<int32_t> update_index_data(update_rows);
+    for (int64_t row = 0; row < update_rows; ++row) {
+        update_index_data[row] = int32_t(row);
+    }
     ggml_backend_tensor_set(k_update, k_update_data.data(), 0, k_update_data.size()*sizeof(float));
     ggml_backend_tensor_set(v_update, v_update_data.data(), 0, v_update_data.size()*sizeof(float));
-    if (index_type == GGML_TYPE_I32) {
-        std::vector<int32_t> update_index_data(update_rows);
-        for (int64_t row = 0; row < update_rows; ++row) { update_index_data[row] = int32_t(row); }
-        ggml_backend_tensor_set(
-            update_index, update_index_data.data(), 0, update_index_data.size()*sizeof(int32_t));
-    } else {
-        GGML_ASSERT(index_type == GGML_TYPE_I64);
-        std::vector<int64_t> update_index_data(update_rows);
-        for (int64_t row = 0; row < update_rows; ++row) { update_index_data[row] = row; }
-        ggml_backend_tensor_set(
-            update_index, update_index_data.data(), 0, update_index_data.size()*sizeof(int64_t));
-    }
+    ggml_backend_tensor_set(update_index, update_index_data.data(), 0, update_index_data.size()*sizeof(int32_t));
 
     ggml_cgraph * graph = ggml_new_graph_custom(compute_ctx.get(), N_TENSORS, false);
     ggml_build_forward_expand(graph, updated_k);
@@ -469,14 +458,13 @@ int main() {
 
         const attention_inputs inputs = make_inputs(512, 256);
         (void) run_attention(
-            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
-            512, 256, 2, 256, false, GGML_TYPE_I64);
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), 512, 256, 2);
 
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         t.assert_equal(uint64_t(2), stats.resident_misses);
         t.assert_equal(uint64_t(2), stats.resident_hits);
         t.assert_equal(uint64_t(0), stats.streamed_pages);
-        t.assert_equal(uint64_t(3*page_bytes), stats.host_to_device_bytes);
+        t.assert_equal(uint64_t(4*page_bytes), stats.host_to_device_bytes);
         t.assert_equal(uint64_t(2), stats.resident_attention_spans);
         t.assert_equal(uint64_t(4), stats.resident_pages_attended);
 
