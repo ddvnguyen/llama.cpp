@@ -539,58 +539,6 @@ static __global__ void kv_stream_normalize_chunk_results(
     dst[row*D + tid] = accumulator[row*D + tid]/accumulator_meta[row].y;
 }
 
-template<int D>
-static __global__ void kv_stream_reduce_deferred_results(
-        const float * parts,
-        const float2 * meta,
-        float * dst,
-        int nrows,
-        int nspans) {
-    ggml_cuda_pdl_lc();
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    if (row >= nrows || tid >= D) {
-        return;
-    }
-    ggml_cuda_pdl_sync();
-
-    __shared__ float maximum;
-    __shared__ float denominator;
-
-    if (tid == 0) {
-        maximum = -FLT_MAX;
-        for (int span = 0; span < nspans; ++span) {
-            const int base = span*KV_STREAM_PARTS_PER_CHUNK*nrows +
-                row*KV_STREAM_PARTS_PER_CHUNK;
-            for (int part = 0; part < KV_STREAM_PARTS_PER_CHUNK; ++part) {
-                maximum = fmaxf(maximum, meta[base + part].x);
-            }
-        }
-
-        denominator = 0.0f;
-        for (int span = 0; span < nspans; ++span) {
-            const int base = span*KV_STREAM_PARTS_PER_CHUNK*nrows +
-                row*KV_STREAM_PARTS_PER_CHUNK;
-            for (int part = 0; part < KV_STREAM_PARTS_PER_CHUNK; ++part) {
-                const float2 partial_meta = meta[base + part];
-                denominator += expf(partial_meta.x - maximum)*partial_meta.y;
-            }
-        }
-    }
-    __syncthreads();
-
-    float numerator = 0.0f;
-    for (int span = 0; span < nspans; ++span) {
-        const int base = span*KV_STREAM_PARTS_PER_CHUNK*nrows +
-            row*KV_STREAM_PARTS_PER_CHUNK;
-        for (int part = 0; part < KV_STREAM_PARTS_PER_CHUNK; ++part) {
-            const float weight = expf(meta[base + part].x - maximum);
-            numerator += weight*parts[(base + part)*D + tid];
-        }
-    }
-    dst[row*D + tid] = numerator/denominator;
-}
-
 template<bool use_logit_softcap>
 static void kv_stream_launch_q8_q4_partial(
         ggml_backend_cuda_context & ctx,
@@ -1005,14 +953,10 @@ void ggml_cuda_flash_attn_ext_streamed(
         resident_cache->page_tokens : kv_stream_block_tokens(dst, stage_bytes);
     const int nchunks = (K->ne[1] + block_tokens - 1)/block_tokens;
     const int nrows = ggml_nrows(dst);
-    const bool defer_decode_reduction = dst->src[0]->ne[1] == 1 && nchunks > 1;
-    const size_t deferred_span_capacity = defer_decode_reduction ? size_t(nchunks) : 1;
 
     ggml_cuda_pool & pool = ctx.pool();
-    ggml_cuda_pool_alloc<float> parts(
-        pool, deferred_span_capacity*KV_STREAM_PARTS_PER_CHUNK*ggml_nelements(dst));
-    ggml_cuda_pool_alloc<float2> meta(
-        pool, deferred_span_capacity*KV_STREAM_PARTS_PER_CHUNK*nrows);
+    ggml_cuda_pool_alloc<float> parts(pool, KV_STREAM_PARTS_PER_CHUNK*ggml_nelements(dst));
+    ggml_cuda_pool_alloc<float2> meta(pool, KV_STREAM_PARTS_PER_CHUNK*nrows);
     ggml_cuda_pool_alloc<float> accumulator(pool, ggml_nelements(dst));
     ggml_cuda_pool_alloc<float2> accumulator_meta(pool, nrows);
 
@@ -1186,7 +1130,6 @@ void ggml_cuda_flash_attn_ext_streamed(
     }
 
     size_t stream_index = 0;
-    size_t deferred_span_count = 0;
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         auto & desc = chunks[chunk];
         uint32_t streamed_span_pages = 0;
@@ -1330,31 +1273,18 @@ void ggml_cuda_flash_attn_ext_streamed(
 
         float logit_softcap = 0.0f;
         memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
-        float * span_parts = parts.ptr;
-        float2 * span_meta = meta.ptr;
-        if (defer_decode_reduction) {
-            span_parts += deferred_span_count*KV_STREAM_PARTS_PER_CHUNK*ggml_nelements(dst);
-            span_meta += deferred_span_count*KV_STREAM_PARTS_PER_CHUNK*nrows;
-        }
         if (logit_softcap == 0.0f) {
-            kv_stream_launch_q8_q4_partial<false>(ctx, &staged_dst, span_parts, span_meta);
+            kv_stream_launch_q8_q4_partial<false>(ctx, &staged_dst, parts.ptr, meta.ptr);
         } else {
-            kv_stream_launch_q8_q4_partial<true>(ctx, &staged_dst, span_parts, span_meta);
+            kv_stream_launch_q8_q4_partial<true>(ctx, &staged_dst, parts.ptr, meta.ptr);
         }
 
-        if (defer_decode_reduction) {
-            ++deferred_span_count;
-        } else {
-            const dim3 blocks(nrows, 1, 1);
-            const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
-            const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
-            ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
-                parts.ptr, meta.ptr, accumulator.ptr, accumulator_meta.ptr, nrows, chunk == 0);
-            CUDA_CHECK(cudaGetLastError());
-            if (resident_cache != nullptr) {
-                ++resident_cache->stats.online_accumulator_launches;
-            }
-        }
+        const dim3 blocks(nrows, 1, 1);
+        const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+        ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
+            parts.ptr, meta.ptr, accumulator.ptr, accumulator_meta.ptr, nrows, chunk == 0);
+        CUDA_CHECK(cudaGetLastError());
 
         if (desc.streamed) {
             for (uint32_t page = 0; page < streamed_span_pages; ++page) {
@@ -1379,17 +1309,8 @@ void ggml_cuda_flash_attn_ext_streamed(
     const dim3 blocks(nrows, 1, 1);
     const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
-    if (defer_decode_reduction) {
-        GGML_ASSERT(deferred_span_count > 0 && deferred_span_count <= deferred_span_capacity);
-        ggml_cuda_kernel_launch(kv_stream_reduce_deferred_results<KV_STREAM_HEAD_DIM>, launch_params,
-            parts.ptr, meta.ptr, static_cast<float *>(dst->data), nrows, int(deferred_span_count));
-        if (resident_cache != nullptr) {
-            ++resident_cache->stats.deferred_reduction_launches;
-        }
-    } else {
-        ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
-            accumulator.ptr, accumulator_meta.ptr, static_cast<float *>(dst->data), nrows);
-    }
+    ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
+        accumulator.ptr, accumulator_meta.ptr, static_cast<float *>(dst->data), nrows);
     CUDA_CHECK(cudaGetLastError());
 }
 
