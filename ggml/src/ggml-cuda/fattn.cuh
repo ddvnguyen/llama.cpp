@@ -22,6 +22,8 @@ struct ggml_cuda_kv_stream_resident_stats {
 
 struct ggml_cuda_kv_stream_transfer_stats {
     uint64_t asynchronous_page_uploads = 0;
+    uint64_t coalesced_upload_batches = 0;
+    uint64_t coalesced_upload_pages = 0;
     uint64_t compute_stream_waits = 0;
     uint64_t stage_slot_reuses = 0;
     uint64_t cross_layer_prefetches = 0;

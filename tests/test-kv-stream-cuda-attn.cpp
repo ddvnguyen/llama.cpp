@@ -532,6 +532,57 @@ int main() {
         t.assert_true("sixteen-layer prefill remains equivalent", max_abs <= 3e-4f);
     });
 
+    t.test("adjacent streamed pages share one H2D batch", [](testing & t) {
+        constexpr int64_t n_kv = 1536;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv - 1);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.pool_bytes           = 3*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 2);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(10), stats.asynchronous_page_uploads);
+        t.assert_equal(uint64_t(4), stats.coalesced_upload_batches);
+        t.assert_equal(uint64_t(8), stats.coalesced_upload_pages);
+        t.assert_equal(uint64_t(6), stats.streamed_attention_spans);
+        t.assert_equal(uint64_t(10), stats.streamed_pages_attended);
+
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr, "coalesced upload attention max_abs=%g\n", max_abs);
+        t.assert_true("coalesced upload output remains finite", std::isfinite(max_abs));
+        t.assert_true("coalesced upload is numerically equivalent", max_abs <= 3e-4f);
+    });
+
     t.test("one shared ring prefetches across attention layers", [](testing & t) {
         constexpr int64_t n_kv = 768;
         // Cross-layer prefetch is a decode optimization. A one-token batch
