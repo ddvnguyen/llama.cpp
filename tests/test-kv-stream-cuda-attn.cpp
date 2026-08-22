@@ -340,6 +340,8 @@ int main() {
         t.assert_equal(uint64_t(6), stats.compute_stream_waits);
         t.assert_equal(uint64_t(4), stats.stage_slot_reuses);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
+        t.assert_equal(uint64_t(6), stats.online_accumulator_launches);
+        t.assert_equal(uint64_t(0), stats.deferred_reduction_launches);
         t.assert_equal(uint64_t(4), stats.streamed_attention_spans);
         t.assert_equal(uint64_t(6), stats.streamed_pages_attended);
 
@@ -583,6 +585,8 @@ int main() {
         t.assert_equal(uint32_t(2), stats.ring_peak_occupancy);
         t.assert_equal(uint64_t(6), stats.streamed_attention_spans);
         t.assert_equal(uint64_t(12), stats.streamed_pages_attended);
+        t.assert_equal(uint64_t(0), stats.online_accumulator_launches);
+        t.assert_equal(uint64_t(6), stats.deferred_reduction_launches);
 
         using feedback_fn_t = bool (*)(
             void *, uint64_t *, uint64_t *, double *, uint32_t *,

@@ -55,6 +55,8 @@ struct ggml_backend_cuda_kv_stream_stats {
     uint64_t resident_pages_attended;
     uint64_t streamed_attention_spans;
     uint64_t streamed_pages_attended;
+    uint64_t online_accumulator_launches;
+    uint64_t deferred_reduction_launches;
     uint64_t asynchronous_page_uploads;
     uint64_t compute_stream_waits;
     uint64_t stage_slot_reuses;
