@@ -337,6 +337,7 @@ int main() {
 
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         t.assert_equal(uint64_t(6), stats.asynchronous_page_uploads);
+        t.assert_equal(uint64_t(16), stats.host_to_device_copy_commands);
         t.assert_equal(uint64_t(6), stats.compute_stream_waits);
         t.assert_equal(uint64_t(4), stats.stage_slot_reuses);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);

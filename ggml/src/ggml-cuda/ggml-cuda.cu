@@ -1606,6 +1606,7 @@ ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
         stats.streamed_attention_spans,
         stats.streamed_pages_attended,
         transfer_stats.asynchronous_page_uploads,
+        transfer_stats.host_to_device_copy_commands,
         transfer_stats.compute_stream_waits,
         transfer_stats.stage_slot_reuses,
         transfer_stats.cross_layer_prefetches,
