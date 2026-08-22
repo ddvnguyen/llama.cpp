@@ -1346,6 +1346,10 @@ struct ggml_backend_cuda_kv_stream_runtime {
     void * stage_data = nullptr;
     ggml_cuda_kv_stream_transfer_ring * transfer_ring = nullptr;
     ggml_cuda_kv_stream_resident_cache * resident_cache = nullptr;
+    std::vector<int64_t> dirty_rows;
+    uint32_t dirty_rows_remaining = 0;
+    uint64_t staged_set_rows = 0;
+    uint64_t staged_set_rows_bytes = 0;
 
     std::atomic<uint32_t> references{1};
     ggml_backend_buffer_type buffer_type{};
@@ -1588,6 +1592,26 @@ bool ggml_backend_cuda_kv_stream_repartition(
         return false;
     }
     runtime->stage_slots = stage_slots;
+    runtime->dirty_rows.clear();
+    runtime->dirty_rows_remaining = 0;
+    runtime->staged_set_rows = 0;
+    runtime->staged_set_rows_bytes = 0;
+    return true;
+}
+
+bool ggml_backend_cuda_kv_stream_mark_dirty_rows(
+        ggml_backend_cuda_kv_stream_runtime_t runtime,
+        const int64_t * rows, size_t count) {
+    if (runtime == nullptr || rows == nullptr || count == 0 ||
+            !ggml_cuda_kv_stream_resident_cache_mark_dirty_rows(
+                runtime->resident_cache, rows, count)) {
+        return false;
+    }
+    runtime->dirty_rows.assign(rows, rows + count);
+    // Every attention layer sharing this runtime updates both K and V.
+    const uint64_t set_rows_uses = 2ULL*runtime->resident_layer_count;
+    runtime->dirty_rows_remaining = set_rows_uses > UINT32_MAX ?
+        UINT32_MAX : uint32_t(set_rows_uses);
     return true;
 }
 
@@ -1615,6 +1639,8 @@ ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
         transfer_stats.deadline_samples,
         transfer_stats.deadline_misses,
         transfer_stats.ring_peak_occupancy,
+        runtime->staged_set_rows,
+        runtime->staged_set_rows_bytes,
     };
 }
 
@@ -2466,6 +2492,39 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+static bool ggml_cuda_kv_stream_staged_set_rows_range(
+        const ggml_backend_cuda_kv_stream_runtime_t runtime, const ggml_tensor * dst,
+        int64_t * first_row, int64_t * row_count) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (runtime == nullptr || runtime->resident_cache == nullptr ||
+            runtime->dirty_rows_remaining == 0 || runtime->dirty_rows.size() <= 1 ||
+            src0 == nullptr || src1 == nullptr || src0->type != GGML_TYPE_F32 ||
+            src1->type != GGML_TYPE_I64 ||
+            (dst->type != GGML_TYPE_Q4_0 && dst->type != GGML_TYPE_Q8_0) ||
+            src0->ne[1] != int64_t(runtime->dirty_rows.size()) ||
+            ggml_nelements(src1) != int64_t(runtime->dirty_rows.size()) ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 ||
+            dst->nb[1] != ggml_row_size(dst->type, dst->ne[0])) {
+        return false;
+    }
+
+    const int64_t first = runtime->dirty_rows.front();
+    const int64_t count = int64_t(runtime->dirty_rows.size());
+    if (first < 0 || first + count > dst->ne[1]) {
+        return false;
+    }
+    for (int64_t i = 1; i < count; ++i) {
+        if (runtime->dirty_rows[size_t(i)] != first + i) {
+            return false;
+        }
+    }
+
+    *first_row = first;
+    *row_count = count;
+    return true;
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -2486,9 +2545,30 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GET_ROWS_BACK:
             ggml_cuda_op_get_rows_back(ctx, dst);
             break;
-        case GGML_OP_SET_ROWS:
-            ggml_cuda_op_set_rows(ctx, dst);
+        case GGML_OP_SET_ROWS: {
+            bool staged = false;
+            if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(dst);
+                    runtime != nullptr && runtime->resident_cache != nullptr) {
+                ggml_cuda_kv_stream_resident_cache_mark_dirty(
+                    runtime->resident_cache, dst, dst->src[1]);
+                int64_t first_row = 0;
+                int64_t row_count = 0;
+                staged = ggml_cuda_kv_stream_staged_set_rows_range(
+                    runtime, dst, &first_row, &row_count);
+                if (runtime->dirty_rows_remaining > 0) {
+                    --runtime->dirty_rows_remaining;
+                }
+                if (staged) {
+                    ggml_cuda_op_set_rows_staged(ctx, dst, first_row, row_count);
+                    ++runtime->staged_set_rows;
+                    runtime->staged_set_rows_bytes += size_t(row_count)*dst->nb[1];
+                }
+            }
+            if (!staged) {
+                ggml_cuda_op_set_rows(ctx, dst);
+            }
             break;
+        }
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -6238,6 +6318,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) +[](void * runtime, uint32_t ring_slots) -> bool {
             return ggml_backend_cuda_kv_stream_repartition(
                 static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime), ring_slots);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_mark_dirty_rows") == 0) {
+        return (void *) +[](void * runtime, const int64_t * rows, size_t count) -> bool {
+            return ggml_backend_cuda_kv_stream_mark_dirty_rows(
+                static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime), rows, count);
         };
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {

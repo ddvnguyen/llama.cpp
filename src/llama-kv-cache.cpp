@@ -244,6 +244,7 @@ llama_kv_cache::llama_kv_cache(
                     using buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
                     using feedback_fn_t = kv_stream_runtime_owner::feedback_fn_t;
                     using repartition_fn_t = kv_stream_runtime_owner::repartition_fn_t;
+                    using mark_dirty_rows_fn_t = kv_stream_runtime_owner::mark_dirty_rows_fn_t;
 
                     auto * runtime_new_fn = (runtime_new_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_runtime_new_for_device");
@@ -255,10 +256,12 @@ llama_kv_cache::llama_kv_cache(
                         reg, "ggml_backend_cuda_kv_stream_feedback");
                     auto * repartition_fn = (repartition_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_repartition");
+                    auto * mark_dirty_rows_fn = (mark_dirty_rows_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_mark_dirty_rows");
 
                     if (runtime_new_fn == nullptr || runtime_free_fn == nullptr ||
                             buffer_type_fn == nullptr || feedback_fn == nullptr ||
-                            repartition_fn == nullptr) {
+                            repartition_fn == nullptr || mark_dirty_rows_fn == nullptr) {
                         throw std::runtime_error("block KV streaming requires the CUDA backend");
                     }
 
@@ -270,6 +273,7 @@ llama_kv_cache::llama_kv_cache(
                     kv_stream_runtime.free_fn = runtime_free_fn;
                     kv_stream_runtime.feedback_fn = feedback_fn;
                     kv_stream_runtime.repartition_fn = repartition_fn;
+                    kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
                     kv_stream_runtime.layer_count = kv_stream_layer_count;
                     if (kv_stream_runtime.runtime == nullptr) {
                         throw std::runtime_error("failed to create CUDA block KV streaming runtime");
@@ -1658,6 +1662,12 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
+    }
+
+    if (kv_stream_runtime.runtime != nullptr) {
+        GGML_ASSERT(kv_stream_runtime.mark_dirty_rows_fn != nullptr);
+        GGML_ASSERT(kv_stream_runtime.mark_dirty_rows_fn(
+            kv_stream_runtime.runtime, data, n_tokens));
     }
 }
 

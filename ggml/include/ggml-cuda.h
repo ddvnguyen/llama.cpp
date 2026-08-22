@@ -63,6 +63,8 @@ struct ggml_backend_cuda_kv_stream_stats {
     uint64_t deadline_samples;
     uint64_t deadline_misses;
     uint32_t ring_peak_occupancy;
+    uint64_t staged_set_rows;
+    uint64_t staged_set_rows_bytes;
 };
 
 GGML_BACKEND_API ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
@@ -80,6 +82,10 @@ GGML_BACKEND_API uint32_t ggml_backend_cuda_kv_stream_resident_pages_per_layer(
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_repartition(
     ggml_backend_cuda_kv_stream_runtime_t runtime,
     uint32_t stage_slots);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_mark_dirty_rows(
+    ggml_backend_cuda_kv_stream_runtime_t runtime,
+    const int64_t * rows,
+    size_t count);
 GGML_BACKEND_API struct ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_stage_upload(
