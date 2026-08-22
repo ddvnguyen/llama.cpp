@@ -371,6 +371,8 @@ int main() {
 
 
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        t.assert_true("multi-token streamed spans use MMA partial attention",
+            stats.mma_prefill_attention_spans > 0);
         t.assert_equal(uint64_t(6), stats.asynchronous_page_uploads);
         t.assert_equal(uint64_t(16), stats.host_to_device_copy_commands);
         t.assert_equal(uint64_t(6), stats.compute_stream_waits);

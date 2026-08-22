@@ -558,7 +558,8 @@ static __global__ void kv_stream_accumulate_chunk_results(
         float * accumulator,
         float2 * accumulator_meta,
         int nrows,
-        bool initialize) {
+        bool initialize,
+        int nparts) {
     ggml_cuda_pdl_lc();
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
@@ -572,17 +573,17 @@ static __global__ void kv_stream_accumulate_chunk_results(
     __shared__ float old_scale;
     __shared__ float denominator;
 
-    const int base = row*KV_STREAM_PARTS_PER_CHUNK;
+    const int base = row*nparts;
     if (tid == 0) {
         old_maximum = initialize ? -FLT_MAX : accumulator_meta[row].x;
         maximum = old_maximum;
-        for (int part = 0; part < KV_STREAM_PARTS_PER_CHUNK; ++part) {
+        for (int part = 0; part < nparts; ++part) {
             maximum = fmaxf(maximum, meta[base + part].x);
         }
 
         old_scale = initialize ? 0.0f : expf(old_maximum - maximum);
         denominator = initialize ? 0.0f : old_scale*accumulator_meta[row].y;
-        for (int part = 0; part < KV_STREAM_PARTS_PER_CHUNK; ++part) {
+        for (int part = 0; part < nparts; ++part) {
             const float weight = expf(meta[base + part].x - maximum);
             denominator += weight*meta[base + part].y;
         }
@@ -591,7 +592,7 @@ static __global__ void kv_stream_accumulate_chunk_results(
     __syncthreads();
 
     float numerator = initialize ? 0.0f : old_scale*accumulator[row*D + tid];
-    for (int part = 0; part < KV_STREAM_PARTS_PER_CHUNK; ++part) {
+    for (int part = 0; part < nparts; ++part) {
         const float weight = expf(meta[base + part].x - maximum);
         numerator += weight*parts[(base + part)*D + tid];
     }
@@ -1025,6 +1026,7 @@ void ggml_cuda_flash_attn_ext_streamed(
     const size_t stage_bytes = transfer_ring->page_bytes;
     GGML_ASSERT(ggml_cuda_flash_attn_ext_streamed_supported(dst, stage_bytes));
 
+    const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
@@ -1334,19 +1336,31 @@ void ggml_cuda_flash_attn_ext_streamed(
             return;
         }
 
-        float logit_softcap = 0.0f;
-        memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
-        if (logit_softcap == 0.0f) {
-            kv_stream_launch_q8_q4_partial<false>(ctx, &staged_dst, parts.ptr, meta.ptr);
+        const bool use_mma_prefill = Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+            mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
+        int partial_count = KV_STREAM_PARTS_PER_CHUNK;
+        if (use_mma_prefill) {
+            ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(
+                ctx, &staged_dst, parts.ptr, meta.ptr);
+            partial_count = 1;
+            if (resident_cache != nullptr) {
+                ++resident_cache->stats.mma_prefill_attention_spans;
+            }
         } else {
-            kv_stream_launch_q8_q4_partial<true>(ctx, &staged_dst, parts.ptr, meta.ptr);
+            float logit_softcap = 0.0f;
+            memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+            if (logit_softcap == 0.0f) {
+                kv_stream_launch_q8_q4_partial<false>(ctx, &staged_dst, parts.ptr, meta.ptr);
+            } else {
+                kv_stream_launch_q8_q4_partial<true>(ctx, &staged_dst, parts.ptr, meta.ptr);
+            }
         }
 
         const dim3 blocks(nrows, 1, 1);
         const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
         ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
-            parts.ptr, meta.ptr, accumulator.ptr, accumulator_meta.ptr, nrows, chunk == 0);
+            parts.ptr, meta.ptr, accumulator.ptr, accumulator_meta.ptr, nrows, chunk == 0, partial_count);
         CUDA_CHECK(cudaGetLastError());
 
         if (desc.streamed) {

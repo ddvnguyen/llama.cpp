@@ -18,6 +18,7 @@ struct ggml_cuda_kv_stream_resident_stats {
     uint64_t resident_pages_attended = 0;
     uint64_t streamed_attention_spans = 0;
     uint64_t streamed_pages_attended = 0;
+    uint64_t mma_prefill_attention_spans = 0;
 };
 
 struct ggml_cuda_kv_stream_transfer_stats {
