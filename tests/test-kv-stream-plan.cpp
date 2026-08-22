@@ -378,6 +378,31 @@ int main() {
         t.assert_equal(uint32_t(16), partition.ring_slots);
     });
 
+    t.test("partition cooldown accumulates pressure without repeatedly resetting residency", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 160;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 12;
+        params.minimum_ring_slots                = 16;
+        params.previous_resident_pages_per_layer = 9;
+        params.previous_ring_slots               = 16;
+        params.deadline_miss_ratio               = 0.12;
+        params.copy_engine_busy_ratio            = 0.70;
+        params.starved_evaluations               = 2;
+        params.evaluations_since_repartition     = 2;
+
+        auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("cooldown preserves the resident boundary", !partition.changed);
+        t.assert_equal(uint32_t(3), partition.starved_evaluations);
+
+        params.evaluations_since_repartition = params.repartition_cooldown_evaluations;
+        partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition changes after cooldown", partition.changed);
+        t.assert_equal(uint32_t(8), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(32), partition.ring_slots);
+    });
+
     t.test("sustained overprovision promotes one balanced resident epoch", [](testing & t) {
         llama_kv_stream_partition_params params;
         params.total_pool_pages                  = 160;

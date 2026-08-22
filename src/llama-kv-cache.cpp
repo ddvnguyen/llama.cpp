@@ -1334,6 +1334,9 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens) {
         return false;
     }
 
+    if (owner.evaluations_since_repartition != UINT32_MAX) {
+        ++owner.evaluations_since_repartition;
+    }
     llama_kv_stream_partition_params params;
     params.total_pool_pages = controlled_pages;
     params.layer_count = owner.layer_count;
@@ -1347,6 +1350,8 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens) {
         std::min(1.0, double(peak_occupancy)/double(ring_slots));
     params.starved_evaluations = owner.starved_evaluations;
     params.overprovisioned_evaluations = owner.overprovisioned_evaluations;
+    params.evaluations_since_repartition =
+        owner.evaluations_since_repartition;
 
     const auto partition = llama_kv_stream_partition_adapt(params);
     if (!partition.valid) {
@@ -1364,6 +1369,7 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens) {
             __func__, partition.ring_slots);
         return false;
     }
+    owner.evaluations_since_repartition = 0;
 
     LLAMA_LOG_INFO("%s: adaptive KV partition: resident pages/layer %u -> %u, ring slots %u -> %u, miss %.1f%%, copy busy %.1f%%\n",
         __func__, resident_pages, partition.resident_pages_per_layer,

@@ -170,6 +170,8 @@ struct llama_kv_stream_partition_params {
     uint32_t overprovisioned_evaluations = 0;
     uint32_t grow_hysteresis_evaluations = 3;
     uint32_t shrink_hysteresis_evaluations = 8;
+    uint32_t evaluations_since_repartition = UINT32_MAX;
+    uint32_t repartition_cooldown_evaluations = 64;
 };
 
 struct llama_kv_stream_partition {

@@ -306,6 +306,7 @@ private:
         uint32_t minimum_ring_slots = 0;
         uint32_t starved_evaluations = 0;
         uint32_t overprovisioned_evaluations = 0;
+        uint32_t evaluations_since_repartition = UINT32_MAX;
         uint64_t previous_deadline_samples = 0;
         uint64_t previous_deadline_misses = 0;
 

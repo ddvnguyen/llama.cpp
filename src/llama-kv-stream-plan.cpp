@@ -367,7 +367,8 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
         return fail_partition("KV stream partition geometry must be non-zero");
     }
     if (params.grow_hysteresis_evaluations == 0 ||
-        params.shrink_hysteresis_evaluations == 0) {
+        params.shrink_hysteresis_evaluations == 0 ||
+        params.repartition_cooldown_evaluations == 0) {
         return fail_partition("KV stream partition hysteresis must be non-zero");
     }
     const auto ratio_valid = [](double value) {
@@ -406,14 +407,16 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
     result.overprovisioned_evaluations = overprovisioned ?
         params.overprovisioned_evaluations + 1 : 0;
 
-    if (starved && result.starved_evaluations >= params.grow_hysteresis_evaluations &&
+    const bool cooldown_complete = params.evaluations_since_repartition >=
+        params.repartition_cooldown_evaluations;
+    if (cooldown_complete && starved && result.starved_evaluations >= params.grow_hysteresis_evaluations &&
         result.resident_pages_per_layer > 0) {
         --result.resident_pages_per_layer;
         result.ring_slots += params.layer_count;
         result.starved_evaluations = 0;
         result.overprovisioned_evaluations = 0;
         result.changed = true;
-    } else if (overprovisioned &&
+    } else if (cooldown_complete && overprovisioned &&
             result.overprovisioned_evaluations >= params.shrink_hysteresis_evaluations &&
             result.resident_pages_per_layer < params.active_pages_per_layer &&
             result.ring_slots >= params.minimum_ring_slots + params.layer_count) {
