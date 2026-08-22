@@ -16,6 +16,8 @@ struct ggml_cuda_kv_stream_resident_stats {
     uint64_t host_to_device_bytes = 0;
     uint64_t resident_attention_spans = 0;
     uint64_t resident_pages_attended = 0;
+    uint64_t streamed_attention_spans = 0;
+    uint64_t streamed_pages_attended = 0;
 };
 
 struct ggml_cuda_kv_stream_transfer_stats {

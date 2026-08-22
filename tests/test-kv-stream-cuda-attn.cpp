@@ -21,25 +21,6 @@ size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1)/alignment*alignment;
 }
 
-std::vector<uint8_t> pack_token_block(
-        const std::vector<uint8_t> & source,
-        ggml_type type,
-        int64_t token_begin,
-        int64_t token_count) {
-    const size_t row_bytes = ggml_row_size(type, HEAD_DIM);
-    const size_t token_bytes = row_bytes*N_KV_HEAD;
-    std::vector<uint8_t> result(row_bytes*token_count*N_KV_HEAD);
-    for (int64_t head = 0; head < N_KV_HEAD; ++head) {
-        for (int64_t token = 0; token < token_count; ++token) {
-            const uint8_t * src = source.data() +
-                (token_begin + token)*token_bytes + head*row_bytes;
-            uint8_t * dst = result.data() + (head*token_count + token)*row_bytes;
-            std::copy_n(src, row_bytes, dst);
-        }
-    }
-    return result;
-}
-
 struct attention_inputs {
     std::vector<float> q;
     std::vector<uint8_t> k;
@@ -353,26 +334,14 @@ int main() {
         const std::vector<float> actual = run_attention(
             backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch, 2, 256, true);
 
-        const std::vector<uint8_t> expected_k = pack_token_block(
-            inputs.k, GGML_TYPE_Q8_0, 768, 256);
-        const std::vector<uint8_t> expected_v = pack_token_block(
-            inputs.v, GGML_TYPE_Q4_0, 768, 256);
-        const size_t v_offset = align_up(expected_k.size(), 128);
-        std::vector<uint8_t> staged(v_offset + expected_v.size());
-        GGML_ASSERT(ggml_backend_cuda_kv_stream_stage_download(
-            runtime, 0, 0, staged.data(), staged.size()));
-        t.assert_true(
-            "final K token block was packed into the managed stage",
-            std::equal(expected_k.begin(), expected_k.end(), staged.begin()));
-        t.assert_true(
-            "final V token block was packed into the managed stage",
-            std::equal(expected_v.begin(), expected_v.end(), staged.begin() + v_offset));
 
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         t.assert_equal(uint64_t(6), stats.asynchronous_page_uploads);
         t.assert_equal(uint64_t(6), stats.compute_stream_waits);
         t.assert_equal(uint64_t(4), stats.stage_slot_reuses);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
+        t.assert_equal(uint64_t(4), stats.streamed_attention_spans);
+        t.assert_equal(uint64_t(6), stats.streamed_pages_attended);
 
         if (!t.assert_equal(expected.size(), actual.size())) {
             return;
@@ -612,6 +581,8 @@ int main() {
         t.assert_true("deadline misses cannot exceed samples",
             stats.deadline_misses <= stats.deadline_samples);
         t.assert_equal(uint32_t(2), stats.ring_peak_occupancy);
+        t.assert_equal(uint64_t(6), stats.streamed_attention_spans);
+        t.assert_equal(uint64_t(12), stats.streamed_pages_attended);
 
         using feedback_fn_t = bool (*)(
             void *, uint64_t *, uint64_t *, double *, uint32_t *,

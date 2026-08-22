@@ -662,7 +662,13 @@ static void kv_stream_graph_upload(
         ggml_cuda_kv_stream_transfer_ring * ring,
         kv_stream_graph_request & request,
         uint32_t slot) {
-    char * stage = ring->pool_data + size_t(slot)*ring->page_bytes;
+    // The active ring is stored as head-major K and V planes. Consecutive
+    // slots are therefore a directly consumable multi-page attention span.
+    char * k_stage = ring->pool_data + size_t(slot)*request.k_head_bytes;
+    char * v_stage = ring->pool_data +
+        size_t(ring->active_slots)*request.k_bytes + size_t(slot)*request.v_head_bytes;
+    const size_t k_head_stride = size_t(ring->active_slots)*request.k_head_bytes;
+    const size_t v_head_stride = size_t(ring->active_slots)*request.v_head_bytes;
     if (ring->slot_used[slot]) {
         CUDA_CHECK(cudaStreamWaitEvent(ring->copy_stream, ring->consumed[slot], 0));
         ++ring->stage_slot_reuses;
@@ -676,7 +682,7 @@ static void kv_stream_graph_upload(
     }
     for (int64_t head = 0; head < request.n_head_kv; ++head) {
         CUDA_CHECK(cudaMemcpy2DAsync(
-            stage + head*request.k_head_bytes, request.k_row_bytes,
+            k_stage + head*k_head_stride, request.k_row_bytes,
             request.k_data + head*request.k_nb2 + request.token_begin*request.k_nb1,
             request.k_nb1,
             request.k_row_bytes, request.token_count,
@@ -684,7 +690,7 @@ static void kv_stream_graph_upload(
     }
     for (int64_t head = 0; head < request.n_head_kv; ++head) {
         CUDA_CHECK(cudaMemcpy2DAsync(
-            stage + request.v_offset + head*request.v_head_bytes, request.v_row_bytes,
+            v_stage + head*v_head_stride, request.v_row_bytes,
             request.v_data + head*request.v_nb2 + request.token_begin*request.v_nb1,
             request.v_nb1,
             request.v_row_bytes, request.token_count,
@@ -1061,8 +1067,14 @@ void ggml_cuda_flash_attn_ext_streamed(
                 GGML_ASSERT(desc.request_index != KV_STREAM_NO_REQUEST);
             } else {
                 desc.slot = uint32_t(stream_index%transfer_ring->active_slots);
-                desc.k_stage = transfer_ring->pool_data + size_t(desc.slot)*transfer_ring->page_bytes;
-                desc.v_stage = desc.k_stage + desc.v_offset;
+                desc.k_stage = transfer_ring->pool_data + size_t(desc.slot)*desc.k_head_bytes;
+                desc.v_stage = transfer_ring->pool_data +
+                    size_t(transfer_ring->active_slots)*desc.k_bytes +
+                    size_t(desc.slot)*desc.v_head_bytes;
+                desc.k_stage_head_stride =
+                    size_t(transfer_ring->active_slots)*desc.k_head_bytes;
+                desc.v_stage_head_stride =
+                    size_t(transfer_ring->active_slots)*desc.v_head_bytes;
             }
             streamed_chunks.push_back(chunk);
         }
@@ -1120,14 +1132,21 @@ void ggml_cuda_flash_attn_ext_streamed(
     size_t stream_index = 0;
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         auto & desc = chunks[chunk];
+        uint32_t streamed_span_pages = 0;
         if (desc.streamed) {
+            streamed_span_pages = 1;
             if (graph_planned) {
                 auto & request = transfer_ring->graph_requests[desc.request_index];
                 GGML_ASSERT(request.scheduled && !request.consumed);
                 desc.slot = request.slot;
-                desc.k_stage = transfer_ring->pool_data +
-                    size_t(desc.slot)*transfer_ring->page_bytes;
-                desc.v_stage = desc.k_stage + desc.v_offset;
+                desc.k_stage = transfer_ring->pool_data + size_t(desc.slot)*desc.k_head_bytes;
+                desc.v_stage = transfer_ring->pool_data +
+                    size_t(transfer_ring->active_slots)*desc.k_bytes +
+                    size_t(desc.slot)*desc.v_head_bytes;
+                desc.k_stage_head_stride =
+                    size_t(transfer_ring->active_slots)*desc.k_head_bytes;
+                desc.v_stage_head_stride =
+                    size_t(transfer_ring->active_slots)*desc.v_head_bytes;
                 if (request.deadline_sample) {
                     kv_stream_record_deadline<<<1, 1, 0, ctx.stream()>>>(
                         transfer_ring->ready_flags_device + desc.slot,
@@ -1138,6 +1157,56 @@ void ggml_cuda_flash_attn_ext_streamed(
             }
             CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), transfer_ring->ready[desc.slot], 0));
             ++transfer_ring->compute_stream_waits;
+
+            // Coalesce ready pages that occupy consecutive plane slots. The
+            // head stride remains the full active-ring plane width, while the
+            // tensor's token extent grows across adjacent slots.
+            while (chunk + int(streamed_span_pages) < nchunks) {
+                auto & candidate = chunks[chunk + streamed_span_pages];
+                if (!candidate.streamed) {
+                    break;
+                }
+                if (graph_planned) {
+                    auto & request = transfer_ring->graph_requests[candidate.request_index];
+                    if (!request.scheduled || request.consumed) {
+                        break;
+                    }
+                    candidate.slot = request.slot;
+                    candidate.k_stage = transfer_ring->pool_data +
+                        size_t(candidate.slot)*candidate.k_head_bytes;
+                    candidate.v_stage = transfer_ring->pool_data +
+                        size_t(transfer_ring->active_slots)*candidate.k_bytes +
+                        size_t(candidate.slot)*candidate.v_head_bytes;
+                    candidate.k_stage_head_stride =
+                        size_t(transfer_ring->active_slots)*candidate.k_head_bytes;
+                    candidate.v_stage_head_stride =
+                        size_t(transfer_ring->active_slots)*candidate.v_head_bytes;
+                }
+                if (candidate.slot != desc.slot + streamed_span_pages ||
+                        candidate.token_begin != desc.token_begin +
+                            int64_t(streamed_span_pages)*block_tokens) {
+                    break;
+                }
+                if (graph_planned) {
+                    auto & request = transfer_ring->graph_requests[candidate.request_index];
+                    if (request.deadline_sample) {
+                        kv_stream_record_deadline<<<1, 1, 0, ctx.stream()>>>(
+                            transfer_ring->ready_flags_device + candidate.slot,
+                            transfer_ring->deadline_counters_device + 0,
+                            transfer_ring->deadline_counters_device + 1);
+                        CUDA_CHECK(cudaGetLastError());
+                    }
+                }
+                CUDA_CHECK(cudaStreamWaitEvent(
+                    ctx.stream(), transfer_ring->ready[candidate.slot], 0));
+                ++transfer_ring->compute_stream_waits;
+                ++streamed_span_pages;
+            }
+            desc.token_count = int64_t(streamed_span_pages)*block_tokens;
+            if (resident_cache != nullptr) {
+                ++resident_cache->stats.streamed_attention_spans;
+                resident_cache->stats.streamed_pages_attended += streamed_span_pages;
+            }
         } else {
             // Resident pages form one contiguous head-major K/V prefix. Upload
             // dirty pages separately, then execute the whole prefix once.
@@ -1218,16 +1287,22 @@ void ggml_cuda_flash_attn_ext_streamed(
         CUDA_CHECK(cudaGetLastError());
 
         if (desc.streamed) {
-            if (graph_planned) {
-                kv_stream_graph_release(transfer_ring, desc.request_index, ctx.stream());
-            } else {
-                CUDA_CHECK(cudaEventRecord(transfer_ring->consumed[desc.slot], ctx.stream()));
-                const size_t next = stream_index + transfer_ring->active_slots;
-                if (next < streamed_chunks.size()) {
-                    schedule_streamed(next);
+            for (uint32_t page = 0; page < streamed_span_pages; ++page) {
+                auto & member = chunks[chunk + page];
+                if (graph_planned) {
+                    kv_stream_graph_release(
+                        transfer_ring, member.request_index, ctx.stream());
+                } else {
+                    CUDA_CHECK(cudaEventRecord(
+                        transfer_ring->consumed[member.slot], ctx.stream()));
+                    const size_t next = stream_index + page + transfer_ring->active_slots;
+                    if (next < streamed_chunks.size()) {
+                        schedule_streamed(next);
+                    }
                 }
             }
-            ++stream_index;
+            stream_index += streamed_span_pages;
+            chunk += int(streamed_span_pages) - 1;
         }
     }
 
