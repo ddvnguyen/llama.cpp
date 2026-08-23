@@ -400,18 +400,32 @@ static bool kv_stream_resident_cache_layout(
     if (decode_active_pages > resident_pages_per_layer) {
         const uint64_t total_active_pages =
             uint64_t(decode_active_pages)*cache->layer_count;
-        GGML_ASSERT(total_active_pages >= controlled_resident_pages);
+        if (total_active_pages < controlled_resident_pages) {
+            return false;
+        }
         const uint64_t streamed_pages =
             total_active_pages - controlled_resident_pages;
         const uint64_t ring_pages = scratch_bytes/cache->page_bytes;
-        GGML_ASSERT(ring_pages > 0 && streamed_pages > 0);
+        if (ring_pages == 0 || streamed_pages == 0) {
+            return false;
+        }
 
-        // Reduce the number of split-attention layers only while each such
-        // layer's streamed working set still fits in the shared ring. Larger
-        // bursts serialize copy and compute. Spread split layers across model
-        // order so fully resident layers provide cross-layer prefetch windows.
-        const uint32_t split_layers = uint32_t(std::min<uint64_t>(
-            cache->layer_count, (streamed_pages + ring_pages - 1)/ring_pages));
+        // Reduce the number of split-attention layers only while each streamed
+        // working set still fits in both the shared ring and the active pages
+        // owned by one layer. Larger bursts serialize copy and compute. Spread
+        // split layers across model order so resident layers provide prefetch windows.
+        const auto ceil_div = [](uint64_t numerator, uint64_t denominator) {
+            return numerator/denominator + (numerator%denominator != 0);
+        };
+        const uint64_t splits_for_ring = ceil_div(streamed_pages, ring_pages);
+        const uint64_t splits_for_layer_capacity =
+            ceil_div(streamed_pages, decode_active_pages);
+        const uint64_t split_layers_wide =
+            std::max(splits_for_ring, splits_for_layer_capacity);
+        if (split_layers_wide == 0 || split_layers_wide > cache->layer_count) {
+            return false;
+        }
+        const uint32_t split_layers = uint32_t(split_layers_wide);
         const uint64_t base_streamed = streamed_pages/split_layers;
         const uint64_t remainder = streamed_pages%split_layers;
         layer_pages.assign(cache->layer_count, decode_active_pages);
@@ -419,7 +433,9 @@ static bool kv_stream_resident_cache_layout(
             const uint32_t layer = uint32_t(
                 uint64_t(split)*cache->layer_count/split_layers);
             const uint64_t layer_streamed = base_streamed + (split < remainder ? 1 : 0);
-            GGML_ASSERT(layer_streamed <= decode_active_pages);
+            if (layer_streamed > decode_active_pages) {
+                return false;
+            }
             layer_pages[layer] = decode_active_pages - uint32_t(layer_streamed);
         }
     }
@@ -428,8 +444,7 @@ static bool kv_stream_resident_cache_layout(
     for (uint32_t layer = 0; layer < cache->layer_count; ++layer) {
         layer_offsets[layer + 1] = layer_offsets[layer] + layer_pages[layer];
     }
-    GGML_ASSERT(layer_offsets.back() == controlled_resident_pages);
-    return true;
+    return layer_offsets.back() == controlled_resident_pages;
 }
 
 static size_t kv_stream_resident_index(
