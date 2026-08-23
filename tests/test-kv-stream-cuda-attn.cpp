@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "ggml-cuda.h"
+#include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
 #include "testing.h"
 
@@ -80,7 +81,10 @@ std::vector<float> run_attention(
         bool change_updates = false,
         ggml_type index_type = GGML_TYPE_I32,
         bool index_on_host = true,
-        ggml_backend_cuda_kv_stream_runtime_t dirty_runtime = nullptr) {
+        ggml_backend_cuda_kv_stream_runtime_t dirty_runtime = nullptr,
+        bool change_indices = false,
+        bool replace_cache = false,
+        uint64_t graph_uid = 0) {
     constexpr size_t N_TENSORS = 32;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
 
@@ -164,6 +168,7 @@ std::vector<float> run_attention(
     }
 
     ggml_cgraph * graph = ggml_new_graph_custom(compute_ctx.get(), N_TENSORS, false);
+    graph->uid = graph_uid;
     ggml_build_forward_expand(graph, updated_k);
     ggml_build_forward_expand(graph, updated_v);
     ggml_build_forward_expand(graph, out);
@@ -171,6 +176,20 @@ std::vector<float> run_attention(
     GGML_ASSERT(ggml_backend_supports_op(backend, updated_v));
     GGML_ASSERT(ggml_backend_supports_op(backend, out));
     for (int repeat = 0; repeat < repeats; ++repeat) {
+        if (replace_cache && repeat == 3) {
+            std::vector<uint8_t> zero_k(inputs.k.size(), 0);
+            std::vector<uint8_t> zero_v(inputs.v.size(), 0);
+            ggml_backend_tensor_set(k_storage, zero_k.data(), 0, zero_k.size());
+            ggml_backend_tensor_set(v_storage, zero_v.data(), 0, zero_v.size());
+        }
+        if (change_indices) {
+            GGML_ASSERT(index_type == GGML_TYPE_I64);
+            for (int64_t row = 0; row < update_rows; ++row) {
+                dirty_rows[row] = (int64_t(repeat)*update_rows + row)%n_kv;
+            }
+            ggml_backend_tensor_set(
+                update_index, dirty_rows.data(), 0, dirty_rows.size()*sizeof(int64_t));
+        }
         if (dirty_runtime != nullptr) {
             GGML_ASSERT(ggml_backend_cuda_kv_stream_mark_dirty_rows(
                 dirty_runtime, dirty_rows.data(), dirty_rows.size()));
@@ -570,6 +589,148 @@ int main() {
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
     });
 
+    t.test("one-row decode refreshes only the changed resident K and V rows", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs = make_inputs(n_kv, n_batch);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 2, 1, true, GGML_TYPE_I32, true);
+
+        const size_t k_token_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD;
+        const size_t v_token_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD;
+        const size_t k_page_bytes = k_token_bytes*256;
+        const size_t v_page_bytes = v_token_bytes*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 1;
+        params.pool_bytes           = 3*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 2, 1, true, GGML_TYPE_I32, true, runtime);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(2), stats.resident_misses);
+        t.assert_equal(uint64_t(2), stats.resident_hits);
+        t.assert_equal(
+            uint64_t(2*page_bytes + k_token_bytes + v_token_bytes),
+            stats.host_to_device_bytes);
+        t.assert_equal(expected.size(), actual.size());
+        t.assert_true("one-row resident refresh remains bit-identical", expected == actual);
+    });
+
+    t.test("resident SET_ROWS mirrors changing decode slots without page refreshes", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs = make_inputs(n_kv, n_batch);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 5, 1, true, GGML_TYPE_I64, false, nullptr, true);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 1;
+        params.pool_bytes           = 3*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 5, 1, true, GGML_TYPE_I64, false, runtime, true);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+
+        using feedback_fn_t = bool (*)(
+            void *, uint64_t *, uint64_t *, double *, uint32_t *,
+            uint32_t *, uint32_t *, uint32_t *);
+        ggml_backend_dev_t device = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        auto feedback_fn = reinterpret_cast<feedback_fn_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_stream_feedback"));
+        uint64_t deadline_samples = 0;
+        uint64_t deadline_misses = 0;
+        double copy_busy_ratio = -1.0;
+        uint32_t peak_occupancy = 0;
+        uint32_t ring_slots = 0;
+        uint32_t resident_pages = 0;
+        uint32_t controlled_pages = 0;
+        t.assert_true("feedback remains readable after resident graph replay",
+            feedback_fn != nullptr && feedback_fn(
+                runtime, &deadline_samples, &deadline_misses, &copy_busy_ratio,
+                &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages));
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(2*page_bytes), stats.host_to_device_bytes);
+        t.assert_equal(expected.size(), actual.size());
+        t.assert_true("mirrored changing slots remain bit-identical", expected == actual);
+    });
+
+    t.test("resident graph reloads after authoritative cache replacement", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs = make_inputs(n_kv, n_batch);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 5, 1, true, GGML_TYPE_I64, false, nullptr, true, true, 1);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 1;
+        params.pool_bytes           = 3*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 5, 1, true, GGML_TYPE_I64, false, runtime, true, true, 1);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(2), stats.resident_misses);
+        t.assert_equal(expected.size(), actual.size());
+        t.assert_true("reloaded resident output is bit-identical", expected == actual);
+    });
+
     t.test("sixteen attention layers share one resident/ring pool during causal prefill", [](testing & t) {
         constexpr int64_t n_kv = 1024;
         constexpr int64_t n_batch = 83;
@@ -770,8 +931,8 @@ int main() {
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
-        t.assert_equal(uint64_t(5), stats.resident_misses);
-        t.assert_equal(uint64_t(1), stats.resident_hits);
+        t.assert_equal(uint64_t(6), stats.resident_misses);
+        t.assert_equal(uint64_t(0), stats.resident_hits);
         t.assert_equal(uint64_t(12), stats.streamed_pages);
         t.assert_equal(uint64_t(4), stats.resident_attention_spans);
         t.assert_equal(uint64_t(6), stats.resident_pages_attended);

@@ -361,15 +361,15 @@ struct ggml_cuda_kv_stream_resident_cache {
     uint32_t resident_pages_per_layer = 0;
     uint32_t decode_active_pages = 0;
     uint32_t next_layer = 0;
-    cudaStream_t layout_stream = nullptr;
-
     std::vector<uint32_t> layer_pages;
     std::vector<size_t> layer_offsets;
     std::unordered_map<const void *, uint32_t> layer_by_k;
     std::unordered_map<const void *, uint32_t> layer_by_data;
+    std::unordered_map<const void *, void *> mirror_by_data;
     std::vector<uint8_t> loaded;
     std::vector<uint8_t> dirty;
     std::vector<uint8_t> precise_dirty_tracking;
+    std::vector<int64_t> dirty_rows;
     std::vector<uint32_t> mutable_pages;
     bool all_pages_mutable = false;
     ggml_cuda_kv_stream_resident_stats stats;
@@ -470,14 +470,10 @@ ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
     cache->loaded.resize(cache->layer_offsets.back(), 0);
     cache->dirty.resize(cache->layer_offsets.back(), 0);
     cache->precise_dirty_tracking.resize(layer_count, 0);
-    CUDA_CHECK(cudaStreamCreateWithFlags(&cache->layout_stream, cudaStreamNonBlocking));
     return cache;
 }
 
 void ggml_cuda_kv_stream_resident_cache_free(ggml_cuda_kv_stream_resident_cache * cache) {
-    if (cache != nullptr && cache->layout_stream != nullptr) {
-        CUDA_CHECK(cudaStreamDestroy(cache->layout_stream));
-    }
     delete cache;
 }
 
@@ -488,10 +484,12 @@ void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache
     std::fill(cache->loaded.begin(), cache->loaded.end(), 0);
     std::fill(cache->dirty.begin(), cache->dirty.end(), 0);
     std::fill(cache->precise_dirty_tracking.begin(), cache->precise_dirty_tracking.end(), 0);
+    cache->dirty_rows.clear();
     cache->mutable_pages.clear();
     cache->all_pages_mutable = false;
     cache->layer_by_k.clear();
     cache->layer_by_data.clear();
+    cache->mirror_by_data.clear();
     cache->next_layer = 0;
     cache->stats = {};
 }
@@ -519,133 +517,12 @@ bool ggml_cuda_kv_stream_resident_cache_repartition(
     cache->loaded.assign(cache->layer_offsets.back(), 0);
     cache->dirty.assign(cache->layer_offsets.back(), 0);
     cache->precise_dirty_tracking.assign(cache->layer_count, 0);
+    cache->dirty_rows.clear();
     cache->layer_by_k.clear();
     cache->layer_by_data.clear();
+    cache->mirror_by_data.clear();
     cache->next_layer = 0;
     cache->stats = {};
-    return true;
-}
-
-static bool kv_stream_resident_cache_migrate_layout(
-        ggml_cuda_kv_stream_resident_cache * cache,
-        const std::vector<uint32_t> & layer_pages,
-        const std::vector<size_t> & layer_offsets) {
-    const size_t slot_count = cache->layer_offsets.back();
-    if (layer_offsets.back() != slot_count || cache->scratch_bytes < cache->page_bytes) {
-        return false;
-    }
-
-    constexpr uint64_t NO_ITEM = UINT64_MAX;
-    const auto item_id = [](uint32_t layer, uint32_t page) {
-        return (uint64_t(layer) << 32) | uint64_t(page);
-    };
-
-    std::vector<uint64_t> current_item(slot_count, NO_ITEM);
-    std::vector<uint64_t> desired_item(slot_count, NO_ITEM);
-    std::vector<uint8_t> migrated_loaded(slot_count, 0);
-    std::vector<uint8_t> migrated_dirty(slot_count, 0);
-    std::unordered_map<uint64_t, size_t> source_slot;
-    std::unordered_map<uint64_t, size_t> desired_slot;
-    source_slot.reserve(slot_count);
-    desired_slot.reserve(slot_count);
-
-    for (uint32_t layer = 0; layer < cache->layer_count; ++layer) {
-        for (uint32_t page = 0; page < cache->layer_pages[layer]; ++page) {
-            const size_t slot = cache->layer_offsets[layer] + page;
-            if (!cache->loaded[slot]) {
-                continue;
-            }
-            const uint64_t item = item_id(layer, page);
-            current_item[slot] = item;
-            source_slot.emplace(item, slot);
-        }
-    }
-    for (uint32_t layer = 0; layer < cache->layer_count; ++layer) {
-        for (uint32_t page = 0; page < layer_pages[layer]; ++page) {
-            if (page >= cache->layer_pages[layer]) {
-                continue;
-            }
-            const size_t old_slot = cache->layer_offsets[layer] + page;
-            if (!cache->loaded[old_slot]) {
-                continue;
-            }
-            const size_t new_slot = layer_offsets[layer] + page;
-            const uint64_t item = item_id(layer, page);
-            desired_item[new_slot] = item;
-            desired_slot.emplace(item, new_slot);
-            migrated_loaded[new_slot] = 1;
-            migrated_dirty[new_slot] = cache->dirty[old_slot];
-        }
-    }
-
-    char * const resident_base = cache->pool_data + cache->scratch_bytes;
-    char * const temporary = cache->pool_data;
-    auto copy_page = [&](const void * source, void * destination) {
-        CUDA_CHECK(cudaMemcpyAsync(destination, source, cache->page_bytes,
-            cudaMemcpyDeviceToDevice, cache->layout_stream));
-    };
-    auto slot_data = [&](size_t slot) -> char * {
-        return resident_base + slot*cache->page_bytes;
-    };
-
-    std::vector<size_t> holes;
-    holes.reserve(slot_count);
-    for (size_t slot = 0; slot < slot_count; ++slot) {
-        if (current_item[slot] == NO_ITEM ||
-                desired_slot.find(current_item[slot]) == desired_slot.end()) {
-            holes.push_back(slot);
-        }
-    }
-    for (size_t next = 0; next < holes.size(); ++next) {
-        const size_t destination = holes[next];
-        const uint64_t wanted = desired_item[destination];
-        if (wanted == NO_ITEM) {
-            continue;
-        }
-        const size_t source = source_slot.at(wanted);
-        if (source == destination) {
-            continue;
-        }
-        copy_page(slot_data(source), slot_data(destination));
-        current_item[destination] = wanted;
-        source_slot[wanted] = destination;
-        current_item[source] = NO_ITEM;
-        holes.push_back(source);
-    }
-
-    for (size_t start = 0; start < slot_count; ++start) {
-        const uint64_t first_wanted = desired_item[start];
-        if (first_wanted == NO_ITEM || source_slot.at(first_wanted) == start) {
-            continue;
-        }
-
-        const uint64_t saved = current_item[start];
-        GGML_ASSERT(saved != NO_ITEM);
-        copy_page(slot_data(start), temporary);
-        size_t hole = start;
-        for (;;) {
-            const uint64_t wanted = desired_item[hole];
-            const size_t source = source_slot.at(wanted);
-            if (source == start) {
-                GGML_ASSERT(wanted == saved);
-                copy_page(temporary, slot_data(hole));
-                current_item[hole] = wanted;
-                source_slot[wanted] = hole;
-                break;
-            }
-            copy_page(slot_data(source), slot_data(hole));
-            current_item[hole] = wanted;
-            source_slot[wanted] = hole;
-            current_item[source] = NO_ITEM;
-            hole = source;
-        }
-    }
-    CUDA_CHECK(cudaStreamSynchronize(cache->layout_stream));
-
-    cache->layer_pages = layer_pages;
-    cache->layer_offsets = layer_offsets;
-    cache->loaded = std::move(migrated_loaded);
-    cache->dirty = std::move(migrated_dirty);
     return true;
 }
 
@@ -667,9 +544,22 @@ bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
         cache->decode_active_pages = active_pages_per_layer;
         return true;
     }
-    if (!kv_stream_resident_cache_migrate_layout(cache, layer_pages, layer_offsets)) {
-        return false;
-    }
+    // Resident storage uses separate contiguous K and V planes per layer.
+    // A layout change moves both the layer base and the V-plane boundary, so
+    // migrating page-sized byte slots cannot preserve logical K/V pages.
+    // Reload lazily from the authoritative host cache instead.
+    cache->layer_pages = std::move(layer_pages);
+    cache->layer_offsets = std::move(layer_offsets);
+    cache->loaded.assign(cache->layer_offsets.back(), 0);
+    cache->dirty.assign(cache->layer_offsets.back(), 0);
+    cache->precise_dirty_tracking.assign(cache->layer_count, 0);
+    cache->dirty_rows.clear();
+    cache->mutable_pages.clear();
+    cache->all_pages_mutable = false;
+    cache->layer_by_k.clear();
+    cache->layer_by_data.clear();
+    cache->mirror_by_data.clear();
+    cache->next_layer = 0;
     cache->decode_active_pages = active_pages_per_layer;
     cache->resident_pages_per_layer = pages_per_layer;
     return true;
@@ -699,6 +589,12 @@ bool ggml_cuda_kv_stream_resident_cache_mark_dirty_rows(
 
     cache->mutable_pages.clear();
     cache->all_pages_mutable = false;
+    if (count == 0) {
+        cache->dirty_rows.clear();
+    } else {
+        cache->dirty_rows.assign(rows, rows + count);
+    }
+    std::fill(cache->dirty.begin(), cache->dirty.end(), 0);
     for (uint32_t layer = 0; layer < cache->layer_count; ++layer) {
         cache->precise_dirty_tracking[layer] = 1;
     }
@@ -720,6 +616,59 @@ bool ggml_cuda_kv_stream_resident_cache_mark_dirty_rows(
         }
     }
     return true;
+}
+
+bool ggml_cuda_kv_stream_resident_cache_all_layers_fit(
+        const ggml_cuda_kv_stream_resident_cache * cache,
+        uint32_t active_pages) {
+    if (cache == nullptr || active_pages == 0) {
+        return false;
+    }
+    return std::all_of(cache->layer_pages.begin(), cache->layer_pages.end(),
+        [active_pages](uint32_t pages) { return pages >= active_pages; });
+}
+
+bool ggml_cuda_kv_stream_resident_cache_get_mirror(
+        ggml_cuda_kv_stream_resident_cache * cache,
+        const ggml_tensor * target,
+        void ** data) {
+    if (cache == nullptr || target == nullptr || data == nullptr ||
+            cache->dirty_rows.size() != 1 || cache->dirty_rows[0] < 0) {
+        return false;
+    }
+    const auto layer_it = cache->layer_by_data.find(target->data);
+    const auto mirror_it = cache->mirror_by_data.find(target->data);
+    if (layer_it == cache->layer_by_data.end() || mirror_it == cache->mirror_by_data.end()) {
+        return false;
+    }
+    const uint64_t capacity = uint64_t(cache->layer_pages[layer_it->second])*cache->page_tokens;
+    if (uint64_t(cache->dirty_rows[0]) >= capacity) {
+        return false;
+    }
+    *data = mirror_it->second;
+    return true;
+}
+
+void ggml_cuda_kv_stream_resident_cache_mark_mirrored(
+        ggml_cuda_kv_stream_resident_cache * cache,
+        const ggml_tensor * target) {
+    if (cache == nullptr || target == nullptr) {
+        return;
+    }
+    const auto layer_it = cache->layer_by_data.find(target->data);
+    if (layer_it == cache->layer_by_data.end()) {
+        return;
+    }
+    const uint32_t layer = layer_it->second;
+    for (const int64_t row : cache->dirty_rows) {
+        if (row < 0) {
+            return;
+        }
+        const uint32_t page = uint32_t(uint64_t(row)/cache->page_tokens);
+        if (page < cache->layer_pages[layer]) {
+            cache->dirty[kv_stream_resident_index(cache, layer, page)] = 0;
+        }
+    }
 }
 
 void ggml_cuda_kv_stream_resident_cache_mark_dirty(
@@ -1183,6 +1132,11 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         const uint32_t resident_layer = kv_stream_resident_layer(resident_cache, K->data);
         resident_cache->layer_by_data[K->data] = resident_layer;
         resident_cache->layer_by_data[V->data] = resident_layer;
+        char * layer_base = resident_cache->pool_data + resident_cache->scratch_bytes +
+            resident_cache->layer_offsets[resident_layer]*resident_cache->page_bytes;
+        resident_cache->mirror_by_data[K->data] = layer_base;
+        resident_cache->mirror_by_data[V->data] = layer_base +
+            size_t(resident_cache->layer_pages[resident_layer])*K->nb[1]*resident_cache->page_tokens;
         return false;
     }
     ring->graph_resident_cache = resident_cache;
@@ -1191,11 +1145,19 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     const uint32_t resident_layer = kv_stream_resident_layer(resident_cache, K->data);
     resident_cache->layer_by_data[K->data] = resident_layer;
     resident_cache->layer_by_data[V->data] = resident_layer;
-    const uint32_t layer = ring->graph_layer_count++;
-    ring->graph_layer_by_k[K->data] = layer;
+    char * layer_base = resident_cache->pool_data + resident_cache->scratch_bytes +
+        resident_cache->layer_offsets[resident_layer]*resident_cache->page_bytes;
+    resident_cache->mirror_by_data[K->data] = layer_base;
+    resident_cache->mirror_by_data[V->data] = layer_base +
+        size_t(resident_cache->layer_pages[resident_layer])*K->nb[1]*resident_cache->page_tokens;
 
     const int64_t block_tokens = resident_cache->page_tokens;
     const int nchunks = int((K->ne[1] + block_tokens - 1)/block_tokens);
+    if (uint32_t(nchunks) <= resident_cache->layer_pages[resident_layer]) {
+        return true;
+    }
+    const uint32_t layer = ring->graph_layer_count++;
+    ring->graph_layer_by_k[K->data] = layer;
     auto & page_requests = ring->graph_request_by_k_page[K->data];
     page_requests.assign(nchunks, KV_STREAM_NO_REQUEST);
 
@@ -1244,6 +1206,10 @@ bool ggml_cuda_kv_stream_graph_add_attention(
 void ggml_cuda_kv_stream_graph_finalize(
         ggml_cuda_kv_stream_transfer_ring * ring, cudaStream_t compute_stream) {
     GGML_ASSERT(ring != nullptr);
+    if (ring->graph_requests.empty()) {
+        ring->timing_current = false;
+        return;
+    }
     if (ring->timing_current) {
         CUDA_CHECK(cudaEventRecord(ring->eval_start, compute_stream));
     }
@@ -1316,6 +1282,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         size_t v_stage_token_stride = 0;
         size_t v_stage_head_stride = 0;
         bool upload = true;
+        bool resident_refresh = false;
         bool streamed = false;
         uint32_t slot = 0;
         size_t request_index = KV_STREAM_NO_REQUEST;
@@ -1384,6 +1351,7 @@ void ggml_cuda_flash_attn_ext_streamed(
                     desc.upload = resident_cache->precise_dirty_tracking[resident_layer] ?
                         resident_cache->dirty[resident_index] :
                         (dst->src[0]->ne[1] > 1 || chunk == nchunks - 1);
+                    desc.resident_refresh = desc.upload;
                 } else {
                     ++resident_cache->stats.resident_misses;
                     resident_cache->loaded[resident_index] = 1;
@@ -1419,6 +1387,35 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
         GGML_ASSERT(K->nb[1] == desc.k_stage_token_stride && K->nb[2] == desc.k_stage_head_stride);
         GGML_ASSERT(V->nb[1] == desc.v_stage_token_stride && V->nb[2] == desc.v_stage_head_stride);
+        size_t dirty_row_count = 0;
+        if (resident_cache != nullptr && desc.resident_refresh &&
+                !resident_cache->all_pages_mutable) {
+            for (const int64_t row : resident_cache->dirty_rows) {
+                if (row >= desc.token_begin && row < desc.token_begin + desc.token_count) {
+                    ++dirty_row_count;
+                }
+            }
+        }
+        const size_t dirty_bytes = dirty_row_count*(desc.k_stage_token_stride + desc.v_stage_token_stride);
+        if (dirty_row_count > 0 && dirty_bytes < desc.k_bytes + desc.v_bytes) {
+            for (const int64_t row : resident_cache->dirty_rows) {
+                if (row < desc.token_begin || row >= desc.token_begin + desc.token_count) {
+                    continue;
+                }
+                const size_t page_row = size_t(row - desc.token_begin);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    desc.k_stage + page_row*desc.k_stage_token_stride,
+                    static_cast<const char *>(K->data) + row*K->nb[1],
+                    desc.k_stage_token_stride, cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    desc.v_stage + page_row*desc.v_stage_token_stride,
+                    static_cast<const char *>(V->data) + row*V->nb[1],
+                    desc.v_stage_token_stride, cudaMemcpyHostToDevice, stream));
+            }
+            transfer_ring->host_to_device_copy_commands += 2*dirty_row_count;
+            resident_cache->stats.host_to_device_bytes += dirty_bytes;
+            return;
+        }
         CUDA_CHECK(cudaMemcpyAsync(
             desc.k_stage, static_cast<const char *>(K->data) + desc.token_begin*K->nb[1],
             desc.k_bytes, cudaMemcpyHostToDevice, stream));

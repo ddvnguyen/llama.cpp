@@ -1350,6 +1350,7 @@ struct ggml_backend_cuda_kv_stream_runtime {
     uint32_t dirty_rows_remaining = 0;
     uint64_t staged_set_rows = 0;
     uint64_t staged_set_rows_bytes = 0;
+    uint64_t generation = 0;
 
     std::atomic<uint32_t> references{1};
     ggml_backend_buffer_type buffer_type{};
@@ -1398,6 +1399,7 @@ static void ggml_backend_cuda_kv_stream_buffer_memset(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
     ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
+    ++context->runtime->generation;
     memset(static_cast<char *>(tensor->data) + offset, value, size);
 }
 
@@ -1405,6 +1407,7 @@ static void ggml_backend_cuda_kv_stream_buffer_set(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
     ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
+    ++context->runtime->generation;
     memcpy(static_cast<char *>(tensor->data) + offset, data, size);
 }
 
@@ -1417,6 +1420,7 @@ static void ggml_backend_cuda_kv_stream_buffer_get(
 static void ggml_backend_cuda_kv_stream_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
     ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
+    ++context->runtime->generation;
     memset(context->host_data, value, buffer->size);
 }
 
@@ -1585,6 +1589,7 @@ bool ggml_backend_cuda_kv_stream_repartition(
         return false;
     }
 
+    const bool changed = runtime->stage_slots != stage_slots;
     ggml_cuda_set_device(runtime->device);
     CUDA_CHECK(cudaDeviceSynchronize());
     if (!ggml_cuda_kv_stream_transfer_ring_set_active_slots(runtime->transfer_ring, stage_slots) ||
@@ -1596,6 +1601,7 @@ bool ggml_backend_cuda_kv_stream_repartition(
     runtime->dirty_rows_remaining = 0;
     runtime->staged_set_rows = 0;
     runtime->staged_set_rows_bytes = 0;
+    runtime->generation += changed;
     return true;
 }
 
@@ -1620,6 +1626,7 @@ bool ggml_backend_cuda_kv_stream_set_decode_layout(
     runtime->dirty_rows_remaining = 0;
     runtime->staged_set_rows = 0;
     runtime->staged_set_rows_bytes = 0;
+    ++runtime->generation;
     return true;
 }
 
@@ -2572,6 +2579,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS: {
             bool staged = false;
+            bool mirrored = false;
             if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(dst);
                     runtime != nullptr && runtime->resident_cache != nullptr) {
                 ggml_cuda_kv_stream_resident_cache_mark_dirty(
@@ -2587,9 +2595,23 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_op_set_rows_staged(ctx, dst, first_row, row_count);
                     ++runtime->staged_set_rows;
                     runtime->staged_set_rows_bytes += size_t(row_count)*dst->nb[1];
+                } else if (dst->src[0]->type == GGML_TYPE_F32 &&
+                        dst->src[1]->type == GGML_TYPE_I64 &&
+                        (dst->type == GGML_TYPE_Q8_0 || dst->type == GGML_TYPE_Q4_0)) {
+                    void * mirror_data = nullptr;
+                    if (ggml_cuda_kv_stream_resident_cache_get_mirror(
+                            runtime->resident_cache, dst, &mirror_data)) {
+                        ggml_cuda_op_set_rows(ctx, dst);
+                        ggml_tensor mirror = *dst;
+                        mirror.data = mirror_data;
+                        ggml_cuda_op_set_rows(ctx, &mirror);
+                        ggml_cuda_kv_stream_resident_cache_mark_mirrored(
+                            runtime->resident_cache, dst);
+                        mirrored = true;
+                    }
                 }
             }
-            if (!staged) {
+            if (!staged && !mirrored) {
                 ggml_cuda_op_set_rows(ctx, dst);
             }
             break;
@@ -3079,12 +3101,36 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (node->src[j] != nullptr && ggml_cuda_kv_stream_runtime_from_tensor(node->src[j]) != nullptr) {
-                // Stream uploads and stage ownership are not represented in
-                // GGML's CUDA graph property key yet.
+        auto * node_runtime = ggml_cuda_kv_stream_runtime_from_tensor(node);
+        bool mirrorable_set_rows = false;
+        if (node_runtime != nullptr) {
+            mirrorable_set_rows = node->op == GGML_OP_SET_ROWS &&
+                node_runtime->dirty_rows.size() == 1 && node_runtime->dirty_rows[0] >= 0 &&
+                node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_F32 &&
+                node->src[1] != nullptr && node->src[1]->type == GGML_TYPE_I64 &&
+                (node->type == GGML_TYPE_Q8_0 || node->type == GGML_TYPE_Q4_0);
+            void * mirror_data = nullptr;
+            mirrorable_set_rows = mirrorable_set_rows &&
+                ggml_cuda_kv_stream_resident_cache_get_mirror(
+                    node_runtime->resident_cache, node, &mirror_data);
+            if (!mirrorable_set_rows) {
                 use_cuda_graph = false;
-                break;
+            }
+        }
+
+        for (int j = 0; use_cuda_graph && j < GGML_MAX_SRC; ++j) {
+            auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(node->src[j]);
+            if (runtime == nullptr) {
+                continue;
+            }
+            const bool resident_attention = mirrorable_set_rows ||
+                (node->op == GGML_OP_FLASH_ATTN_EXT &&
+                node->src[0]->ne[1] == 1 && ggml_cuda_kv_stream_fattn_fits(node) &&
+                ggml_cuda_kv_stream_resident_cache_all_layers_fit(
+                    runtime->resident_cache,
+                    uint32_t((node->src[1]->ne[1] + 255)/256)));
+            if (!resident_attention) {
+                use_cuda_graph = false;
             }
         }
 
@@ -3119,8 +3165,26 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    uint64_t kv_stream_generation = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i])) {
+            kv_stream_generation = std::max(kv_stream_generation, runtime->generation);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i]->src[j])) {
+                kv_stream_generation = std::max(kv_stream_generation, runtime->generation);
+            }
+        }
+    }
+    uint64_t previous_kv_stream_generation = 0;
+    for (const auto & prop : graph->node_props) {
+        previous_kv_stream_generation = std::max(
+            previous_kv_stream_generation, prop.kv_stream_generation);
+    }
+
     if (cgraph->uid != 0 &&
-        cgraph->uid == graph->uid) {
+        cgraph->uid == graph->uid &&
+        kv_stream_generation == previous_kv_stream_generation) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
@@ -3138,8 +3202,16 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
 
+        if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i])) {
+            prop.kv_stream_generation = runtime->generation;
+        }
+
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
+                if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i]->src[j])) {
+                    prop.kv_stream_generation = std::max(
+                        prop.kv_stream_generation, runtime->generation);
+                }
                 prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
                 memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
                 memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
