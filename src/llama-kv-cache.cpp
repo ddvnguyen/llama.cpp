@@ -1407,7 +1407,7 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
     }
     owner.evaluations_since_repartition = 0;
 
-    LLAMA_LOG_INFO("%s: adaptive KV partition: resident pages/layer %u -> %u, ring slots %u -> %u, miss %.1f%%, copy busy %.1f%%\n",
+    LLAMA_LOG_WARN("%s: adaptive KV partition: resident pages/layer %u -> %u, ring slots %u -> %u, miss %.1f%%, copy busy %.1f%%\n",
         __func__, resident_pages, partition.resident_pages_per_layer,
         ring_slots, partition.ring_slots,
         100.0*delta.deadline_miss_ratio, 100.0*copy_busy_ratio);
