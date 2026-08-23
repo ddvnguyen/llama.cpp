@@ -361,6 +361,7 @@ struct ggml_cuda_kv_stream_resident_cache {
     uint32_t resident_pages_per_layer = 0;
     uint32_t decode_active_pages = 0;
     uint32_t next_layer = 0;
+    cudaStream_t layout_stream = nullptr;
 
     std::vector<uint32_t> layer_pages;
     std::vector<size_t> layer_offsets;
@@ -469,10 +470,14 @@ ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
     cache->loaded.resize(cache->layer_offsets.back(), 0);
     cache->dirty.resize(cache->layer_offsets.back(), 0);
     cache->precise_dirty_tracking.resize(layer_count, 0);
+    CUDA_CHECK(cudaStreamCreateWithFlags(&cache->layout_stream, cudaStreamNonBlocking));
     return cache;
 }
 
 void ggml_cuda_kv_stream_resident_cache_free(ggml_cuda_kv_stream_resident_cache * cache) {
+    if (cache != nullptr && cache->layout_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(cache->layout_stream));
+    }
     delete cache;
 }
 
@@ -521,6 +526,129 @@ bool ggml_cuda_kv_stream_resident_cache_repartition(
     return true;
 }
 
+static bool kv_stream_resident_cache_migrate_layout(
+        ggml_cuda_kv_stream_resident_cache * cache,
+        const std::vector<uint32_t> & layer_pages,
+        const std::vector<size_t> & layer_offsets) {
+    const size_t slot_count = cache->layer_offsets.back();
+    if (layer_offsets.back() != slot_count || cache->scratch_bytes < cache->page_bytes) {
+        return false;
+    }
+
+    constexpr uint64_t NO_ITEM = UINT64_MAX;
+    const auto item_id = [](uint32_t layer, uint32_t page) {
+        return (uint64_t(layer) << 32) | uint64_t(page);
+    };
+
+    std::vector<uint64_t> current_item(slot_count, NO_ITEM);
+    std::vector<uint64_t> desired_item(slot_count, NO_ITEM);
+    std::vector<uint8_t> migrated_loaded(slot_count, 0);
+    std::vector<uint8_t> migrated_dirty(slot_count, 0);
+    std::unordered_map<uint64_t, size_t> source_slot;
+    std::unordered_map<uint64_t, size_t> desired_slot;
+    source_slot.reserve(slot_count);
+    desired_slot.reserve(slot_count);
+
+    for (uint32_t layer = 0; layer < cache->layer_count; ++layer) {
+        for (uint32_t page = 0; page < cache->layer_pages[layer]; ++page) {
+            const size_t slot = cache->layer_offsets[layer] + page;
+            if (!cache->loaded[slot]) {
+                continue;
+            }
+            const uint64_t item = item_id(layer, page);
+            current_item[slot] = item;
+            source_slot.emplace(item, slot);
+        }
+    }
+    for (uint32_t layer = 0; layer < cache->layer_count; ++layer) {
+        for (uint32_t page = 0; page < layer_pages[layer]; ++page) {
+            if (page >= cache->layer_pages[layer]) {
+                continue;
+            }
+            const size_t old_slot = cache->layer_offsets[layer] + page;
+            if (!cache->loaded[old_slot]) {
+                continue;
+            }
+            const size_t new_slot = layer_offsets[layer] + page;
+            const uint64_t item = item_id(layer, page);
+            desired_item[new_slot] = item;
+            desired_slot.emplace(item, new_slot);
+            migrated_loaded[new_slot] = 1;
+            migrated_dirty[new_slot] = cache->dirty[old_slot];
+        }
+    }
+
+    char * const resident_base = cache->pool_data + cache->scratch_bytes;
+    char * const temporary = cache->pool_data;
+    auto copy_page = [&](const void * source, void * destination) {
+        CUDA_CHECK(cudaMemcpyAsync(destination, source, cache->page_bytes,
+            cudaMemcpyDeviceToDevice, cache->layout_stream));
+    };
+    auto slot_data = [&](size_t slot) -> char * {
+        return resident_base + slot*cache->page_bytes;
+    };
+
+    std::vector<size_t> holes;
+    holes.reserve(slot_count);
+    for (size_t slot = 0; slot < slot_count; ++slot) {
+        if (current_item[slot] == NO_ITEM ||
+                desired_slot.find(current_item[slot]) == desired_slot.end()) {
+            holes.push_back(slot);
+        }
+    }
+    for (size_t next = 0; next < holes.size(); ++next) {
+        const size_t destination = holes[next];
+        const uint64_t wanted = desired_item[destination];
+        if (wanted == NO_ITEM) {
+            continue;
+        }
+        const size_t source = source_slot.at(wanted);
+        if (source == destination) {
+            continue;
+        }
+        copy_page(slot_data(source), slot_data(destination));
+        current_item[destination] = wanted;
+        source_slot[wanted] = destination;
+        current_item[source] = NO_ITEM;
+        holes.push_back(source);
+    }
+
+    for (size_t start = 0; start < slot_count; ++start) {
+        const uint64_t first_wanted = desired_item[start];
+        if (first_wanted == NO_ITEM || source_slot.at(first_wanted) == start) {
+            continue;
+        }
+
+        const uint64_t saved = current_item[start];
+        GGML_ASSERT(saved != NO_ITEM);
+        copy_page(slot_data(start), temporary);
+        size_t hole = start;
+        for (;;) {
+            const uint64_t wanted = desired_item[hole];
+            const size_t source = source_slot.at(wanted);
+            if (source == start) {
+                GGML_ASSERT(wanted == saved);
+                copy_page(temporary, slot_data(hole));
+                current_item[hole] = wanted;
+                source_slot[wanted] = hole;
+                break;
+            }
+            copy_page(slot_data(source), slot_data(hole));
+            current_item[hole] = wanted;
+            source_slot[wanted] = hole;
+            current_item[source] = NO_ITEM;
+            hole = source;
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cache->layout_stream));
+
+    cache->layer_pages = layer_pages;
+    cache->layer_offsets = layer_offsets;
+    cache->loaded = std::move(migrated_loaded);
+    cache->dirty = std::move(migrated_dirty);
+    return true;
+}
+
 bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
         ggml_cuda_kv_stream_resident_cache * cache,
         uint32_t active_pages_per_layer) {
@@ -535,20 +663,15 @@ bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
             pages_per_layer, layer_pages, layer_offsets)) {
         return false;
     }
-    cache->decode_active_pages = active_pages_per_layer;
     if (cache->layer_pages == layer_pages) {
+        cache->decode_active_pages = active_pages_per_layer;
         return true;
     }
+    if (!kv_stream_resident_cache_migrate_layout(cache, layer_pages, layer_offsets)) {
+        return false;
+    }
+    cache->decode_active_pages = active_pages_per_layer;
     cache->resident_pages_per_layer = pages_per_layer;
-    cache->layer_pages = std::move(layer_pages);
-    cache->layer_offsets = std::move(layer_offsets);
-    cache->loaded.assign(cache->layer_offsets.back(), 0);
-    cache->dirty.assign(cache->layer_offsets.back(), 0);
-    cache->precise_dirty_tracking.assign(cache->layer_count, 0);
-    cache->layer_by_k.clear();
-    cache->layer_by_data.clear();
-    cache->next_layer = 0;
-    cache->stats = {};
     return true;
 }
 

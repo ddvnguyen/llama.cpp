@@ -198,7 +198,8 @@ std::vector<float> run_attention_layers(
         int repeats = 1,
         int64_t update_rows = 1,
         ggml_type index_type = GGML_TYPE_I32,
-        ggml_backend_cuda_kv_stream_runtime_t dirty_runtime = nullptr) {
+        ggml_backend_cuda_kv_stream_runtime_t dirty_runtime = nullptr,
+        uint32_t layout_after_first = 0) {
     constexpr size_t N_TENSORS = 256;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS +
         ggml_graph_overhead_custom(N_TENSORS, false);
@@ -316,6 +317,10 @@ std::vector<float> run_attention_layers(
                 dirty_runtime, dirty_rows.data(), dirty_rows.size()));
         }
         GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        if (repeat == 0 && layout_after_first != 0) {
+            GGML_ASSERT(ggml_backend_cuda_kv_stream_set_decode_layout(
+                dirty_runtime, layout_after_first));
+        }
     }
 
     std::vector<float> result;
@@ -761,13 +766,15 @@ int main() {
 
         const std::vector<float> actual = run_attention_layers(
             backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
-            n_kv, n_batch, 1, 1, GGML_TYPE_I32, runtime);
+            n_kv, n_batch, 2, 1, GGML_TYPE_I32, runtime, 4);
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
-        t.assert_equal(uint64_t(6), stats.streamed_pages);
-        t.assert_equal(uint64_t(1), stats.resident_attention_spans);
-        t.assert_equal(uint64_t(3), stats.resident_pages_attended);
+        t.assert_equal(uint64_t(5), stats.resident_misses);
+        t.assert_equal(uint64_t(1), stats.resident_hits);
+        t.assert_equal(uint64_t(12), stats.streamed_pages);
+        t.assert_equal(uint64_t(4), stats.resident_attention_spans);
+        t.assert_equal(uint64_t(6), stats.resident_pages_attended);
         if (!t.assert_equal(expected.size(), actual.size())) {
             return;
         }
