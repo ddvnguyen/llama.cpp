@@ -410,18 +410,21 @@ static bool kv_stream_resident_cache_layout(
             return false;
         }
 
-        // Reduce the number of split-attention layers only while each streamed
-        // working set still fits in both the shared ring and the active pages
-        // owned by one layer. Larger bursts serialize copy and compute. Spread
-        // split layers across model order so resident layers provide prefetch windows.
+        // Reduce the number of split-attention layers while each streamed
+        // working set fits in both the shared ring and the active pages owned
+        // by one layer. When even one split per model layer exceeds the ring,
+        // that layer streams in multiple waves. Spread split layers across
+        // model order so resident layers provide prefetch windows.
         const auto ceil_div = [](uint64_t numerator, uint64_t denominator) {
             return numerator/denominator + (numerator%denominator != 0);
         };
         const uint64_t splits_for_ring = ceil_div(streamed_pages, ring_pages);
         const uint64_t splits_for_layer_capacity =
             ceil_div(streamed_pages, decode_active_pages);
+        const uint64_t ring_bounded_splits =
+            std::min<uint64_t>(cache->layer_count, splits_for_ring);
         const uint64_t split_layers_wide =
-            std::max(splits_for_ring, splits_for_layer_capacity);
+            std::max(ring_bounded_splits, splits_for_layer_capacity);
         if (split_layers_wide == 0 || split_layers_wide > cache->layer_count) {
             return false;
         }

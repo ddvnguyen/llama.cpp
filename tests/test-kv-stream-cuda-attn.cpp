@@ -879,6 +879,36 @@ int main() {
         t.assert_true("multi-layer streamed logits remain equivalent", max_abs <= 3e-4f);
     });
 
+    t.test("decode layout permits multiple streaming waves through a small ring", [](testing & t) {
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 1;
+        params.pool_bytes           = 5*page_bytes;
+        params.resident_layer_count = 4;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("small-ring runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        // Each of four layers has one resident and two streamed pages. The
+        // one-slot ring services each layer in two waves, so requiring one
+        // split layer per ring-sized portion would incorrectly demand eight
+        // split layers from a four-layer model.
+        t.assert_true("small ring selects a valid decode layout",
+            ggml_backend_cuda_kv_stream_set_decode_layout(runtime, 3));
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+    });
+
     t.test("decode layout spreads an oversized streamed deficit across enough layers", [](testing & t) {
         constexpr int64_t n_kv = 768;
         constexpr int64_t n_batch = 1;
