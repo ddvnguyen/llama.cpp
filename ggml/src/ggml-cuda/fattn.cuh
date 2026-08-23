@@ -39,7 +39,11 @@ void ggml_cuda_kv_stream_resident_cache_free(ggml_cuda_kv_stream_resident_cache 
 void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache * cache);
 bool ggml_cuda_kv_stream_resident_cache_repartition(
     ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes);
+bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
+    ggml_cuda_kv_stream_resident_cache * cache, uint32_t active_pages_per_layer);
 uint32_t ggml_cuda_kv_stream_resident_cache_pages_per_layer(
+    const ggml_cuda_kv_stream_resident_cache * cache);
+uint32_t ggml_cuda_kv_stream_resident_cache_decode_active_pages(
     const ggml_cuda_kv_stream_resident_cache * cache);
 ggml_cuda_kv_stream_resident_stats ggml_cuda_kv_stream_resident_cache_get_stats(
     const ggml_cuda_kv_stream_resident_cache * cache);

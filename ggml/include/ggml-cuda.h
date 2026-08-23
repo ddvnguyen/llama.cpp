@@ -83,6 +83,9 @@ GGML_BACKEND_API uint32_t ggml_backend_cuda_kv_stream_resident_pages_per_layer(
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_repartition(
     ggml_backend_cuda_kv_stream_runtime_t runtime,
     uint32_t stage_slots);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_set_decode_layout(
+    ggml_backend_cuda_kv_stream_runtime_t runtime,
+    uint32_t active_pages_per_layer);
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_mark_dirty_rows(
     ggml_backend_cuda_kv_stream_runtime_t runtime,
     const int64_t * rows,

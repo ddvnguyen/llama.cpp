@@ -1382,7 +1382,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             const llama_kv_cache_context * attn_context = hybrid_context->get_attn();
             if (attn_context != nullptr) {
                 (void) hybrid_memory->get_mem_attn()->kv_stream_adapt(
-                    attn_context->get_n_kv());
+                    attn_context->get_n_kv(), ubatch.n_tokens);
             }
         }
     }

@@ -1599,6 +1599,30 @@ bool ggml_backend_cuda_kv_stream_repartition(
     return true;
 }
 
+bool ggml_backend_cuda_kv_stream_set_decode_layout(
+        ggml_backend_cuda_kv_stream_runtime_t runtime,
+        uint32_t active_pages_per_layer) {
+    if (runtime == nullptr || runtime->resident_cache == nullptr) {
+        return false;
+    }
+    if (ggml_cuda_kv_stream_resident_cache_decode_active_pages(
+            runtime->resident_cache) == active_pages_per_layer) {
+        return true;
+    }
+
+    ggml_cuda_set_device(runtime->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (!ggml_cuda_kv_stream_resident_cache_set_decode_layout(
+            runtime->resident_cache, active_pages_per_layer)) {
+        return false;
+    }
+    runtime->dirty_rows.clear();
+    runtime->dirty_rows_remaining = 0;
+    runtime->staged_set_rows = 0;
+    runtime->staged_set_rows_bytes = 0;
+    return true;
+}
+
 bool ggml_backend_cuda_kv_stream_mark_dirty_rows(
         ggml_backend_cuda_kv_stream_runtime_t runtime,
         const int64_t * rows, size_t count) {
@@ -6331,6 +6355,13 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) +[](void * runtime, uint32_t ring_slots) -> bool {
             return ggml_backend_cuda_kv_stream_repartition(
                 static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime), ring_slots);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_set_decode_layout") == 0) {
+        return (void *) +[](void * runtime, uint32_t active_pages_per_layer) -> bool {
+            return ggml_backend_cuda_kv_stream_set_decode_layout(
+                static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime),
+                active_pages_per_layer);
         };
     }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_mark_dirty_rows") == 0) {

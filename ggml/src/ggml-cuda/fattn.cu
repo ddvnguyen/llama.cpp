@@ -359,15 +359,85 @@ struct ggml_cuda_kv_stream_resident_cache {
     uint32_t layer_count = 0;
     uint32_t page_tokens = 0;
     uint32_t resident_pages_per_layer = 0;
+    uint32_t decode_active_pages = 0;
     uint32_t next_layer = 0;
 
+    std::vector<uint32_t> layer_pages;
+    std::vector<size_t> layer_offsets;
     std::unordered_map<const void *, uint32_t> layer_by_k;
     std::unordered_map<const void *, uint32_t> layer_by_data;
     std::vector<uint8_t> loaded;
     std::vector<uint8_t> dirty;
     std::vector<uint8_t> precise_dirty_tracking;
+    std::vector<uint32_t> mutable_pages;
+    bool all_pages_mutable = false;
     ggml_cuda_kv_stream_resident_stats stats;
 };
+
+static bool kv_stream_resident_cache_layout(
+        const ggml_cuda_kv_stream_resident_cache * cache,
+        size_t scratch_bytes,
+        uint32_t decode_active_pages,
+        uint32_t & resident_pages_per_layer,
+        std::vector<uint32_t> & layer_pages,
+        std::vector<size_t> & layer_offsets) {
+    if (cache == nullptr || scratch_bytes > cache->pool_bytes ||
+            scratch_bytes%cache->page_bytes != 0) {
+        return false;
+    }
+    const size_t resident_pages_total =
+        (cache->pool_bytes - scratch_bytes)/cache->page_bytes;
+    const size_t pages_per_layer = resident_pages_total/cache->layer_count;
+    if (pages_per_layer > UINT32_MAX ||
+            pages_per_layer > std::numeric_limits<size_t>::max()/cache->layer_count) {
+        return false;
+    }
+
+    resident_pages_per_layer = uint32_t(pages_per_layer);
+    const size_t controlled_resident_pages = pages_per_layer*cache->layer_count;
+    layer_pages.assign(cache->layer_count, resident_pages_per_layer);
+    if (decode_active_pages > resident_pages_per_layer) {
+        const uint64_t total_active_pages =
+            uint64_t(decode_active_pages)*cache->layer_count;
+        GGML_ASSERT(total_active_pages >= controlled_resident_pages);
+        const uint64_t streamed_pages =
+            total_active_pages - controlled_resident_pages;
+        const uint64_t ring_pages = scratch_bytes/cache->page_bytes;
+        GGML_ASSERT(ring_pages > 0 && streamed_pages > 0);
+
+        // Reduce the number of split-attention layers only while each such
+        // layer's streamed working set still fits in the shared ring. Larger
+        // bursts serialize copy and compute. Spread split layers across model
+        // order so fully resident layers provide cross-layer prefetch windows.
+        const uint32_t split_layers = uint32_t(std::min<uint64_t>(
+            cache->layer_count, (streamed_pages + ring_pages - 1)/ring_pages));
+        const uint64_t base_streamed = streamed_pages/split_layers;
+        const uint64_t remainder = streamed_pages%split_layers;
+        layer_pages.assign(cache->layer_count, decode_active_pages);
+        for (uint32_t split = 0; split < split_layers; ++split) {
+            const uint32_t layer = uint32_t(
+                uint64_t(split)*cache->layer_count/split_layers);
+            const uint64_t layer_streamed = base_streamed + (split < remainder ? 1 : 0);
+            GGML_ASSERT(layer_streamed <= decode_active_pages);
+            layer_pages[layer] = decode_active_pages - uint32_t(layer_streamed);
+        }
+    }
+
+    layer_offsets.assign(size_t(cache->layer_count) + 1, 0);
+    for (uint32_t layer = 0; layer < cache->layer_count; ++layer) {
+        layer_offsets[layer + 1] = layer_offsets[layer] + layer_pages[layer];
+    }
+    GGML_ASSERT(layer_offsets.back() == controlled_resident_pages);
+    return true;
+}
+
+static size_t kv_stream_resident_index(
+        const ggml_cuda_kv_stream_resident_cache * cache,
+        uint32_t layer,
+        uint32_t page) {
+    GGML_ASSERT(layer < cache->layer_count && page < cache->layer_pages[layer]);
+    return cache->layer_offsets[layer] + page;
+}
 
 ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
         void * pool_data, size_t pool_bytes, size_t scratch_bytes, size_t page_bytes,
@@ -391,8 +461,13 @@ ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
     cache->layer_count = layer_count;
     cache->page_tokens = page_tokens;
     cache->resident_pages_per_layer = resident_pages;
-    cache->loaded.resize(size_t(layer_count)*resident_pages, 0);
-    cache->dirty.resize(size_t(layer_count)*resident_pages, 0);
+    cache->layer_pages.assign(layer_count, uint32_t(resident_pages));
+    cache->layer_offsets.resize(size_t(layer_count) + 1);
+    for (uint32_t layer = 0; layer <= layer_count; ++layer) {
+        cache->layer_offsets[layer] = size_t(layer)*resident_pages;
+    }
+    cache->loaded.resize(cache->layer_offsets.back(), 0);
+    cache->dirty.resize(cache->layer_offsets.back(), 0);
     cache->precise_dirty_tracking.resize(layer_count, 0);
     return cache;
 }
@@ -408,6 +483,8 @@ void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache
     std::fill(cache->loaded.begin(), cache->loaded.end(), 0);
     std::fill(cache->dirty.begin(), cache->dirty.end(), 0);
     std::fill(cache->precise_dirty_tracking.begin(), cache->precise_dirty_tracking.end(), 0);
+    cache->mutable_pages.clear();
+    cache->all_pages_mutable = false;
     cache->layer_by_k.clear();
     cache->layer_by_data.clear();
     cache->next_layer = 0;
@@ -416,19 +493,57 @@ void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache
 
 bool ggml_cuda_kv_stream_resident_cache_repartition(
         ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes) {
-    if (cache == nullptr || scratch_bytes > cache->pool_bytes ||
-        scratch_bytes%cache->page_bytes != 0) {
+    if (cache == nullptr) {
         return false;
     }
-    const size_t pages = (cache->pool_bytes - scratch_bytes)/
-        (cache->page_bytes*cache->layer_count);
-    if (pages > UINT32_MAX) {
+    uint32_t pages_per_layer = 0;
+    std::vector<uint32_t> layer_pages;
+    std::vector<size_t> layer_offsets;
+    if (!kv_stream_resident_cache_layout(
+            cache, scratch_bytes, cache->decode_active_pages,
+            pages_per_layer, layer_pages, layer_offsets)) {
         return false;
+    }
+    if (cache->scratch_bytes == scratch_bytes && cache->layer_pages == layer_pages) {
+        return true;
     }
     cache->scratch_bytes = scratch_bytes;
-    cache->resident_pages_per_layer = uint32_t(pages);
-    cache->loaded.assign(size_t(cache->layer_count)*pages, 0);
-    cache->dirty.assign(size_t(cache->layer_count)*pages, 0);
+    cache->resident_pages_per_layer = pages_per_layer;
+    cache->layer_pages = std::move(layer_pages);
+    cache->layer_offsets = std::move(layer_offsets);
+    cache->loaded.assign(cache->layer_offsets.back(), 0);
+    cache->dirty.assign(cache->layer_offsets.back(), 0);
+    cache->precise_dirty_tracking.assign(cache->layer_count, 0);
+    cache->layer_by_k.clear();
+    cache->layer_by_data.clear();
+    cache->next_layer = 0;
+    cache->stats = {};
+    return true;
+}
+
+bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
+        ggml_cuda_kv_stream_resident_cache * cache,
+        uint32_t active_pages_per_layer) {
+    if (cache == nullptr) {
+        return false;
+    }
+    uint32_t pages_per_layer = 0;
+    std::vector<uint32_t> layer_pages;
+    std::vector<size_t> layer_offsets;
+    if (!kv_stream_resident_cache_layout(
+            cache, cache->scratch_bytes, active_pages_per_layer,
+            pages_per_layer, layer_pages, layer_offsets)) {
+        return false;
+    }
+    cache->decode_active_pages = active_pages_per_layer;
+    if (cache->layer_pages == layer_pages) {
+        return true;
+    }
+    cache->resident_pages_per_layer = pages_per_layer;
+    cache->layer_pages = std::move(layer_pages);
+    cache->layer_offsets = std::move(layer_offsets);
+    cache->loaded.assign(cache->layer_offsets.back(), 0);
+    cache->dirty.assign(cache->layer_offsets.back(), 0);
     cache->precise_dirty_tracking.assign(cache->layer_count, 0);
     cache->layer_by_k.clear();
     cache->layer_by_data.clear();
@@ -440,6 +555,11 @@ bool ggml_cuda_kv_stream_resident_cache_repartition(
 uint32_t ggml_cuda_kv_stream_resident_cache_pages_per_layer(
         const ggml_cuda_kv_stream_resident_cache * cache) {
     return cache == nullptr ? 0 : cache->resident_pages_per_layer;
+}
+
+uint32_t ggml_cuda_kv_stream_resident_cache_decode_active_pages(
+        const ggml_cuda_kv_stream_resident_cache * cache) {
+    return cache == nullptr ? 0 : cache->decode_active_pages;
 }
 
 ggml_cuda_kv_stream_resident_stats ggml_cuda_kv_stream_resident_cache_get_stats(
@@ -454,20 +574,26 @@ bool ggml_cuda_kv_stream_resident_cache_mark_dirty_rows(
         return false;
     }
 
+    cache->mutable_pages.clear();
+    cache->all_pages_mutable = false;
     for (uint32_t layer = 0; layer < cache->layer_count; ++layer) {
         cache->precise_dirty_tracking[layer] = 1;
     }
     for (size_t i = 0; i < count; ++i) {
         if (rows[i] < 0) {
+            cache->all_pages_mutable = true;
             std::fill(cache->dirty.begin(), cache->dirty.end(), 1);
             return true;
         }
-        const uint64_t page = uint64_t(rows[i])/cache->page_tokens;
-        if (page >= cache->resident_pages_per_layer) {
-            continue;
+        const uint32_t page = uint32_t(uint64_t(rows[i])/cache->page_tokens);
+        if (std::find(cache->mutable_pages.begin(), cache->mutable_pages.end(), page) ==
+                cache->mutable_pages.end()) {
+            cache->mutable_pages.push_back(page);
         }
         for (uint32_t layer = 0; layer < cache->layer_count; ++layer) {
-            cache->dirty[size_t(layer)*cache->resident_pages_per_layer + page] = 1;
+            if (page < cache->layer_pages[layer]) {
+                cache->dirty[kv_stream_resident_index(cache, layer, page)] = 1;
+            }
         }
     }
     return true;
@@ -492,8 +618,8 @@ void ggml_cuda_kv_stream_resident_cache_mark_dirty(
     }
 
     cache->precise_dirty_tracking[layer] = 1;
-    const size_t begin = size_t(layer)*cache->resident_pages_per_layer;
-    const size_t end = begin + cache->resident_pages_per_layer;
+    const size_t begin = cache->layer_offsets[layer];
+    const size_t end = cache->layer_offsets[layer + 1];
     const size_t count = ggml_nelements(indices);
     for (size_t i = 0; i < count; ++i) {
         const int64_t row = indices->type == GGML_TYPE_I32 ?
@@ -504,7 +630,7 @@ void ggml_cuda_kv_stream_resident_cache_mark_dirty(
             return;
         }
         const uint64_t page = uint64_t(row)/cache->page_tokens;
-        if (page < cache->resident_pages_per_layer) {
+        if (page < cache->layer_pages[layer]) {
             cache->dirty[begin + page] = 1;
         }
     }
@@ -519,6 +645,14 @@ static uint32_t kv_stream_resident_layer(
         ++cache->next_layer;
     }
     return it->second;
+}
+
+static bool kv_stream_page_mutable(
+        const ggml_cuda_kv_stream_resident_cache * cache,
+        uint32_t page) {
+    return cache->all_pages_mutable ||
+        std::find(cache->mutable_pages.begin(), cache->mutable_pages.end(), page) !=
+            cache->mutable_pages.end();
 }
 
 namespace {
@@ -945,7 +1079,7 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     bool sampled_first_streamed_page = false;
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         const uint32_t page = uint32_t(chunk);
-        if (page < resident_cache->resident_pages_per_layer) {
+        if (page < resident_cache->layer_pages[resident_layer]) {
             continue;
         }
         const int64_t token_begin = chunk*block_tokens;
@@ -971,7 +1105,8 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         request.v_head_bytes = v_row_bytes*token_count;
         request.v_bytes = request.v_head_bytes*V->ne[2];
         request.layer = layer;
-        request.mutable_tail = chunk == nchunks - 1;
+        request.mutable_tail = chunk == nchunks - 1 ||
+            kv_stream_page_mutable(resident_cache, page);
         request.eligible = !request.mutable_tail;
         request.deadline_sample = !sampled_first_streamed_page || request.mutable_tail;
         sampled_first_streamed_page = true;
@@ -1067,6 +1202,8 @@ void ggml_cuda_flash_attn_ext_streamed(
     if (resident_cache != nullptr) {
         resident_layer = kv_stream_resident_layer(resident_cache, K->data);
     }
+    const uint32_t resident_layer_pages = resident_cache == nullptr ?
+        0 : resident_cache->layer_pages[resident_layer];
     const bool graph_planned = kv_stream_graph_layer_begin(
         transfer_ring, K->data, ctx.stream());
 
@@ -1108,15 +1245,15 @@ void ggml_cuda_flash_attn_ext_streamed(
             GGML_ASSERT(v_offset + v_bytes == resident_cache->page_bytes);
 
             const uint32_t page = token_begin/resident_cache->page_tokens;
-            if (page < resident_cache->resident_pages_per_layer) {
-                const size_t resident_index = size_t(resident_layer)*resident_cache->resident_pages_per_layer + page;
+            if (page < resident_layer_pages) {
+                const size_t resident_index =
+                    kv_stream_resident_index(resident_cache, resident_layer, page);
                 // Keep each layer's resident K and V in separate token-major
                 // planes so resident pages form one directly consumable span.
                 char * layer_base = resident_cache->pool_data + resident_cache->scratch_bytes +
-                    size_t(resident_layer)*resident_cache->resident_pages_per_layer*
-                        resident_cache->page_bytes;
+                    resident_cache->layer_offsets[resident_layer]*resident_cache->page_bytes;
                 const size_t resident_k_plane_bytes =
-                    size_t(resident_cache->resident_pages_per_layer)*k_bytes;
+                    size_t(resident_layer_pages)*k_bytes;
                 desc.k_stage = layer_base + size_t(page)*k_bytes;
                 desc.v_stage = layer_base + resident_k_plane_bytes + size_t(page)*v_bytes;
                 if (resident_cache->loaded[resident_index]) {
@@ -1275,15 +1412,15 @@ void ggml_cuda_flash_attn_ext_streamed(
             if (chunk > 0) {
                 continue;
             }
-            const uint32_t resident_span_pages = std::min<uint32_t>(
-                uint32_t(nchunks), resident_cache->resident_pages_per_layer);
+            const uint32_t resident_span_pages =
+                std::min<uint32_t>(uint32_t(nchunks), resident_layer_pages);
             GGML_ASSERT(resident_span_pages > 0);
             for (uint32_t page = 0; page < resident_span_pages; ++page) {
                 upload(chunks[page], ctx.stream());
                 if (chunks[page].upload &&
                         resident_cache->precise_dirty_tracking[resident_layer]) {
-                    resident_cache->dirty[size_t(resident_layer)*
-                        resident_cache->resident_pages_per_layer + page] = 0;
+                    resident_cache->dirty[
+                        kv_stream_resident_index(resident_cache, resident_layer, page)] = 0;
                 }
             }
             desc.token_count = int64_t(resident_span_pages)*block_tokens;

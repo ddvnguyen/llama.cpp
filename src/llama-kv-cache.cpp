@@ -244,6 +244,7 @@ llama_kv_cache::llama_kv_cache(
                     using buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
                     using feedback_fn_t = kv_stream_runtime_owner::feedback_fn_t;
                     using repartition_fn_t = kv_stream_runtime_owner::repartition_fn_t;
+                    using decode_layout_fn_t = kv_stream_runtime_owner::decode_layout_fn_t;
                     using mark_dirty_rows_fn_t = kv_stream_runtime_owner::mark_dirty_rows_fn_t;
 
                     auto * runtime_new_fn = (runtime_new_fn_t) ggml_backend_reg_get_proc_address(
@@ -256,12 +257,15 @@ llama_kv_cache::llama_kv_cache(
                         reg, "ggml_backend_cuda_kv_stream_feedback");
                     auto * repartition_fn = (repartition_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_repartition");
+                    auto * decode_layout_fn = (decode_layout_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_set_decode_layout");
                     auto * mark_dirty_rows_fn = (mark_dirty_rows_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_mark_dirty_rows");
 
                     if (runtime_new_fn == nullptr || runtime_free_fn == nullptr ||
                             buffer_type_fn == nullptr || feedback_fn == nullptr ||
-                            repartition_fn == nullptr || mark_dirty_rows_fn == nullptr) {
+                            repartition_fn == nullptr || decode_layout_fn == nullptr ||
+                            mark_dirty_rows_fn == nullptr) {
                         throw std::runtime_error("block KV streaming requires the CUDA backend");
                     }
 
@@ -273,6 +277,7 @@ llama_kv_cache::llama_kv_cache(
                     kv_stream_runtime.free_fn = runtime_free_fn;
                     kv_stream_runtime.feedback_fn = feedback_fn;
                     kv_stream_runtime.repartition_fn = repartition_fn;
+                    kv_stream_runtime.decode_layout_fn = decode_layout_fn;
                     kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
                     kv_stream_runtime.layer_count = kv_stream_layer_count;
                     if (kv_stream_runtime.runtime == nullptr) {
@@ -1290,10 +1295,11 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
-bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens) {
+bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens) {
     auto & owner = kv_stream_runtime;
     if (owner.runtime == nullptr || owner.feedback_fn == nullptr ||
-            owner.repartition_fn == nullptr || owner.layer_count == 0) {
+            owner.repartition_fn == nullptr || owner.decode_layout_fn == nullptr ||
+            owner.layer_count == 0) {
         return false;
     }
 
@@ -1322,6 +1328,23 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens) {
             (unsigned long long) delta.deadline_misses,
             100.0*copy_busy_ratio, peak_occupancy);
     }
+    const uint32_t active_pages = (active_tokens + 255)/256;
+    // Prompt chunks use the uniform layout because it grows without
+    // repartitioning. Decode-like microbatches concentrate the same page
+    // budget into fewer split layers, bounded by the ring working set so copy
+    // and compute can still overlap. A zero target restores prefill.
+    constexpr uint32_t MAX_DECODE_QUERY_TOKENS = 32;
+    const uint32_t decode_layout_pages =
+        query_tokens <= MAX_DECODE_QUERY_TOKENS && active_pages > resident_pages ?
+            active_pages : 0;
+    if (decode_layout_pages != owner.decode_layout_pages) {
+        if (!owner.decode_layout_fn(owner.runtime, decode_layout_pages)) {
+            LLAMA_LOG_WARN("%s: failed to select CUDA KV decode layout for %u active pages\n",
+                __func__, decode_layout_pages);
+            return false;
+        }
+        owner.decode_layout_pages = decode_layout_pages;
+    }
     if (!delta.valid) {
         owner.starved_evaluations = 0;
         owner.overprovisioned_evaluations = 0;
@@ -1339,7 +1362,6 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens) {
         owner.minimum_ring_slots = ring_slots;
     }
 
-    const uint32_t active_pages = (active_tokens + 255)/256;
     // No streaming pressure exists while every active page fits in the
     // resident partition; preserve the current boundary without churn.
     if (active_pages <= resident_pages) {

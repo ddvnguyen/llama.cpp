@@ -159,7 +159,7 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
-    bool kv_stream_adapt(uint32_t active_tokens);
+    bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
 
     bool get_has_shift() const;
 
@@ -297,15 +297,18 @@ private:
             void *, uint64_t *, uint64_t *, double *, uint32_t *,
             uint32_t *, uint32_t *, uint32_t *);
         using repartition_fn_t = bool (*)(void *, uint32_t);
+        using decode_layout_fn_t = bool (*)(void *, uint32_t);
         using mark_dirty_rows_fn_t = bool (*)(void *, const int64_t *, size_t);
 
         void * runtime = nullptr;
         void (*free_fn)(void *) = nullptr;
         feedback_fn_t feedback_fn = nullptr;
         repartition_fn_t repartition_fn = nullptr;
+        decode_layout_fn_t decode_layout_fn = nullptr;
         mark_dirty_rows_fn_t mark_dirty_rows_fn = nullptr;
         uint32_t layer_count = 0;
         uint32_t minimum_ring_slots = 0;
+        uint32_t decode_layout_pages = 0;
         uint32_t starved_evaluations = 0;
         uint32_t overprovisioned_evaluations = 0;
         uint32_t evaluations_since_repartition = UINT32_MAX;

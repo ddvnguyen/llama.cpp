@@ -713,6 +713,77 @@ int main() {
         t.assert_true("multi-layer streamed logits remain equivalent", max_abs <= 3e-4f);
     });
 
+    t.test("decode layout bounds layer concentration by the transfer ring", [](testing & t) {
+        constexpr int64_t n_kv = 768;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        std::vector<attention_inputs> inputs{
+            make_inputs(n_kv, n_batch, n_kv - 1),
+            make_inputs(n_kv, n_batch, n_kv - 1),
+            make_inputs(n_kv, n_batch, n_kv - 1),
+        };
+        const std::vector<float> expected = run_attention_layers(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 3;
+        params.pool_bytes           = 6*page_bytes;
+        params.resident_layer_count = 3;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("shared runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        const std::vector<float> uniform = run_attention_layers(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 1, 1, GGML_TYPE_I32, runtime);
+        float uniform_max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            uniform_max_abs =
+                std::max(uniform_max_abs, std::abs(expected[i] - uniform[i]));
+        }
+        std::fprintf(stderr, "uniform decode max_abs=%g\n", uniform_max_abs);
+        t.assert_true("uniform decode control remains equivalent", uniform_max_abs <= 3e-4f);
+        if (!t.assert_true("decode residency becomes ring-bounded",
+                ggml_backend_cuda_kv_stream_set_decode_layout(runtime, 3))) {
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+            return;
+        }
+
+        const std::vector<float> actual = run_attention_layers(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 1, 1, GGML_TYPE_I32, runtime);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(6), stats.streamed_pages);
+        t.assert_equal(uint64_t(1), stats.resident_attention_spans);
+        t.assert_equal(uint64_t(3), stats.resident_pages_attended);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        float max_abs = 0.0f;
+        std::vector<float> layer_max_abs(inputs.size(), 0.0f);
+        const size_t layer_elements = expected.size()/inputs.size();
+        for (size_t i = 0; i < expected.size(); ++i) {
+            const float error = std::abs(expected[i] - actual[i]);
+            max_abs = std::max(max_abs, error);
+            layer_max_abs[i/layer_elements] = std::max(layer_max_abs[i/layer_elements], error);
+        }
+        std::fprintf(stderr, "ring-bounded decode max_abs=%g layers=%g,%g,%g\n",
+            max_abs, layer_max_abs[0], layer_max_abs[1], layer_max_abs[2]);
+        t.assert_true("ring-bounded decode remains equivalent", max_abs <= 3e-4f);
+    });
+
     ggml_quantize_free();
     return t.summary();
 }
