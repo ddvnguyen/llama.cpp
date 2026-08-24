@@ -358,6 +358,45 @@ int main() {
         t.assert_equal(uint32_t(0), partition.starved_evaluations);
     });
 
+    t.test("feedback cannot demote beyond one epoch past the overlap target", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 7010;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 716;
+        params.minimum_ring_slots                = 18;
+        params.previous_resident_pages_per_layer = 416;
+        params.previous_ring_slots               = 354;
+        params.deadline_miss_ratio                = 0.10;
+        params.copy_engine_busy_ratio             = 0.80;
+        params.starved_evaluations                = 2;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("partition remains stable", !partition.changed);
+        t.assert_equal(uint32_t(416), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(354), partition.ring_slots);
+    });
+
+    t.test("runaway feedback partition heals to the bounded floor", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 7010;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 716;
+        params.minimum_ring_slots                = 18;
+        params.previous_resident_pages_per_layer = 368;
+        params.previous_ring_slots               = 1122;
+        params.deadline_miss_ratio                = 0.10;
+        params.copy_engine_busy_ratio             = 0.80;
+        params.starved_evaluations                = 2;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("partition repairs the resident boundary", partition.changed);
+        t.assert_equal(uint32_t(416), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(354), partition.ring_slots);
+        t.assert_equal(uint32_t(0), partition.starved_evaluations);
+    });
+
     t.test("PCIe saturation does not sacrifice more resident pages", [](testing & t) {
         llama_kv_stream_partition_params params;
         params.total_pool_pages                  = 160;

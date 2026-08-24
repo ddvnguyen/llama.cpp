@@ -6,6 +6,7 @@
 #include "fattn.cuh"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -139,6 +140,7 @@ namespace {
 
 constexpr size_t KV_STREAM_NO_REQUEST = std::numeric_limits<size_t>::max();
 constexpr uint32_t KV_STREAM_NO_LAYER = std::numeric_limits<uint32_t>::max();
+constexpr uint32_t KV_STREAM_COPY_BATCH_PAGES = 32;
 
 struct kv_stream_graph_request {
     const char * k_data = nullptr;
@@ -159,6 +161,7 @@ struct kv_stream_graph_request {
     size_t v_bytes = 0;
     uint32_t layer = 0;
     uint32_t slot = 0;
+    uint32_t ready_slot = 0;
     bool mutable_tail = false;
     bool eligible = false;
     bool scheduled = false;
@@ -208,6 +211,7 @@ struct ggml_cuda_kv_stream_transfer_ring {
     uint32_t last_ring_peak_occupancy = 0;
     uint64_t current_epoch_uploads = 0;
     double last_copy_engine_busy_ratio = 0.0;
+    uint32_t copy_sample_uploads = 0;
     bool timing_pending = false;
     bool timing_current = false;
     bool copy_sample_recorded = false;
@@ -748,7 +752,16 @@ static bool kv_stream_page_mutable(
 namespace {
 
 constexpr int KV_STREAM_HEAD_DIM = 256;
-constexpr int KV_STREAM_PARTS_PER_CHUNK = 2;
+constexpr int KV_STREAM_MAX_PARTS_PER_CHUNK = 16;
+
+static int kv_stream_parts_per_chunk() {
+    static const int parts = []() {
+        const char * value = getenv("GGML_CUDA_KV_STREAM_PARTS");
+        const int parsed = value == nullptr ? 16 : atoi(value);
+        return parsed == 2 || parsed == 4 || parsed == 8 || parsed == 16 ? parsed : 16;
+    }();
+    return parts;
+}
 
 static int64_t kv_stream_block_tokens(const ggml_tensor * dst, size_t stage_bytes) {
     const ggml_tensor * K = dst->src[1];
@@ -845,7 +858,8 @@ static void kv_stream_launch_q8_q4_partial(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
         float * parts,
-        float2 * meta) {
+        float2 * meta,
+        int nparts) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -873,7 +887,7 @@ static void kv_stream_launch_q8_q4_partial(
     const float m1 = powf(2.0f, -(max_bias/2.0f)/n_head_log2);
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
-    const dim3 blocks(Q->ne[1], KV_STREAM_PARTS_PER_CHUNK, Q->ne[2]*Q->ne[3]);
+    const dim3 blocks(Q->ne[1], nparts, Q->ne[2]*Q->ne[3]);
     const dim3 threads(WARP_SIZE, nwarps, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
     ggml_cuda_kernel_launch(kernel, launch_params,
@@ -954,8 +968,9 @@ static bool kv_stream_collect_timing(ggml_cuda_kv_stream_transfer_ring * ring) {
         float copy_ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(
             &copy_ms, ring->copy_sample_start, ring->copy_sample_end));
-        busy_ratio = std::min(1.0,
-            double(copy_ms)*double(ring->current_epoch_uploads)/double(eval_ms));
+        GGML_ASSERT(ring->copy_sample_uploads > 0);
+        busy_ratio = std::min(1.0, double(copy_ms)*double(ring->current_epoch_uploads)/
+            (double(ring->copy_sample_uploads)*double(eval_ms)));
     }
     ring->last_copy_engine_busy_ratio = busy_ratio;
     ring->last_ring_peak_occupancy = ring->current_ring_peak_occupancy;
@@ -1001,11 +1016,13 @@ static void kv_stream_graph_upload(
     if (ring->timing_current && !ring->copy_sample_recorded) {
         CUDA_CHECK(cudaEventRecord(ring->copy_sample_end, ring->copy_stream));
         ring->copy_sample_recorded = true;
+        ring->copy_sample_uploads = 1;
     }
     CUDA_CHECK(cudaEventRecord(ring->ready[slot], ring->copy_stream));
     request.slot = slot;
     request.scheduled = true;
     ring->slot_used[slot] = 1;
+    request.ready_slot = slot;
     ring->slot_request[slot] = size_t(&request - ring->graph_requests.data());
     ++ring->current_occupancy;
     ring->ring_peak_occupancy = std::max(
@@ -1023,28 +1040,162 @@ static void kv_stream_graph_upload(
     }
 }
 
-static bool kv_stream_graph_schedule_slot(
-        ggml_cuda_kv_stream_transfer_ring * ring, uint32_t slot) {
-    if (!ring->graph_active || slot >= ring->active_slots ||
-            ring->next_request >= ring->graph_requests.size()) {
-        return false;
+static bool kv_stream_graph_request_follows(
+        const kv_stream_graph_request & previous,
+        const kv_stream_graph_request & request) {
+    return request.eligible && !request.scheduled && !request.consumed &&
+        request.layer == previous.layer &&
+        request.k_data == previous.k_data && request.v_data == previous.v_data &&
+        request.k_nb1 == previous.k_nb1 && request.v_nb1 == previous.v_nb1 &&
+        request.k_bytes == previous.k_bytes && request.v_bytes == previous.v_bytes &&
+        request.token_count == previous.token_count &&
+        request.token_begin == previous.token_begin + previous.token_count;
+}
+
+static void kv_stream_graph_upload_batch(
+        ggml_cuda_kv_stream_transfer_ring * ring,
+        size_t first_request,
+        uint32_t first_slot,
+        uint32_t batch_pages) {
+    GGML_ASSERT(batch_pages > 1);
+    GGML_ASSERT(first_request + batch_pages <= ring->graph_requests.size());
+    GGML_ASSERT(first_slot + batch_pages <= ring->active_slots);
+    auto & first = ring->graph_requests[first_request];
+
+    for (uint32_t page = 0; page < batch_pages; ++page) {
+        auto & request = ring->graph_requests[first_request + page];
+        const uint32_t slot = first_slot + page;
+        GGML_ASSERT(request.eligible && !request.scheduled && !request.consumed);
+        GGML_ASSERT(ring->slot_request[slot] == KV_STREAM_NO_REQUEST);
+        if (ring->slot_used[slot]) {
+            CUDA_CHECK(cudaStreamWaitEvent(ring->copy_stream, ring->consumed[slot], 0));
+            ++ring->stage_slot_reuses;
+        }
+        if (request.deadline_sample) {
+            CUDA_CHECK(cudaMemsetAsync(
+                ring->ready_flags_device + slot, 0, sizeof(uint32_t), ring->copy_stream));
+        }
     }
-    auto & request = ring->graph_requests[ring->next_request];
-    if (!request.eligible) {
-        return false;
+
+    if (ring->timing_current && !ring->copy_sample_recorded) {
+        CUDA_CHECK(cudaEventRecord(ring->copy_sample_start, ring->copy_stream));
     }
-    GGML_ASSERT(!request.scheduled && !request.consumed);
-    ++ring->next_request;
-    kv_stream_graph_upload(ring, request, slot);
-    return true;
+    GGML_ASSERT(first.k_nb1 == first.k_row_bytes*first.n_head_kv);
+    GGML_ASSERT(first.k_nb2 == first.k_row_bytes);
+    GGML_ASSERT(first.v_nb1 == first.v_row_bytes*first.n_head_kv);
+    GGML_ASSERT(first.v_nb2 == first.v_row_bytes);
+    char * k_stage = ring->pool_data + size_t(first_slot)*first.k_bytes;
+    char * v_stage = ring->pool_data +
+        size_t(ring->active_slots)*first.k_bytes + size_t(first_slot)*first.v_bytes;
+    CUDA_CHECK(cudaMemcpyAsync(
+        k_stage, first.k_data + first.token_begin*first.k_nb1,
+        size_t(batch_pages)*first.k_bytes, cudaMemcpyHostToDevice, ring->copy_stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        v_stage, first.v_data + first.token_begin*first.v_nb1,
+        size_t(batch_pages)*first.v_bytes, cudaMemcpyHostToDevice, ring->copy_stream));
+    ring->host_to_device_copy_commands += 2;
+
+    for (uint32_t page = 0; page < batch_pages; ++page) {
+        auto & request = ring->graph_requests[first_request + page];
+        if (request.deadline_sample) {
+            CUDA_CHECK(cudaMemsetAsync(
+                ring->ready_flags_device + first_slot + page, 1,
+                sizeof(uint32_t), ring->copy_stream));
+        }
+    }
+    if (ring->timing_current && !ring->copy_sample_recorded) {
+        CUDA_CHECK(cudaEventRecord(ring->copy_sample_end, ring->copy_stream));
+        ring->copy_sample_recorded = true;
+        ring->copy_sample_uploads = batch_pages;
+    }
+    CUDA_CHECK(cudaEventRecord(ring->ready[first_slot], ring->copy_stream));
+
+    for (uint32_t page = 0; page < batch_pages; ++page) {
+        auto & request = ring->graph_requests[first_request + page];
+        const uint32_t slot = first_slot + page;
+        request.slot = slot;
+        request.ready_slot = first_slot;
+        request.scheduled = true;
+        ring->slot_used[slot] = 1;
+        ring->slot_request[slot] = first_request + page;
+        ++ring->current_occupancy;
+        ++ring->asynchronous_page_uploads;
+        ++ring->current_epoch_uploads;
+        if (ring->graph_resident_cache != nullptr) {
+            ring->graph_resident_cache->stats.host_to_device_bytes +=
+                request.k_bytes + request.v_bytes;
+        }
+        if (ring->current_layer != KV_STREAM_NO_LAYER && request.layer > ring->current_layer) {
+            ++ring->cross_layer_prefetches;
+        }
+    }
+    ring->ring_peak_occupancy = std::max(
+        ring->ring_peak_occupancy, ring->current_occupancy);
+    ring->current_ring_peak_occupancy = std::max(
+        ring->current_ring_peak_occupancy, ring->current_occupancy);
+}
+
+static uint32_t kv_stream_graph_batch_pages(
+        const ggml_cuda_kv_stream_transfer_ring * ring,
+        uint32_t first_slot) {
+    if (!ring->graph_active || first_slot >= ring->active_slots ||
+            ring->next_request >= ring->graph_requests.size() ||
+            ring->slot_request[first_slot] != KV_STREAM_NO_REQUEST) {
+        return 0;
+    }
+    const auto & first = ring->graph_requests[ring->next_request];
+    if (!first.eligible) {
+        return 0;
+    }
+    GGML_ASSERT(!first.scheduled && !first.consumed);
+
+    const uint32_t maximum = std::min<uint32_t>({
+        KV_STREAM_COPY_BATCH_PAGES,
+        ring->active_slots - first_slot,
+        uint32_t(ring->graph_requests.size() - ring->next_request),
+    });
+    uint32_t pages = 1;
+    while (pages < maximum) {
+        if (ring->slot_request[first_slot + pages] != KV_STREAM_NO_REQUEST ||
+                !kv_stream_graph_request_follows(
+                    ring->graph_requests[ring->next_request + pages - 1],
+                    ring->graph_requests[ring->next_request + pages])) {
+            break;
+        }
+        ++pages;
+    }
+    return pages;
+}
+
+static uint32_t kv_stream_graph_schedule_batch(
+        ggml_cuda_kv_stream_transfer_ring * ring,
+        uint32_t first_slot) {
+    const uint32_t batch_pages = kv_stream_graph_batch_pages(ring, first_slot);
+    if (batch_pages == 0) {
+        return 0;
+    }
+    const size_t first_request = ring->next_request;
+    ring->next_request += batch_pages;
+    if (batch_pages == 1) {
+        kv_stream_graph_upload(
+            ring, ring->graph_requests[first_request], first_slot);
+    } else {
+        kv_stream_graph_upload_batch(
+            ring, first_request, first_slot, batch_pages);
+    }
+    return batch_pages;
 }
 
 static void kv_stream_graph_fill_free_slots(ggml_cuda_kv_stream_transfer_ring * ring) {
     for (uint32_t slot = 0; slot < ring->active_slots; ++slot) {
-        if (ring->slot_request[slot] == KV_STREAM_NO_REQUEST &&
-                !kv_stream_graph_schedule_slot(ring, slot)) {
+        if (ring->slot_request[slot] != KV_STREAM_NO_REQUEST) {
+            continue;
+        }
+        const uint32_t scheduled = kv_stream_graph_schedule_batch(ring, slot);
+        if (scheduled == 0) {
             break;
         }
+        slot += scheduled - 1;
     }
 }
 
@@ -1097,7 +1248,6 @@ static void kv_stream_graph_release(
     ring->slot_request[slot] = KV_STREAM_NO_REQUEST;
     GGML_ASSERT(ring->current_occupancy > 0);
     --ring->current_occupancy;
-    (void) kv_stream_graph_schedule_slot(ring, slot);
 }
 
 } // namespace
@@ -1118,6 +1268,7 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
         ring->current_ring_peak_occupancy = 0;
         ring->current_epoch_uploads = 0;
         ring->copy_sample_recorded = false;
+        ring->copy_sample_uploads = 0;
     }
     ring->timing_current = timing_available;
     std::fill(ring->slot_request.begin(), ring->slot_request.end(), KV_STREAM_NO_REQUEST);
@@ -1179,7 +1330,7 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     auto & page_requests = ring->graph_request_by_k_page[K->data];
     page_requests.assign(nchunks, KV_STREAM_NO_REQUEST);
 
-    bool sampled_first_streamed_page = false;
+    bool sampled_prefetch_deadline = false;
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         const uint32_t page = uint32_t(chunk);
         if (page < resident_cache->layer_pages[resident_layer]) {
@@ -1211,8 +1362,8 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         request.mutable_tail = chunk == nchunks - 1 ||
             kv_stream_page_mutable(resident_cache, page);
         request.eligible = !request.mutable_tail;
-        request.deadline_sample = !sampled_first_streamed_page || request.mutable_tail;
-        sampled_first_streamed_page = true;
+        request.deadline_sample = request.eligible && !sampled_prefetch_deadline;
+        sampled_prefetch_deadline |= request.deadline_sample;
         GGML_ASSERT(request.v_offset + request.v_bytes == ring->page_bytes);
 
         page_requests[page] = ring->graph_requests.size();
@@ -1278,8 +1429,8 @@ void ggml_cuda_flash_attn_ext_streamed(
     const int nrows = ggml_nrows(dst);
 
     ggml_cuda_pool & pool = ctx.pool();
-    ggml_cuda_pool_alloc<float> parts(pool, KV_STREAM_PARTS_PER_CHUNK*ggml_nelements(dst));
-    ggml_cuda_pool_alloc<float2> meta(pool, KV_STREAM_PARTS_PER_CHUNK*nrows);
+    ggml_cuda_pool_alloc<float> parts(pool, KV_STREAM_MAX_PARTS_PER_CHUNK*ggml_nelements(dst));
+    ggml_cuda_pool_alloc<float2> meta(pool, KV_STREAM_MAX_PARTS_PER_CHUNK*nrows);
     ggml_cuda_pool_alloc<float> accumulator(pool, ggml_nelements(dst));
     ggml_cuda_pool_alloc<float2> accumulator_meta(pool, nrows);
 
@@ -1480,10 +1631,12 @@ void ggml_cuda_flash_attn_ext_streamed(
         uint32_t streamed_span_pages = 0;
         if (desc.streamed) {
             streamed_span_pages = 1;
+            uint32_t ready_slot = desc.slot;
             if (graph_planned) {
                 auto & request = transfer_ring->graph_requests[desc.request_index];
                 GGML_ASSERT(request.scheduled && !request.consumed);
                 desc.slot = request.slot;
+                ready_slot = request.ready_slot;
                 desc.k_stage = transfer_ring->pool_data + size_t(desc.slot)*desc.k_bytes;
                 desc.v_stage = transfer_ring->pool_data +
                     size_t(transfer_ring->active_slots)*desc.k_bytes +
@@ -1496,7 +1649,7 @@ void ggml_cuda_flash_attn_ext_streamed(
                     CUDA_CHECK(cudaGetLastError());
                 }
             }
-            CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), transfer_ring->ready[desc.slot], 0));
+            CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), transfer_ring->ready[ready_slot], 0));
             ++transfer_ring->compute_stream_waits;
 
             // Coalesce ready pages that occupy consecutive plane slots. The
@@ -1504,6 +1657,7 @@ void ggml_cuda_flash_attn_ext_streamed(
             // tensor's token extent grows across adjacent slots.
             while (chunk + int(streamed_span_pages) < nchunks) {
                 auto & candidate = chunks[chunk + streamed_span_pages];
+                uint32_t candidate_ready_slot = candidate.slot;
                 if (!candidate.streamed) {
                     break;
                 }
@@ -1513,6 +1667,7 @@ void ggml_cuda_flash_attn_ext_streamed(
                         break;
                     }
                     candidate.slot = request.slot;
+                    candidate_ready_slot = request.ready_slot;
                     candidate.k_stage = transfer_ring->pool_data +
                         size_t(candidate.slot)*candidate.k_bytes;
                     candidate.v_stage = transfer_ring->pool_data +
@@ -1534,9 +1689,12 @@ void ggml_cuda_flash_attn_ext_streamed(
                         CUDA_CHECK(cudaGetLastError());
                     }
                 }
-                CUDA_CHECK(cudaStreamWaitEvent(
-                    ctx.stream(), transfer_ring->ready[candidate.slot], 0));
-                ++transfer_ring->compute_stream_waits;
+                if (candidate_ready_slot != ready_slot) {
+                    CUDA_CHECK(cudaStreamWaitEvent(
+                        ctx.stream(), transfer_ring->ready[candidate_ready_slot], 0));
+                    ++transfer_ring->compute_stream_waits;
+                    ready_slot = candidate_ready_slot;
+                }
                 ++streamed_span_pages;
             }
             desc.token_count = int64_t(streamed_span_pages)*block_tokens;
@@ -1604,6 +1762,7 @@ void ggml_cuda_flash_attn_ext_streamed(
             if (desc.streamed) {
                 if (graph_planned) {
                     kv_stream_graph_release(transfer_ring, desc.request_index, ctx.stream());
+                    kv_stream_graph_fill_free_slots(transfer_ring);
                 } else {
                     CUDA_CHECK(cudaEventRecord(transfer_ring->consumed[desc.slot], ctx.stream()));
                 }
@@ -1613,7 +1772,7 @@ void ggml_cuda_flash_attn_ext_streamed(
 
         const bool use_mma_prefill = Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
             mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
-        int partial_count = KV_STREAM_PARTS_PER_CHUNK;
+        int partial_count = kv_stream_parts_per_chunk();
         if (use_mma_prefill) {
             ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(
                 ctx, &staged_dst, parts.ptr, meta.ptr);
@@ -1625,9 +1784,11 @@ void ggml_cuda_flash_attn_ext_streamed(
             float logit_softcap = 0.0f;
             memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
             if (logit_softcap == 0.0f) {
-                kv_stream_launch_q8_q4_partial<false>(ctx, &staged_dst, parts.ptr, meta.ptr);
+                kv_stream_launch_q8_q4_partial<false>(
+                    ctx, &staged_dst, parts.ptr, meta.ptr, partial_count);
             } else {
-                kv_stream_launch_q8_q4_partial<true>(ctx, &staged_dst, parts.ptr, meta.ptr);
+                kv_stream_launch_q8_q4_partial<true>(
+                    ctx, &staged_dst, parts.ptr, meta.ptr, partial_count);
             }
         }
 
@@ -1654,6 +1815,9 @@ void ggml_cuda_flash_attn_ext_streamed(
                 }
             }
             stream_index += streamed_span_pages;
+            if (graph_planned) {
+                kv_stream_graph_fill_free_slots(transfer_ring);
+            }
             chunk += int(streamed_span_pages) - 1;
         }
     }

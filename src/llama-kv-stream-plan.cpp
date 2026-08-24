@@ -401,6 +401,7 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
     constexpr double COPY_SATURATED  = 0.85;
     constexpr double COPY_LIGHT      = 0.50;
     constexpr double RING_LIGHT      = 0.50;
+    constexpr uint32_t FEEDBACK_GROWTH_EPOCHS = 1;
 
     uint32_t target_resident_pages = 0;
     const uint32_t maximum_resident_pages = std::min(
@@ -418,10 +419,16 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
             break;
         }
     }
+    const uint32_t feedback_resident_floor = target_resident_pages >
+        FEEDBACK_GROWTH_EPOCHS ? target_resident_pages - FEEDBACK_GROWTH_EPOCHS : 0;
+    const bool overgrown_ring =
+        params.previous_resident_pages_per_layer < feedback_resident_floor;
 
     const bool below_overlap_target =
         params.previous_resident_pages_per_layer > target_resident_pages;
-    const bool feedback_starved = params.deadline_miss_ratio > MISS_THRESHOLD &&
+    const bool feedback_starved =
+        params.previous_resident_pages_per_layer > feedback_resident_floor &&
+        params.deadline_miss_ratio > MISS_THRESHOLD &&
         params.copy_engine_busy_ratio < COPY_SATURATED;
     const bool starved = below_overlap_target || feedback_starved;
     const bool overprovisioned = params.deadline_miss_ratio <= MISS_THRESHOLD &&
@@ -434,8 +441,16 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
 
     const bool cooldown_complete = params.evaluations_since_repartition >=
         params.repartition_cooldown_evaluations;
-    if (cooldown_complete && starved && result.starved_evaluations >= params.grow_hysteresis_evaluations &&
-        result.resident_pages_per_layer > 0) {
+    if (cooldown_complete && overgrown_ring) {
+        result.resident_pages_per_layer = feedback_resident_floor;
+        result.ring_slots = params.total_pool_pages -
+            result.resident_pages_per_layer*params.layer_count;
+        result.starved_evaluations = 0;
+        result.overprovisioned_evaluations = 0;
+        result.changed = true;
+    } else if (cooldown_complete && starved &&
+            result.starved_evaluations >= params.grow_hysteresis_evaluations &&
+            result.resident_pages_per_layer > 0) {
         result.resident_pages_per_layer = below_overlap_target ?
             target_resident_pages : result.resident_pages_per_layer - 1;
         result.ring_slots = params.total_pool_pages -

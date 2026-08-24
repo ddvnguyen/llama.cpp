@@ -731,6 +731,52 @@ int main() {
         t.assert_true("reloaded resident output is bit-identical", expected == actual);
     });
 
+    t.test("decode batches contiguous streamed pages without changing logits", [](testing & t) {
+        constexpr int64_t n_kv = 1536;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs = make_inputs(n_kv, n_batch);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 2);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 4;
+        params.pool_bytes           = 5*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("batched runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 2);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(10), stats.asynchronous_page_uploads);
+        t.assert_equal(uint64_t(12), stats.host_to_device_copy_commands);
+        t.assert_equal(uint64_t(4), stats.compute_stream_waits);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        t.assert_true("batched streamed logits remain equivalent", max_abs <= 3e-4f);
+    });
     t.test("sixteen attention layers share one resident/ring pool during causal prefill", [](testing & t) {
         constexpr int64_t n_kv = 1024;
         constexpr int64_t n_batch = 83;
@@ -830,7 +876,7 @@ int main() {
         t.assert_equal(uint64_t(12), stats.asynchronous_page_uploads);
         t.assert_equal(uint64_t(12), stats.compute_stream_waits);
         t.assert_equal(uint64_t(4), stats.cross_layer_prefetches);
-        t.assert_equal(uint64_t(12), stats.deadline_samples);
+        t.assert_equal(uint64_t(6), stats.deadline_samples);
         t.assert_true("deadline misses cannot exceed samples",
             stats.deadline_misses <= stats.deadline_samples);
         t.assert_equal(uint32_t(2), stats.ring_peak_occupancy);
@@ -859,7 +905,7 @@ int main() {
         t.assert_true("dynamic feedback is readable", feedback_fn(
             runtime, &deadline_samples, &deadline_misses, &copy_busy_ratio,
             &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages));
-        t.assert_equal(uint64_t(12), deadline_samples);
+        t.assert_equal(uint64_t(6), deadline_samples);
         t.assert_true("copy busy ratio is normalized",
             copy_busy_ratio >= 0.0 && copy_busy_ratio <= 1.0);
         t.assert_equal(uint32_t(2), peak_occupancy);
