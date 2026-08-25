@@ -1507,7 +1507,8 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
     runtime->resident_layer_count = params.resident_layer_count;
 
     const size_t total_stage_bytes = runtime->pool_bytes;
-    const cudaError_t error = ggml_cuda_device_malloc(&runtime->stage_data, total_stage_bytes, params.device);
+    ggml_cuda_set_device(params.device);
+    const cudaError_t error = cudaMalloc(&runtime->stage_data, total_stage_bytes);
     if (error != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_ERROR("%s: allocating %.2f MiB KV staging on device %d failed: %s\n",
