@@ -10,10 +10,18 @@ import urllib.request
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--url", default="http://127.0.0.1:12355")
     parser.add_argument("--prompt-tokens", type=int, required=True)
     parser.add_argument("--decode-tokens", type=int, default=4096)
+    parser.add_argument("--prompt-suffix", default="The capital of France is")
+    parser.add_argument(
+        "--fill-token-id", type=int,
+        help="repeated prefix token; defaults to the first token in --prompt-suffix",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--timeout", type=int, default=1800)
     return parser.parse_args()
@@ -31,16 +39,24 @@ def post_json(url: str, payload: dict, timeout: int) -> dict:
 
 def main() -> int:
     args = parse_args()
+    if args.prompt_tokens <= 0 or args.decode_tokens <= 0 or args.timeout <= 0:
+        raise SystemExit("prompt, decode, and timeout values must be positive")
+    if not args.prompt_suffix or (args.fill_token_id is not None and args.fill_token_id < 0):
+        raise SystemExit("prompt suffix and fill token settings are invalid")
+    base_url = args.url.rstrip("/")
     suffix = post_json(
-        f"{args.url}/tokenize",
-        {"content": "The capital of France is", "add_special": False},
+        f"{base_url}/tokenize",
+        {"content": args.prompt_suffix, "add_special": False},
         30,
     )["tokens"]
+    if not suffix or not all(isinstance(token, int) for token in suffix):
+        raise SystemExit("the server returned an invalid tokenized suffix")
     if args.prompt_tokens < len(suffix):
         raise SystemExit("prompt is shorter than the fixed suffix")
+    fill_token_id = args.fill_token_id if args.fill_token_id is not None else suffix[0]
 
     payload = {
-        "prompt": [23066] * (args.prompt_tokens - len(suffix)) + suffix,
+        "prompt": [fill_token_id] * (args.prompt_tokens - len(suffix)) + suffix,
         "n_predict": args.decode_tokens,
         "ignore_eos": True,
         "cache_prompt": False,
@@ -50,7 +66,7 @@ def main() -> int:
         "stream": True,
     }
     request = urllib.request.Request(
-        f"{args.url}/completion",
+        f"{base_url}/completion",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )

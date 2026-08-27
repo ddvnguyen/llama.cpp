@@ -1,3 +1,59 @@
+# Adaptive KV Streaming for llama.cpp
+
+This branch adds an experimental, block-granular KV cache streaming path to the CUDA `llama-server`. It is intended for running long contexts when model weights leave too little VRAM for the complete KV cache.
+
+With `--kv-stream-stage-mib N`, the authoritative KV tensors are stored in pinned host memory while a bounded CUDA pool is shared by resident KV pages and a transfer ring. The runtime adapts that split as the context grows: it keeps as many pages resident as the budget allows, reclaims resident space for staging when more streaming is required, and prefetches later layers while the current layer computes. This avoids relying on uncontrolled Unified Memory page thrashing and preserves exact attention over the full context.
+
+> [!WARNING]
+> This is research code tailored to our current NVIDIA CUDA configuration: an RTX 5070 Ti with 16 GB VRAM, `unsloth/Qwen3.8-27B-GGUF` `UD-Q3_K_XL`, a 262144-token context, Flash Attention, a Q8_0 K cache, a Q4_0 V cache, and one server slot. Other models, KV cache quantization combinations, parallel slots, and non-CUDA backends are not yet supported or validated. Expanding model and KV quantization support is follow-up work.
+
+## Build the modified server
+
+Install a C++ compiler, CMake, and the CUDA toolkit, then run this command from the repository root:
+
+```bash
+cmake -S . -B build -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release --target llama-server -j
+```
+
+The executable is created at `build/bin/llama-server`.
+
+Example using the tested cache configuration:
+
+```bash
+./build/bin/llama-server \
+  --model /path/to/model.gguf \
+  --ctx-size 262144 \
+  -fa on \
+  -ctk q8_0 \
+  -ctv q4_0 \
+  -ngl all \
+  -np 1 \
+  --kv-stream-stage-mib 2304
+```
+
+The best value for `--kv-stream-stage-mib` depends on the model, context capacity, GPU, and other VRAM consumers. Start conservatively and increase it while checking startup and peak VRAM use.
+
+## Recreate the benchmark comparison graphs
+
+First collect one successful 256-token measurement per 8K context point into the four result directories. See [benchmarks/README.md](benchmarks/README.md) for the portable benchmark driver and the difference between context-matched and fixed-capacity runs. Then install Matplotlib and render the PNG, SVG, and CSV outputs:
+
+```bash
+python3 -m pip install matplotlib
+
+python3 benchmarks/plot_kv_stream_context_comparison.py \
+  --matched-stock benchmarks/results/context-matched-stock \
+  --matched-adaptive benchmarks/results/context-matched-adaptive \
+  --fixed-stock benchmarks/results/fixed-192k-stock \
+  --fixed-adaptive benchmarks/results/fixed-192k-adaptive \
+  --output-dir benchmarks/results/comparison-graphs
+```
+
+This creates `kv-stream-context-matched-comparison.*` and `kv-stream-fixed-192k-comparison.*` in the output directory.
+
+---
+
+## Upstream llama.cpp README
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
