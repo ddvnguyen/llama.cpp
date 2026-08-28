@@ -1,119 +1,81 @@
-# Adaptive KV streaming benchmarks
+# Adaptive KV streaming benchmark
 
-`benchmark_server_uvm_matrix.py` compares a stock llama.cpp server with this
-branch, using ordinary CUDA allocation and CUDA Unified Memory (UVM). It writes
-newline-delimited JSON measurements and keeps one server log per variant.
-
-## Build the two servers
-
-Build this branch:
+`benchmark_kv_stream.py` performs the complete context-matched benchmark and
+creates its graph. The only required inputs are the GGUF model and the largest
+context capacity to test:
 
 ```bash
-cmake -B build \
-  -DGGML_CUDA=ON \
-  -DGGML_CUDA_FA_ALL_QUANTS=ON \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release --target llama-server -j
-```
-
-Build an unmodified llama.cpp revision in a separate checkout with the same
-CMake options. `GGML_CUDA_FA_ALL_QUANTS=ON` is needed for the benchmark
-defaults, `--cache-type-k q8_0 --cache-type-v q4_0`.
-
-## Run a comparison
-
-```bash
-python3 benchmarks/benchmark_server_uvm_matrix.py \
+python3 benchmarks/benchmark_kv_stream.py \
   --model /path/to/model.gguf \
-  --adaptive-server ./build/bin/llama-server \
-  --stock-server /path/to/stock-llama.cpp/build/bin/llama-server \
-  --adaptive-revision feature/adaptive-kv-stream \
-  --stock-revision stock-revision \
-  --variants stock_cuda,stock_uvm,adaptive_cuda,adaptive_uvm \
-  --sizes 8192,16384,32768,65536,98304,131072,163840,196608 \
-  --decode-tokens 256 \
-  --adaptive-pool-mib 2304 \
-  --gpu-index 0 \
-  --output benchmarks/results/my-uvm-comparison.jsonl
+  --max-context 192K
 ```
 
-The adaptive server defaults to `./build/bin/llama-server`, so
-`--adaptive-server` can be omitted for the standard in-tree build. The model
-path is required; the script does not assume a Hugging Face cache layout.
-
-The four variants are:
-
-- `stock_cuda`: stock server with ordinary CUDA allocation.
-- `stock_uvm`: stock server with UVM enabled.
-- `adaptive_cuda`: this branch with the adaptive KV staging pool.
-- `adaptive_uvm`: this branch with UVM and the model-weight/KV memory advice
-  used by this project.
-
-Select a subset with `--variants`. A stock binary is required only when a
-`stock_*` variant is selected.
-
-## Machine-dependent settings
-
-All machine-specific inputs are command-line options:
-
-- `--model`, `--stock-server`, and `--adaptive-server` select local files.
-- `--cuda-visible-devices` selects the CUDA device(s) exposed to each server.
-- `--gpu-index` selects the physical GPU queried by the `--nvidia-smi`
-  telemetry executable.
-- `--gpu-release-threshold-mib` should be slightly above the GPU's idle memory
-  usage. This prevents the next variant from starting before the previous one
-  releases VRAM. Increase it on a display GPU.
-- `--port`, `--startup-timeout`, and `--request-timeout` control local
-  execution.
-- `--adaptive-pool-mib` sets the adaptive server's device-resident KV staging
-  pool.
-- `--stock-revision` and `--adaptive-revision` are labels stored in the
-  result metadata; they do not change either binary.
-
-The workload is configurable with `--cache-type-k`, `--cache-type-v`,
-`--flash-attention`, `--gpu-layers`, `--batch-size`, `--ubatch-size`,
-`--parallel`, and repeatable `--extra-server-arg`. For example:
+The default server is `build/bin/llama-server`. Use `--server` when the
+binary is elsewhere. Matplotlib is the only Python dependency:
 
 ```bash
-python3 benchmarks/benchmark_server_uvm_matrix.py \
+python3 -m pip install matplotlib
+```
+
+## What the script does
+
+For every configured context capacity from 8K through `--max-context`, in 8K
+steps, the script:
+
+1. Starts a fresh adaptive KV streaming server with a small probe pool.
+2. Measures free VRAM after model initialization and a warm-up request.
+3. Assigns all measured free VRAM to the pool, rounded down to 32 MiB.
+4. Runs a full prompt and 256-token decode to validate that pool.
+5. If the candidate fails, reduces it by 64 MiB and retries.
+6. Records prefill speed, decode speed, selected pool size, and VRAM telemetry.
+7. Updates the CSV and Matplotlib graph after every successful point.
+
+There is no fixed VRAM safety reserve. Actual server execution is the
+validation: allocation failures are handled by automatic pool backoff.
+
+The prompt length at each point is the configured context capacity minus the
+256 decode tokens. For example, the 192K point starts the server with
+`--ctx-size 196608`, prefills 196352 tokens, and then decodes 256 tokens.
+If the maximum is not a multiple of 8K, the exact maximum is appended as the
+last point.
+
+The driver uses the configuration currently supported and validated by this
+branch:
+
+- Flash Attention enabled
+- K cache `q8_0`
+- V cache `q4_0`
+- all model layers on the GPU
+- one server slot
+- 256-token batch and micro-batch
+- ordinary CUDA allocation, without UVM
+
+## Results and resuming
+
+By default, a timestamped directory is created under
+`benchmarks/results/adaptive-kv-sweep-*`. It contains:
+
+- `results.jsonl`: metadata, pool probes, retries, and measurements
+- `results.csv`: one successful measurement per context capacity
+- `kv-stream-sweep.png` and `kv-stream-sweep.svg`: decode, prefill, and pool
+  size plots
+- `logs/`: one server log per probe and benchmark attempt
+
+Use an explicit output directory to resume an interrupted sweep:
+
+```bash
+python3 benchmarks/benchmark_kv_stream.py \
   --model /path/to/model.gguf \
-  --variants adaptive_cuda \
-  --sizes 8192 \
-  --decode-tokens 64 \
-  --extra-server-arg=--verbosity \
-  --extra-server-arg=3
+  --max-context 192K \
+  --output-dir benchmarks/results/my-sweep
 ```
 
-The script tokenizes `--prompt-suffix` with the selected model and uses its
-first token to build the synthetic prefix. Use `--fill-token-id` to pin the
-exact token when reproducing an existing run.
+Re-run the same command after an interruption. Completed contexts are skipped.
+The script rejects a resume if the model or benchmark settings differ, avoiding
+mixed data in one result set.
 
-## Context-size behavior
+Run `python3 benchmarks/benchmark_kv_stream.py --help` for optional GPU,
+timeout, pool-step, output, and server arguments.
 
-For a multi-size run, each non-stock-CUDA variant starts once with a context
-size equal to the largest prompt plus decode headroom. `--server-context`
-overrides that value. Stock CUDA probes downward to find the largest requested
-context that fits in VRAM.
-
-To measure context-matched server allocations, invoke the script once per
-prompt size, using one value in `--sizes`. This also lets you choose the
-largest safe adaptive pool independently for each context size.
-
-Run `python3 benchmarks/benchmark_server_uvm_matrix.py --help` for every
-available option.
-
-## Measure a continuous decode
-
-`benchmark_long_decode.py` records per-token arrival latency against an
-already running server:
-
-```bash
-python3 benchmarks/benchmark_long_decode.py \
-  --url http://127.0.0.1:12355 \
-  --prompt-tokens 114688 \
-  --decode-tokens 4096 \
-  --output benchmarks/results/long-decode.jsonl
-```
-
-It uses the same model-independent prefix-token selection as the matrix driver.
-Use `--prompt-suffix` or `--fill-token-id` to reproduce a specific workload.
+Do not run another GPU workload during the sweep. Its allocations would change
+the automatically selected pool and invalidate comparisons between points.

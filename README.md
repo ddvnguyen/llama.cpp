@@ -33,22 +33,38 @@ Example using the tested cache configuration:
 
 The best value for `--kv-stream-stage-mib` depends on the model, context capacity, GPU, and other VRAM consumers. Start conservatively and increase it while checking startup and peak VRAM use.
 
-## Recreate the benchmark comparison graphs
+### Optional Unified Memory for model weights
 
-First collect one successful 256-token measurement per 8K context point into the four result directories. See [benchmarks/README.md](benchmarks/README.md) for the portable benchmark driver and the difference between context-matched and fixed-capacity runs. Then install Matplotlib and render the PNG, SVG, and CSV outputs:
+Adaptive KV streaming works with or without Unified Memory. Leave `GGML_CUDA_ENABLE_UNIFIED_MEMORY` unset for ordinary CUDA device allocations. To make GPU-offloaded model buffers CUDA managed allocations, launch the same server with the environment variable enabled:
+
+```bash
+GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
+./build/bin/llama-server \
+  --model /path/to/model.gguf \
+  --ctx-size 262144 \
+  -fa on \
+  -ctk q8_0 \
+  -ctv q4_0 \
+  -ngl all \
+  -np 1 \
+  --kv-stream-stage-mib 2304
+```
+
+With this flag, CUDA-backed model buffers, including GPU-offloaded weights, are allocated with `cudaMallocManaged` and their pages can migrate between VRAM and host memory. The adaptive resident-page and transfer-ring pool is intentionally different: it is still allocated with `cudaMalloc`, so that fixed-size pool remains physically allocated in VRAM instead of becoming managed memory. UVM is therefore optional for this branch and does not change the KV streaming pool into pageable storage.
+
+## Recreate the benchmark graph
+
+The benchmark driver automatically selects the largest practical adaptive KV pool for each configured context capacity, sweeps from 8K through the requested maximum, and generates the CSV, PNG, and SVG results:
 
 ```bash
 python3 -m pip install matplotlib
 
-python3 benchmarks/plot_kv_stream_context_comparison.py \
-  --matched-stock benchmarks/results/context-matched-stock \
-  --matched-adaptive benchmarks/results/context-matched-adaptive \
-  --fixed-stock benchmarks/results/fixed-192k-stock \
-  --fixed-adaptive benchmarks/results/fixed-192k-adaptive \
-  --output-dir benchmarks/results/comparison-graphs
+python3 benchmarks/benchmark_kv_stream.py \
+  --model /path/to/model.gguf \
+  --max-context 192K
 ```
 
-This creates `kv-stream-context-matched-comparison.*` and `kv-stream-fixed-192k-comparison.*` in the output directory.
+The only required arguments are the model GGUF and maximum context. See [benchmarks/README.md](benchmarks/README.md) for the pool-probing algorithm, generated files, optional settings, and resumable output directories.
 
 ---
 
