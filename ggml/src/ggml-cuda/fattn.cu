@@ -1760,12 +1760,6 @@ void ggml_cuda_flash_attn_ext_streamed(
     const uint32_t maximum_streamed_span_pages = Q->ne[1] == 1 ?
         transfer_ring->graph_decode_span_pages : UINT32_MAX;
 
-    ggml_cuda_pool & pool = ctx.pool();
-    ggml_cuda_pool_alloc<float> parts(pool, KV_STREAM_MAX_PARTS_PER_CHUNK*ggml_nelements(dst));
-    ggml_cuda_pool_alloc<float2> meta(pool, KV_STREAM_MAX_PARTS_PER_CHUNK*nrows);
-    ggml_cuda_pool_alloc<float> accumulator(pool, ggml_nelements(dst));
-    ggml_cuda_pool_alloc<float2> accumulator_meta(pool, nrows);
-
     struct chunk_descriptor {
         int64_t token_begin = 0;
         int64_t token_count = 0;
@@ -1880,6 +1874,25 @@ void ggml_cuda_flash_attn_ext_streamed(
             }
             streamed_chunks.push_back(chunk);
         }
+    }
+
+    const bool use_mma_prefill = !convert_to_f16 &&
+        Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
+    const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
+    GGML_ASSERT(partial_count > 0 && partial_count <= KV_STREAM_MAX_PARTS_PER_CHUNK);
+
+    ggml_cuda_pool & pool = ctx.pool();
+    ggml_cuda_pool_alloc<float> parts(pool);
+    ggml_cuda_pool_alloc<float2> meta(pool);
+    ggml_cuda_pool_alloc<float> accumulator(pool);
+    ggml_cuda_pool_alloc<float2> accumulator_meta(pool);
+    const bool needs_partial_reduction = convert_to_f16 || (!streamed_chunks.empty() && nchunks > 1);
+    if (needs_partial_reduction) {
+        parts.alloc(size_t(partial_count)*ggml_nelements(dst));
+        meta.alloc(size_t(partial_count)*nrows);
+        accumulator.alloc(ggml_nelements(dst));
+        accumulator_meta.alloc(nrows);
     }
 
     auto upload = [&](const chunk_descriptor & desc, cudaStream_t stream) {
@@ -2160,14 +2173,11 @@ void ggml_cuda_flash_attn_ext_streamed(
             return;
         }
 
-        const bool use_mma_prefill = !convert_to_f16 &&
-            Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
-            mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
-        int partial_count = kv_stream_parts_per_chunk();
+        GGML_ASSERT(needs_partial_reduction);
+
         if (use_mma_prefill) {
             ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(
                 ctx, &staged_dst, parts.ptr, meta.ptr);
-            partial_count = 1;
             if (resident_cache != nullptr) {
                 ++resident_cache->stats.mma_prefill_attention_spans;
             }

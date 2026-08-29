@@ -781,7 +781,7 @@ int main() {
 
     t.test("wide causal prefills remain equivalent across the 256-query boundary", [](testing & t) {
         constexpr int64_t n_kv = 1024;
-        const int64_t query_counts[] = { 257, 512 };
+        const int64_t query_counts[] = { 257, 512, 513, 1024 };
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
