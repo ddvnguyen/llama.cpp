@@ -1226,7 +1226,7 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
         Q->type == GGML_TYPE_F32 &&
         ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type) != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED &&
         Q->ne[0] == KV_STREAM_HEAD_DIM && V->ne[0] == KV_STREAM_HEAD_DIM &&
-        Q->ne[1] >= 1 && Q->ne[1] <= 256 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
+        Q->ne[1] >= 1 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
         K->ne[1] == V->ne[1] && K->ne[2] == V->ne[2] &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 &&
         K->nb[0] == ggml_element_size(K) && V->nb[0] == ggml_element_size(V) &&

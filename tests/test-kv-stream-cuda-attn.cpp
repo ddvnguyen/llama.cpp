@@ -778,6 +778,62 @@ int main() {
         t.assert_true("page-boundary output remains finite", all_finite);
         t.assert_true("page-boundary output remains equivalent", max_abs <= 3e-4f);
     });
+
+    t.test("wide causal prefills remain equivalent across the 256-query boundary", [](testing & t) {
+        constexpr int64_t n_kv = 1024;
+        const int64_t query_counts[] = { 257, 512 };
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+
+        for (const int64_t n_batch : query_counts) {
+            const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv - n_batch);
+            const std::vector<float> expected = run_attention(
+                backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+                n_kv, n_batch, 1, n_batch);
+
+            ggml_backend_cuda_kv_stream_params params{};
+            params.device               = 0;
+            params.stage_bytes          = page_bytes;
+            params.stage_slots          = 2;
+            params.pool_bytes           = 3*page_bytes;
+            params.resident_layer_count = 1;
+            params.page_tokens          = 256;
+            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+                return;
+            }
+
+            const std::vector<float> actual = run_attention(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                n_kv, n_batch, 1, n_batch, false, GGML_TYPE_I64, false, runtime);
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+            if (!t.assert_equal(expected.size(), actual.size())) {
+                return;
+            }
+            bool all_finite = true;
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < expected.size(); ++i) {
+                all_finite = all_finite && std::isfinite(actual[i]);
+                max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+            }
+            std::fprintf(stderr,
+                "wide-query n_batch=%lld max_abs=%g streamed_pages=%llu\n",
+                (long long) n_batch, max_abs,
+                (unsigned long long) stats.streamed_pages);
+            t.assert_true("wide-query output remains finite", all_finite);
+            t.assert_true("wide-query output remains equivalent", max_abs <= 3e-4f);
+            t.assert_true("wide-query test exercises streamed pages", stats.streamed_pages > 0);
+        }
+    });
+
     t.test("resident pages survive between evaluations while the tail is refreshed", [](testing & t) {
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
