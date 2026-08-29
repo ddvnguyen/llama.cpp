@@ -37,6 +37,9 @@ ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
     uint32_t layer_count, uint32_t page_tokens);
 void ggml_cuda_kv_stream_resident_cache_free(ggml_cuda_kv_stream_resident_cache * cache);
 void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache * cache);
+bool ggml_cuda_kv_stream_resident_cache_reconfigure(
+    ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes,
+    uint32_t active_pages_per_layer);
 bool ggml_cuda_kv_stream_resident_cache_repartition(
     ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes);
 bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
@@ -65,10 +68,15 @@ void ggml_cuda_kv_stream_resident_cache_mark_mirrored(
     const ggml_tensor * target);
 
 ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
-    void * pool_data, size_t page_bytes, uint32_t stage_slots);
+    void * pool_data, size_t page_bytes, uint32_t stage_slots,
+    void * conversion_data, size_t conversion_bytes,
+    uint32_t forced_decode_span_pages);
 void ggml_cuda_kv_stream_transfer_ring_free(ggml_cuda_kv_stream_transfer_ring * ring);
 bool ggml_cuda_kv_stream_transfer_ring_set_active_slots(
     ggml_cuda_kv_stream_transfer_ring * ring, uint32_t stage_slots);
+void ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(ggml_cuda_kv_stream_transfer_ring * ring);
+bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
+    ggml_cuda_kv_stream_transfer_ring * ring, double elapsed_ms);
 ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
     const ggml_cuda_kv_stream_transfer_ring * ring);
 void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring);
@@ -84,6 +92,15 @@ double ggml_cuda_kv_stream_copy_engine_busy_ratio(
     ggml_cuda_kv_stream_transfer_ring * ring);
 uint32_t ggml_cuda_kv_stream_last_ring_peak_occupancy(
     const ggml_cuda_kv_stream_transfer_ring * ring);
+
+bool ggml_cuda_kv_stream_page_bytes(
+    ggml_type type_k, ggml_type type_v,
+    uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
+    uint32_t page_tokens, size_t * page_bytes);
+bool ggml_cuda_kv_stream_workspace_bytes(
+    ggml_type type_k, ggml_type type_v,
+    uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
+    uint32_t page_tokens, size_t * workspace_bytes);
 
 bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes);
 

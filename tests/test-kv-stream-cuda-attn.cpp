@@ -3,12 +3,14 @@
 #include "ggml-cpp.h"
 #include "ggml-cuda.h"
 #include "../ggml/src/ggml-impl.h"
+#include "../ggml/src/ggml-cuda/kv-stream-span-tuner.h"
 #include "ggml.h"
 #include "testing.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cstdint>
 #include <vector>
 
@@ -23,14 +25,20 @@ size_t align_up(size_t value, size_t alignment) {
 }
 
 struct attention_inputs {
+    ggml_type type_k = GGML_TYPE_Q8_0;
+    ggml_type type_v = GGML_TYPE_Q4_0;
     std::vector<float> q;
     std::vector<uint8_t> k;
     std::vector<uint8_t> v;
     std::vector<uint16_t> mask;
 };
 
-attention_inputs make_inputs(int64_t n_kv, int64_t n_batch, int64_t query_start = 0) {
+attention_inputs make_inputs(
+        int64_t n_kv, int64_t n_batch, int64_t query_start = 0,
+        ggml_type type_k = GGML_TYPE_Q8_0, ggml_type type_v = GGML_TYPE_Q4_0) {
     attention_inputs result;
+    result.type_k = type_k;
+    result.type_v = type_v;
 
     result.q.resize(HEAD_DIM*n_batch*N_Q_HEAD);
     for (size_t i = 0; i < result.q.size(); ++i) {
@@ -43,17 +51,17 @@ attention_inputs make_inputs(int64_t n_kv, int64_t n_batch, int64_t query_start 
         source[i] = 0.4f*std::sin(float(i)*0.001953125f) + 0.2f*std::cos(float(i)*0.00048828125f);
     }
 
-    result.k.resize(ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*nrows);
+    result.k.resize(ggml_row_size(type_k, HEAD_DIM)*nrows);
     const size_t k_written = ggml_quantize_chunk(
-        GGML_TYPE_Q8_0, source.data(), result.k.data(), 0, nrows, HEAD_DIM, nullptr);
+        type_k, source.data(), result.k.data(), 0, nrows, HEAD_DIM, nullptr);
     GGML_ASSERT(k_written == result.k.size());
 
     for (size_t i = 0; i < source.size(); ++i) {
         source[i] = 0.35f*std::cos(float(i)*0.00146484375f) - 0.1f*std::sin(float(i)*0.00390625f);
     }
-    result.v.resize(ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*nrows);
+    result.v.resize(ggml_row_size(type_v, HEAD_DIM)*nrows);
     const size_t v_written = ggml_quantize_chunk(
-        GGML_TYPE_Q4_0, source.data(), result.v.data(), 0, nrows, HEAD_DIM, nullptr);
+        type_v, source.data(), result.v.data(), 0, nrows, HEAD_DIM, nullptr);
     GGML_ASSERT(v_written == result.v.size());
 
     result.mask.resize(n_kv*n_batch);
@@ -67,6 +75,44 @@ attention_inputs make_inputs(int64_t n_kv, int64_t n_batch, int64_t query_start 
             result.mask[batch*n_kv + token] = ggml_fp32_to_fp16(bias);
         }
     }
+    return result;
+}
+
+attention_inputs make_f16_reference(const attention_inputs & inputs, int64_t n_kv) {
+    attention_inputs result;
+    result.type_k = GGML_TYPE_F16;
+    result.type_v = GGML_TYPE_F16;
+    result.q = inputs.q;
+    result.mask = inputs.mask;
+
+    const int64_t nrows = n_kv*N_KV_HEAD;
+    result.k.resize(ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*nrows);
+    result.v.resize(ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*nrows);
+    std::vector<float> row(HEAD_DIM);
+
+    auto convert = [&](ggml_type type, const std::vector<uint8_t> & source,
+            std::vector<uint8_t> & destination) {
+        const size_t source_row_bytes = ggml_row_size(type, HEAD_DIM);
+        const size_t destination_row_bytes = ggml_row_size(GGML_TYPE_F16, HEAD_DIM);
+        const auto * traits = ggml_get_type_traits(type);
+        for (int64_t i = 0; i < nrows; ++i) {
+            const void * source_row = source.data() + size_t(i)*source_row_bytes;
+            if (type == GGML_TYPE_F32) {
+                std::memcpy(row.data(), source_row, HEAD_DIM*sizeof(float));
+            } else {
+                GGML_ASSERT(traits->to_float != nullptr);
+                traits->to_float(source_row, row.data(), HEAD_DIM);
+            }
+            ggml_fp32_to_fp16_row(
+                row.data(),
+                reinterpret_cast<ggml_fp16_t *>(
+                    destination.data() + size_t(i)*destination_row_bytes),
+                HEAD_DIM);
+        }
+    };
+
+    convert(inputs.type_k, inputs.k, result.k);
+    convert(inputs.type_v, inputs.v, result.v);
     return result;
 }
 
@@ -103,19 +149,19 @@ std::vector<float> run_attention(
     ggml_tensor * mask = ggml_new_tensor_4d(
         compute_ctx.get(), GGML_TYPE_F16, n_kv, n_batch, 1, 1);
     ggml_tensor * k_storage = ggml_new_tensor_2d(
-        kv_ctx.get(), GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD, n_kv);
+        kv_ctx.get(), inputs.type_k, HEAD_DIM*N_KV_HEAD, n_kv);
     ggml_tensor * v_storage = ggml_new_tensor_2d(
-        kv_ctx.get(), GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD, n_kv);
+        kv_ctx.get(), inputs.type_v, HEAD_DIM*N_KV_HEAD, n_kv);
     ggml_tensor * k_cache = ggml_view_4d(
         kv_ctx.get(), k_storage, HEAD_DIM, N_KV_HEAD, n_kv, 1,
-        ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM),
-        ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD),
-        ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
+        ggml_row_size(inputs.type_k, HEAD_DIM),
+        ggml_row_size(inputs.type_k, HEAD_DIM*N_KV_HEAD),
+        ggml_row_size(inputs.type_k, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
     ggml_tensor * v_cache = ggml_view_4d(
         kv_ctx.get(), v_storage, HEAD_DIM, N_KV_HEAD, n_kv, 1,
-        ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM),
-        ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD),
-        ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
+        ggml_row_size(inputs.type_v, HEAD_DIM),
+        ggml_row_size(inputs.type_v, HEAD_DIM*N_KV_HEAD),
+        ggml_row_size(inputs.type_v, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
     ggml_tensor * k = ggml_permute(kv_ctx.get(), k_cache, 0, 2, 1, 3);
     ggml_tensor * v = ggml_permute(kv_ctx.get(), v_cache, 0, 2, 1, 3);
 
@@ -174,6 +220,11 @@ std::vector<float> run_attention(
     ggml_build_forward_expand(graph, out);
     GGML_ASSERT(ggml_backend_supports_op(backend, updated_k));
     GGML_ASSERT(ggml_backend_supports_op(backend, updated_v));
+    if (!ggml_backend_supports_op(backend, out)) {
+        std::fprintf(stderr, "unsupported attention K=%s V=%s buft=%s\n",
+            ggml_type_name(inputs.type_k), ggml_type_name(inputs.type_v),
+            ggml_backend_buft_name(kv_buft));
+    }
     GGML_ASSERT(ggml_backend_supports_op(backend, out));
     for (int repeat = 0; repeat < repeats; ++repeat) {
         if (replace_cache && repeat == 3) {
@@ -356,6 +407,198 @@ std::vector<float> run_attention_layers(
 
 int main() {
     testing t;
+
+    t.test("decode span tuner selects the faster measured mode per layout", [](testing & t) {
+        ggml_cuda_kv_stream_span_tuner production_tuner;
+        production_tuner.observe(100.0, /* streamed = */ true, /* bounded = */ false);
+        for (uint32_t sample = 0; sample < 4; ++sample) {
+            production_tuner.observe(10.0, /* streamed = */ true, /* bounded = */ false);
+        }
+        t.assert_true("production tuner does not decide from four samples",
+            !production_tuner.use_bounded() && !production_tuner.selected());
+
+        ggml_cuda_kv_stream_span_tuner tuner(/* trial_samples = */ 2, 0.005, /* warmup_samples = */ 1);
+
+        tuner.observe(100.0, /* streamed = */ false, /* bounded = */ false);
+        t.assert_true("non-streamed graphs do not start a trial", !tuner.use_bounded());
+        t.assert_true("non-streamed graphs do not select a mode", !tuner.selected());
+
+        tuner.observe(100.0, /* streamed = */ true, /* bounded = */ false);
+        t.assert_true("unbounded warmup is not measured", !tuner.use_bounded());
+
+        tuner.observe(10.0, /* streamed = */ true, /* bounded = */ false);
+        tuner.observe(10.2, /* streamed = */ true, /* bounded = */ false);
+        t.assert_true("tuner advances to bounded trials", tuner.use_bounded());
+        t.assert_true("both modes are measured before selection", !tuner.selected());
+
+        tuner.observe(100.0, /* streamed = */ true, /* bounded = */ true);
+        t.assert_true("bounded warmup is not measured", !tuner.selected());
+
+        tuner.observe(8.0, /* streamed = */ true, /* bounded = */ true);
+        tuner.observe(8.2, /* streamed = */ true, /* bounded = */ true);
+        t.assert_true("bounded mode is selected when materially faster", tuner.selected());
+        t.assert_true("bounded mode remains active after selection", tuner.use_bounded());
+
+        tuner.reset();
+        tuner.observe(100.0, /* streamed = */ true, /* bounded = */ false);
+        tuner.observe(10.0, /* streamed = */ true, /* bounded = */ false);
+        tuner.observe(10.0, /* streamed = */ true, /* bounded = */ false);
+        tuner.observe(100.0, /* streamed = */ true, /* bounded = */ true);
+        tuner.observe(10.0, /* streamed = */ true, /* bounded = */ true);
+        tuner.observe(10.0, /* streamed = */ true, /* bounded = */ true);
+        t.assert_true("tuner selects after both trials", tuner.selected());
+        t.assert_true("noise does not displace the ordinary kernel", !tuner.use_bounded());
+
+        tuner.observe(1.0, /* streamed = */ true, /* bounded = */ true);
+        t.assert_true("selection remains stable until layout reset", !tuner.use_bounded());
+    });
+
+    t.test("all native CUDA KV pairs preserve streamed prefill results", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 4;
+        const ggml_type native_types[] = {
+            GGML_TYPE_F16,
+            GGML_TYPE_Q4_0,
+            GGML_TYPE_Q4_1,
+            GGML_TYPE_Q5_0,
+            GGML_TYPE_Q5_1,
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_BF16,
+        };
+
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        for (const ggml_type type_k : native_types) {
+            for (const ggml_type type_v : native_types) {
+                const attention_inputs inputs =
+                    make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
+                const std::vector<float> expected = run_attention(
+                    backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+                    n_kv, n_batch);
+
+                const size_t k_page_bytes =
+                    ggml_row_size(type_k, HEAD_DIM)*N_KV_HEAD*256;
+                const size_t v_page_bytes =
+                    ggml_row_size(type_v, HEAD_DIM)*N_KV_HEAD*256;
+                const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+                ggml_backend_cuda_kv_stream_params params{};
+                params.device      = 0;
+                params.stage_bytes = page_bytes;
+                params.stage_slots = 1;
+                auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+                if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+                    return;
+                }
+
+                const std::vector<float> actual = run_attention(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                    n_kv, n_batch);
+                const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+                ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+                if (!t.assert_equal(expected.size(), actual.size())) {
+                    return;
+                }
+                float max_abs = 0.0f;
+                for (size_t i = 0; i < expected.size(); ++i) {
+                    max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+                }
+                if (!std::isfinite(max_abs) || max_abs > 5e-4f ||
+                        stats.asynchronous_page_uploads == 0) {
+                    std::fprintf(stderr,
+                        "native pair K=%s V=%s max_abs=%g async_uploads=%llu\n",
+                        ggml_type_name(type_k), ggml_type_name(type_v), max_abs,
+                        (unsigned long long) stats.asynchronous_page_uploads);
+                }
+                t.assert_true("native pair executes streamed attention",
+                    stats.asynchronous_page_uploads > 0);
+                t.assert_true("native pair remains numerically equivalent",
+                    std::isfinite(max_abs) && max_abs <= 5e-4f);
+            }
+        }
+    });
+
+    t.test("all bounded-fallback KV pairs preserve streamed prefill results", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 4;
+        const ggml_type kv_types[] = {
+            GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
+            GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+            GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+            GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+        };
+
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        for (const ggml_type type_k : kv_types) {
+            for (const ggml_type type_v : kv_types) {
+                if (ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v) !=
+                        GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16) {
+                    continue;
+                }
+
+                const attention_inputs inputs =
+                    make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
+                const attention_inputs reference = make_f16_reference(inputs, n_kv);
+                const std::vector<float> expected = run_attention(
+                    backend.get(), reference, ggml_backend_get_default_buffer_type(backend.get()),
+                    n_kv, n_batch);
+
+                const size_t k_page_bytes =
+                    ggml_row_size(type_k, HEAD_DIM)*N_KV_HEAD*256;
+                const size_t v_page_bytes =
+                    ggml_row_size(type_v, HEAD_DIM)*N_KV_HEAD*256;
+                const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+                const size_t f16_k_page_bytes =
+                    ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+                const size_t f16_v_page_bytes =
+                    ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+                const size_t conversion_bytes =
+                    align_up(f16_k_page_bytes, 128) + f16_v_page_bytes;
+
+                ggml_backend_cuda_kv_stream_params params{};
+                params.device           = 0;
+                params.stage_bytes      = page_bytes;
+                params.stage_slots      = 1;
+                params.conversion_bytes = conversion_bytes;
+                auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+                if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+                    return;
+                }
+
+                const std::vector<float> actual = run_attention(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                    n_kv, n_batch);
+                const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+                ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+                if (!t.assert_equal(expected.size(), actual.size())) {
+                    return;
+                }
+                float max_abs = 0.0f;
+                for (size_t i = 0; i < expected.size(); ++i) {
+                    max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+                }
+                if (!std::isfinite(max_abs) || max_abs > 2e-3f ||
+                        stats.asynchronous_page_uploads == 0) {
+                    std::fprintf(stderr,
+                        "fallback pair K=%s V=%s max_abs=%g async_uploads=%llu\n",
+                        ggml_type_name(type_k), ggml_type_name(type_v), max_abs,
+                        (unsigned long long) stats.asynchronous_page_uploads);
+                }
+                t.assert_true("fallback pair executes streamed attention",
+                    stats.asynchronous_page_uploads > 0);
+                t.assert_true("fallback pair remains numerically equivalent",
+                    std::isfinite(max_abs) && max_abs <= 2e-3f);
+            }
+        }
+    });
 
     t.test("server-shaped causal prefill pipelines four Q8/Q4 blocks through two slots", [](testing & t) {
         constexpr int64_t n_kv = 1024;
@@ -566,7 +809,7 @@ int main() {
         t.assert_equal(uint64_t(2), stats.resident_misses);
         t.assert_equal(uint64_t(2), stats.resident_hits);
         t.assert_equal(uint64_t(0), stats.streamed_pages);
-        t.assert_equal(uint64_t(3*page_bytes), stats.host_to_device_bytes);
+        t.assert_equal(uint64_t(2*page_bytes), stats.host_to_device_bytes);
         t.assert_equal(uint64_t(2), stats.resident_attention_spans);
         t.assert_equal(uint64_t(4), stats.resident_pages_attended);
         t.assert_equal(uint64_t(4), stats.staged_set_rows);
@@ -692,6 +935,90 @@ int main() {
         t.assert_true("mirrored changing slots remain bit-identical", expected == actual);
     });
 
+    t.test("resident staged writes support every exposed KV-cache format", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 1;
+        const ggml_type kv_types[] = {
+            GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
+            GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+            GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+            GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+        };
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        for (const ggml_type type : kv_types) {
+            const attention_inputs inputs =
+                make_inputs(n_kv, n_batch, n_kv - 1, type, type);
+            const size_t typed_page_bytes =
+                ggml_row_size(type, HEAD_DIM)*N_KV_HEAD*256;
+            const size_t page_bytes = align_up(typed_page_bytes, 128) + typed_page_bytes;
+            const bool fallback =
+                ggml_backend_cuda_kv_stream_get_attention_mode(type, type) ==
+                GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
+            const size_t f16_page_bytes =
+                ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+            const size_t conversion_bytes = fallback ?
+                align_up(f16_page_bytes, 128) + f16_page_bytes : 0;
+
+            ggml_backend_cuda_kv_stream_params baseline_params{};
+            baseline_params.device           = 0;
+            baseline_params.stage_bytes      = page_bytes;
+            baseline_params.stage_slots      = 1;
+            baseline_params.conversion_bytes = conversion_bytes;
+            auto baseline_runtime = ggml_backend_cuda_kv_stream_runtime_new(baseline_params);
+            if (!t.assert_true("baseline runtime initializes", baseline_runtime != nullptr)) {
+                return;
+            }
+            const std::vector<float> expected = run_attention(
+                backend.get(), inputs,
+                ggml_backend_cuda_kv_stream_buffer_type(baseline_runtime),
+                n_kv, n_batch, 5, 3, true, GGML_TYPE_I64, false, nullptr, true);
+            ggml_backend_cuda_kv_stream_runtime_free(baseline_runtime);
+
+            ggml_backend_cuda_kv_stream_params resident_params{};
+            resident_params.device               = 0;
+            resident_params.stage_bytes          = page_bytes;
+            resident_params.stage_slots          = 1;
+            resident_params.pool_bytes           = 3*page_bytes + conversion_bytes;
+            resident_params.conversion_bytes     = conversion_bytes;
+            resident_params.resident_layer_count = 1;
+            resident_params.page_tokens          = 256;
+            auto resident_runtime = ggml_backend_cuda_kv_stream_runtime_new(resident_params);
+            if (!t.assert_true("resident runtime initializes", resident_runtime != nullptr)) {
+                return;
+            }
+            const std::vector<float> actual = run_attention(
+                backend.get(), inputs,
+                ggml_backend_cuda_kv_stream_buffer_type(resident_runtime),
+                n_kv, n_batch, 5, 3, true, GGML_TYPE_I64, false,
+                resident_runtime, true);
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(resident_runtime);
+            ggml_backend_cuda_kv_stream_runtime_free(resident_runtime);
+
+            if (!t.assert_equal(expected.size(), actual.size())) {
+                return;
+            }
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < expected.size(); ++i) {
+                max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+            }
+            if (!t.assert_true(ggml_type_name(type),
+                    std::isfinite(max_abs) && max_abs <= 5e-4f)) {
+                std::fprintf(stderr, "resident staged write type=%s max_abs=%g\n",
+                    ggml_type_name(type), max_abs);
+                return;
+            }
+            t.assert_equal(uint64_t(2*page_bytes), stats.host_to_device_bytes);
+            t.assert_equal(uint64_t(10), stats.staged_set_rows);
+            t.assert_equal(
+                uint64_t(10*3*ggml_row_size(type, HEAD_DIM*N_KV_HEAD)),
+                stats.staged_set_rows_bytes);
+        }
+    });
+
     t.test("resident graph reloads after authoritative cache replacement", [](testing & t) {
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 1;
@@ -777,6 +1104,61 @@ int main() {
         }
         t.assert_true("batched streamed logits remain equivalent", max_abs <= 3e-4f);
     });
+
+    t.test("decode pipelines bounded attention chunks and samples every immutable copy batch", [](testing & t) {
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs = make_inputs(n_kv, n_batch);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 40;
+        params.pool_bytes           = 41*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        params.decode_span_pages    = 32;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("chunk-pipelined runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(40), stats.streamed_pages);
+        t.assert_equal(uint64_t(2), stats.streamed_attention_spans);
+        // The 39 immutable pages form one full 32-page transfer and one
+        // seven-page transfer. The mutable tail is deliberately excluded from
+        // adaptive prefetch feedback because its producer runs in this graph.
+        t.assert_equal(uint64_t(2), stats.deadline_samples);
+        t.assert_true("chunk deadline misses cannot exceed samples",
+            stats.deadline_misses <= stats.deadline_samples);
+
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        t.assert_true("chunk-pipelined logits remain equivalent", max_abs <= 3e-4f);
+    });
+
     t.test("sixteen attention layers share one resident/ring pool during causal prefill", [](testing & t) {
         constexpr int64_t n_kv = 1024;
         constexpr int64_t n_batch = 83;
@@ -954,6 +1336,39 @@ int main() {
             ggml_backend_cuda_kv_stream_set_decode_layout(runtime, 3));
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
     });
+
+    t.test("decode layout and ring boundary publish as one reconfiguration", [](testing & t) {
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 8;
+        params.pool_bytes           = 12*page_bytes;
+        params.resident_layer_count = 4;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("shared runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        t.assert_true("combined reconfiguration succeeds",
+            ggml_backend_cuda_kv_stream_reconfigure(
+                runtime, /* active pages per layer = */ 3, /* ring slots = */ 4));
+        t.assert_equal(uint32_t(4),
+            ggml_backend_cuda_kv_stream_stage_slots(runtime));
+        t.assert_equal(uint32_t(2),
+            ggml_backend_cuda_kv_stream_resident_pages_per_layer(runtime));
+
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+    });
+
 
     t.test("decode layout spreads an oversized streamed deficit across enough layers", [](testing & t) {
         constexpr int64_t n_kv = 768;

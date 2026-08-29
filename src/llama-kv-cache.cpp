@@ -239,14 +239,26 @@ llama_kv_cache::llama_kv_cache(
 
                 if (kv_stream_runtime.runtime == nullptr) {
                     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                    using runtime_new_fn_t = void * (*)(ggml_backend_dev_t, size_t, size_t, uint32_t);
+                    using type_pair_supported_fn_t = bool (*)(ggml_type, ggml_type);
+                    using page_bytes_fn_t = bool (*)(
+                        ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
+                    using runtime_new_fn_t = void * (*)(
+                        ggml_backend_dev_t, size_t, size_t, size_t, uint32_t);
                     using runtime_free_fn_t = void (*)(void *);
                     using buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
                     using feedback_fn_t = kv_stream_runtime_owner::feedback_fn_t;
+                    using span_feedback_fn_t = kv_stream_runtime_owner::span_feedback_fn_t;
+                    using reconfigure_fn_t = kv_stream_runtime_owner::reconfigure_fn_t;
                     using repartition_fn_t = kv_stream_runtime_owner::repartition_fn_t;
                     using decode_layout_fn_t = kv_stream_runtime_owner::decode_layout_fn_t;
                     using mark_dirty_rows_fn_t = kv_stream_runtime_owner::mark_dirty_rows_fn_t;
 
+                    auto * type_pair_supported_fn = (type_pair_supported_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_type_pair_supported");
+                    auto * page_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_page_bytes");
+                    auto * workspace_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_workspace_bytes");
                     auto * runtime_new_fn = (runtime_new_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_runtime_new_for_device");
                     auto * runtime_free_fn = (runtime_free_fn_t) ggml_backend_reg_get_proc_address(
@@ -255,6 +267,10 @@ llama_kv_cache::llama_kv_cache(
                         reg, "ggml_backend_cuda_kv_stream_buffer_type");
                     auto * feedback_fn = (feedback_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_feedback");
+                    auto * span_feedback_fn = (span_feedback_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_observe_decode_latency");
+                    auto * reconfigure_fn = (reconfigure_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_reconfigure");
                     auto * repartition_fn = (repartition_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_repartition");
                     auto * decode_layout_fn = (decode_layout_fn_t) ggml_backend_reg_get_proc_address(
@@ -262,21 +278,44 @@ llama_kv_cache::llama_kv_cache(
                     auto * mark_dirty_rows_fn = (mark_dirty_rows_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_mark_dirty_rows");
 
-                    if (runtime_new_fn == nullptr || runtime_free_fn == nullptr ||
+                    if (type_pair_supported_fn == nullptr || page_bytes_fn == nullptr ||
+                            workspace_bytes_fn == nullptr || runtime_new_fn == nullptr ||
+                            runtime_free_fn == nullptr ||
                             buffer_type_fn == nullptr || feedback_fn == nullptr ||
+                            span_feedback_fn == nullptr ||
                             repartition_fn == nullptr || decode_layout_fn == nullptr ||
+                            reconfigure_fn == nullptr ||
                             mark_dirty_rows_fn == nullptr) {
                         throw std::runtime_error("block KV streaming requires the CUDA backend");
                     }
 
-                    const size_t page_bytes = 256ULL*(
-                        ggml_row_size(type_k, n_embd_k_gqa) +
-                        ggml_row_size(type_v, n_embd_v_gqa));
+                    if (!type_pair_supported_fn(type_k, type_v)) {
+                        throw std::runtime_error(
+                            "block KV streaming does not support K " + std::string(ggml_type_name(type_k)) +
+                            " and V " + ggml_type_name(type_v));
+                    }
+
+                    size_t page_bytes = 0;
+                    if (!page_bytes_fn(
+                            type_k, type_v,
+                            hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
+                            256, &page_bytes)) {
+                        throw std::runtime_error("invalid block KV streaming page geometry");
+                    }
+                    size_t conversion_bytes = 0;
+                    if (!workspace_bytes_fn(
+                            type_k, type_v,
+                            hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
+                            256, &conversion_bytes)) {
+                        throw std::runtime_error("invalid block KV streaming conversion workspace geometry");
+                    }
                     kv_stream_runtime.runtime = runtime_new_fn(
-                        dev, kv_stream_stage_bytes, page_bytes, kv_stream_layer_count);
+                        dev, kv_stream_stage_bytes, page_bytes, conversion_bytes, kv_stream_layer_count);
                     kv_stream_runtime.free_fn = runtime_free_fn;
                     kv_stream_runtime.feedback_fn = feedback_fn;
+                    kv_stream_runtime.span_feedback_fn = span_feedback_fn;
                     kv_stream_runtime.repartition_fn = repartition_fn;
+                    kv_stream_runtime.reconfigure_fn = reconfigure_fn;
                     kv_stream_runtime.decode_layout_fn = decode_layout_fn;
                     kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
                     kv_stream_runtime.layer_count = kv_stream_layer_count;
@@ -1298,10 +1337,24 @@ uint32_t llama_kv_cache::get_n_stream() const {
 bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens) {
     auto & owner = kv_stream_runtime;
     if (owner.runtime == nullptr || owner.feedback_fn == nullptr ||
-            owner.repartition_fn == nullptr || owner.decode_layout_fn == nullptr ||
+            owner.span_feedback_fn == nullptr || owner.reconfigure_fn == nullptr ||
             owner.layer_count == 0) {
         return false;
     }
+
+    constexpr uint32_t MAX_DECODE_QUERY_TOKENS = 32;
+    constexpr double MAX_DECODE_INTERVAL_MS = 1000.0;
+    const int64_t now_us = ggml_time_us();
+    if (owner.previous_adapt_us != 0 &&
+            owner.previous_query_tokens <= MAX_DECODE_QUERY_TOKENS &&
+            query_tokens <= MAX_DECODE_QUERY_TOKENS) {
+        const double elapsed_ms = (now_us - owner.previous_adapt_us)/1000.0;
+        if (elapsed_ms > 0.0 && elapsed_ms <= MAX_DECODE_INTERVAL_MS) {
+            (void) owner.span_feedback_fn(owner.runtime, elapsed_ms);
+        }
+    }
+    owner.previous_adapt_us = now_us;
+    owner.previous_query_tokens = query_tokens;
 
     uint64_t deadline_samples = 0;
     uint64_t deadline_misses = 0;
@@ -1328,89 +1381,95 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
             (unsigned long long) delta.deadline_misses,
             100.0*copy_busy_ratio, peak_occupancy);
     }
+
     const uint32_t active_pages = (active_tokens + 255)/256;
     // Prompt chunks use the uniform layout because it grows without
     // repartitioning. Decode-like microbatches concentrate the same page
     // budget into fewer split layers, bounded by the ring working set so copy
     // and compute can still overlap. A zero target restores prefill.
-    constexpr uint32_t MAX_DECODE_QUERY_TOKENS = 32;
     const uint32_t decode_layout_pages =
         query_tokens <= MAX_DECODE_QUERY_TOKENS && active_pages > resident_pages ?
             active_pages : 0;
-    if (decode_layout_pages != owner.decode_layout_pages) {
-        if (!owner.decode_layout_fn(owner.runtime, decode_layout_pages)) {
-            LLAMA_LOG_WARN("%s: failed to select CUDA KV decode layout for %u active pages\n",
-                __func__, decode_layout_pages);
-            return false;
-        }
-        owner.decode_layout_pages = decode_layout_pages;
+    const bool entering_decode_layout =
+        decode_layout_pages != 0 && decode_layout_pages != owner.decode_layout_pages;
+
+    if (ring_slots != 0 && owner.minimum_ring_slots == 0) {
+        owner.minimum_ring_slots = ring_slots;
     }
     if (!delta.valid) {
         owner.starved_evaluations = 0;
         owner.overprovisioned_evaluations = 0;
         LLAMA_LOG_WARN("%s: ignoring invalid CUDA feedback: %s\n",
             __func__, delta.error.c_str());
-        return false;
     }
-    if (!delta.has_evaluation || ring_slots == 0) {
-        return false;
-    }
-    if (getenv("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS") != nullptr) {
-        return false;
-    }
-    if (owner.minimum_ring_slots == 0) {
-        owner.minimum_ring_slots = ring_slots;
-    }
+
+    uint32_t target_ring_slots = ring_slots;
+    uint32_t target_resident_pages = resident_pages;
+    bool partition_changed = false;
+    const bool fixed_ring =
+        getenv("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS") != nullptr;
 
     // No streaming pressure exists while every active page fits in the
     // resident partition; preserve the current boundary without churn.
     if (active_pages <= resident_pages) {
         owner.starved_evaluations = 0;
         owner.overprovisioned_evaluations = 0;
-        return false;
+    } else if (ring_slots != 0 && !fixed_ring &&
+            (entering_decode_layout || (delta.valid && delta.has_evaluation))) {
+        if (delta.has_evaluation && owner.evaluations_since_repartition != UINT32_MAX) {
+            ++owner.evaluations_since_repartition;
+        }
+
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages = controlled_pages;
+        params.layer_count = owner.layer_count;
+        params.active_pages_per_layer = active_pages;
+        params.minimum_ring_slots = owner.minimum_ring_slots;
+        params.previous_resident_pages_per_layer = resident_pages;
+        params.previous_ring_slots = ring_slots;
+        params.deadline_miss_ratio = delta.valid ? delta.deadline_miss_ratio : 0.0;
+        params.copy_engine_busy_ratio = copy_busy_ratio;
+        params.ring_peak_occupancy_ratio =
+            std::min(1.0, double(peak_occupancy)/double(ring_slots));
+        params.starved_evaluations = owner.starved_evaluations;
+        params.overprovisioned_evaluations = owner.overprovisioned_evaluations;
+        params.evaluations_since_repartition = owner.evaluations_since_repartition;
+        params.entering_decode_layout = entering_decode_layout;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        if (!partition.valid) {
+            LLAMA_LOG_WARN("%s: ignoring invalid partition feedback: %s\n",
+                __func__, partition.error.c_str());
+        } else {
+            owner.starved_evaluations = partition.starved_evaluations;
+            owner.overprovisioned_evaluations = partition.overprovisioned_evaluations;
+            partition_changed = partition.changed;
+            target_ring_slots = partition.ring_slots;
+            target_resident_pages = partition.resident_pages_per_layer;
+        }
     }
 
-    if (owner.evaluations_since_repartition != UINT32_MAX) {
-        ++owner.evaluations_since_repartition;
+    const bool layout_changed = decode_layout_pages != owner.decode_layout_pages;
+    if ((layout_changed || partition_changed) && ring_slots != 0) {
+        if (!owner.reconfigure_fn(
+                owner.runtime, decode_layout_pages, target_ring_slots)) {
+            LLAMA_LOG_WARN(
+                "%s: failed to publish CUDA KV decode layout %u with ring %u\n",
+                __func__, decode_layout_pages, target_ring_slots);
+            return false;
+        }
+        owner.decode_layout_pages = decode_layout_pages;
     }
-    llama_kv_stream_partition_params params;
-    params.total_pool_pages = controlled_pages;
-    params.layer_count = owner.layer_count;
-    params.active_pages_per_layer = active_pages;
-    params.minimum_ring_slots = owner.minimum_ring_slots;
-    params.previous_resident_pages_per_layer = resident_pages;
-    params.previous_ring_slots = ring_slots;
-    params.deadline_miss_ratio = delta.deadline_miss_ratio;
-    params.copy_engine_busy_ratio = copy_busy_ratio;
-    params.ring_peak_occupancy_ratio =
-        std::min(1.0, double(peak_occupancy)/double(ring_slots));
-    params.starved_evaluations = owner.starved_evaluations;
-    params.overprovisioned_evaluations = owner.overprovisioned_evaluations;
-    params.evaluations_since_repartition =
-        owner.evaluations_since_repartition;
 
-    const auto partition = llama_kv_stream_partition_adapt(params);
-    if (!partition.valid) {
-        LLAMA_LOG_WARN("%s: ignoring invalid partition feedback: %s\n",
-            __func__, partition.error.c_str());
-        return false;
-    }
-    owner.starved_evaluations = partition.starved_evaluations;
-    owner.overprovisioned_evaluations = partition.overprovisioned_evaluations;
-    if (!partition.changed) {
-        return false;
-    }
-    if (!owner.repartition_fn(owner.runtime, partition.ring_slots)) {
-        LLAMA_LOG_WARN("%s: failed to move KV resident/ring boundary to %u slots\n",
-            __func__, partition.ring_slots);
+    if (!partition_changed) {
         return false;
     }
     owner.evaluations_since_repartition = 0;
-
     LLAMA_LOG_WARN("%s: adaptive KV partition: resident pages/layer %u -> %u, ring slots %u -> %u, miss %.1f%%, copy busy %.1f%%\n",
-        __func__, resident_pages, partition.resident_pages_per_layer,
-        ring_slots, partition.ring_slots,
-        100.0*delta.deadline_miss_ratio, 100.0*copy_busy_ratio);
+        __func__, resident_pages, target_resident_pages,
+        ring_slots, target_ring_slots,
+        100.0*(delta.valid ? delta.deadline_miss_ratio : 0.0),
+        100.0*copy_busy_ratio);
     return true;
 }
 

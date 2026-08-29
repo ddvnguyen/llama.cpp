@@ -408,7 +408,6 @@ llama_context::llama_context(
             /*.single_sequence     =*/ cparams.n_seq_max == 1,
             /*.flash_attention     =*/ cparams.flash_attn,
             /*.kv_offload          =*/ cparams.offload_kqv,
-            /*.cache_q8_q4         =*/ params.type_k == GGML_TYPE_Q8_0 && params.type_v == GGML_TYPE_Q4_0,
         };
         const auto stream_validation = llama_kv_stream_config_validate(stream_config);
         if (!stream_validation.valid) {

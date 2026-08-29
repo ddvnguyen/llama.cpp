@@ -204,7 +204,7 @@ int main() {
         constexpr size_t page_bytes = 64*1024;
         constexpr size_t pool_pages = 160;
         constexpr uint32_t layers = 16;
-        using new_fn_t = void * (*)(ggml_backend_dev_t, size_t, size_t, uint32_t);
+        using new_fn_t = void * (*)(ggml_backend_dev_t, size_t, size_t, size_t, uint32_t);
 
         ggml_backend_t backend = ggml_backend_cuda_init(0);
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
@@ -219,7 +219,7 @@ int main() {
             return;
         }
         auto runtime = static_cast<ggml_backend_cuda_kv_stream_runtime_t>(
-            new_fn(device, pool_pages*page_bytes, page_bytes, layers));
+            new_fn(device, pool_pages*page_bytes, page_bytes, 0, layers));
         if (!t.assert_true("factory runtime initializes", runtime != nullptr)) {
             ggml_backend_free(backend);
             return;

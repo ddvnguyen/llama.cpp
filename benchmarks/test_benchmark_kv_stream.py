@@ -28,11 +28,31 @@ class BenchmarkKvStreamTest(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             BENCHMARK.parse_token_count("bad")
 
+    def test_parse_args_resolves_launched_paths(self) -> None:
+        model = Path("models/model.gguf")
+        server = Path("build/bin/llama-server")
+        args = BENCHMARK.parse_args(
+            [
+                "--model", str(model),
+                "--server", str(server),
+                "--max-context", "8K",
+            ]
+        )
+        self.assertEqual(args.model, model.resolve())
+        self.assertEqual(args.server, server.resolve())
+
     def test_context_capacities_include_non_aligned_maximum(self) -> None:
         self.assertEqual(
             BENCHMARK.context_capacities(20000),
             [8192, 16384, 20000],
         )
+
+    def test_context_capacities_honor_custom_start_and_step(self) -> None:
+        self.assertEqual(
+            BENCHMARK.context_capacities(163840, 40960, 8192),
+            list(range(40960, 163841, 8192)),
+        )
+
 
     def test_pool_estimate_uses_all_free_memory_and_rounds_down(self) -> None:
         self.assertEqual(BENCHMARK.estimate_pool_mib(64, 3500, 32), 3552)
@@ -55,6 +75,8 @@ class BenchmarkKvStreamTest(unittest.TestCase):
         self.assertNotIn("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS", env)
         self.assertEqual(env["KEEP_ME"], "yes")
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "2")
+        traced = BENCHMARK.clean_server_env(None, trace_kv_stream=True)
+        self.assertEqual(traced["LLAMA_KV_STREAM_TRACE"], "1")
 
     def test_server_command_uses_tested_configuration(self) -> None:
         args = argparse.Namespace(
@@ -62,17 +84,40 @@ class BenchmarkKvStreamTest(unittest.TestCase):
             model=Path("/tmp/model.gguf"),
             port=12355,
             extra_server_arg=["--verbosity", "3"],
+            cache_type_k="bf16",
+            cache_type_v="q8_0",
         )
         command = BENCHMARK.server_command(args, 131072, 2304)
         self.assertEqual(command[0], "/tmp/llama-server")
         self.assertIn("131072", command)
         self.assertIn("2304", command)
-        self.assertEqual(command[command.index("-ctk") + 1], "q8_0")
-        self.assertEqual(command[command.index("-ctv") + 1], "q4_0")
+        self.assertEqual(command[command.index("-ctk") + 1], "bf16")
+        self.assertEqual(command[command.index("-ctv") + 1], "q8_0")
         self.assertEqual(command[command.index("-np") + 1], "1")
         self.assertEqual(command[-2:], ["--verbosity", "3"])
 
+    def test_trace_parser_marks_only_pages_beyond_resident_partition(self) -> None:
+        log = (
+            "I kv_stream_adapt: active 65536, resident 256, ring 32, "
+            "samples 1, misses 0, copy busy 0.0%, peak 1\n"
+            "W kv_stream_adapt: adaptive KV partition: resident pages/layer "
+            "256 -> 248, ring slots 32 -> 160, miss 50.0%, copy busy 25.0%\n"
+            "I kv_stream_adapt: active 65792, resident 248, ring 160, "
+            "samples 2, misses 1, copy busy 25.0%, peak 10\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_text(log)
+            parsed = BENCHMARK.parse_kv_stream_trace(path)
+        self.assertTrue(parsed["streaming_active"])
+        self.assertEqual(parsed["stream_first_active_tokens"], 65792)
+        self.assertEqual(parsed["stream_trace_samples"], 2)
+        self.assertEqual(parsed["stream_repartitions"], 1)
+        self.assertEqual(parsed["stream_max_ring_slots"], 160)
+
+
     def test_resume_rejects_changed_settings(self) -> None:
+
         signature = {"model": "/tmp/model.gguf", "max_context": 16384}
         BENCHMARK.validate_resume(signature.copy(), signature, Path("results.jsonl"))
         with self.assertRaisesRegex(SystemExit, "different settings"):

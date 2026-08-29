@@ -42,9 +42,33 @@ struct ggml_backend_cuda_kv_stream_params {
     size_t stage_bytes;
     uint32_t stage_slots;
     size_t pool_bytes;
+    size_t conversion_bytes;
     uint32_t resident_layer_count;
     uint32_t page_tokens;
+    uint32_t decode_span_pages;
 };
+
+struct ggml_backend_cuda_kv_stream_type_capabilities {
+    bool classified;
+    bool storage;
+    bool online_write;
+    bool decode_f16;
+    bool direct_attention;
+    bool requires_initialization;
+    bool requires_importance_matrix;
+    bool auxiliary;
+};
+
+enum ggml_backend_cuda_kv_stream_attention_mode {
+    GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED = 0,
+    GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT      = 1,
+    GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16         = 2,
+};
+
+GGML_BACKEND_API struct ggml_backend_cuda_kv_stream_type_capabilities
+ggml_backend_cuda_kv_stream_get_type_capabilities(enum ggml_type type);
+GGML_BACKEND_API enum ggml_backend_cuda_kv_stream_attention_mode
+ggml_backend_cuda_kv_stream_get_attention_mode(enum ggml_type type_k, enum ggml_type type_v);
 
 struct ggml_backend_cuda_kv_stream_stats {
     uint64_t resident_hits;
@@ -80,6 +104,10 @@ GGML_BACKEND_API uint32_t ggml_backend_cuda_kv_stream_stage_slots(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API uint32_t ggml_backend_cuda_kv_stream_resident_pages_per_layer(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_reconfigure(
+    ggml_backend_cuda_kv_stream_runtime_t runtime,
+    uint32_t active_pages_per_layer,
+    uint32_t stage_slots);
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_repartition(
     ggml_backend_cuda_kv_stream_runtime_t runtime,
     uint32_t stage_slots);

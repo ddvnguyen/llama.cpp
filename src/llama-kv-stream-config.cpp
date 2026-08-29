@@ -26,9 +26,6 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
     if (!config.kv_offload) {
         return invalid("block KV streaming requires GPU KV offload");
     }
-    if (!config.cache_q8_q4) {
-        return invalid("block KV streaming currently requires K Q8_0 and V Q4_0");
-    }
     if (config.minimum_stage_bytes == 0 || config.stage_bytes < config.minimum_stage_bytes) {
         return invalid("block KV streaming stage is too small for one 256-token cache page");
     }

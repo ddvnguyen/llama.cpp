@@ -1,9 +1,11 @@
 #include "common.cuh"
+#include "convert.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "kv-stream-span-tuner.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -141,6 +143,7 @@ namespace {
 constexpr size_t KV_STREAM_NO_REQUEST = std::numeric_limits<size_t>::max();
 constexpr uint32_t KV_STREAM_NO_LAYER = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t KV_STREAM_COPY_BATCH_PAGES = 32;
+constexpr uint32_t KV_STREAM_DECODE_SPAN_PAGES = KV_STREAM_COPY_BATCH_PAGES;
 
 struct kv_stream_graph_request {
     const char * k_data = nullptr;
@@ -174,8 +177,12 @@ struct kv_stream_graph_request {
 struct ggml_cuda_kv_stream_transfer_ring {
     char * pool_data = nullptr;
     size_t page_bytes = 0;
+    char * conversion_data = nullptr;
+    size_t conversion_bytes = 0;
     uint32_t capacity_slots = 0;
     uint32_t active_slots = 0;
+    uint32_t forced_decode_span_pages = 0;
+    uint32_t graph_decode_span_pages = UINT32_MAX;
     cudaStream_t copy_stream = nullptr;
     cudaEvent_t producer_ready = nullptr;
     cudaEvent_t eval_start = nullptr;
@@ -192,6 +199,8 @@ struct ggml_cuda_kv_stream_transfer_ring {
     uint64_t * deadline_counters_device = nullptr;
 
     bool graph_active = false;
+    bool graph_decode = true;
+    ggml_cuda_kv_stream_span_tuner span_tuner;
     uint32_t graph_layer_count = 0;
     uint32_t current_layer = KV_STREAM_NO_LAYER;
     size_t next_request = 0;
@@ -214,21 +223,30 @@ struct ggml_cuda_kv_stream_transfer_ring {
     uint32_t copy_sample_uploads = 0;
     bool timing_pending = false;
     bool timing_current = false;
+    bool last_graph_decode = false;
+    bool last_graph_bounded = false;
+    bool last_graph_streamed = false;
     bool copy_sample_recorded = false;
 };
 
 ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
-        void * pool_data, size_t page_bytes, uint32_t stage_slots) {
-    if (pool_data == nullptr || page_bytes == 0 || stage_slots == 0) {
+        void * pool_data, size_t page_bytes, uint32_t stage_slots,
+        void * conversion_data, size_t conversion_bytes,
+        uint32_t forced_decode_span_pages) {
+    if (pool_data == nullptr || page_bytes == 0 || stage_slots == 0 ||
+            (conversion_bytes != 0 && conversion_data == nullptr)) {
         return nullptr;
     }
 
     auto * ring = new ggml_cuda_kv_stream_transfer_ring;
     ring->pool_data = static_cast<char *>(pool_data);
     ring->page_bytes = page_bytes;
+    ring->conversion_data = static_cast<char *>(conversion_data);
+    ring->conversion_bytes = conversion_bytes;
     ring->capacity_slots = stage_slots;
     ring->active_slots = stage_slots;
     ring->ready.resize(stage_slots, nullptr);
+    ring->forced_decode_span_pages = forced_decode_span_pages;
     ring->consumed.resize(stage_slots, nullptr);
     ring->slot_used.resize(stage_slots, 0);
     ring->slot_request.resize(stage_slots, KV_STREAM_NO_REQUEST);
@@ -334,7 +352,44 @@ bool ggml_cuda_kv_stream_transfer_ring_set_active_slots(
     if (ring == nullptr || stage_slots == 0 || stage_slots > ring->capacity_slots) {
         return false;
     }
+    if (ring->active_slots != stage_slots) {
+        ring->span_tuner.reset();
+        ring->timing_pending = false;
+        ring->timing_current = false;
+    }
     ring->active_slots = stage_slots;
+    return true;
+}
+
+void ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(
+        ggml_cuda_kv_stream_transfer_ring * ring) {
+    if (ring != nullptr) {
+        ring->span_tuner.reset();
+        ring->timing_pending = false;
+        ring->timing_current = false;
+    }
+}
+
+bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
+        ggml_cuda_kv_stream_transfer_ring * ring, double elapsed_ms) {
+    if (ring == nullptr) {
+        return false;
+    }
+    if (ring->forced_decode_span_pages != 0) {
+        return true;
+    }
+    const bool was_selected = ring->span_tuner.selected();
+    ring->span_tuner.observe(
+        elapsed_ms, ring->last_graph_decode && ring->last_graph_streamed,
+        ring->last_graph_bounded);
+    if (!was_selected && ring->span_tuner.selected()) {
+        GGML_LOG_WARN(
+            "%s: selected %s decode spans from end-to-end latency "
+            "(unbounded %.3f ms, %u-page %.3f ms)\n",
+            __func__, ring->span_tuner.use_bounded() ? "bounded" : "unbounded",
+            ring->span_tuner.unbounded_average_ms(), KV_STREAM_DECODE_SPAN_PAGES,
+            ring->span_tuner.bounded_average_ms());
+    }
     return true;
 }
 
@@ -516,6 +571,55 @@ void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache
     cache->stats = {};
 }
 
+bool ggml_cuda_kv_stream_resident_cache_reconfigure(
+        ggml_cuda_kv_stream_resident_cache * cache,
+        size_t scratch_bytes,
+        uint32_t active_pages_per_layer) {
+    if (cache == nullptr) {
+        return false;
+    }
+
+    uint32_t pages_per_layer = 0;
+    std::vector<uint32_t> layer_pages;
+    std::vector<size_t> layer_offsets;
+    if (!kv_stream_resident_cache_layout(
+            cache, scratch_bytes, active_pages_per_layer,
+            pages_per_layer, layer_pages, layer_offsets)) {
+        return false;
+    }
+
+    const bool scratch_changed = cache->scratch_bytes != scratch_bytes;
+    const bool layout_changed = cache->layer_pages != layer_pages;
+    cache->decode_active_pages = active_pages_per_layer;
+    cache->resident_pages_per_layer = pages_per_layer;
+    if (!scratch_changed && !layout_changed) {
+        return true;
+    }
+
+    // Publish the scratch boundary and concentrated decode layout together.
+    // Both changes alter physical K/V addresses, so one invalidation is
+    // required; applying them separately would discard and reload the same
+    // resident working set twice.
+    cache->scratch_bytes = scratch_bytes;
+    cache->layer_pages = std::move(layer_pages);
+    cache->layer_offsets = std::move(layer_offsets);
+    cache->loaded.assign(cache->layer_offsets.back(), 0);
+    cache->dirty.assign(cache->layer_offsets.back(), 0);
+    cache->precise_dirty_tracking.assign(cache->layer_count, 0);
+    cache->dirty_rows.clear();
+    cache->mutable_pages.clear();
+    cache->all_pages_mutable = false;
+    cache->layer_by_k.clear();
+    cache->layer_by_data.clear();
+    cache->mirror_by_data.clear();
+    cache->next_layer = 0;
+    if (scratch_changed) {
+        cache->stats = {};
+    }
+    return true;
+}
+
+
 bool ggml_cuda_kv_stream_resident_cache_repartition(
         ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes) {
     if (cache == nullptr) {
@@ -655,7 +759,7 @@ bool ggml_cuda_kv_stream_resident_cache_get_mirror(
         const ggml_tensor * target,
         void ** data) {
     if (cache == nullptr || target == nullptr || data == nullptr ||
-            cache->dirty_rows.size() != 1 || cache->dirty_rows[0] < 0) {
+            cache->dirty_rows.empty()) {
         return false;
     }
     const auto layer_it = cache->layer_by_data.find(target->data);
@@ -664,8 +768,10 @@ bool ggml_cuda_kv_stream_resident_cache_get_mirror(
         return false;
     }
     const uint64_t capacity = uint64_t(cache->layer_pages[layer_it->second])*cache->page_tokens;
-    if (uint64_t(cache->dirty_rows[0]) >= capacity) {
-        return false;
+    for (const int64_t row : cache->dirty_rows) {
+        if (row < 0 || uint64_t(row) >= capacity) {
+            return false;
+        }
     }
     *data = mirror_it->second;
     return true;
@@ -853,62 +959,258 @@ static __global__ void kv_stream_normalize_chunk_results(
     dst[row*D + tid] = accumulator[row*D + tid]/accumulator_meta[row].y;
 }
 
-template<bool use_logit_softcap>
-static void kv_stream_launch_q8_q4_partial(
-        ggml_backend_cuda_context & ctx,
-        ggml_tensor * dst,
-        float * parts,
-        float2 * meta,
-        int nparts) {
-    const ggml_tensor * Q = dst->src[0];
-    const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+using kv_stream_native_partial_fn = void (*)(
+    ggml_backend_cuda_context &, ggml_tensor *, float *, float2 *, int);
 
-    constexpr int ncols = 1;
-    constexpr int nthreads = 128;
-    constexpr int nwarps = nthreads/WARP_SIZE;
-    fattn_kernel_t kernel = flash_attn_ext_vec<
-        KV_STREAM_HEAD_DIM, ncols, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, use_logit_softcap>;
-
-    float scale = 1.0f;
-    float max_bias = 0.0f;
-    float logit_softcap = 0.0f;
-    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
-    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
-    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
-    if (logit_softcap != 0.0f) {
-        scale /= logit_softcap;
+template<ggml_type type_K>
+static kv_stream_native_partial_fn kv_stream_resolve_native_partial_for_v(ggml_type type_v) {
+    switch (type_v) {
+        case GGML_TYPE_F16:
+            return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_F16>;
+        case GGML_TYPE_Q4_0:
+            return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q4_0>;
+        case GGML_TYPE_Q4_1:
+            return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q4_1>;
+        case GGML_TYPE_Q5_0:
+            return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q5_0>;
+        case GGML_TYPE_Q5_1:
+            return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q5_1>;
+        case GGML_TYPE_Q8_0:
+            return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q8_0>;
+        case GGML_TYPE_BF16:
+            return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_BF16>;
+        default:
+            return nullptr;
     }
-
-    const uint32_t n_head = Q->ne[2];
-    const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
-    const float m0 = powf(2.0f, -(max_bias       )/n_head_log2);
-    const float m1 = powf(2.0f, -(max_bias/2.0f)/n_head_log2);
-    const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
-
-    const dim3 blocks(Q->ne[1], nparts, Q->ne[2]*Q->ne[3]);
-    const dim3 threads(WARP_SIZE, nwarps, 1);
-    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
-    ggml_cuda_kernel_launch(kernel, launch_params,
-        (const char *) Q->data,
-        (const char *) K->data,
-        (const char *) V->data,
-        mask ? (const char *) mask->data : nullptr,
-        nullptr,
-        nullptr,
-        parts,
-        meta,
-        scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-        Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
-        V->nb[1], V->nb[2], V->nb[3],
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0);
-    CUDA_CHECK(cudaGetLastError());
 }
 
+static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
+        ggml_type type_k, ggml_type type_v) {
+#define KV_STREAM_NATIVE_K_CASE(type_K) \
+        case type_K: return kv_stream_resolve_native_partial_for_v<type_K>(type_v)
+    switch (type_k) {
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_F16);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q4_0);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q4_1);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q5_0);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q5_1);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q8_0);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_BF16);
+        default: return nullptr;
+    }
+#undef KV_STREAM_NATIVE_K_CASE
+}
+#endif // GGML_CUDA_FA_ALL_QUANTS
+
 } // namespace
+
+struct ggml_backend_cuda_kv_stream_type_capabilities
+ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
+    ggml_backend_cuda_kv_stream_type_capabilities result{};
+
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+            result.classified = true;
+            break;
+        default:
+            return result;
+    }
+
+    result.storage = type != GGML_TYPE_Q8_1 && type != GGML_TYPE_Q8_K;
+
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+            result.online_write = true;
+            break;
+        default:
+            break;
+    }
+
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+            result.decode_f16 = true;
+            break;
+        default:
+            break;
+    }
+
+    switch (type) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            result.direct_attention = true;
+            break;
+        default:
+            break;
+    }
+
+    result.requires_initialization =
+        type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S;
+    result.requires_importance_matrix =
+        type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+        type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M;
+    result.auxiliary = type == GGML_TYPE_Q8_1 || type == GGML_TYPE_Q8_K;
+    return result;
+}
+
+ggml_backend_cuda_kv_stream_attention_mode
+ggml_backend_cuda_kv_stream_get_attention_mode(ggml_type type_k, ggml_type type_v) {
+    const auto capabilities_k = ggml_backend_cuda_kv_stream_get_type_capabilities(type_k);
+    const auto capabilities_v = ggml_backend_cuda_kv_stream_get_type_capabilities(type_v);
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+    if (capabilities_k.direct_attention && capabilities_v.direct_attention) {
+        return GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
+    }
+#endif // GGML_CUDA_FA_ALL_QUANTS
+    if (capabilities_k.storage && capabilities_v.storage &&
+            capabilities_k.online_write && capabilities_v.online_write &&
+            capabilities_k.decode_f16 && capabilities_v.decode_f16 &&
+            !capabilities_k.requires_importance_matrix && !capabilities_v.requires_importance_matrix) {
+        return GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
+    }
+    return GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED;
+}
+
+bool ggml_cuda_kv_stream_page_bytes(
+        ggml_type type_k, ggml_type type_v,
+        uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
+        uint32_t page_tokens, size_t * page_bytes) {
+    if (head_dim_k == 0 || head_dim_v == 0 || head_count == 0 || page_tokens == 0 || page_bytes == nullptr) {
+        return false;
+    }
+
+    const auto capabilities_k = ggml_backend_cuda_kv_stream_get_type_capabilities(type_k);
+    const auto capabilities_v = ggml_backend_cuda_kv_stream_get_type_capabilities(type_v);
+    if (!capabilities_k.storage || !capabilities_v.storage) {
+        return false;
+    }
+
+    const uint32_t block_size_k = ggml_blck_size(type_k);
+    const uint32_t block_size_v = ggml_blck_size(type_v);
+    if (block_size_k == 0 || block_size_v == 0 ||
+            head_dim_k % block_size_k != 0 || head_dim_v % block_size_v != 0) {
+        return false;
+    }
+
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    const size_t row_bytes_k = ggml_row_size(type_k, head_dim_k);
+    const size_t row_bytes_v = ggml_row_size(type_v, head_dim_v);
+    if (row_bytes_k > maximum/head_count || row_bytes_v > maximum/head_count) {
+        return false;
+    }
+    const size_t token_bytes_k = row_bytes_k*head_count;
+    const size_t token_bytes_v = row_bytes_v*head_count;
+    if (token_bytes_k > maximum/page_tokens || token_bytes_v > maximum/page_tokens) {
+        return false;
+    }
+    const size_t page_bytes_k = token_bytes_k*page_tokens;
+    const size_t page_bytes_v = token_bytes_v*page_tokens;
+    if (page_bytes_k > maximum - 127) {
+        return false;
+    }
+    const size_t page_offset_v = (page_bytes_k + 127) & ~size_t(127);
+    if (page_bytes_v > maximum - page_offset_v) {
+        return false;
+    }
+
+    *page_bytes = page_offset_v + page_bytes_v;
+    return true;
+}
+
+bool ggml_cuda_kv_stream_workspace_bytes(
+        ggml_type type_k, ggml_type type_v,
+        uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
+        uint32_t page_tokens, size_t * workspace_bytes) {
+    if (workspace_bytes == nullptr) {
+        return false;
+    }
+    const auto mode =
+        ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v);
+    if (mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT) {
+        *workspace_bytes = 0;
+        return true;
+    }
+    if (mode != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16) {
+        return false;
+    }
+    return ggml_cuda_kv_stream_page_bytes(
+        GGML_TYPE_F16, GGML_TYPE_F16,
+        head_dim_k, head_dim_v, head_count, page_tokens, workspace_bytes);
+}
 
 bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes) {
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
@@ -921,7 +1223,8 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
     const ggml_tensor * sinks = dst->src[4];
 
     return Q != nullptr && K != nullptr && V != nullptr &&
-        Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 &&
+        Q->type == GGML_TYPE_F32 &&
+        ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type) != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED &&
         Q->ne[0] == KV_STREAM_HEAD_DIM && V->ne[0] == KV_STREAM_HEAD_DIM &&
         Q->ne[1] >= 1 && Q->ne[1] <= 256 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
         K->ne[1] == V->ne[1] && K->ne[2] == V->ne[2] &&
@@ -1175,6 +1478,11 @@ static uint32_t kv_stream_graph_schedule_batch(
         return 0;
     }
     const size_t first_request = ring->next_request;
+    // Probe every immutable copy batch at its actual compute deadline. Mutable
+    // tails are produced by this graph and are excluded from prefetch quality
+    // feedback so they do not force unnecessary resident-page demotions.
+    ring->graph_requests[first_request].deadline_sample =
+        !ring->graph_requests[first_request].mutable_tail;
     ring->next_request += batch_pages;
     if (batch_pages == 1) {
         kv_stream_graph_upload(
@@ -1256,6 +1564,10 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
     GGML_ASSERT(ring != nullptr);
     const bool timing_available = kv_stream_collect_timing(ring);
     ring->graph_active = true;
+    ring->graph_decode = true;
+    ring->graph_decode_span_pages = ring->forced_decode_span_pages != 0 ?
+        ring->forced_decode_span_pages :
+        (ring->span_tuner.use_bounded() ? KV_STREAM_DECODE_SPAN_PAGES : UINT32_MAX);
     ring->graph_layer_count = 0;
     ring->current_layer = KV_STREAM_NO_LAYER;
     ring->next_request = 0;
@@ -1288,6 +1600,7 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     if (ring->graph_resident_cache != nullptr && ring->graph_resident_cache != resident_cache) {
         return false;
     }
+    ring->graph_decode = ring->graph_decode && dst->src[0]->ne[1] == 1;
     if (dst->src[0]->ne[1] != 1) {
         // Graphs are rebuilt across warmup, prompt chunks, and slot reuse.
         // Relearn pointer-to-layer identity once per prefill graph while the
@@ -1330,7 +1643,6 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     auto & page_requests = ring->graph_request_by_k_page[K->data];
     page_requests.assign(nchunks, KV_STREAM_NO_REQUEST);
 
-    bool sampled_prefetch_deadline = false;
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         const uint32_t page = uint32_t(chunk);
         if (page < resident_cache->layer_pages[resident_layer]) {
@@ -1362,8 +1674,6 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         request.mutable_tail = chunk == nchunks - 1 ||
             kv_stream_page_mutable(resident_cache, page);
         request.eligible = !request.mutable_tail;
-        request.deadline_sample = request.eligible && !sampled_prefetch_deadline;
-        sampled_prefetch_deadline |= request.deadline_sample;
         GGML_ASSERT(request.v_offset + request.v_bytes == ring->page_bytes);
 
         page_requests[page] = ring->graph_requests.size();
@@ -1375,6 +1685,9 @@ bool ggml_cuda_kv_stream_graph_add_attention(
 void ggml_cuda_kv_stream_graph_finalize(
         ggml_cuda_kv_stream_transfer_ring * ring, cudaStream_t compute_stream) {
     GGML_ASSERT(ring != nullptr);
+    ring->last_graph_decode = ring->graph_decode;
+    ring->last_graph_bounded = ring->graph_decode_span_pages != UINT32_MAX;
+    ring->last_graph_streamed = !ring->graph_requests.empty();
     if (ring->graph_requests.empty()) {
         ring->timing_current = false;
         return;
@@ -1423,10 +1736,29 @@ void ggml_cuda_flash_attn_ext_streamed(
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const auto attention_mode =
+        ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type);
+    const bool convert_to_f16 =
+        attention_mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+    const kv_stream_native_partial_fn native_partial =
+        attention_mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT ?
+            kv_stream_resolve_native_partial(K->type, V->type) : nullptr;
+    GGML_ASSERT(attention_mode != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT ||
+        native_partial != nullptr);
+#endif // GGML_CUDA_FA_ALL_QUANTS
+    const to_fp16_cuda_t converter_k = convert_to_f16 && K->type != GGML_TYPE_F16 ?
+        ggml_get_to_fp16_cuda(K->type) : nullptr;
+    const to_fp16_cuda_t converter_v = convert_to_f16 && V->type != GGML_TYPE_F16 ?
+        ggml_get_to_fp16_cuda(V->type) : nullptr;
+    GGML_ASSERT(!convert_to_f16 || K->type == GGML_TYPE_F16 || converter_k != nullptr);
+    GGML_ASSERT(!convert_to_f16 || V->type == GGML_TYPE_F16 || converter_v != nullptr);
     const int64_t block_tokens = resident_cache != nullptr ?
         resident_cache->page_tokens : kv_stream_block_tokens(dst, stage_bytes);
     const int nchunks = (K->ne[1] + block_tokens - 1)/block_tokens;
     const int nrows = ggml_nrows(dst);
+    const uint32_t maximum_streamed_span_pages = Q->ne[1] == 1 ?
+        transfer_ring->graph_decode_span_pages : UINT32_MAX;
 
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<float> parts(pool, KV_STREAM_MAX_PARTS_PER_CHUNK*ggml_nelements(dst));
@@ -1655,7 +1987,9 @@ void ggml_cuda_flash_attn_ext_streamed(
             // Coalesce ready pages that occupy consecutive plane slots. The
             // head stride remains the full active-ring plane width, while the
             // tensor's token extent grows across adjacent slots.
-            while (chunk + int(streamed_span_pages) < nchunks) {
+            while (!convert_to_f16 &&
+                    streamed_span_pages < maximum_streamed_span_pages &&
+                    chunk + int(streamed_span_pages) < nchunks) {
                 auto & candidate = chunks[chunk + streamed_span_pages];
                 uint32_t candidate_ready_slot = candidate.slot;
                 if (!candidate.streamed) {
@@ -1703,29 +2037,41 @@ void ggml_cuda_flash_attn_ext_streamed(
                 resident_cache->stats.streamed_pages_attended += streamed_span_pages;
             }
         } else {
-            // Resident pages form one contiguous head-major K/V prefix. Upload
-            // dirty pages separately, then execute the whole prefix once.
-            if (chunk > 0) {
-                continue;
-            }
-            const uint32_t resident_span_pages =
-                std::min<uint32_t>(uint32_t(nchunks), resident_layer_pages);
-            GGML_ASSERT(resident_span_pages > 0);
-            for (uint32_t page = 0; page < resident_span_pages; ++page) {
-                upload(chunks[page], ctx.stream());
-                if (chunks[page].upload &&
-                        resident_cache->precise_dirty_tracking[resident_layer]) {
-                    resident_cache->dirty[
-                        kv_stream_resident_index(resident_cache, resident_layer, page)] = 0;
+            if (convert_to_f16) {
+                // Generic quantized K/V is converted one page at a time into
+                // the bounded workspace. Keep resident pages separate so the
+                // fallback never creates a context-sized F16 allocation.
+                upload(desc, ctx.stream());
+                if (desc.upload && resident_cache->precise_dirty_tracking[resident_layer]) {
+                    resident_cache->dirty[kv_stream_resident_index(
+                        resident_cache, resident_layer, uint32_t(chunk))] = 0;
                 }
+                ++resident_cache->stats.resident_attention_spans;
+                ++resident_cache->stats.resident_pages_attended;
+            } else {
+                // Native kernels consume the resident K/V prefix in one span.
+                if (chunk > 0) {
+                    continue;
+                }
+                const uint32_t resident_span_pages =
+                    std::min<uint32_t>(uint32_t(nchunks), resident_layer_pages);
+                GGML_ASSERT(resident_span_pages > 0);
+                for (uint32_t page = 0; page < resident_span_pages; ++page) {
+                    upload(chunks[page], ctx.stream());
+                    if (chunks[page].upload &&
+                            resident_cache->precise_dirty_tracking[resident_layer]) {
+                        resident_cache->dirty[
+                            kv_stream_resident_index(resident_cache, resident_layer, page)] = 0;
+                    }
+                }
+                desc.token_count = int64_t(resident_span_pages)*block_tokens;
+                desc.k_head_bytes = desc.k_row_bytes*desc.token_count;
+                desc.k_bytes = desc.k_head_bytes*K->ne[2];
+                desc.v_head_bytes = desc.v_row_bytes*desc.token_count;
+                desc.v_bytes = desc.v_head_bytes*V->ne[2];
+                ++resident_cache->stats.resident_attention_spans;
+                resident_cache->stats.resident_pages_attended += resident_span_pages;
             }
-            desc.token_count = int64_t(resident_span_pages)*block_tokens;
-            desc.k_head_bytes = desc.k_row_bytes*desc.token_count;
-            desc.k_bytes = desc.k_head_bytes*K->ne[2];
-            desc.v_head_bytes = desc.v_row_bytes*desc.token_count;
-            desc.v_bytes = desc.v_head_bytes*V->ne[2];
-            ++resident_cache->stats.resident_attention_spans;
-            resident_cache->stats.resident_pages_attended += resident_span_pages;
         }
 
         ggml_tensor staged_k = *K;
@@ -1741,6 +2087,50 @@ void ggml_cuda_flash_attn_ext_streamed(
         staged_v.nb[2] = desc.v_stage_head_stride;
         staged_v.nb[3] = desc.v_stage_token_stride*desc.token_count;
 
+        ggml_tensor converted_k{};
+        ggml_tensor converted_v{};
+        if (convert_to_f16) {
+            GGML_ASSERT(transfer_ring->conversion_data != nullptr);
+            const size_t k_elements = size_t(K->ne[0])*desc.token_count*K->ne[2];
+            const size_t v_elements = size_t(V->ne[0])*desc.token_count*V->ne[2];
+            const size_t k_f16_bytes = k_elements*sizeof(half);
+            const size_t v_f16_offset = GGML_PAD(k_f16_bytes, 128);
+            const size_t v_f16_bytes = v_elements*sizeof(half);
+            GGML_ASSERT(v_f16_offset <= transfer_ring->conversion_bytes &&
+                v_f16_bytes <= transfer_ring->conversion_bytes - v_f16_offset);
+
+            auto convert_page = [&](const ggml_tensor & src, half * converted,
+                    size_t elements, to_fp16_cuda_t converter) {
+                if (converter == nullptr) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        converted, src.data, elements*sizeof(half),
+                        cudaMemcpyDeviceToDevice, ctx.stream()));
+                    return;
+                }
+                converter(src.data, converted, elements, ctx.stream());
+            };
+
+            auto * converted_k_data = reinterpret_cast<half *>(transfer_ring->conversion_data);
+            auto * converted_v_data = reinterpret_cast<half *>(
+                transfer_ring->conversion_data + v_f16_offset);
+            convert_page(staged_k, converted_k_data, k_elements, converter_k);
+            convert_page(staged_v, converted_v_data, v_elements, converter_v);
+
+            converted_k = staged_k;
+            converted_k.type = GGML_TYPE_F16;
+            converted_k.data = converted_k_data;
+            converted_k.nb[0] = sizeof(half);
+            converted_k.nb[1] = size_t(K->ne[0])*K->ne[2]*sizeof(half);
+            converted_k.nb[2] = size_t(K->ne[0])*sizeof(half);
+            converted_k.nb[3] = converted_k.nb[1]*converted_k.ne[1];
+            converted_v = staged_v;
+            converted_v.type = GGML_TYPE_F16;
+            converted_v.data = converted_v_data;
+            converted_v.nb[0] = sizeof(half);
+            converted_v.nb[1] = size_t(V->ne[0])*V->ne[2]*sizeof(half);
+            converted_v.nb[2] = size_t(V->ne[0])*sizeof(half);
+            converted_v.nb[3] = converted_v.nb[1]*converted_v.ne[1];
+        }
         ggml_tensor staged_mask{};
         ggml_tensor * staged_mask_ptr = nullptr;
         if (mask != nullptr) {
@@ -1751,13 +2141,13 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
 
         ggml_tensor staged_dst = *dst;
-        staged_dst.src[1] = &staged_k;
-        staged_dst.src[2] = &staged_v;
+        staged_dst.src[1] = convert_to_f16 ? &converted_k : &staged_k;
+        staged_dst.src[2] = convert_to_f16 ? &converted_v : &staged_v;
         staged_dst.src[3] = staged_mask_ptr;
 
         // Preserve normal CUDA flash attention when the active cache is fully resident or fits in one streamed page.
         // This avoids a partial reduction and keeps logits identical to a non-streamed cache.
-        if (streamed_chunks.empty() || nchunks == 1) {
+        if (!convert_to_f16 && (streamed_chunks.empty() || nchunks == 1)) {
             ggml_cuda_flash_attn_ext(ctx, &staged_dst);
             if (desc.streamed) {
                 if (graph_planned) {
@@ -1770,7 +2160,8 @@ void ggml_cuda_flash_attn_ext_streamed(
             return;
         }
 
-        const bool use_mma_prefill = Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        const bool use_mma_prefill = !convert_to_f16 &&
+            Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
             mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
         int partial_count = kv_stream_parts_per_chunk();
         if (use_mma_prefill) {
@@ -1781,14 +2172,17 @@ void ggml_cuda_flash_attn_ext_streamed(
                 ++resident_cache->stats.mma_prefill_attention_spans;
             }
         } else {
-            float logit_softcap = 0.0f;
-            memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
-            if (logit_softcap == 0.0f) {
-                kv_stream_launch_q8_q4_partial<false>(
-                    ctx, &staged_dst, parts.ptr, meta.ptr, partial_count);
+            if (convert_to_f16) {
+                ggml_cuda_flash_attn_ext_vec_partial_case<
+                    KV_STREAM_HEAD_DIM, GGML_TYPE_F16, GGML_TYPE_F16>(
+                        ctx, &staged_dst, parts.ptr, meta.ptr, partial_count);
             } else {
-                kv_stream_launch_q8_q4_partial<true>(
-                    ctx, &staged_dst, parts.ptr, meta.ptr, partial_count);
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+                GGML_ASSERT(native_partial != nullptr);
+                native_partial(ctx, &staged_dst, parts.ptr, meta.ptr, partial_count);
+#else
+                GGML_ABORT("native quantized KV streaming requires GGML_CUDA_FA_ALL_QUANTS");
+#endif // GGML_CUDA_FA_ALL_QUANTS
             }
         }
 

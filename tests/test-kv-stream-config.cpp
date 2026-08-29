@@ -20,7 +20,6 @@ int main() {
         config.single_sequence    = true;
         config.flash_attention    = true;
         config.kv_offload         = true;
-        config.cache_q8_q4        = true;
 
         const auto result = llama_kv_stream_config_validate(config);
         t.assert_true("config is valid", result.valid);
@@ -36,7 +35,6 @@ int main() {
         base.single_sequence     = true;
         base.flash_attention     = true;
         base.kv_offload          = true;
-        base.cache_q8_q4         = true;
 
         auto expect_invalid = [&](const char * name, const llama_kv_stream_config & config) {
             const auto result = llama_kv_stream_config_validate(config);
@@ -58,10 +56,6 @@ int main() {
         config = base;
         config.kv_offload = false;
         expect_invalid("KV offload disabled", config);
-        config = base;
-        config.cache_q8_q4 = false;
-        expect_invalid("unsupported cache types", config);
-        config = base;
         config.stage_bytes = config.minimum_stage_bytes - 1;
         expect_invalid("stage smaller than one page", config);
     });

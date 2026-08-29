@@ -437,6 +437,24 @@ int main() {
         t.assert_equal(uint32_t(262), partition.ring_slots);
     });
 
+    t.test("decode transition selects its overlap target before feedback exists", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 6971;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 673;
+        params.minimum_ring_slots                = 11;
+        params.previous_resident_pages_per_layer = 435;
+        params.previous_ring_slots               = 11;
+        params.evaluations_since_repartition     = 0;
+        params.entering_decode_layout            = true;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("decode transition changes immediately", partition.changed);
+        t.assert_equal(uint32_t(418), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(283), partition.ring_slots);
+    });
+
     t.test("copy pressure stops demotion after overlap target is reached", [](testing & t) {
         llama_kv_stream_partition_params params;
         params.total_pool_pages                  = 630;
@@ -456,6 +474,28 @@ int main() {
         t.assert_equal(uint32_t(23), partition.resident_pages_per_layer);
         t.assert_equal(uint32_t(262), partition.ring_slots);
     });
+    t.test("near-saturated copy traffic does not trigger a disruptive feedback epoch", [](testing & t) {
+        llama_kv_stream_partition_params params;
+        params.total_pool_pages                  = 6971;
+        params.layer_count                       = N_TARGET_LAYERS;
+        params.active_pages_per_layer            = 673;
+        params.minimum_ring_slots                = 11;
+        params.previous_resident_pages_per_layer = 418;
+        params.previous_ring_slots               = 283;
+        params.deadline_miss_ratio                = 0.053;
+        params.copy_engine_busy_ratio             = 0.848;
+        params.ring_peak_occupancy_ratio          = 1.0;
+        params.starved_evaluations                = 2;
+        params.evaluations_since_repartition      = 128;
+
+        const auto partition = llama_kv_stream_partition_adapt(params);
+        t.assert_true("partition is valid", partition.valid);
+        t.assert_true("near-saturated partition remains stable", !partition.changed);
+        t.assert_equal(uint32_t(418), partition.resident_pages_per_layer);
+        t.assert_equal(uint32_t(283), partition.ring_slots);
+        t.assert_equal(uint32_t(0), partition.starved_evaluations);
+    });
+
 
     t.test("light utilization does not promote above overlap target", [](testing & t) {
         llama_kv_stream_partition_params params;

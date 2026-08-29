@@ -1342,6 +1342,8 @@ struct ggml_backend_cuda_kv_stream_runtime {
     size_t stage_bytes = 0;
     uint32_t stage_slots = 0;
     size_t pool_bytes = 0;
+    size_t staging_pool_bytes = 0;
+    size_t conversion_bytes = 0;
     uint32_t resident_layer_count = 0;
     void * stage_data = nullptr;
     ggml_cuda_kv_stream_transfer_ring * transfer_ring = nullptr;
@@ -1498,9 +1500,14 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
         return nullptr;
     }
 
-    const bool resident_enabled = params.pool_bytes != 0 || params.resident_layer_count != 0 || params.page_tokens != 0;
+    const bool resident_enabled =
+        params.pool_bytes != 0 || params.resident_layer_count != 0 || params.page_tokens != 0;
     const size_t scratch_bytes = params.stage_bytes*params.stage_slots;
-    if (resident_enabled && (params.pool_bytes <= scratch_bytes ||
+    if (params.conversion_bytes > std::numeric_limits<size_t>::max() - scratch_bytes) {
+        return nullptr;
+    }
+    const size_t minimum_pool_bytes = scratch_bytes + params.conversion_bytes;
+    if (resident_enabled && (params.pool_bytes <= minimum_pool_bytes ||
             params.resident_layer_count == 0 || params.page_tokens != 256)) {
         return nullptr;
     }
@@ -1509,7 +1516,10 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
     runtime->device      = params.device;
     runtime->stage_bytes = params.stage_bytes;
     runtime->stage_slots = params.stage_slots;
-    runtime->pool_bytes  = resident_enabled ? params.pool_bytes : scratch_bytes;
+    runtime->pool_bytes  = resident_enabled ? params.pool_bytes : minimum_pool_bytes;
+    runtime->conversion_bytes = params.conversion_bytes;
+    runtime->staging_pool_bytes = runtime->pool_bytes - runtime->conversion_bytes;
+    GGML_ASSERT(runtime->staging_pool_bytes >= scratch_bytes);
     runtime->resident_layer_count = params.resident_layer_count;
 
     const size_t total_stage_bytes = runtime->pool_bytes;
@@ -1525,7 +1535,7 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
 
     if (resident_enabled) {
         runtime->resident_cache = ggml_cuda_kv_stream_resident_cache_new(
-            runtime->stage_data, runtime->pool_bytes, scratch_bytes, params.stage_bytes,
+            runtime->stage_data, runtime->staging_pool_bytes, scratch_bytes, params.stage_bytes,
             params.resident_layer_count, params.page_tokens);
         if (runtime->resident_cache == nullptr) {
             CUDA_CHECK(cudaFree(runtime->stage_data));
@@ -1535,7 +1545,7 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
     }
 
     const size_t ring_capacity = resident_enabled ?
-        runtime->pool_bytes/runtime->stage_bytes : runtime->stage_slots;
+        runtime->staging_pool_bytes/runtime->stage_bytes : runtime->stage_slots;
     if (ring_capacity == 0 || ring_capacity > UINT32_MAX) {
         ggml_cuda_kv_stream_resident_cache_free(runtime->resident_cache);
         CUDA_CHECK(cudaFree(runtime->stage_data));
@@ -1543,7 +1553,11 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
         return nullptr;
     }
     runtime->transfer_ring = ggml_cuda_kv_stream_transfer_ring_new(
-        runtime->stage_data, runtime->stage_bytes, uint32_t(ring_capacity));
+        runtime->stage_data, runtime->stage_bytes, uint32_t(ring_capacity),
+        runtime->conversion_bytes == 0 ? nullptr :
+            static_cast<char *>(runtime->stage_data) + runtime->staging_pool_bytes,
+        runtime->conversion_bytes,
+        params.decode_span_pages);
     if (runtime->transfer_ring == nullptr) {
         ggml_cuda_kv_stream_resident_cache_free(runtime->resident_cache);
         CUDA_CHECK(cudaFree(runtime->stage_data));
@@ -1584,6 +1598,50 @@ uint32_t ggml_backend_cuda_kv_stream_resident_pages_per_layer(
         ggml_cuda_kv_stream_resident_cache_pages_per_layer(runtime->resident_cache);
 }
 
+bool ggml_backend_cuda_kv_stream_reconfigure(
+        ggml_backend_cuda_kv_stream_runtime_t runtime,
+        uint32_t active_pages_per_layer,
+        uint32_t stage_slots) {
+    if (runtime == nullptr || runtime->resident_cache == nullptr || stage_slots == 0 ||
+            runtime->stage_bytes > std::numeric_limits<size_t>::max()/stage_slots) {
+        return false;
+    }
+
+    const size_t scratch_bytes = runtime->stage_bytes*stage_slots;
+    if (scratch_bytes > runtime->staging_pool_bytes) {
+        return false;
+    }
+
+    const bool ring_changed = runtime->stage_slots != stage_slots;
+    const bool layout_changed =
+        ggml_cuda_kv_stream_resident_cache_decode_active_pages(
+            runtime->resident_cache) != active_pages_per_layer;
+    if (!ring_changed && !layout_changed) {
+        return true;
+    }
+
+    ggml_cuda_set_device(runtime->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (!ggml_cuda_kv_stream_resident_cache_reconfigure(
+            runtime->resident_cache, scratch_bytes, active_pages_per_layer) ||
+        !ggml_cuda_kv_stream_transfer_ring_set_active_slots(
+            runtime->transfer_ring, stage_slots)) {
+        return false;
+    }
+    if (layout_changed && !ring_changed) {
+        ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(runtime->transfer_ring);
+    }
+
+    runtime->stage_slots = stage_slots;
+    runtime->dirty_rows.clear();
+    runtime->dirty_rows_remaining = 0;
+    runtime->staged_set_rows = 0;
+    runtime->staged_set_rows_bytes = 0;
+    ++runtime->generation;
+    return true;
+}
+
+
 bool ggml_backend_cuda_kv_stream_repartition(
         ggml_backend_cuda_kv_stream_runtime_t runtime, uint32_t stage_slots) {
     if (runtime == nullptr || runtime->resident_cache == nullptr || stage_slots == 0 ||
@@ -1592,7 +1650,7 @@ bool ggml_backend_cuda_kv_stream_repartition(
     }
 
     const size_t scratch_bytes = runtime->stage_bytes*stage_slots;
-    if (scratch_bytes > runtime->pool_bytes) {
+    if (scratch_bytes > runtime->staging_pool_bytes) {
         return false;
     }
 
@@ -1629,6 +1687,7 @@ bool ggml_backend_cuda_kv_stream_set_decode_layout(
             runtime->resident_cache, active_pages_per_layer)) {
         return false;
     }
+    ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(runtime->transfer_ring);
     runtime->dirty_rows.clear();
     runtime->dirty_rows_remaining = 0;
     runtime->staged_set_rows = 0;
@@ -2540,7 +2599,8 @@ static bool ggml_cuda_kv_stream_staged_set_rows_range(
             runtime->dirty_rows_remaining == 0 || runtime->dirty_rows.size() <= 1 ||
             src0 == nullptr || src1 == nullptr || src0->type != GGML_TYPE_F32 ||
             src1->type != GGML_TYPE_I64 ||
-            (dst->type != GGML_TYPE_Q4_0 && dst->type != GGML_TYPE_Q8_0) ||
+            !ggml_backend_cuda_kv_stream_get_type_capabilities(
+                dst->type).online_write ||
             src0->ne[1] != int64_t(runtime->dirty_rows.size()) ||
             ggml_nelements(src1) != int64_t(runtime->dirty_rows.size()) ||
             src0->ne[2] != 1 || src0->ne[3] != 1 ||
@@ -2599,12 +2659,20 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     --runtime->dirty_rows_remaining;
                 }
                 if (staged) {
-                    ggml_cuda_op_set_rows_staged(ctx, dst, first_row, row_count);
+                    void * mirror_data = nullptr;
+                    ggml_cuda_kv_stream_resident_cache_get_mirror(
+                        runtime->resident_cache, dst, &mirror_data);
+                    ggml_cuda_op_set_rows_staged(
+                        ctx, dst, first_row, row_count, mirror_data);
+                    if (mirror_data != nullptr) {
+                        ggml_cuda_kv_stream_resident_cache_mark_mirrored(
+                            runtime->resident_cache, dst);
+                    }
                     ++runtime->staged_set_rows;
                     runtime->staged_set_rows_bytes += size_t(row_count)*dst->nb[1];
                 } else if (dst->src[0]->type == GGML_TYPE_F32 &&
                         dst->src[1]->type == GGML_TYPE_I64 &&
-                        (dst->type == GGML_TYPE_Q8_0 || dst->type == GGML_TYPE_Q4_0)) {
+                        ggml_backend_cuda_kv_stream_get_type_capabilities(dst->type).online_write) {
                     void * mirror_data = nullptr;
                     if (ggml_cuda_kv_stream_resident_cache_get_mirror(
                             runtime->resident_cache, dst, &mirror_data)) {
@@ -3115,7 +3183,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 node_runtime->dirty_rows.size() == 1 && node_runtime->dirty_rows[0] >= 0 &&
                 node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_F32 &&
                 node->src[1] != nullptr && node->src[1]->type == GGML_TYPE_I64 &&
-                (node->type == GGML_TYPE_Q8_0 || node->type == GGML_TYPE_Q4_0);
+                ggml_backend_cuda_kv_stream_get_type_capabilities(
+                    node->type).online_write;
             void * mirror_data = nullptr;
             mirrorable_set_rows = mirrorable_set_rows &&
                 ggml_cuda_kv_stream_resident_cache_get_mirror(
@@ -6123,8 +6192,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
-            if (uses_streamed_kv && !ggml_cuda_kv_stream_fattn_fits(op)) {
-                return false;
+            if (uses_streamed_kv) {
+                return ggml_cuda_kv_stream_fattn_fits(op);
             }
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -6325,17 +6394,44 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_buffer_set_preferred_host") == 0) {
         return (void *) ggml_backend_cuda_buffer_set_preferred_host;
     }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_type_pair_supported") == 0) {
+        return (void *) +[](ggml_type type_k, ggml_type type_v) {
+            return ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v) !=
+                GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED;
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_page_bytes") == 0) {
+        return (void *) +[](ggml_type type_k, ggml_type type_v,
+                uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
+                uint32_t page_tokens, size_t * page_bytes) {
+            return ggml_cuda_kv_stream_page_bytes(
+                type_k, type_v, head_dim_k, head_dim_v, head_count, page_tokens, page_bytes);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_workspace_bytes") == 0) {
+        return (void *) +[](ggml_type type_k, ggml_type type_v,
+                uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
+                uint32_t page_tokens, size_t * workspace_bytes) {
+            return ggml_cuda_kv_stream_workspace_bytes(
+                type_k, type_v, head_dim_k, head_dim_v, head_count, page_tokens, workspace_bytes);
+        };
+    }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_runtime_new_for_device") == 0) {
         return (void *) +[](ggml_backend_dev_t dev, size_t pool_bytes, size_t page_bytes,
+                size_t conversion_bytes,
                 uint32_t resident_layer_count) -> void * {
             if (dev == nullptr || dev->iface.get_name != ggml_backend_cuda_device_get_name) {
                 return nullptr;
             }
             auto * dev_ctx = static_cast<ggml_backend_cuda_device_context *>(dev->context);
-            if (page_bytes == 0 || pool_bytes/page_bytes <= resident_layer_count) {
+            if (page_bytes == 0 || conversion_bytes > pool_bytes) {
                 return nullptr;
             }
-            const size_t pool_pages = pool_bytes/page_bytes;
+            const size_t staging_pool_bytes = pool_bytes - conversion_bytes;
+            if (staging_pool_bytes/page_bytes <= resident_layer_count) {
+                return nullptr;
+            }
+            const size_t pool_pages = staging_pool_bytes/page_bytes;
             size_t minimum_slots = std::min<size_t>(
                 8, pool_pages - resident_layer_count);
             // Diagnostic override for reproducible resident:ring sweeps. The
@@ -6365,6 +6461,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
             params.pool_bytes           = pool_bytes;
             params.resident_layer_count = resident_layer_count;
             params.page_tokens          = 256;
+            params.conversion_bytes      = conversion_bytes;
             return ggml_backend_cuda_kv_stream_runtime_new(params);
         };
     }
@@ -6378,6 +6475,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) +[](void * runtime) -> ggml_backend_buffer_type_t {
             return ggml_backend_cuda_kv_stream_buffer_type(
                 static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime));
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_observe_decode_latency") == 0) {
+        return (void *) +[](void * opaque, double elapsed_ms) -> bool {
+            auto * runtime = static_cast<ggml_backend_cuda_kv_stream_runtime_t>(opaque);
+            return runtime != nullptr &&
+                ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
+                    runtime->transfer_ring, elapsed_ms);
         };
     }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_feedback") == 0) {
@@ -6430,6 +6535,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
             return true;
         };
     }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_reconfigure") == 0) {
+        return (void *) +[](void * runtime, uint32_t active_pages, uint32_t ring_slots) -> bool {
+            return ggml_backend_cuda_kv_stream_reconfigure(
+                static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime),
+                active_pages, ring_slots);
+        };
+    }
+
     if (strcmp(name, "ggml_backend_cuda_kv_stream_repartition") == 0) {
         return (void *) +[](void * runtime, uint32_t ring_slots) -> bool {
             return ggml_backend_cuda_kv_stream_repartition(

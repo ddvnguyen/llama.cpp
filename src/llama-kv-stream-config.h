@@ -12,7 +12,6 @@ struct llama_kv_stream_config {
     bool single_sequence = false;
     bool flash_attention = false;
     bool kv_offload      = false;
-    bool cache_q8_q4     = false;
 };
 
 struct llama_kv_stream_config_result {

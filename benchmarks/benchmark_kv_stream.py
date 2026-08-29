@@ -10,6 +10,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -26,6 +27,12 @@ UVM_ENV_NAMES = (
     "GGML_CUDA_PREFER_KV_HOST",
     "GGML_CUDA_KV_ACCESSED_BY_GPU",
 )
+
+KV_STREAM_TRACE_RE = re.compile(
+    r"kv_stream_adapt: active (\d+), resident (\d+), ring (\d+), "
+    r"samples (\d+), misses (\d+), copy busy ([0-9.]+)%, peak (\d+)"
+)
+
 
 
 def parse_token_count(value: str) -> int:
@@ -65,6 +72,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="largest configured context capacity, for example 192K or 196608",
     )
     parser.add_argument(
+        "--min-context",
+        type=parse_token_count,
+        default=CONTEXT_STEP,
+        help="smallest configured context capacity",
+    )
+    parser.add_argument(
+        "--context-step",
+        type=parse_token_count,
+        default=CONTEXT_STEP,
+        help="context-capacity increment",
+    )
+    parser.add_argument(
         "--server",
         type=Path,
         default=ROOT / "build/bin/llama-server",
@@ -76,11 +95,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="result directory; reuse it to resume an interrupted sweep",
     )
     parser.add_argument("--decode-tokens", type=int, default=256)
+    parser.add_argument("--cache-type-k", default="q8_0")
+    parser.add_argument("--cache-type-v", default="q4_0")
     parser.add_argument("--probe-pool-mib", type=int, default=64)
     parser.add_argument("--pool-step-mib", type=int, default=32)
     parser.add_argument("--pool-backoff-mib", type=int, default=64)
     parser.add_argument("--pool-retries", type=int, default=8)
     parser.add_argument("--max-pool-mib", type=int)
+    parser.add_argument(
+        "--fixed-pool-mib",
+        type=int,
+        help="use exactly this KV pool size and skip per-context probing",
+    )
+    parser.add_argument(
+        "--trace-kv-stream",
+        action="store_true",
+        help="enable and parse adaptive KV residency trace logging",
+    )
     parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument(
         "--cuda-visible-devices",
@@ -101,11 +132,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="ARG",
         help="append a server argument (repeat; use --extra-server-arg=--flag)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.model = args.model.resolve()
+    args.server = args.server.resolve()
+    return args
 
 
-def context_capacities(max_context: int) -> list[int]:
-    capacities = list(range(CONTEXT_STEP, max_context + 1, CONTEXT_STEP))
+def context_capacities(
+    max_context: int,
+    min_context: int = CONTEXT_STEP,
+    step: int = CONTEXT_STEP,
+) -> list[int]:
+    capacities = list(range(min_context, max_context + 1, step))
     if not capacities or capacities[-1] != max_context:
         capacities.append(max_context)
     return capacities
@@ -175,11 +213,17 @@ def http_json(url: str, payload: dict | None, timeout: int) -> dict:
         raise RuntimeError(f"HTTP {exc.code}: {body[:1000]}") from exc
 
 
-def clean_server_env(cuda_visible_devices: str | None) -> dict[str, str]:
+def clean_server_env(
+    cuda_visible_devices: str | None,
+    trace_kv_stream: bool = False,
+) -> dict[str, str]:
     env = os.environ.copy()
     for name in UVM_ENV_NAMES:
         env.pop(name, None)
     env.pop("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS", None)
+    env.pop("LLAMA_KV_STREAM_TRACE", None)
+    if trace_kv_stream:
+        env["LLAMA_KV_STREAM_TRACE"] = "1"
     if cuda_visible_devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     return env
@@ -205,9 +249,9 @@ def server_command(
         "-fa",
         "on",
         "-ctk",
-        "q8_0",
+        args.cache_type_k,
         "-ctv",
-        "q4_0",
+        args.cache_type_v,
         "-ngl",
         "all",
         "-b",
@@ -242,7 +286,10 @@ class Server:
             self.process = subprocess.Popen(
                 server_command(args, context_capacity, pool_mib),
                 cwd=args.server.parent,
-                env=clean_server_env(args.cuda_visible_devices),
+                env=clean_server_env(
+                    args.cuda_visible_devices,
+                    args.trace_kv_stream,
+                ),
                 stdout=self.log_file,
                 stderr=subprocess.STDOUT,
             )
@@ -374,6 +421,12 @@ def resume_signature(args: argparse.Namespace, capacities: list[int]) -> dict:
         "model": str(args.model.resolve()),
         "server": str(args.server.resolve()),
         "max_context": args.max_context,
+        "min_context": args.min_context,
+        "context_step": args.context_step,
+        "cache_type_k": args.cache_type_k,
+        "cache_type_v": args.cache_type_v,
+        "fixed_pool_mib": args.fixed_pool_mib,
+        "trace_kv_stream": args.trace_kv_stream,
         "capacities": capacities,
         "decode_tokens": args.decode_tokens,
         "probe_pool_mib": args.probe_pool_mib,
@@ -462,6 +515,46 @@ def probe_pool(
         if server is not None:
             server.stop()
         wait_for_release(args, baseline_used_mib)
+def parse_kv_stream_trace(log_path: Path) -> dict:
+    text = log_path.read_text(errors="replace")
+    samples = []
+    for match in KV_STREAM_TRACE_RE.finditer(text):
+        active_tokens = int(match.group(1))
+        resident_pages = int(match.group(2))
+        samples.append(
+            {
+                "active_tokens": active_tokens,
+                "active_pages": (active_tokens + 255) // 256,
+                "resident_pages": resident_pages,
+                "ring_slots": int(match.group(3)),
+            }
+        )
+    streamed = [
+        sample
+        for sample in samples
+        if sample["active_pages"] > sample["resident_pages"]
+    ]
+    return {
+        "streaming_active": bool(streamed),
+        "stream_first_active_tokens": (
+            min(sample["active_tokens"] for sample in streamed)
+            if streamed
+            else None
+        ),
+        "stream_trace_samples": len(samples),
+        "stream_max_active_pages": max(
+            (sample["active_pages"] for sample in samples), default=None
+        ),
+        "stream_min_resident_pages": min(
+            (sample["resident_pages"] for sample in samples), default=None
+        ),
+        "stream_max_ring_slots": max(
+            (sample["ring_slots"] for sample in samples), default=None
+        ),
+        "stream_repartitions": text.count("adaptive KV partition:"),
+    }
+
+
 
 
 def run_measurement(
@@ -508,7 +601,7 @@ def run_measurement(
                 f"received {timings.get('predicted_n')}"
             )
         after = query_gpu_memory(args.nvidia_smi, args.gpu_index)
-        return {
+        measurement = {
             "type": "measurement",
             "status": "ok",
             "context_capacity": context_capacity,
@@ -525,6 +618,9 @@ def run_measurement(
             "vram_after_mib": after.used_mib,
             "vram_free_after_mib": after.free_mib,
         }
+        if args.trace_kv_stream:
+            measurement.update(parse_kv_stream_trace(server.log_path))
+        return measurement
     finally:
         if server is not None:
             server.stop()
@@ -595,6 +691,13 @@ def write_csv(path: Path, rows: dict[int, dict]) -> None:
         "vram_before_mib",
         "vram_after_mib",
         "vram_free_after_mib",
+        "streaming_active",
+        "stream_first_active_tokens",
+        "stream_trace_samples",
+        "stream_max_active_pages",
+        "stream_min_resident_pages",
+        "stream_max_ring_slots",
+        "stream_repartitions",
     ]
     with path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -692,6 +795,12 @@ def validate_args(args: argparse.Namespace) -> None:
     )
     if any(value <= 0 for value in numeric_positive):
         raise SystemExit("decode, pool, and timeout settings must be positive")
+    if args.min_context <= 0 or args.context_step <= 0:
+        raise SystemExit("minimum context and context step must be positive")
+    if args.min_context > args.max_context:
+        raise SystemExit("minimum context must not exceed maximum context")
+    if args.fixed_pool_mib is not None and args.fixed_pool_mib <= 0:
+        raise SystemExit("fixed pool must be positive")
     if (
         args.pool_retries < 0
         or args.release_slack_mib < 0
@@ -728,7 +837,11 @@ def main(argv: list[str] | None = None) -> int:
     csv_path = args.output_dir / "results.csv"
 
     baseline = query_gpu_memory(args.nvidia_smi, args.gpu_index)
-    capacities = context_capacities(args.max_context)
+    capacities = context_capacities(
+        args.max_context,
+        args.min_context,
+        args.context_step,
+    )
     signature = resume_signature(args, capacities)
     if results_path.exists():
         validate_resume(load_metadata(results_path), signature, results_path)
@@ -742,8 +855,8 @@ def main(argv: list[str] | None = None) -> int:
                 "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "revision": git_revision(),
                 **signature,
-                "cache_type_k": "q8_0",
-                "cache_type_v": "q4_0",
+                "cache_type_k": args.cache_type_k,
+                "cache_type_v": args.cache_type_v,
                 "flash_attention": True,
                 "parallel": 1,
                 "baseline_vram_used_mib": baseline.used_mib,
@@ -757,8 +870,8 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
     print(
-        f"Sweep: {len(capacities)} points, 8K through "
-        f"{args.max_context} tokens",
+        f"Sweep: {len(capacities)} points, {args.min_context} through "
+        f"{args.max_context} tokens, K={args.cache_type_k}, V={args.cache_type_v}",
         flush=True,
     )
 
@@ -779,21 +892,21 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
             try:
-                selected_pool = probe_pool(
-                    args,
-                    context_capacity,
-                    baseline.used_mib,
-                    logs_dir,
-                    results_path,
-                )
-                measurement = benchmark_with_backoff(
-                    args,
-                    context_capacity,
-                    selected_pool,
-                    baseline.used_mib,
-                    logs_dir,
-                    results_path,
-                )
+                if args.fixed_pool_mib is None:
+                    selected_pool = probe_pool(
+                        args, context_capacity, baseline.used_mib,
+                        logs_dir, results_path,
+                    )
+                    measurement = benchmark_with_backoff(
+                        args, context_capacity, selected_pool,
+                        baseline.used_mib, logs_dir, results_path,
+                    )
+                else:
+                    selected_pool = args.fixed_pool_mib
+                    measurement = run_measurement(
+                        args, context_capacity, selected_pool,
+                        baseline.used_mib, logs_dir,
+                    )
                 append_jsonl(results_path, measurement)
                 rows[context_capacity] = measurement
                 write_csv(csv_path, rows)

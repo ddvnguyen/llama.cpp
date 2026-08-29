@@ -296,6 +296,8 @@ private:
         using feedback_fn_t = bool (*)(
             void *, uint64_t *, uint64_t *, double *, uint32_t *,
             uint32_t *, uint32_t *, uint32_t *);
+        using span_feedback_fn_t = bool (*)(void *, double);
+        using reconfigure_fn_t = bool (*)(void *, uint32_t, uint32_t);
         using repartition_fn_t = bool (*)(void *, uint32_t);
         using decode_layout_fn_t = bool (*)(void *, uint32_t);
         using mark_dirty_rows_fn_t = bool (*)(void *, const int64_t *, size_t);
@@ -303,6 +305,8 @@ private:
         void * runtime = nullptr;
         void (*free_fn)(void *) = nullptr;
         feedback_fn_t feedback_fn = nullptr;
+        span_feedback_fn_t span_feedback_fn = nullptr;
+        reconfigure_fn_t reconfigure_fn = nullptr;
         repartition_fn_t repartition_fn = nullptr;
         decode_layout_fn_t decode_layout_fn = nullptr;
         mark_dirty_rows_fn_t mark_dirty_rows_fn = nullptr;
@@ -314,6 +318,8 @@ private:
         uint32_t evaluations_since_repartition = UINT32_MAX;
         uint64_t previous_deadline_samples = 0;
         uint64_t previous_deadline_misses = 0;
+        int64_t previous_adapt_us = 0;
+        uint32_t previous_query_tokens = UINT32_MAX;
 
         ~kv_stream_runtime_owner() {
             if (runtime != nullptr) {

@@ -176,6 +176,12 @@ struct llama_kv_stream_partition_params {
     uint32_t shrink_hysteresis_evaluations = 8;
     uint32_t evaluations_since_repartition = UINT32_MAX;
     uint32_t repartition_cooldown_evaluations = 64;
+
+    // The first decode graph has no useful streaming feedback yet, but its
+    // active working set is already known. Select the deterministic overlap
+    // target immediately instead of spending several tokens in an undersized
+    // prefill ring before hysteresis can react.
+    bool entering_decode_layout = false;
 };
 
 struct llama_kv_stream_partition {

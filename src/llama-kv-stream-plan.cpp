@@ -398,7 +398,10 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
     }
 
     constexpr double MISS_THRESHOLD = 0.01;
-    constexpr double COPY_SATURATED  = 0.85;
+    // A repartition invalidates compact resident addresses. Do not pay that
+    // transition cost when the copy engine already has too little headroom
+    // for a larger lookahead ring to increase sustained throughput.
+    constexpr double COPY_SATURATED  = 0.80;
     constexpr double COPY_LIGHT      = 0.50;
     constexpr double RING_LIGHT      = 0.50;
     constexpr uint32_t FEEDBACK_GROWTH_EPOCHS = 1;
@@ -441,7 +444,14 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
 
     const bool cooldown_complete = params.evaluations_since_repartition >=
         params.repartition_cooldown_evaluations;
-    if (cooldown_complete && overgrown_ring) {
+    if (params.entering_decode_layout && below_overlap_target) {
+        result.resident_pages_per_layer = target_resident_pages;
+        result.ring_slots = params.total_pool_pages -
+            result.resident_pages_per_layer*params.layer_count;
+        result.starved_evaluations = 0;
+        result.overprovisioned_evaluations = 0;
+        result.changed = true;
+    } else if (cooldown_complete && overgrown_ring) {
         result.resident_pages_per_layer = feedback_resident_floor;
         result.ring_slots = params.total_pool_pages -
             result.resident_pages_per_layer*params.layer_count;
