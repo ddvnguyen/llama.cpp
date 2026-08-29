@@ -600,6 +600,68 @@ int main() {
         }
     });
 
+    t.test("wide generic fallback remains equivalent across query workspace tiles", [](testing & t) {
+        constexpr int64_t n_kv = 1024;
+        constexpr int64_t n_batch = 513;
+        constexpr ggml_type type_k = GGML_TYPE_IQ4_NL;
+        constexpr ggml_type type_v = GGML_TYPE_IQ4_NL;
+
+        t.assert_equal(
+            GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16,
+            ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v));
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs =
+            make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
+        const attention_inputs reference = make_f16_reference(inputs, n_kv);
+        const std::vector<float> expected = run_attention(
+            backend.get(), reference, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch);
+
+        const size_t k_page_bytes = ggml_row_size(type_k, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(type_v, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        const size_t f16_page_bytes =
+            ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t conversion_bytes = align_up(f16_page_bytes, 128) + f16_page_bytes;
+
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device           = 0;
+        params.stage_bytes      = page_bytes;
+        params.stage_slots      = 2;
+        params.conversion_bytes = conversion_bytes;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr,
+            "wide-fallback n_batch=%lld max_abs=%g async_uploads=%llu\n",
+            (long long) n_batch, max_abs,
+            (unsigned long long) stats.asynchronous_page_uploads);
+        t.assert_true("wide fallback executes streamed attention",
+            stats.asynchronous_page_uploads > 0);
+        t.assert_equal(uint64_t(8), stats.host_to_device_copy_commands);
+        t.assert_true("wide fallback remains numerically equivalent",
+            std::isfinite(max_abs) && max_abs <= 2e-3f);
+    });
+
     t.test("server-shaped causal prefill pipelines four Q8/Q4 blocks through two slots", [](testing & t) {
         constexpr int64_t n_kv = 1024;
         constexpr int64_t n_batch = 83;

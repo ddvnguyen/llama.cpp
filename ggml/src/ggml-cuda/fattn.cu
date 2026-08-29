@@ -859,6 +859,7 @@ namespace {
 
 constexpr int KV_STREAM_HEAD_DIM = 256;
 constexpr int KV_STREAM_MAX_PARTS_PER_CHUNK = 16;
+constexpr int KV_STREAM_QUERY_WORKSPACE_TOKENS = 256;
 
 static int kv_stream_parts_per_chunk() {
     static const int parts = []() {
@@ -1881,6 +1882,12 @@ void ggml_cuda_flash_attn_ext_streamed(
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
     GGML_ASSERT(partial_count > 0 && partial_count <= KV_STREAM_MAX_PARTS_PER_CHUNK);
+    GGML_ASSERT(Q->ne[1] > 0 && nrows % Q->ne[1] == 0);
+    const int64_t rows_per_query = nrows/Q->ne[1];
+    const int64_t workspace_queries = use_mma_prefill ? Q->ne[1] :
+        std::min<int64_t>(Q->ne[1], KV_STREAM_QUERY_WORKSPACE_TOKENS);
+    const size_t workspace_rows = size_t(workspace_queries*rows_per_query);
+    const size_t workspace_elements = workspace_rows*dst->ne[0];
 
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<float> parts(pool);
@@ -1889,8 +1896,8 @@ void ggml_cuda_flash_attn_ext_streamed(
     ggml_cuda_pool_alloc<float2> accumulator_meta(pool);
     const bool needs_partial_reduction = convert_to_f16 || (!streamed_chunks.empty() && nchunks > 1);
     if (needs_partial_reduction) {
-        parts.alloc(size_t(partial_count)*ggml_nelements(dst));
-        meta.alloc(size_t(partial_count)*nrows);
+        parts.alloc(size_t(partial_count)*workspace_elements);
+        meta.alloc(size_t(partial_count)*workspace_rows);
         accumulator.alloc(ggml_nelements(dst));
         accumulator_meta.alloc(nrows);
     }
@@ -2175,33 +2182,62 @@ void ggml_cuda_flash_attn_ext_streamed(
 
         GGML_ASSERT(needs_partial_reduction);
 
-        if (use_mma_prefill) {
-            ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(
-                ctx, &staged_dst, parts.ptr, meta.ptr);
-            if (resident_cache != nullptr) {
-                ++resident_cache->stats.mma_prefill_attention_spans;
-            }
-        } else {
-            if (convert_to_f16) {
-                ggml_cuda_flash_attn_ext_vec_partial_case<
-                    KV_STREAM_HEAD_DIM, GGML_TYPE_F16, GGML_TYPE_F16>(
-                        ctx, &staged_dst, parts.ptr, meta.ptr, partial_count);
-            } else {
-#ifdef GGML_CUDA_FA_ALL_QUANTS
-                GGML_ASSERT(native_partial != nullptr);
-                native_partial(ctx, &staged_dst, parts.ptr, meta.ptr, partial_count);
-#else
-                GGML_ABORT("native quantized KV streaming requires GGML_CUDA_FA_ALL_QUANTS");
-#endif // GGML_CUDA_FA_ALL_QUANTS
-            }
-        }
+        // Keep each staged KV span alive while all bounded query tiles consume it.
+        // This bounds vector scratch without issuing another H2D transfer for the span.
+        for (int64_t query_begin = 0; query_begin < Q->ne[1]; query_begin += workspace_queries) {
+            const int64_t query_count = std::min<int64_t>(
+                workspace_queries, Q->ne[1] - query_begin);
+            ggml_tensor query_q = *Q;
+            query_q.data = static_cast<char *>(Q->data) + query_begin*Q->nb[1];
+            query_q.ne[1] = query_count;
 
-        const dim3 blocks(nrows, 1, 1);
-        const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
-        ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
-            parts.ptr, meta.ptr, accumulator.ptr, accumulator_meta.ptr, nrows, chunk == 0, partial_count);
-        CUDA_CHECK(cudaGetLastError());
+            ggml_tensor query_mask{};
+            ggml_tensor * query_mask_ptr = nullptr;
+            if (staged_mask_ptr != nullptr) {
+                query_mask = *staged_mask_ptr;
+                query_mask.data = static_cast<char *>(staged_mask_ptr->data) +
+                    query_begin*mask->nb[1];
+                query_mask.ne[1] = query_count;
+                query_mask_ptr = &query_mask;
+            }
+
+            ggml_tensor query_dst = staged_dst;
+            query_dst.ne[1] = query_count;
+            query_dst.src[0] = &query_q;
+            query_dst.src[3] = query_mask_ptr;
+
+            if (use_mma_prefill) {
+                ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(
+                    ctx, &query_dst, parts.ptr, meta.ptr);
+                if (resident_cache != nullptr) {
+                    ++resident_cache->stats.mma_prefill_attention_spans;
+                }
+            } else {
+                if (convert_to_f16) {
+                    ggml_cuda_flash_attn_ext_vec_partial_case<
+                        KV_STREAM_HEAD_DIM, GGML_TYPE_F16, GGML_TYPE_F16>(
+                            ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
+                } else {
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+                    GGML_ASSERT(native_partial != nullptr);
+                    native_partial(ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
+#else
+                    GGML_ABORT("native quantized KV streaming requires GGML_CUDA_FA_ALL_QUANTS");
+#endif // GGML_CUDA_FA_ALL_QUANTS
+                }
+            }
+
+            const int tile_nrows = int(query_count*rows_per_query);
+            const size_t row_offset = size_t(query_begin*rows_per_query);
+            const dim3 blocks(tile_nrows, 1, 1);
+            const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+            ggml_cuda_kernel_launch(
+                kv_stream_accumulate_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
+                parts.ptr, meta.ptr, accumulator.ptr + row_offset*dst->ne[0],
+                accumulator_meta.ptr + row_offset, tile_nrows, chunk == 0, partial_count);
+            CUDA_CHECK(cudaGetLastError());
+        }
 
         if (desc.streamed) {
             for (uint32_t page = 0; page < streamed_span_pages; ++page) {
