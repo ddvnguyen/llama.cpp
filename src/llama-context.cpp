@@ -3011,6 +3011,8 @@ size_t llama_context::state_get_size() {
 // hydra: zero-copy socket streaming (class stays here; C wrapper in llama-hydra.cpp)
 #if !defined(_WIN32)
 #include <sys/socket.h>
+// hydra#713: shared EAGAIN/EWOULDBLOCK retry helper (poll + drain-on-HUP).
+#include "../common/hydra-socket-retry.h"
 // xxh3 for M2 decode-side wire-hash verification (see state_seq_set_data_from_fd)
 #include "../vendor/xxhash/xxhash.h"
 
@@ -3143,9 +3145,13 @@ class llama_io_read_socket : public llama_io_read_i {
         if (staging_pos < staging_len) {
             return;
         }
-        ssize_t r = ::recv(fd, staging.data(), staging.size(), 0);
+        ssize_t r = hydra_recv_with_retry(fd, staging.data(), staging.size(), 30000);
         if (r <= 0) {
-            throw std::runtime_error("hydra: socket recv failed during state restore");
+            if (r == 0) {
+                throw std::runtime_error("hydra: socket recv EOF during state restore");
+            }
+            throw std::runtime_error(std::string("hydra: socket recv failed during state restore: ")
+                                     + std::strerror(errno));
         }
         staging_pos = 0;
         staging_len = (size_t)r;

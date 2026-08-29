@@ -48,8 +48,11 @@
 #  include <sys/socket.h>
 #  include <netinet/in.h>
 #  include <unistd.h>
+#  include <poll.h>
 #  include <cerrno>
 #  include <cstring>
+// hydra#713: shared EAGAIN/EWOULDBLOCK retry helper (poll + drain-on-HUP).
+#  include "../../common/hydra-socket-retry.h"
 #endif
 
 // fix problem with std::min and std::max
@@ -10333,21 +10336,27 @@ struct hydra_rpc_ctx {
 // `false` return as "give up" but none logged *why*, so a wedged RPC
 // response looked identical to a client that vanished. Log once, centrally,
 // instead of touching the ~30 call sites.
+//
+// hydra#713: EAGAIN/EWOULDBLOCK is retried via hydra_recv_with_retry()
+// (common/hydra-socket-retry.h) with a 30 s per-call budget.  True EOF
+// and hard errors remain terminal.
 static bool hydra_recv_all(int fd, void * buf, size_t n) {
     char * p = reinterpret_cast<char *>(buf);
     const size_t total = n;
     while (n > 0) {
-        ssize_t r = ::recv(fd, p, n, 0);
-        if (r < 0) {
-            SRV_WRN("hydra rpc: recv failed on fd=%d (%zu/%zu bytes): %s\n",
-                    fd, total - n, total, std::strerror(errno));
-            return false;
+        ssize_t r = hydra_recv_with_retry(fd, p, n, 30000);
+        if (r > 0) {
+            p += r; n -= r;
+            continue;
         }
         if (r == 0) {
             SRV_DBG("hydra rpc: recv EOF on fd=%d (%zu/%zu bytes)\n", fd, total - n, total);
             return false;
         }
-        p += r; n -= r;
+        // r < 0: hard error or timeout.  errno is set by hydra_recv_with_retry.
+        SRV_WRN("hydra rpc: recv failed on fd=%d (%zu/%zu bytes): %s\n",
+                fd, total - n, total, std::strerror(errno));
+        return false;
     }
     return true;
 }
