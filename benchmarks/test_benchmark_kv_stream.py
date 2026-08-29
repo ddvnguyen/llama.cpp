@@ -36,10 +36,33 @@ class BenchmarkKvStreamTest(unittest.TestCase):
                 "--model", str(model),
                 "--server", str(server),
                 "--max-context", "8K",
+                "--batch-size", "768",
+                "--ubatch-size", "512",
             ]
         )
         self.assertEqual(args.model, model.resolve())
         self.assertEqual(args.server, server.resolve())
+        self.assertEqual(args.batch_size, 768)
+        self.assertEqual(args.ubatch_size, 512)
+
+    def test_validate_args_rejects_ubatch_larger_than_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.gguf"
+            server = root / "llama-server"
+            model.touch()
+            server.touch(mode=0o755)
+            args = BENCHMARK.parse_args(
+                [
+                    "--model", str(model),
+                    "--server", str(server),
+                    "--max-context", "8K",
+                    "--batch-size", "256",
+                    "--ubatch-size", "512",
+                ]
+            )
+            with self.assertRaisesRegex(SystemExit, "must not exceed"):
+                BENCHMARK.validate_args(args)
 
     def test_context_capacities_include_non_aligned_maximum(self) -> None:
         self.assertEqual(
@@ -86,6 +109,8 @@ class BenchmarkKvStreamTest(unittest.TestCase):
             extra_server_arg=["--verbosity", "3"],
             cache_type_k="bf16",
             cache_type_v="q8_0",
+            batch_size=768,
+            ubatch_size=512,
         )
         command = BENCHMARK.server_command(args, 131072, 2304)
         self.assertEqual(command[0], "/tmp/llama-server")
@@ -93,6 +118,8 @@ class BenchmarkKvStreamTest(unittest.TestCase):
         self.assertIn("2304", command)
         self.assertEqual(command[command.index("-ctk") + 1], "bf16")
         self.assertEqual(command[command.index("-ctv") + 1], "q8_0")
+        self.assertEqual(command[command.index("-b") + 1], "768")
+        self.assertEqual(command[command.index("-ub") + 1], "512")
         self.assertEqual(command[command.index("-np") + 1], "1")
         self.assertEqual(command[-2:], ["--verbosity", "3"])
 

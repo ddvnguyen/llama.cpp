@@ -95,6 +95,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="result directory; reuse it to resume an interrupted sweep",
     )
     parser.add_argument("--decode-tokens", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--ubatch-size", type=int, default=256)
     parser.add_argument("--cache-type-k", default="q8_0")
     parser.add_argument("--cache-type-v", default="q4_0")
     parser.add_argument("--probe-pool-mib", type=int, default=64)
@@ -255,9 +257,9 @@ def server_command(
         "-ngl",
         "all",
         "-b",
-        "256",
+        str(args.batch_size),
         "-ub",
-        "256",
+        str(args.ubatch_size),
         "-np",
         "1",
         "--no-mmproj",
@@ -429,6 +431,8 @@ def resume_signature(args: argparse.Namespace, capacities: list[int]) -> dict:
         "trace_kv_stream": args.trace_kv_stream,
         "capacities": capacities,
         "decode_tokens": args.decode_tokens,
+        "batch_size": args.batch_size,
+        "ubatch_size": args.ubatch_size,
         "probe_pool_mib": args.probe_pool_mib,
         "pool_step_mib": args.pool_step_mib,
         "pool_backoff_mib": args.pool_backoff_mib,
@@ -786,6 +790,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit(f"server is not executable: {args.server}")
     numeric_positive = (
         args.decode_tokens,
+        args.batch_size,
+        args.ubatch_size,
         args.probe_pool_mib,
         args.pool_step_mib,
         args.pool_backoff_mib,
@@ -799,6 +805,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("minimum context and context step must be positive")
     if args.min_context > args.max_context:
         raise SystemExit("minimum context must not exceed maximum context")
+    if args.ubatch_size > args.batch_size:
+        raise SystemExit("ubatch size must not exceed batch size")
     if args.fixed_pool_mib is not None and args.fixed_pool_mib <= 0:
         raise SystemExit("fixed pool must be positive")
     if (
