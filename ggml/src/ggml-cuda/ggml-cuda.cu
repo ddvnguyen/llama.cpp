@@ -1444,9 +1444,15 @@ static ggml_backend_buffer_t ggml_backend_cuda_kv_stream_buffer_alloc(
     ggml_cuda_set_device(runtime->device);
 
     void * host_data = nullptr;
-    const cudaError_t error = cudaHostAlloc(
-        &host_data, size,
-        cudaHostAllocMapped | cudaHostAllocWriteCombined);
+#if defined(_WIN32)
+    // Direct decode writes to mapped write-combined host memory have been
+    // observed to fault under WDDM. Keep the storage mapped, but omit the
+    // write-combined hint on native Windows.
+    const unsigned int host_flags = cudaHostAllocMapped;
+#else
+    const unsigned int host_flags = cudaHostAllocMapped | cudaHostAllocWriteCombined;
+#endif
+    const cudaError_t error = cudaHostAlloc(&host_data, size, host_flags);
     if (error != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_ERROR("%s: allocating %.2f MiB pinned KV storage failed: %s\n",

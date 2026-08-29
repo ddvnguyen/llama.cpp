@@ -68,7 +68,11 @@ int main() {
         bool write_combined = false;
         t.assert_true("host allocation flags are readable",
             query_fn(base, &write_combined));
+#if defined(_WIN32)
+        t.assert_true("authoritative KV storage is not write-combined on Windows", !write_combined);
+#else
         t.assert_true("authoritative KV storage is write-combined", write_combined);
+#endif
 
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
         ggml_backend_buffer_free(buffer);
