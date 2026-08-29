@@ -47,8 +47,18 @@ branch:
 - V cache `q4_0`
 - all model layers on the GPU
 - one server slot
-- 256-token batch and micro-batch
+- 256-token batch and micro-batch by default
 - ordinary CUDA allocation, without UVM
+
+Use `--batch-size` and `--ubatch-size` to benchmark other logical and physical batch sizes. The micro-batch must not exceed the logical batch. Both values are included in result metadata and the resume signature.
+
+```bash
+python3 benchmarks/benchmark_kv_stream.py \
+  --model /path/to/model.gguf \
+  --max-context 192K \
+  --batch-size 512 \
+  --ubatch-size 512
+```
 
 ## Results and resuming
 

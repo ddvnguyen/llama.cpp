@@ -8,7 +8,8 @@ Detailed project story, design, implementation, and benchmark results are in
 [Running Qwen 27B on 16G VRAM with Full Context Length: Building Adaptive KV Cache Streaming for llama.cpp](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9).
 
 > [!WARNING]
-> This is research code tailored to our current NVIDIA CUDA configuration: an RTX 5070 Ti with 16 GB VRAM, `unsloth/Qwen3.8-27B-GGUF` `UD-Q3_K_XL`, a 262144-token context, Flash Attention, a Q8_0 K cache, a Q4_0 V cache, and one server slot. Other models, KV cache quantization combinations, parallel slots, and non-CUDA backends are not yet supported or validated. Expanding model and KV quantization support is follow-up work.
+> This is research code optimized and production-validated primarily for an RTX 5070 Ti with 16 GB VRAM, `unsloth/Qwen3.8-27B-GGUF` `UD-Q3_K_XL`, a 262144-token context, Flash Attention, a Q8_0 K cache, a Q4_0 V cache, and one server slot.
+> CUDA correctness tests cover every KV type currently accepted by the CLI, including native and F16-conversion fallback paths. Production performance for other models, KV combinations, parallel slots, and non-CUDA backends is not yet broadly characterized.
 
 ## Build the modified server
 
@@ -30,11 +31,21 @@ Example using the tested cache configuration:
   -ctk q8_0 \
   -ctv q4_0 \
   -ngl all \
+  -b 512 \
+  -ub 512 \
   -np 1 \
   --kv-stream-stage-mib 2304
 ```
 
 The best value for `--kv-stream-stage-mib` depends on the model, context capacity, GPU, and other VRAM consumers. Start conservatively and increase it while checking startup and peak VRAM use.
+
+### Batch and micro-batch sizes
+
+`-b` sets the logical prompt batch size and `-ub` sets the largest physical batch submitted to one graph. This branch no longer requires `256/256`; `-ub` may be any positive value no larger than `-b`.
+
+The Qwen3.8 MMA prefill path processes the full physical batch and allocates only the partial workspace that kernel actually emits. Generic vector and F16-conversion fallback paths use a bounded 256-query workspace: each staged KV span is consumed by all query tiles before its ring slot is released, so wider micro-batches do not multiply KV host-to-device transfers.
+
+The Q8_0/Q4_0 Qwen configuration has been exercised with `b/ub` values `256/256`, `512/512`, `768/512`, and `1024/1024`, including non-divisible final micro-batches. A 122880-token production-shaped run at `512/512` completed with adaptive streaming active. Wider values can require more graph and accumulator memory, so validate them on the target GPU.
 
 ### Optional Unified Memory for model weights
 
@@ -49,6 +60,8 @@ GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
   -ctk q8_0 \
   -ctv q4_0 \
   -ngl all \
+  -b 512 \
+  -ub 512 \
   -np 1 \
   --kv-stream-stage-mib 2304
 ```
@@ -64,7 +77,9 @@ python3 -m pip install matplotlib
 
 python3 benchmarks/benchmark_kv_stream.py \
   --model /path/to/model.gguf \
-  --max-context 192K
+  --max-context 192K \
+  --batch-size 512 \
+  --ubatch-size 512
 ```
 
 The only required arguments are the model GGUF and maximum context. See [benchmarks/README.md](benchmarks/README.md) for the pool-probing algorithm, generated files, optional settings, and resumable output directories.

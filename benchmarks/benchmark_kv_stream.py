@@ -95,8 +95,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="result directory; reuse it to resume an interrupted sweep",
     )
     parser.add_argument("--decode-tokens", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--ubatch-size", type=int, default=256)
+    parser.add_argument(
+        "--batch-size", type=int, default=256,
+        help="logical maximum prompt batch size",
+    )
+    parser.add_argument(
+        "--ubatch-size", type=int, default=256,
+        help="physical maximum batch size; must not exceed --batch-size",
+    )
     parser.add_argument("--cache-type-k", default="q8_0")
     parser.add_argument("--cache-type-v", default="q4_0")
     parser.add_argument("--probe-pool-mib", type=int, default=64)
@@ -800,7 +806,7 @@ def validate_args(args: argparse.Namespace) -> None:
         args.release_timeout,
     )
     if any(value <= 0 for value in numeric_positive):
-        raise SystemExit("decode, pool, and timeout settings must be positive")
+        raise SystemExit("decode, batch, pool, and timeout settings must be positive")
     if args.min_context <= 0 or args.context_step <= 0:
         raise SystemExit("minimum context and context step must be positive")
     if args.min_context > args.max_context:
