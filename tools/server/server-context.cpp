@@ -3803,15 +3803,18 @@ private:
                     const size_t    state_len = has_hdr ? buf.size() - hdr_offset : buf.size();
                     const size_t n_read = llama_state_seq_set_data(ctx_tgt, state_ptr, state_len, slot->id);
                     if (n_read == 0) {
+                        // #713 quarantine: restore failed (state_seq_set_data error
+                        // / short stream).  Clear the slot fully so PREFILL cannot
+                        // run on a dirty KV pool — mirror the DECODE_APPLY cleanup
+                        // (~line 5260).  The RPC handler sends HYDRA_STATUS_ERROR
+                        // back to the coordinator, which maps it to a retry-after-clean.
+                        SRV_ERR("hydra: STATE_PUT slot=%d quarantine: restore failed "
+                                "(state_len=%zu n_read=0) — clearing slot\n",
+                                id_slot, state_len);
                         res->rpc_status = HYDRA_STATUS_ERROR;
-                        res->error      = "llama_state_set_data returned 0";
-                        // Tokens were registered before set_data — clear them so the slot
-                        // is not left poisoned (n_past > 0 with no KV cells → pos_min == -1
-                        // abort on the next decode that touches this slot).
-                        slot->prompt.tokens.clear();
-                        slot->prompt.checkpoints.clear();
+                        res->error      = "KV restore failed (llama_state_seq_set_data returned 0)";
+                        slot->prompt_clear(false);  // clears KV cells + tokens + logits
                         slot->n_prompt_tokens_cache = 0;
-                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot->id, -1, -1);
                     } else {
                         // D4: Inject trailing logits into per-slot buffer instead of the
                         // shared context-wide llama_get_logits(). This avoids the race where
