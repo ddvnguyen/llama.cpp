@@ -8,6 +8,12 @@
 # that no libs are missing. RUNPATH is $ORIGIN (set at build with
 # -DCMAKE_BUILD_RPATH='$ORIGIN' -DCMAKE_INSTALL_RPATH='$ORIGIN'), so /llama
 # is the search dir; LD_LIBRARY_PATH=/llama is added as a defensive fallback.
+# Follow-up #498 glibc: host is Ubuntu 26.04 (glibc 2.43) but runtime base is
+# nvidia/cuda:12.9.2-runtime-ubuntu24.04 (glibc 2.39). Host-built sm60 binaries
+# require GLIBC_2.43 and crash in the image (5× version not found). The
+# pipeline now builds sm60 inside nvidia/cuda:12.9.2-devel-ubuntu24.04
+# (matching runtime glibc 2.39) — see build-combo.sh containerized build.
+# Ldd gate now fails on BOTH "=> not found" and "version GLIBC not found".
 
 ARG CUDA_VERSION=13.2
 ARG UBUNTU_VERSION=24.04
@@ -31,11 +37,11 @@ RUN chmod +x /llama/${BINARY} 2>/dev/null || chmod +x /llama/llama-engine 2>/dev
     && echo "=== ldd verify for /llama/${BINARY:-llama-engine} ===" \
     && ldd /llama/${BINARY:-llama-engine} 2>&1 | tee /tmp/ldd.txt || true \
     && cat /tmp/ldd.txt \
-    && if grep "=> not found" /tmp/ldd.txt | grep -vE "libcuda|libibverbs" | grep -q .; then \
-         echo "ERROR: missing hydra shared libs in image — COPY bin/ must include *.so*"; \
-         grep "=> not found" /tmp/ldd.txt; exit 1; \
+    && if grep -E "=> not found|version .*GLIBC.*not found" /tmp/ldd.txt | grep -vE "libcuda|libibverbs" | grep -q .; then \
+         echo "ERROR: missing hydra shared libs or GLIBC version mismatch in image — COPY bin/ must include *.so* and builder must match runtime glibc (use nvidia/cuda:12.9.2-devel-ubuntu24.04 for sm60)"; \
+         grep -E "=> not found|version .*GLIBC.*not found" /tmp/ldd.txt; exit 1; \
        fi \
-    && echo "=== ldd OK — hydra libs present (libcuda/libibverbs expected to be host-mounted) ===" \
+    && echo "=== ldd OK — hydra libs present, no GLIBC mismatch (libcuda/libibverbs expected to be host-mounted) ===" \
     && ls -lh /llama/*.so* 2>/dev/null | head -n 40 || echo "no .so files in /llama (static build?)"
 
 ENV LD_LIBRARY_PATH=/llama:${LD_LIBRARY_PATH}
