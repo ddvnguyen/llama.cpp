@@ -147,9 +147,9 @@ echo "=== Staging contents (${STAGING_DIR}/bin/) ==="
 ls -lh "${STAGING_DIR}/bin/" | head -n 50
 echo "=== Host ldd check for $BUILD_DIR/bin/$BINARY (expect CUDA libs 'not found' on host, but hydra .so should resolve via \$ORIGIN) ==="
 ldd "$BUILD_DIR/bin/$BINARY" || true
-if ldd "$BUILD_DIR/bin/$BINARY" 2>&1 | grep -E "=> not found|version .*GLIBC.*not found" | grep -vE "libcuda|libibverbs" | grep -q .; then
+if ldd "$BUILD_DIR/bin/$BINARY" 2>&1 | grep -E "=> not found|version .*GLIBC.*not found" | grep -vE "libcuda|libcudart|libcublas|libibverbs" | grep -q .; then
   echo "NOTE: some non-CUDA libs still 'not found' or GLIBC mismatch — check \$ORIGIN RPATH and builder glibc (sm60 must be built in nvidia/cuda:12.9.2-devel-ubuntu24.04)"
-  ldd "$BUILD_DIR/bin/$BINARY" 2>&1 | grep -E "=> not found|version .*GLIBC.*not found" || true
+  ldd "$BUILD_DIR/bin/$BINARY" 2>&1 | grep -E "=> not found|version .*GLIBC.*not found" | grep -vE "libcuda|libcudart|libcublas|libibverbs" || true
 fi
 # Fail hard if any hydra .so is missing in staging (e.g., libllama-server-impl.so for llama-server)
 if [ "$BINARY" = "llama-server" ]; then
