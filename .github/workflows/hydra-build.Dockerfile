@@ -15,8 +15,10 @@ ARG BINARY=llama-engine
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
+ARG BINARY
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 curl \
+    && apt-get install -y --no-install-recommends libgomp1 curl libibverbs1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /llama
@@ -25,14 +27,15 @@ WORKDIR /llama
 COPY bin/ /llama/
 
 # Make binary executable, verify ldd, and ensure fallback LD_LIBRARY_PATH
-RUN chmod +x /llama/${BINARY} 2>/dev/null || true \
-    && echo "=== ldd verify for /llama/${BINARY} ===" \
-    && ldd /llama/${BINARY} || true \
-    && if ldd /llama/${BINARY} 2>&1 | grep -q "not found"; then \
-         echo "ERROR: missing shared libs in image — COPY bin/ must include *.so*"; \
-         ldd /llama/${BINARY}; exit 1; \
+RUN chmod +x /llama/${BINARY} 2>/dev/null || chmod +x /llama/llama-engine 2>/dev/null || true \
+    && echo "=== ldd verify for /llama/${BINARY:-llama-engine} ===" \
+    && ldd /llama/${BINARY:-llama-engine} 2>&1 | tee /tmp/ldd.txt || true \
+    && cat /tmp/ldd.txt \
+    && if grep "=> not found" /tmp/ldd.txt | grep -vE "libcuda|libibverbs" | grep -q .; then \
+         echo "ERROR: missing hydra shared libs in image — COPY bin/ must include *.so*"; \
+         grep "=> not found" /tmp/ldd.txt; exit 1; \
        fi \
-    && echo "=== ldd OK — no missing libs ===" \
+    && echo "=== ldd OK — hydra libs present (libcuda/libibverbs expected to be host-mounted) ===" \
     && ls -lh /llama/*.so* 2>/dev/null | head -n 40 || echo "no .so files in /llama (static build?)"
 
 ENV LD_LIBRARY_PATH=/llama:${LD_LIBRARY_PATH}
@@ -40,7 +43,7 @@ ENV LD_LIBRARY_PATH=/llama:${LD_LIBRARY_PATH}
 # Ensure entrypoint works for both binaries: if BINARY != llama-engine, symlink
 # so the fixed ENTRYPOINT still resolves. This keeps hydra-head's
 # /llama/llama-engine expectation while supporting llama-server images.
-RUN if [ "${BINARY}" != "llama-engine" ]; then ln -sf /llama/${BINARY} /llama/llama-engine || true; fi
+RUN if [ "${BINARY:-llama-engine}" != "llama-engine" ]; then ln -sf /llama/${BINARY} /llama/llama-engine || true; fi
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
