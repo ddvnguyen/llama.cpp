@@ -685,6 +685,13 @@ struct server_task_result_hydra_state : server_task_result {
     bool     is_transferring = false;       // true while M1/M2 background send is active
     uint64_t state_size      = 0;
 
+    // hydra#713 review (finding 6): STATE_META quarantine observability —
+    // lets an external observer (test/coordinator) verify a failed restore
+    // left no dangling slot state behind. Backward-compatible metadata
+    // additions (coordinator ignores unknown JSON keys).
+    uint32_t n_checkpoints   = 0;           // slot->prompt.checkpoints.size()
+    bool     just_restored   = false;       // one-shot KV-restore flag
+
     // M-Perf.9 #289 / #470: model identity for the slot. Populated from
     // impl->model_name (the alias) and impl->params_base.model.path.
     // model_hash has been replaced by GGUF-derived semantic identity fields

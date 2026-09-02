@@ -3014,7 +3014,12 @@ size_t llama_context::state_get_size() {
 // hydra#713: shared EAGAIN/EWOULDBLOCK retry helper (poll + drain-on-HUP).
 #include "../common/hydra-socket-retry.h"
 // xxh3 for M2 decode-side wire-hash verification (see state_seq_set_data_from_fd)
+// Use header-only inline variant so libllama does not need an external
+// xxhash.c object — server-context.cpp already compiles the non-inline
+// implementation for the server binary, but tests link only libllama.
+#define XXH_INLINE_ALL
 #include "../vendor/xxhash/xxhash.h"
+#undef XXH_INLINE_ALL
 
 class llama_io_write_socket : public llama_io_write_i {
     // hydra#334: chunk size is caller-supplied (see llama_cparams::hydra_state_chunk_size,
@@ -3215,10 +3220,18 @@ public:
             staging_pos += take;
             done        += take;
             if (staging_pos >= staging_len && done < size) {
-                // recv the next chunk WHILE the H2D copy of the current one runs
-                ssize_t r = ::recv(fd, other.data(), other.size(), 0);
+                // recv the next chunk WHILE the H2D copy of the current one runs.
+                // hydra#713 review (finding 1): this pipelined branch is the
+                // dominant CUDA path (tensor_backend != nullptr) and carries the
+                // whole ~800 MB stream — it must retry EAGAIN/EWOULDBLOCK like
+                // refill() does, not treat the first -1 as stream-end.
+                ssize_t r = hydra_recv_with_retry(fd, other.data(), other.size(), 30000);
                 if (r <= 0) {
-                    throw std::runtime_error("hydra: socket recv failed during state restore");
+                    if (r == 0) {
+                        throw std::runtime_error("hydra: socket recv EOF during state restore");
+                    }
+                    throw std::runtime_error(std::string("hydra: socket recv failed during state restore: ")
+                                             + std::strerror(errno));
                 }
                 other_len = (size_t)r;
                 if (hash_state != nullptr) {

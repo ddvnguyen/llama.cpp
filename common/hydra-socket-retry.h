@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 
 #include <poll.h>
 #include <sys/socket.h>
@@ -32,7 +33,8 @@
 // Attempt a non-blocking recv with bounded poll-retry on EAGAIN/EWOULDBLOCK.
 //
 // Returns:
-//   >0  — bytes read (always == n on success, caller loop handles short reads)
+//   >0  — bytes read (1..n).  recv may return a short read (r < n), so the
+//         caller's loop must keep reading until n bytes are in or EOF/error.
 //    0  — clean EOF (peer closed after draining any buffered data)
 //   -1  — hard error or timeout; errno is set:
 //           ETIMEDOUT  — timeout_ms elapsed with no data
@@ -63,32 +65,38 @@ inline ssize_t hydra_recv_with_retry(int fd, void * buf, size_t n, int timeout_m
     // EAGAIN: poll + retry loop with a bounded wall-clock deadline.
     // The deadline is relative to the FIRST EAGAIN, not to the original call,
     // so the caller's per-call budget is respected.
-    const int64_t deadline_ms =
-        static_cast<int64_t>(timeout_ms) > 0 ? timeout_ms : 30000;
-    // We track elapsed time via poll slices rather than a clock to avoid
-    // clock-resolution issues on all platforms; the loop simply counts
-    // down `remaining_ms`.
-    int remaining_ms = deadline_ms;
+    //
+    // Elapsed time is measured with a monotonic clock (steady_clock), not by
+    // subtracting the poll slice each iteration.  Slice-subtraction burns the
+    // whole budget on events that consumed no wall time (EINTR, a spurious
+    // POLLIN that still yields EAGAIN), which would time out a healthy
+    // transfer prematurely.  Charging real elapsed time also makes the EINTR
+    // handling actually correct rather than merely bounded.
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(static_cast<long long>(timeout_ms > 0 ? timeout_ms : 30000));
 
     for (;;) {
-        if (remaining_ms <= 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
             errno = ETIMEDOUT;
             return -1;
         }
-        const int wait_ms = std::min(remaining_ms, 1000);
+        const auto rem_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        const int wait_ms = static_cast<int>(std::min<long long>(rem_ms, 1000LL));
+
         struct pollfd pfd = { fd, POLLIN, 0 };
         int pr = ::poll(&pfd, 1, wait_ms);
         if (pr < 0) {
             if (errno == EINTR) {
-                // EINTR on poll: subtract the slice we waited and retry.
-                remaining_ms -= wait_ms;
+                // Interrupted before any data: real elapsed time is already
+                // charged against the deadline at the top of the loop.
                 continue;
             }
             return -1;  // real poll error (EBADF, EINVAL, …)
         }
         if (pr == 0) {
-            // Timeout slice expired — subtract and loop.
-            remaining_ms -= wait_ms;
+            // Poll slice expired with no data: loop back — the deadline check
+            // accounts for the time that actually passed.
             continue;
         }
 
@@ -119,15 +127,9 @@ inline ssize_t hydra_recv_with_retry(int fd, void * buf, size_t n, int timeout_m
             return 0;  // clean EOF
         }
         // r < 0
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // Still EAGAIN — subtract the poll slice and loop.
-            remaining_ms -= wait_ms;
-            continue;
-        }
-        if (errno == EINTR) {
-            // EINTR on recv: subtract the poll slice and retry (don't
-            // count this as a "no data" cycle against the deadline).
-            remaining_ms -= wait_ms;
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            // Still no data (spurious readiness / interrupted): retry within
+            // the deadline.  Real elapsed time is charged at the top of the loop.
             continue;
         }
         return -1;  // hard error (ECONNRESET, etc.)

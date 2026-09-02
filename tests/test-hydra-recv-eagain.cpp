@@ -23,10 +23,19 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
+#include <pthread.h>
+
 static int g_failures = 0;
+
+// Case H bookkeeping: tick counter for the periodic SIGALRM that interrupts
+// the reader's poll() calls.  Handler is async-signal-safe (counter bump only).
+static volatile sig_atomic_t g_sigalrm_ticks = 0;
+static void sigalrm_handler(int) { g_sigalrm_ticks++; }
 
 static void expect(const char * what, bool ok) {
     if (!ok) {
@@ -137,8 +146,11 @@ int main() {
 
         char buf[8] = {};
         ssize_t r = hydra_recv_with_retry(sv[0], buf, sizeof(buf), 100);
+        // Capture errno IMMEDIATELY — expect()'s fprintf may clobber it
+        // (review NIT-10).
+        const int r_errno = errno;
         expect("D: slow peer -> timeout returns -1", r == -1);
-        expect("D: errno is ETIMEDOUT", errno == ETIMEDOUT);
+        expect("D: errno is ETIMEDOUT", r_errno == ETIMEDOUT);
 
         writer.join();
         ::close(sv[0]);
@@ -215,6 +227,105 @@ int main() {
         expect("F: payload matches", ok && memcmp(buf, payload, sizeof(payload)) == 0);
 
         ::close(sv[0]);
+    }
+
+    // ── Case G: production socket mode — BLOCKING socket + SO_RCVTIMEO
+    //    (no O_NONBLOCK).  The engine's RPC sockets (hydra_handle_connection)
+    //    are exactly this: blocking with a 120 s SO_RCVTIMEO, where "no data
+    //    yet" surfaces as -1/EAGAIN only after the kernel receive timeout
+    //    elapses.  All cases above use O_NONBLOCK; this one pins the
+    //    blocking-mode contract: that EAGAIN must be retried within the
+    //    budget, not treated as a hard error or stream-end.
+    {
+        int sv[2];
+        expect("G: socketpair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        // sv[0] stays BLOCKING; give it a short kernel receive timeout so the
+        // first recv() fails fast with EAGAIN instead of parking for 120 s.
+        struct timeval tv = { 0, 100 * 1000 }; // 100 ms
+        expect("G: setsockopt SO_RCVTIMEO",
+               setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+
+        const char payload[] = "blocking-mode payload";
+        std::thread writer([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            ssize_t w = ::send(sv[1], payload, sizeof(payload), 0);
+            expect("G: send", w == (ssize_t)sizeof(payload));
+        });
+
+        char buf[sizeof(payload)] = {};
+        // Timeline: fast-path recv() blocks ~100 ms -> -1/EAGAIN; poll() then
+        // wakes when the writer's bytes land at ~250 ms; the next recv() returns
+        // the data.  All within the 30 s per-call budget (1 s here via recv_all
+        // would also be fine — the point is the EAGAIN retry, not the timing).
+        bool ok = recv_all(sv[0], buf, sizeof(payload));
+        expect("G: blocking+SO_RCVTIMEO EAGAIN retried, data received", ok);
+        expect("G: payload matches", ok && memcmp(buf, payload, sizeof(payload)) == 0);
+
+        writer.join();
+        ::close(sv[0]);
+        ::close(sv[1]);
+    }
+
+    // ── Case H: EINTR storm — clock-based deadline accounting (finding 5).
+    //    A periodic SIGALRM interrupts the reader's poll() every ~50 ms.
+    //    The writer's data lands at ~800 ms, inside the budget.  With the old
+    //    slice-subtraction accounting each EINTR burned a full poll slice
+    //    (up to 1 s) of budget, so a couple of interrupts timed the call out
+    //    long before the data arrived.  With steady_clock accounting the real
+    //    elapsed time is charged and the read succeeds.
+    {
+        struct sigaction sa{};
+        sa.sa_handler = sigalrm_handler;
+        sigemptyset(&sa.sa_mask);
+        expect("H: sigaction", sigaction(SIGALRM, &sa, nullptr) == 0);
+
+        // Block SIGALRM in the writer thread so every tick lands on the
+        // reader (main) — the only thread in poll() — and deterministically
+        // exercises the EINTR path.
+        sigset_t alarm_set;
+        sigemptyset(&alarm_set);
+        sigaddset(&alarm_set, SIGALRM);
+        pthread_sigmask(SIG_UNBLOCK, &alarm_set, nullptr); // main: ensure unblocked
+
+        struct itimerval itv{};
+        itv.it_interval.tv_usec = 50 * 1000;  // tick every 50 ms
+        itv.it_value.tv_usec    = 20 * 1000;  // first tick at 20 ms
+        expect("H: setitimer", setitimer(ITIMER_REAL, &itv, nullptr) == 0);
+
+        int sv[2];
+        expect("H: socketpair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        int flags = fcntl(sv[0], F_GETFL, 0);
+        fcntl(sv[0], F_SETFL, flags | O_NONBLOCK);
+
+        const char payload[] = "eintr storm survivor";
+        g_sigalrm_ticks = 0;
+        std::thread writer([&] {
+            pthread_sigmask(SIG_BLOCK, &alarm_set, nullptr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(800));
+            ssize_t w = ::send(sv[1], payload, sizeof(payload), 0);
+            expect("H: send", w == (ssize_t)sizeof(payload));
+        });
+
+        char buf[sizeof(payload)] = {};
+        bool ok = recv_all(sv[0], buf, sizeof(payload));
+
+        // Disarm before asserting so a late tick cannot race the cleanup.
+        itv.it_interval.tv_usec = 0;
+        itv.it_value.tv_usec    = 0;
+        setitimer(ITIMER_REAL, &itv, nullptr);
+
+        expect("H: data received despite repeated poll EINTR", ok);
+        expect("H: payload matches", ok && memcmp(buf, payload, sizeof(payload)) == 0);
+        expect("H: EINTRs actually occurred", g_sigalrm_ticks > 0);
+
+        writer.join();
+        ::close(sv[0]);
+        ::close(sv[1]);
+
+        struct sigaction sa_def{};
+        sa_def.sa_handler = SIG_DFL;
+        sigemptyset(&sa_def.sa_mask);
+        sigaction(SIGALRM, &sa_def, nullptr);
     }
 
     if (g_failures == 0) {

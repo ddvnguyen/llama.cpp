@@ -673,6 +673,39 @@ struct server_slot {
     }
 };
 
+// hydra#713 review (findings 2, 3, 7): full slot quarantine on a failed KV
+// restore.  Converges the STATE_PUT zero-read cleanup and the DECODE_APPLY
+// status==0 cleanup, which previously drifted apart.  `prompt_clear(false)`
+// clears KV cells + prompt.tokens + restored_logits but does NOT touch
+// prompt.checkpoints / just_restored / n_prompt_tokens_cache — the removed
+// code cleared those, so this helper restores that completeness so a failed
+// restore cannot leave checkpoints referencing positions with no backing KV
+// cells (the pos_min == -1 / #641 class this quarantine exists to prevent).
+//
+// After this returns the slot is exactly as if nothing had been restored:
+//   KV cells (ctx_tgt + ctx_dft)      — prompt_clear → common_context_seq_rm(-1,-1)
+//   prompt.tokens                     — prompt_clear
+//   restored_logits / logits_valid    — prompt_clear
+//   prompt.checkpoints                — cleared here (prompt_clear skips them)
+//   just_restored                     — cleared here (one-shot restore flag)
+//   n_prompt_tokens_cache             — reset to 0
+//   n_prompt_tokens_processed/n_decoded — reset to 0 (same trio as the
+//                                         PREFILL task start, so STATE_META
+//                                         reports n_past == 0)
+//
+// Inference-thread only; the slot must not be processing (prompt_clear asserts).
+// Both callers (STATE_PUT zero-read, DECODE_APPLY status==0) run there on an
+// idle slot; DECODE_APPLY already prompt_clears the same slot earlier in the
+// handler, so the assert cannot newly fire.
+static void hydra_quarantine_slot(server_slot & slot) {
+    slot.prompt_clear(false);         // KV cells + tokens + restored logits
+    slot.prompt.checkpoints.clear();  // prompt_clear does NOT clear checkpoints
+    slot.just_restored = false;       // one-shot flag must not survive a failure
+    slot.n_prompt_tokens_cache = 0;
+    slot.n_prompt_tokens_processed = 0;
+    slot.n_decoded = 0;
+}
+
 
 
 //
@@ -3813,8 +3846,7 @@ private:
                                 id_slot, state_len);
                         res->rpc_status = HYDRA_STATUS_ERROR;
                         res->error      = "KV restore failed (llama_state_seq_set_data returned 0)";
-                        slot->prompt_clear(false);  // clears KV cells + tokens + logits
-                        slot->n_prompt_tokens_cache = 0;
+                        hydra_quarantine_slot(*slot);  // KV + tokens + checkpoints + just_restored
                     } else {
                         // D4: Inject trailing logits into per-slot buffer instead of the
                         // shared context-wide llama_get_logits(). This avoids the race where
@@ -3914,6 +3946,11 @@ private:
                     res->is_processing   = slot->is_processing();
                     res->is_transferring = slot->hydra_transferring->load();
                     res->state_size    = (uint64_t)llama_state_seq_get_size(ctx_tgt, slot->id);
+                    // hydra#713 review (finding 6): quarantine observability —
+                    // checkpoint count + restore flag so an observer can verify
+                    // a failed restore left the slot fully clean.
+                    res->n_checkpoints = (uint32_t)slot->prompt.checkpoints.size();
+                    res->just_restored = slot->just_restored;
                     // M-Perf.9 #289: surface model identity. The Coordinator uses
                     // these to detect cross-model restores — a slot holding a Mini
                     // KV cache must never have it decoded by a Balanced-loaded model.
@@ -5271,14 +5308,14 @@ private:
                                 ::shutdown(task.hydra_action.hydra_fd, SHUT_RD);
                             }
                             slot->reserved_for_decode_id = -1;
-                            // Tokens were registered from the v2 header before set_data —
-                            // clear them so the slot is not left poisoned (n_past > 0
-                            // with no KV cells → pos_min == -1 abort on the next decode
-                            // that touches this slot). Matches the STATE_PUT failure path.
-                            slot->prompt.tokens.clear();
-                            slot->prompt.checkpoints.clear();
-                            slot->n_prompt_tokens_cache = 0;
-                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot->id, -1, -1);
+                            // Full quarantine — same helper as the STATE_PUT zero-read
+                            // branch (hydra#713 review, finding 3): KV cells, tokens,
+                            // checkpoints, restored logits, just_restored,
+                            // n_prompt_tokens_cache.  Tokens were registered from the
+                            // v2 header before set_data, so the slot must not be left
+                            // poisoned (n_past > 0 with no KV cells → pos_min == -1
+                            // abort on the next decode that touches this slot).
+                            hydra_quarantine_slot(*slot);
                             if (routes_ptr) {
                                 server_routes::decode_result_entry entry;
                                 entry.id_slot = id_slot;
@@ -9029,6 +9066,9 @@ void server_routes::init_routes() {
             {"slot_id",        hr->id_slot},
             {"n_past",         hr->n_past},
             {"state_size",     (uint64_t)hr->state_size},
+            // hydra#713 review (finding 6): quarantine observability
+            {"n_checkpoints",  (uint32_t)hr->n_checkpoints},
+            {"just_restored",  hr->just_restored},
             {"is_processing",  hr->is_processing},
             {"is_transferring", hr->is_transferring},
             {"operation",      hr->operation},
@@ -10506,6 +10546,13 @@ static void hydra_handle_state_put(int fd, int slot_id, uint64_t payload_len, co
     if (!hydra_recv_all(fd, buf.data(), (size_t)payload_len)) {
         SRV_WRN("%s", "hydra rpc: STATE_PUT failed to read payload\n");
         hydra_write_res(fd, HYDRA_STATUS_ERROR, 0, 0);
+        // hydra#713 review (finding 7): the peer declared payload_len bytes but
+        // we stopped reading short — the residual KV bytes would otherwise be
+        // parsed as the next request header (bad magic → drop).  Self-recovering,
+        // but SHUT_RD closes the read side deterministically, mirroring the
+        // DECODE_APPLY stream-failure drain.  The write side stays open (the
+        // error response above was the last thing we send on it).
+        ::shutdown(fd, SHUT_RD);
         return;
     }
 
@@ -10598,6 +10645,9 @@ static void hydra_handle_state_meta(int fd, int slot_id, const hydra_rpc_ctx & c
         meta_j["slot_id"]         = res->id_slot;
         meta_j["n_past"]          = res->n_past;
         meta_j["state_size"]      = res->state_size;
+        // hydra#713 review (finding 6): quarantine observability
+        meta_j["n_checkpoints"]   = res->n_checkpoints;
+        meta_j["just_restored"]   = res->just_restored;
         meta_j["is_processing"]   = res->is_processing;
         meta_j["is_transferring"] = res->is_transferring;
         if (!res->model_alias.empty()) meta_j["model_alias"] = res->model_alias;
