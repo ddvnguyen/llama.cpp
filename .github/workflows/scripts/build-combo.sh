@@ -66,10 +66,43 @@ esac
 
 echo "=== [$ARCH/$BINARY] CMake configure (CUDA $CUDA_VERSION @ $CUDA_PATH) ==="
 echo "CMake args: ${CMAKE_ARGS[*]}"
-cmake -B "$BUILD_DIR" -G Ninja "${CMAKE_ARGS[@]}" .
-
-echo "=== [$ARCH/$BINARY] CMake build ==="
-cmake --build "$BUILD_DIR" --target "$BINARY" -j"$(nproc)"
+# Fix #498 glibc follow-up: host is Ubuntu 26.04 (glibc 2.43) but runtime base is
+# nvidia/cuda:12.9.2-runtime-ubuntu24.04 (glibc 2.39). Host-built sm60 binaries
+# require GLIBC_2.43 and crash in the image (5× version not found). Build sm60
+# inside a container matching the runtime base to ensure glibc compatibility.
+# sm86-sm120 stays host-built (latent same issue, hardened ldd gate now protects).
+if [ "$ARCH" = "sm60" ]; then
+  echo "=== [$ARCH/$BINARY] Containerized build in nvidia/cuda:12.9.2-devel-ubuntu24.04 (glibc 2.39) to match runtime ==="
+  # Clean previous host-built artifacts (wrong glibc)
+  rm -rf "$BUILD_DIR"
+  # Pull devel image (contains /usr/local/cuda 12.9.2, gcc, but not cmake/ninja/ccache)
+  podman pull nvidia/cuda:12.9.2-devel-ubuntu24.04 2>&1 | tail -n 5 || true
+  mkdir -p "$HOME/.cache/hydra-ccache"
+  # Run cmake configure + build inside the devel container, mounting source and ccache
+  # Use --userns=keep-id so files are owned by host user, not root
+  podman run --rm \
+    -v "$PWD:/work" -w /work \
+    -v "$HOME/.cache/hydra-ccache:/tmp/ccache:rw" \
+    -e CCACHE_DIR=/tmp/ccache \
+    -e CCACHE_MAXSIZE=10G \
+    -e CCACHE_SLOPPINESS="pch_defines,time_macros,locale" \
+    --userns=keep-id \
+    nvidia/cuda:12.9.2-devel-ubuntu24.04 \
+    bash -c '
+      set -e
+      echo "=== [container] apt-get install build deps ==="
+      apt-get update -qq
+      apt-get install -y -qq cmake ninja-build ccache g++-14 libssl-dev libgomp1 > /dev/null
+      echo "=== [container] cmake configure ==="
+      cmake -B "'"$BUILD_DIR"'" -G Ninja         -DCMAKE_CUDA_ARCHITECTURES="'"$CUDA_ARCH"'"         -DCMAKE_C_COMPILER_LAUNCHER=ccache         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache         -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache         -DGGML_CUDA=ON -DGGML_CUDA_FORCE_CUBLAS=ON -DGGML_RPC=ON -DGGML_NVML=ON         -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON         -DCMAKE_BUILD_RPATH='\''$ORIGIN'\'' -DCMAKE_INSTALL_RPATH='\''$ORIGIN'\'' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON         -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF         -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc         -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14         -DGGML_CUDA_FA_ALL_QUANTS=OFF -DGGML_NATIVE=OFF         .
+      echo "=== [container] cmake build ==="
+      cmake --build "'"$BUILD_DIR"'" --target "'"$BINARY"'" -j$(nproc)
+    '
+else
+  cmake -B "$BUILD_DIR" -G Ninja "${CMAKE_ARGS[@]}" .
+  echo "=== [$ARCH/$BINARY] CMake build ==="
+  cmake --build "$BUILD_DIR" --target "$BINARY" -j"$(nproc)"
+fi
 
 ccache -s || true
 
@@ -104,8 +137,27 @@ fi
 echo "=== [$ARCH/$BINARY] ${IMAGE_TAG} not in registry — building ==="
 
 mkdir -p "${STAGING_DIR}/bin"
-cp "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
-cp "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
+cp -a "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
+# Fix #498: preserve symlinks (-a) and ensure ALL shared libs are staged.
+# The previous `cp *.so*` without -a could dereference symlinks and miss
+# versioned chains (e.g., libllama.so -> libllama.so.0 -> libllama.so.0.x).
+# Use -a and explicitly list contents for verification.
+cp -a "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
+echo "=== Staging contents (${STAGING_DIR}/bin/) ==="
+ls -lh "${STAGING_DIR}/bin/" | head -n 50
+echo "=== Host ldd check for $BUILD_DIR/bin/$BINARY (expect CUDA libs 'not found' on host, but hydra .so should resolve via \$ORIGIN) ==="
+ldd "$BUILD_DIR/bin/$BINARY" || true
+if ldd "$BUILD_DIR/bin/$BINARY" 2>&1 | grep -E "=> not found|version .*GLIBC.*not found" | grep -vE "libcuda|libcudart|libcublas|libibverbs" | grep -q .; then
+  echo "NOTE: some non-CUDA libs still 'not found' or GLIBC mismatch — check \$ORIGIN RPATH and builder glibc (sm60 must be built in nvidia/cuda:12.9.2-devel-ubuntu24.04)"
+  ldd "$BUILD_DIR/bin/$BINARY" 2>&1 | grep -E "=> not found|version .*GLIBC.*not found" | grep -vE "libcuda|libcudart|libcublas|libibverbs" || true
+fi
+# Fail hard if any hydra .so is missing in staging (e.g., libllama-server-impl.so for llama-server)
+if [ "$BINARY" = "llama-server" ]; then
+  if [ ! -f "${STAGING_DIR}/bin/libllama-server-impl.so"* ] && ! ls "${STAGING_DIR}/bin/libllama-server-impl.so"* >/dev/null 2>&1; then
+    echo "WARNING: llama-server build should have libllama-server-impl.so in staging — check BUILD_SHARED_LIBS=ON"
+    ls -lh "${STAGING_DIR}/bin/"*.so* 2>&1 | head -n 20 || true
+  fi
+fi
 
 echo "=== [$ARCH/$BINARY] Build + push OCI image ==="
 # Docker Hub's nvidia/cuda runtime images are tagged with a full patch
