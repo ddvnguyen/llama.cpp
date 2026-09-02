@@ -104,8 +104,27 @@ fi
 echo "=== [$ARCH/$BINARY] ${IMAGE_TAG} not in registry — building ==="
 
 mkdir -p "${STAGING_DIR}/bin"
-cp "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
-cp "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
+cp -a "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
+# Fix #498: preserve symlinks (-a) and ensure ALL shared libs are staged.
+# The previous `cp *.so*` without -a could dereference symlinks and miss
+# versioned chains (e.g., libllama.so -> libllama.so.0 -> libllama.so.0.x).
+# Use -a and explicitly list contents for verification.
+cp -a "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
+echo "=== Staging contents (${STAGING_DIR}/bin/) ==="
+ls -lh "${STAGING_DIR}/bin/" | head -n 50
+echo "=== Host ldd check for $BUILD_DIR/bin/$BINARY (expect CUDA libs 'not found' on host, but hydra .so should resolve via \$ORIGIN) ==="
+ldd "$BUILD_DIR/bin/$BINARY" || true
+if ldd "$BUILD_DIR/bin/$BINARY" 2>&1 | grep "not found" | grep -vE "libcudart|libcublas|libcuda" | grep -q .; then
+  echo "NOTE: some non-CUDA libs still 'not found' — check \$ORIGIN RPATH"
+  ldd "$BUILD_DIR/bin/$BINARY" | grep "not found" || true
+fi
+# Fail hard if any hydra .so is missing in staging (e.g., libllama-server-impl.so for llama-server)
+if [ "$BINARY" = "llama-server" ]; then
+  if [ ! -f "${STAGING_DIR}/bin/libllama-server-impl.so"* ] && ! ls "${STAGING_DIR}/bin/libllama-server-impl.so"* >/dev/null 2>&1; then
+    echo "WARNING: llama-server build should have libllama-server-impl.so in staging — check BUILD_SHARED_LIBS=ON"
+    ls -lh "${STAGING_DIR}/bin/"*.so* 2>&1 | head -n 20 || true
+  fi
+fi
 
 echo "=== [$ARCH/$BINARY] Build + push OCI image ==="
 # Docker Hub's nvidia/cuda runtime images are tagged with a full patch
