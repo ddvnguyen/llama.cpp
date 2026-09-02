@@ -2010,6 +2010,9 @@ json server_task_result_hydra_state::to_json() {
     if (op == 0x32) {
         j["n_past"]          = n_past;
         j["state_size"]      = state_size;
+        // hydra#713 review (finding 6): quarantine observability
+        j["n_checkpoints"]   = n_checkpoints;
+        j["just_restored"]   = just_restored;
         j["is_processing"]   = is_processing;
         j["is_transferring"] = is_transferring; // true while M1/M2 async GET is active
         // #451: progress fields

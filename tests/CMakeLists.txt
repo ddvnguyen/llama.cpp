@@ -182,6 +182,14 @@ target_link_libraries(test-hydra-rpc-stale-sock PRIVATE ggml)
 # #470: test uses ggml_backend_buffer_copy_tensor (declared in ggml-backend-impl.h).
 target_include_directories(test-hydra-rpc-stale-sock PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+# hydra#713: EAGAIN/EWOULDBLOCK retry in hydra_recv_all and
+# llama_io_read_socket::refill(). Pure socket test — no model/GPU needed.
+# Verifies that recv returning EAGAIN is retried with poll (not treated as
+# EOF) and that true EOF / timeout still fail cleanly.
+if (NOT WIN32)
+    llama_build_and_test(test-hydra-recv-eagain.cpp)
+endif()
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
