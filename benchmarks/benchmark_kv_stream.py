@@ -20,6 +20,7 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SERVER_BIN = "Release/llama-server.exe" if os.name == "nt" else "llama-server"
 CONTEXT_STEP = 8192
 UVM_ENV_NAMES = (
     "GGML_CUDA_ENABLE_UNIFIED_MEMORY",
@@ -86,7 +87,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--server",
         type=Path,
-        default=ROOT / "build/bin/llama-server",
+        default=ROOT / "build/bin" / SERVER_BIN,
         help="adaptive KV streaming llama-server binary",
     )
     parser.add_argument(
@@ -143,6 +144,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     args.model = args.model.resolve()
     args.server = args.server.resolve()
+    if not args.server.is_file():
+        exe_server = args.server.with_suffix(".exe").resolve()
+        if exe_server.is_file():
+            args.server = exe_server
     return args
 
 
@@ -337,12 +342,25 @@ class Server:
 
     def stop(self) -> None:
         if self.process is not None and self.process.poll() is None:
-            self.process.send_signal(signal.SIGINT)
+            terminate_signal = (
+                signal.CTRL_C_EVENT if os.name == "nt" else signal.SIGINT
+            )
+            # On Windows, CTRL_C_EVENT reaches the shared console and would
+            # interrupt this benchmark process itself; mask SIGINT while we
+            # send it so the child stops but we keep running.
+            previous_handler = None
+            if os.name == "nt":
+                previous_handler = signal.signal(signal.SIGINT, lambda *_: None)
             try:
-                self.process.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=10)
+                self.process.send_signal(terminate_signal)
+                try:
+                    self.process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=10)
+            finally:
+                if previous_handler is not None:
+                    signal.signal(signal.SIGINT, previous_handler)
         if not self.log_file.closed:
             self.log_file.close()
 
@@ -792,7 +810,10 @@ def plot_results(output_dir: Path, rows: dict[int, dict], plt) -> None:
 def validate_args(args: argparse.Namespace) -> None:
     if not args.model.is_file():
         raise SystemExit(f"model not found: {args.model}")
-    if not args.server.is_file() or not os.access(args.server, os.X_OK):
+    server_ok = args.server.is_file() and (
+        os.name == "nt" or os.access(args.server, os.X_OK)
+    )
+    if not server_ok:
         raise SystemExit(f"server is not executable: {args.server}")
     numeric_positive = (
         args.decode_tokens,
