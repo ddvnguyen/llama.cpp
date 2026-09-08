@@ -2562,6 +2562,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }
     add_opt(common_arg(
+        {"--parallel-ctx-threshold"}, "N",
+        "server: defer queued requests when the sum of resident contexts across processing slots plus the candidate prompt would reach N tokens; deferred requests are retried when a slot is released (0 = disabled, hydra#747)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: invalid value for parallel_ctx_threshold\n");
+            }
+            params.parallel_ctx_threshold = value;
+        }
+    ).set_env("LLAMA_ARG_PARALLEL_CTX_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ns", "--sequences"}, "N",
         string_format("number of sequences to decode (default: %d)", params.n_sequences),
         [](common_params & params, int value) {
