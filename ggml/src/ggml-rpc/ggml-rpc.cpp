@@ -279,7 +279,21 @@ struct ggml_backend_rpc_device_context {
     // must be invalidated (next compute = full GRAPH_COMPUTE). Compared by
     // identity at compute time (lock-free; get_socket never touches the
     // registry mutex, so no lock-order inversion with ggml_backend_rpc_add_server).
-    std::weak_ptr<socket_t> last_sock;
+    //
+    // STRONG ref (hydra_vortex#747 boot finding, 2026-09-08): a weak ref here
+    // let the socket die between a failed graph_compute and the T3 rebuild's
+    // buffer re-creation, so EVERY rebuild re-resolved a fresh socket and the
+    // reconnection check below re-tripped forever (one full model reload per
+    // request, non-converging). Holding the socket alive across the rebuild
+    // window makes get_socket() re-resolve to the SAME socket, so the check
+    // converges after at most one rebuild.
+    std::shared_ptr<socket_t> last_sock;
+    // true once the first graph_compute has seeded last_sock. The identity
+    // check must not treat first use as a reconnection: on a fresh boot the
+    // peer was just provisioned by the model load itself, and returning
+    // FAILED here caused a spurious T3 rebuild (which then re-tripped via the
+    // socket churn above — the boot-time reload loop).
+    bool ever_connected = false;
     // #470 Option B: set when a peer reconnection is detected (last_sock changed).
     // The engine checks this after graph_compute and triggers a T3 rebuild to
     // re-provision model layers on the fresh peer. Cleared by check function.
@@ -974,19 +988,32 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     // fresh instance with an empty stored-graph cache — a GRAPH_RECOMPUTE
     // would be refused and the connection would churn. Detect it here (lock
     // free, by socket identity) and fall back to a full GRAPH_COMPUTE.
-    if (rpc_dev_ctx->last_sock.lock() != sock) {
+    // hydra_vortex#747: the identity check must NOT fire on first use — on a
+    // fresh boot the peer was just provisioned by the model load, and a
+    // spurious FAILED here caused a T3 rebuild whose own socket churn
+    // re-triggered the check forever (non-converging boot reload loop).
+    if (rpc_dev_ctx->last_sock != sock) {
+        const bool first_use = !rpc_dev_ctx->ever_connected;
+
         rpc_dev_ctx->last_graph_uid = 0;
         rpc_dev_ctx->last_sock      = sock;
-        // #470 Option B: signal that the peer reconnected — the engine
-        // must re-provision model layers (T3 rebuild) before compute can
-        // succeed on this peer again.
-        rpc_dev_ctx->peer_reconnected.store(true, std::memory_order_release);
-        GGML_LOG_WARN("[%s] peer %s reconnected — stale buffers, "
-                      "engine should trigger re-provision\n",
-                      __func__, rpc_ctx->endpoint.c_str());
-        // Return FAILED so the engine knows the peer needs re-provision.
-        // The caller (engine) will detect this and trigger T3 rebuild.
-        return GGML_STATUS_FAILED;
+        rpc_dev_ctx->ever_connected = true;
+
+        if (first_use) {
+            GGML_LOG_DEBUG("[%s] first graph_compute on %s — seeding last_sock (not a reconnection)\n",
+                           __func__, rpc_ctx->endpoint.c_str());
+        } else {
+            // #470 Option B: signal that the peer reconnected — the engine
+            // must re-provision model layers (T3 rebuild) before compute can
+            // succeed on this peer again.
+            rpc_dev_ctx->peer_reconnected.store(true, std::memory_order_release);
+            GGML_LOG_WARN("[%s] peer %s reconnected — stale buffers, "
+                          "engine should trigger re-provision\n",
+                          __func__, rpc_ctx->endpoint.c_str());
+            // Return FAILED so the engine knows the peer needs re-provision.
+            // The caller (engine) will detect this and trigger T3 rebuild.
+            return GGML_STATUS_FAILED;
+        }
     }
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
     if (reuse) {
