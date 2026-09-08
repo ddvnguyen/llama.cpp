@@ -169,6 +169,16 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
 
             err = cudaMalloc(ptr, size);
         }
+#else
+        if (err == cudaSuccess) {
+            // avoid lazy first-touch page faults: place pages on this device
+            // up front instead of migrating them one page-fault at a time
+            cudaMemLocation loc;
+            loc.type = cudaMemLocationTypeDevice;
+            loc.id = device;
+            (void)cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, loc);
+            (void)cudaMemPrefetchAsync(*ptr, size, loc, 0, 0);
+        }
 #endif // defined(GGML_USE_HIP)
     } else {
         err = cudaMalloc(ptr, size);
