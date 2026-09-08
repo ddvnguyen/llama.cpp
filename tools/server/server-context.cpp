@@ -2620,6 +2620,30 @@ private:
 
                     const int id_task = task.id;
 
+                    // hydra#747 admission gate: only admit a request into an auto-selected free slot when the
+                    // combined context it would create stays under the threshold. Resident accounting counts
+                    // every processing slot at max(prompt-cache tokens, full task prompt length) — the max()
+                    // covers both early prefill (cache small, task long) and deep generation. Explicit
+                    // id_slot requests bypass the gate. Deferred tasks are retried on slot release via
+                    // queue_tasks.pop_deferred_task().
+                    if (params_base.parallel_ctx_threshold > 0 && task.id_slot == -1) {
+                        int64_t resident = 0;
+                        for (const server_slot & s : slots) {
+                            if (s.is_processing()) {
+                                resident += std::max<int64_t>(s.prompt.n_tokens(),
+                                        s.task ? (int64_t) s.task->tokens.size() : 0);
+                            }
+                        }
+                        const int64_t candidate = (int64_t) task.tokens.size();
+                        if (resident + candidate >= params_base.parallel_ctx_threshold) {
+                            SRV_INF("parallel-ctx-threshold: defer task %d (resident %" PRId64
+                                    " + candidate %" PRId64 " >= threshold %d)\n",
+                                    id_task, resident, candidate, params_base.parallel_ctx_threshold);
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                    }
+
                     server_slot * slot = get_available_slot(task);
 
                     //
