@@ -2642,6 +2642,9 @@ private:
                             queue_tasks.defer(std::move(task));
                             break;
                         }
+                        SRV_INF("parallel-ctx-threshold: admit task %d (resident %" PRId64
+                                " + candidate %" PRId64 " < threshold %d)\n",
+                                id_task, resident, candidate, params_base.parallel_ctx_threshold);
                     }
 
                     server_slot * slot = get_available_slot(task);
