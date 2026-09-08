@@ -3111,6 +3111,51 @@ private:
                     const int id_slot = task.id_slot;
                     const int id_task = task.id;
 
+                    // Hydra #747: dynamic parallel-slot admission by combined-ctx
+                    // threshold. When enabled, a queued request is only admitted into
+                    // an auto-selected free slot if (resident ctx across active slots)
+                    // + (candidate prompt ctx) stays below the threshold. Otherwise it
+                    // stays in the existing defer queue (cont_batching's wait
+                    // mechanism) and is retried when a slot releases. Scheduling-only:
+                    // KV pool sizing is untouched. Explicitly requested slots
+                    // (id_slot >= 0) bypass the gate — the caller takes responsibility.
+                    if (id_slot == -1 && params_base.parallel_ctx_threshold > 0) {
+                        int n_resident = 0;
+
+                        for (const server_slot & s : slots) {
+                            if (s.is_processing() || s.hydra_transferring->load()) {
+                                // tokens already in the slot's KV plus whatever still
+                                // remains of its prompt (counted as if resident — it
+                                // will be within the next batch). Before the first
+                                // processing pass the per-slot counters still hold the
+                                // previous task's values, so fall back to the full
+                                // prompt of the resident task.
+                                const int n_pending = s.task
+                                    ? std::max(0, s.task->n_tokens() - s.n_prompt_tokens_cache - s.n_prompt_tokens_processed)
+                                    : 0;
+
+                                const int n_ctx_used = std::max(s.prompt.n_tokens() + n_pending,
+                                                                s.task ? s.task->n_tokens() : 0);
+
+                                n_resident += n_ctx_used;
+                            }
+                        }
+
+                        const int n_candidate = task.n_tokens();
+
+                        if (n_resident + n_candidate >= params_base.parallel_ctx_threshold) {
+                            SRV_INF("parallel-ctx-threshold: defer task %d (resident %d + candidate %d >= threshold %d)\n",
+                                    id_task, n_resident, n_candidate, (int) params_base.parallel_ctx_threshold);
+
+                            queue_tasks.defer(std::move(task));
+
+                            break;
+                        }
+
+                        SRV_DBG("parallel-ctx-threshold: admit task %d (resident %d + candidate %d < threshold %d)\n",
+                                id_task, n_resident, n_candidate, (int) params_base.parallel_ctx_threshold);
+                    }
+
                     server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
 
                     //

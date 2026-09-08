@@ -431,6 +431,10 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    // Hydra #747: defer admission of a queued request into a free slot when
+    // (combined active context across slots) + (candidate prompt) would reach
+    // this many tokens; 0 = disabled. Scheduling-only, no KV sizing change.
+    int32_t parallel_ctx_threshold =     0; // combined-ctx admission threshold (tokens, 0 = disabled)
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t grp_attn_n            =     1; // group-attention factor
