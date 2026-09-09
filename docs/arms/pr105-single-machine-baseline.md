@@ -27,6 +27,7 @@ in results is attributable to the topology alone.
 | KV | `-fa on -ctk q8_0 -ctv q5_1`, no `-kvu` | unchanged |
 | MTP | `--spec-type draft-mtp` | unchanged |
 | UM | `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` (PR #110 prefetch net) | unchanged |
+| Reference flags (YaRN, draft KV, prompt cache) | per 747.0 yml | unchanged — now explicit in launch spec |
 | Build | `-DGGML_CUDA=ON -DGGML_RPC=ON -DGGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_FORCE_CUBLAS` off | same binary as PR #110 |
 
 `GGML_RPC=ON` is kept in the build so one binary serves this arm and the
@@ -42,16 +43,23 @@ export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
   -hf unsloth/Qwen3.8-27B-GGUF:UD-Q5_K_M \
   -dev CUDA0,CUDA1 \
   -sm row -ts 27,38 -mg 0 \
+  --rope-scaling yarn --rope-scale 5 --yarn-orig-ctx 32768 \
   -fa on -ctk q8_0 -ctv q5_1 \
+  -ctkd q8_0 -ctvd q5_1 \
+  --cache-prompt --cache-reuse 64 --cache-idle-slots --cache-ram 16384 \
   -np 2 -c 296000 \
   --parallel-ctx-threshold 100000 \
   --spec-type draft-mtp \
   --jinja --host 127.0.0.1 --port 8080
 ```
 
-Context value: `-c 296000` = 148000 per slot x 2, carried from the arm102
-record ("per-slot fences 148000"); confirm the exact `-c` expression against
-the arm102 launch yml before first boot.
+Reference config: `747.0-baseline-nokvu-p2-vq51-th100k.yml` (parallel=2,
+ctx=296000 = 148000 x 2, kv_unified off, V q5_1) — the arm that produced the
+40.1 t/s single / 49.2-52.6 agg bars. All flags above are carried from that
+yml: YaRN rope scaling, draft KV types, prompt/idle-slot caching. (The arm102
+yml itself is parallel=3 / ctx=438528 / V q4_1 and is the source of the
+secondary-cell bar.) RoPE scaling changes actual position-encoding math —
+do not omit the YaRN flags when comparing against the reference bars.
 
 ## Hypothesis and purpose
 
