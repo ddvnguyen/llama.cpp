@@ -90,22 +90,30 @@ int server_queue::get_new_id() {
 void server_queue::pop_deferred_task(int id_slot) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!queue_tasks_deferred.empty()) {
-        // try to find a task that uses the specified slot
-        bool found = false;
-        for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
-            if (it->id_slot == id_slot) {
-                QUE_DBG("pop deferred task (use slot %d), id_task = %d\n", id_slot, it->id);
-                queue_tasks.emplace_front(std::move(*it));
-                queue_tasks_deferred.erase(it);
-                found = true;
-                break;
+        // re-post ALL deferred tasks, not just one: a single-pop retry can burn
+        // the release event on a head task that re-defers (e.g. the hydra#747
+        // threshold gate) and leave the rest waiting for another release even
+        // when a slot sits idle. Re-evaluating the whole FIFO in order gives
+        // every waiter a look at the freed capacity; tasks that still cannot
+        // proceed re-defer to the back, keeping FIFO order.
+        std::vector<server_task> repost;
+        for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end();) {
+            if (id_slot != -1 && it->id_slot == id_slot) {
+                // tasks explicitly requesting the released slot keep priority
+                repost.push_back(std::move(*it));
+                it = queue_tasks_deferred.erase(it);
+            } else {
+                ++it;
             }
         }
-        // if not tasks found using the slot, just pop the first deferred task (default behavior)
-        if (!found) {
-            QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
-            queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
+        while (!queue_tasks_deferred.empty()) {
+            repost.push_back(std::move(queue_tasks_deferred.front()));
             queue_tasks_deferred.pop_front();
+        }
+        QUE_DBG("re-posting %zu deferred task(s) for release of slot %d\n", repost.size(), id_slot);
+        // iterate in reverse so push_front preserves the repost order
+        for (auto it = repost.rbegin(); it != repost.rend(); ++it) {
+            queue_tasks.push_front(std::move(*it));
         }
     }
     time_last_task = ggml_time_ms();
