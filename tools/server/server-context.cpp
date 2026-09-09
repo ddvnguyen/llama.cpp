@@ -2620,12 +2620,14 @@ private:
 
                     const int id_task = task.id;
 
-                    // hydra#747 admission gate: only admit a request into an auto-selected free slot when the
-                    // combined context it would create stays under the threshold. Resident accounting counts
-                    // every processing slot at max(prompt-cache tokens, full task prompt length) — the max()
-                    // covers both early prefill (cache small, task long) and deep generation. Explicit
-                    // id_slot requests bypass the gate. Deferred tasks are retried on slot release via
-                    // queue_tasks.pop_deferred_task().
+                    // hydra#747 admission gate: only defer a request into an auto-selected free slot when
+                    // another slot is resident AND the combined context would reach the threshold. A lone
+                    // request (resident 0) always admits - its own size is bounded by the per-slot cap, and
+                    // with nothing resident there is nothing to release, so a defer would be permanent.
+                    // Resident accounting counts every processing slot at max(prompt-cache tokens, full task
+                    // prompt length) - the max() covers both early prefill (cache small, task long) and deep
+                    // generation. Explicit id_slot requests bypass the gate. Deferred tasks are retried on
+                    // slot release via queue_tasks.pop_deferred_task().
                     if (params_base.parallel_ctx_threshold > 0 && task.id_slot == -1) {
                         int64_t resident = 0;
                         for (const server_slot & s : slots) {
@@ -2635,16 +2637,22 @@ private:
                             }
                         }
                         const int64_t candidate = (int64_t) task.tokens.size();
-                        if (resident + candidate >= params_base.parallel_ctx_threshold) {
+                        if (resident > 0 && resident + candidate >= params_base.parallel_ctx_threshold) {
                             SRV_INF("parallel-ctx-threshold: defer task %d (resident %" PRId64
                                     " + candidate %" PRId64 " >= threshold %d)\n",
                                     id_task, resident, candidate, params_base.parallel_ctx_threshold);
                             queue_tasks.defer(std::move(task));
                             break;
                         }
-                        SRV_INF("parallel-ctx-threshold: admit task %d (resident %" PRId64
-                                " + candidate %" PRId64 " < threshold %d)\n",
-                                id_task, resident, candidate, params_base.parallel_ctx_threshold);
+                        if (resident == 0 && candidate >= params_base.parallel_ctx_threshold) {
+                            SRV_INF("parallel-ctx-threshold: admit task %d (resident 0 + candidate %" PRId64
+                                    " >= threshold %d; lone request on idle pool)\n",
+                                    id_task, candidate, params_base.parallel_ctx_threshold);
+                        } else {
+                            SRV_INF("parallel-ctx-threshold: admit task %d (resident %" PRId64
+                                    " + candidate %" PRId64 " < threshold %d)\n",
+                                    id_task, resident, candidate, params_base.parallel_ctx_threshold);
+                        }
                     }
 
                     server_slot * slot = get_available_slot(task);
