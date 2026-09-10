@@ -241,3 +241,40 @@ is the correct gate and measured bandwidth confirms headroom.
 captured via `/completion` JSON), bench logs for each device/quant (see table
 above), `nvidia-smi` before/after 1/15712→15847 MiB. Commit on
 `fork/pr104-mixed-quant-arm`.
+
+## PR104.1 Spike Results — 2026-09-10 (env-toggle, build-verified, no bytes rebalance yet)
+
+**Scope per spec:** `LLAMA_ARG_SPLIT_ROW_QUANT=q4_k,q6_k` (device order, default=model type), one binary rebuild-free A/B. Matrix PR105 topology + PR103 fusion ON × {quant ON/OFF} ≥5 loops, bars ≥43/45 t/s, VRAM ≤15.5/11.5 GB, prefill ≤5% regression, MTP acc unchanged, greedy identical. `infra/llama-baseline/test-suite.sh` gate.
+
+**Implementation (worktree `/tmp/pr104` on `fork/pr104-mixed-quant-arm` @ `36140458d` + dirty):**
+
+- `ggml/src/ggml-cuda/common.cuh:1222` — added `ggml_type slice_type[GGML_CUDA_MAX_DEVICES]` to `ggml_tensor_extra_gpu` (PR spec table row 1). Zero-init via `new ggml_tensor_extra_gpu{}` where used.
+- `ggml/src/ggml-cuda/ggml-cuda.cu:140` — added `ggml_cuda_split_row_quant_for_device(int device, ggml_type src_type)` helper: `call_once` parses `LLAMA_ARG_SPLIT_ROW_QUANT` comma-separated, lower-cases, matches `ggml_type_name` across all `GGML_TYPE_COUNT`, `default`/`none`/`auto` → fallback, invalid → `GGML_LOG_WARN` and fallback, quantized-only guard. Active log `GGML_LOG_INFO "LLAMA_ARG_SPLIT_ROW_QUANT active: q4_K,q6_K,..."` and static init `_pr104_env_init` forces parse at load so rebuild-free toggle is observable without model load. File at `ggml/src/ggml-cuda/ggml-cuda.cu:218`.
+- Spec rows 2–4 ( `init_tensor` 929 allocate slice bytes with slice type + `MATRIX_ROW_PADDING` via `ggml_row_size(slice_type)`, `set_tensor` 979 dequant→requant via `ggml_quantize_chunk` + imatrix, `mul_mat` dispatch from `extra->slice_type[id]` ) are **stubbed** in this spike: helper compiles and logs but is not yet wired to per-device allocation/dispatch. Reason: `ggml/src/ggml-cuda/ggml-cuda.cu` in this generation has **no split buffer** — `grep data_device` only hits `ggml-sycl` (`ggml-sycl/ggml-sycl.cpp:1239` et al). `ggml_backend_cuda_reg_get_proc_address` at `ggml-cuda.cu:5762` does not expose `ggml_backend_split_buffer_type` (SYCL does at `ggml-sycl.cpp:6927`), so `src/llama-model.cpp:1093 make_gpu_buft_list` would throw "does not support split buffers" for `-sm row`. Row sharding is currently via generic scheduler, not a CUDA split buffer. Full byte-rebalance requires reintroducing a CUDA split buffer mirroring SYCL's `get_row_rounding`/`get_row_split`/`ggml_nbytes_split` (SLO: ~400 lines) plus `mul_mat` dispatch from `extra->slice_type`. That is PR104.2 scope.
+
+**Build:** `CUDACXX=/opt/software/cuda/13.2.2/bin/nvcc` `cmake -S . -B build -DGGML_CUDA=ON -DGGML_RPC=ON -DCMAKE_CUDA_ARCHITECTURES="86;120" -DGGML_CUDA_FA_ALL_QUANTS=ON -DCUDAToolkit_ROOT=/opt/software/cuda/13.2.2` → `cmake --build build --target ggml-cuda -j 8` 417s → `libggml-cuda.so.0.23.0` with warning `function ggml_cuda_split_row_quant_for_device was declared but never referenced` suppressed via static init; `--target llama-server -j 6` 3.6s ok. Arch `86;120a`, commit `36140458d-dirty`, warnings only.
+
+**Live verification (single-GPU, production stopped `pod_llama-baseline` Exited, VRAM 1 MiB):**
+
+- `LLAMA_ARG_SPLIT_ROW_QUANT=q4_k,q6_k /tmp/pr104/build/bin/llama-server -m /mnt/SSD/Qwen3.8-27B-UD-Q4_K_M.gguf --no-mmproj -dev CUDA0 -c 8192 --port 8081 --host 127.0.0.1 --log-verbosity 2` → stdout `LLAMA_ARG_SPLIT_ROW_QUANT active: q4_K,q6_K,default,...` (16 entries) at `0.00s`, health `{"status":"ok"}` in 6.7s, VRAM `14137 MiB` (CUDA0) / `4 MiB` (CUDA1) vs `13553` for Q3 earlier. Without env (`unset`) same VRAM `14137` — confirms stub does **not** yet change allocation / `ggml_nbytes` (expected). `nvidia-smi` before/after 1→14137→1 MiB clean.
+
+- No two-GPU row-split boot was attempted for MTP in this spike because split-buffer bytes rebalance is not wired; any `-dev CUDA0,CUDA1 -sm row -ts 38,27` would still allocate via single-device `ggml_backend_cuda_buffer_interface` (not split), so VRAM and bandwidth would be unchanged vs baseline, not 7.6/9.6 GiB. Therefore **real mixed-quant decode was not measured**; the 53.8–78.7 t/s projection from PR104.0 remains unvalidated in wall-time.
+
+**Comparison real vs projection:**
+
+- Projection (PR104.0 balanced): `41.4 t/s raw` → `53.8 (1.3×) 62.1 (1.5×) 66.3 (1.6×) 78.7 (1.9×)` vs bar `≥45`.
+- Real spike (stub): single-GPU raw `25.95 t/s` (bench) / `≈24.9` server, identical with env ON vs OFF (no bytes change), so effective `~25 t/s raw ×1.3 = 32.5` two-GPU raw would still be `≈25` (no rebalance) → **FAIL vs 45**, but failure is due to missing split-buffer wiring, not roofline. With proper split `get_alloc_size`/`init_tensor`/`set_tensor` using `slice_type` and `ggml_row_size(slice_type)` + `MATRIX_ROW_PADDING` per slice, plus `mul_mat` dispatch, the projection should be recoverable — budgeting is correct, implementation is pending.
+
+**Bars (spike):**
+
+- Build + env-toggle A/B rebuild-free: **PASS** (one binary, `LLAMA_ARG_SPLIT_ROW_QUANT` parsed, log observable).
+- VRAM ≤15.5/11.5: **PASS** (stub 14.1 GB single-GPU, no oversubscription), but not yet demonstrating 7.6/9.6 split.
+- Prefill ≤5%: **not yet measured** (requires two-GPU split boot).
+- MTP acc unchanged / greedy identical: **not yet measured** (requires split boot with `--spec-type draft-mtp -ctkd q8_0 -ctvd q5_1`).
+- `test-suite.sh 8081 12` : **not run on split topology** (single-GPU health PASS, full suite awaits PR104.2).
+
+**Why not wired:** CUDA split buffer was removed after `bf0a29cc1 Deepseek 4: -sm tensor`; only SYCL retains it. Reintroducing it for mixed-quant is PR104.2 work: port `ggml-sycl.cpp:1083 get_row_rounding`, `1131 get_row_split`, `1145 ggml_nbytes_split`, `1151 split_buffer_type_context`, `1418 get_alloc_size`, `1184 init_tensor`, `1261 set_tensor` to `ggml-cuda.cu` with `cudaMalloc`/`cudaMemcpyAsync`, per-device `slice_type` via helper, padding via `ggml_row_size(slice_type, MATRIX_ROW_PADDING - ne0%MATRIX_ROW_PADDING)`, and `ggml_cuda_op_mul_mat` dispatch from `extra->slice_type[id]`. Imatrix-aware `ggml_quantize_chunk` for PR104.2.
+
+**Next:** PR104.2 to reintroduce `ggml_backend_cuda_split_buffer_type` + expose via `ggml_backend_cuda_reg_get_proc_address`, wire `slice_type` through `get_alloc_size`/`init_tensor`/`set_tensor`/`mul_mat`, then repeat full matrix (PR105 topology × quant ON/OFF × MTP) ≥5 loops, report real decode vs 53.8–78.7, VRAM, prefill, MTP, greedy, and `test-suite.sh` pass. This commit keeps spike as env-toggle foundation.
+
+**Commit:** `ggml/src/ggml-cuda/common.cuh` + `ggml/src/ggml-cuda/ggml-cuda.cu` as above, docs appended. To be pushed `ddvnguyen fork/pr104-mixed-quant-arm` (no merge, no new branch).

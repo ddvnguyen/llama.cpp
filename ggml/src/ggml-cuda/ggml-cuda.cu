@@ -137,6 +137,86 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+// --- PR104.1 spike: per-device row-split quant via LLAMA_ARG_SPLIT_ROW_QUANT ---
+// Env format: "q4_k,q6_k" (device order, comma separated). Default = model type.
+// Parsing is cached on first use; invalid names warn once and fall back to src type.
+static ggml_type ggml_cuda_split_row_quant_for_device(int device, ggml_type src_type) {
+    static std::once_flag parse_once;
+    static std::array<ggml_type, GGML_CUDA_MAX_DEVICES> parsed;
+    static bool has_env = false;
+    static bool warned_invalid = false;
+
+    std::call_once(parse_once, []() {
+        for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) parsed[i] = GGML_TYPE_COUNT;
+        const char * env = getenv("LLAMA_ARG_SPLIT_ROW_QUANT");
+        if (!env || !*env) {
+            return;
+        }
+        has_env = true;
+        std::string s(env);
+        // split by ','
+        size_t start = 0;
+        int idx = 0;
+        while (idx < GGML_CUDA_MAX_DEVICES) {
+            size_t comma = s.find(',', start);
+            std::string token = (comma == std::string::npos) ? s.substr(start) : s.substr(start, comma - start);
+            // trim whitespace
+            size_t a = token.find_first_not_of(" \t\r\n");
+            size_t b = token.find_last_not_of(" \t\r\n");
+            if (a != std::string::npos && b != std::string::npos) token = token.substr(a, b - a + 1);
+            else token.clear();
+            // lower case for comparison
+            for (char & c : token) c = std::tolower(c);
+            if (!token.empty() && token != "default" && token != "none" && token != "auto") {
+                bool found = false;
+                for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                    const char * name = ggml_type_name((ggml_type)t);
+                    if (!name) continue;
+                    std::string lname(name);
+                    for (char & c : lname) c = std::tolower(c);
+                    if (lname == token) {
+                        parsed[idx] = (ggml_type)t;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    GGML_LOG_WARN("LLAMA_ARG_SPLIT_ROW_QUANT: unknown type '%s' for device %d, using model default\n",
+                        token.c_str(), idx);
+                }
+            }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+            ++idx;
+        }
+        if (has_env) {
+            std::string log = "LLAMA_ARG_SPLIT_ROW_QUANT active: ";
+            for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+                if (i) log += ",";
+                log += (parsed[i] == GGML_TYPE_COUNT ? std::string("default") : ggml_type_name(parsed[i]));
+            }
+            GGML_LOG_INFO("%s\n", log.c_str());
+        }
+    });
+
+    if (!has_env) return src_type;
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return src_type;
+    ggml_type t = parsed[device];
+    if (t == GGML_TYPE_COUNT) return src_type;
+    // only apply to quantized source; non-quantized keeps src
+    if (!ggml_is_quantized(src_type)) return src_type;
+    if (!ggml_is_quantized(t)) {
+        if (!warned_invalid) {
+            GGML_LOG_WARN("LLAMA_ARG_SPLIT_ROW_QUANT: device %d target %s is not quantized, fallback to %s\n",
+                device, ggml_type_name(t), ggml_type_name(src_type));
+            warned_invalid = true;
+        }
+        return src_type;
+    }
+    return t;
+}
+static bool _pr104_env_init = [](){ (void)ggml_cuda_split_row_quant_for_device(0, GGML_TYPE_Q4_K); return true; }();
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
