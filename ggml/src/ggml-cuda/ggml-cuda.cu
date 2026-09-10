@@ -1164,22 +1164,36 @@ static enum ggml_status ggml_backend_cuda_split_buffer_init_tensor(ggml_backend_
         }
     }
     // for devices without rows, keep slice_type as COUNT (fallback to tensor->type in dispatch)
-    // also alloc contiguous copy on main_device for compute (avoids per-op gather, graph-safe)
+    // also alloc contiguous copy on main_device for compute of ops without a native split path
+    // (PR104.2: gated by size so weight tensors consumed by the split MUL_MAT dispatch stay slices-only)
     {
         int main_id = buft_ctx->main_device;
         if (main_id < 0 || main_id >= ggml_backend_cuda_get_device_count()) main_id = 0;
-        size_t cont_size = ggml_nbytes(tensor);
-        if (ne0 % MATRIX_ROW_PADDING != 0) {
-            cont_size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
+        static size_t contig_max_bytes = [] {
+            const char * env = getenv("GGML_SPLIT_CONTIG_MAX_BYTES");
+            // PR104.2: contiguous copies are only needed by ops without a native split path
+            // (norm/bias-scale MUL etc.); weight tensors stay slices-only for the split MUL_MAT dispatch.
+            // 16 MiB keeps all small f32 norm/rope weights and drops mid-size layer weights.
+            return env ? (size_t) std::atoll(env) : (size_t) 16*1024*1024;
+        }();
+        if (ggml_nbytes(tensor) <= contig_max_bytes) {
+            size_t cont_size = ggml_nbytes(tensor);
+            if (ne0 % MATRIX_ROW_PADDING != 0) {
+                cont_size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
+            }
+            fprintf(stderr, "PR104 split contig: %s type=%s size=%zu cont=%zu\n", tensor->name, ggml_type_name(tensor->type), (size_t) ggml_nbytes(tensor), cont_size);
+            ggml_cuda_set_device(main_id);
+            void * cbuf = nullptr;
+            CUDA_CHECK(ggml_cuda_device_malloc(&cbuf, cont_size, main_id));
+            if (cont_size > ggml_nbytes(tensor)) {
+                CUDA_CHECK(cudaMemset((char*)cbuf + ggml_nbytes(tensor), 0, cont_size - ggml_nbytes(tensor)));
+            }
+            extra->contiguous_data = cbuf;
+            extra->contiguous_device = main_id;
+        } else {
+            extra->contiguous_data = nullptr;
+            extra->contiguous_device = main_id;
         }
-        ggml_cuda_set_device(main_id);
-        void * cbuf = nullptr;
-        CUDA_CHECK(ggml_cuda_device_malloc(&cbuf, cont_size, main_id));
-        if (cont_size > ggml_nbytes(tensor)) {
-            CUDA_CHECK(cudaMemset((char*)cbuf + ggml_nbytes(tensor), 0, cont_size - ggml_nbytes(tensor)));
-        }
-        extra->contiguous_data = cbuf;
-        extra->contiguous_device = main_id;
     }
     tensor->extra = extra;
     return GGML_STATUS_SUCCESS;
@@ -1231,13 +1245,15 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
         // padding already zeroed in init
         GGML_UNUSED(ne0);
     }
-    // also copy full tensor to contiguous on main_device (original type)
+    // also copy full tensor to contiguous on main_device (original type), when the tensor qualifies
     {
         int main_id = extra->contiguous_device;
         if (main_id < 0) main_id = buft_ctx->main_device;
         if (main_id < 0 || main_id >= ggml_backend_cuda_get_device_count()) main_id = 0;
-        ggml_cuda_set_device(main_id);
-        CUDA_CHECK(cudaMemcpy(extra->contiguous_data, data, ggml_nbytes(tensor), cudaMemcpyHostToDevice));
+        if (extra->contiguous_data) {
+            ggml_cuda_set_device(main_id);
+            CUDA_CHECK(cudaMemcpy(extra->contiguous_data, data, ggml_nbytes(tensor), cudaMemcpyHostToDevice));
+        }
     }
     GGML_UNUSED(buffer);
 }
@@ -2259,8 +2275,214 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// PR104.2: row-split MUL_MAT. Each device runs a native quantized matmul over its own weights slice, so no
+// per-op contiguous gather is needed and devices compute concurrently. Port of the removed per-op
+// ggml_cuda_op_mul_mat (SYCL ggml_sycl_op_mul_mat), with per-device chunked src1 staging.
+#define PR104_MUL_MAT_SRC1_COL_STRIDE 128
+
+// cudaMemcpy2DAsync may fail with copies between vmm pools of different devices, so use cudaMemcpy3DPeerAsync
+static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
+    void * dst, int dstDevice, size_t dpitch, void * src, int srcDevice, size_t spitch, size_t width, size_t height, cudaStream_t stream) {
+
+    cudaMemcpy3DPeerParms p = {};
+    p.dstDevice = dstDevice;
+    p.dstPtr = make_cudaPitchedPtr(dst, dpitch, dpitch, height);
+    p.srcDevice = srcDevice;
+    p.srcPtr = make_cudaPitchedPtr(src, spitch, spitch, height);
+    p.extent = make_cudaExtent(width, height, 1);
+    return cudaMemcpy3DPeerAsync(&p, stream);
+}
+
+static void ggml_cuda_mul_mat_split(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_backend_buffer_is_cuda_split(src0->buffer));
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    ggml_backend_cuda_split_buffer_type_context * buft_ctx = (ggml_backend_cuda_split_buffer_type_context *) src0->buffer->buft->context;
+    ggml_tensor_extra_gpu * src0_extra = (ggml_tensor_extra_gpu *) src0->extra;
+    GGML_ASSERT(src0_extra);
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(!dst->src[2]); // no mul_mat ids
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+    GGML_ASSERT(nb0  == sizeof(float));
+
+    // split weights are 2D; broadcast (ne12 != ne02) src1 and split src1/dst are not supported
+    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+    GGML_ASSERT(ne12 == 1 && ne13 == 1);
+    GGML_ASSERT(!ggml_backend_buffer_is_cuda_split(src1->buffer));
+    GGML_ASSERT(!ggml_backend_buffer_is_cuda_split(dst->buffer));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(dst->nb[1] == ne0*sizeof(float)); // dst stitch copies full-size rows
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_type type_src0 = src0->type;
+    GGML_ASSERT(ggml_is_quantized(type_src0));
+
+    const bool use_mmvq = ggml_cuda_should_use_mmvq(type_src0, cc, ne11);
+    const bool use_mmq  = !use_mmvq && ggml_cuda_should_use_mmq(type_src0, cc, ne11, /*n_experts=*/0);
+    if (!use_mmvq && !use_mmq) {
+        GGML_ABORT("PR104: split-buffer MUL_MAT needs a quantized src0 (mmvq/mmq), got %s", ggml_type_name(type_src0));
+    }
+
+    const int dev_src1 = ((ggml_backend_cuda_buffer_context *) src1->buffer->context)->device;
+
+    struct dev_data {
+        int64_t row_low  = 0;
+        int64_t row_high = 0;
+
+        ggml_cuda_pool_alloc<float> src1_ddf_alloc;
+        ggml_cuda_pool_alloc<float>   dst_dd_alloc;
+
+        float *   dst_dd = nullptr;
+        float * src1_ddf = nullptr;
+    };
+
+    dev_data dev[GGML_CUDA_MAX_DEVICES];
+
+    int used_devices = 0;
+    for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
+        dev[id].row_low  = 0;
+        dev[id].row_high = ne01;
+
+        // for multi GPU, get the row boundaries from the tensor split and round to mul_mat_q tile sizes
+        get_row_split_cuda(&dev[id].row_low, &dev[id].row_high, src0, buft_ctx->tensor_split, id);
+
+        if (dev[id].row_low == dev[id].row_high) {
+            continue;
+        }
+
+        used_devices++;
+
+        // the main device writes its result directly into dst (per-op kernels offset by row_low),
+        // every other device needs a token-major dst staging buffer
+        const bool dst_on_device = id == ctx.device;
+        const int64_t row_diff   = dev[id].row_high - dev[id].row_low;
+
+        ggml_cuda_set_device(id);
+        cudaStream_t stream = ctx.stream(id, 0);
+
+        dev[id].src1_ddf = dev[id].src1_ddf_alloc.alloc(ctx.pool(id), ne11*ne10);
+
+        if (dst_on_device) {
+            dev[id].dst_dd = (float *) dst->data;
+        } else {
+            dev[id].dst_dd = dev[id].dst_dd_alloc.alloc(ctx.pool(id), row_diff*ne1);
+        }
+    }
+    GGML_ASSERT(used_devices > 0);
+
+    // if multiple devices are used, they need to wait for the main device's input data to be ready
+    if (used_devices > 1) {
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaEventRecord(src0_extra->events[ctx.device][0], ctx.stream()));
+    }
+
+    const int64_t src1_col_stride = used_devices > 1 ? PR104_MUL_MAT_SRC1_COL_STRIDE : ne11;
+    for (int64_t src1_col_0 = 0; src1_col_0 < ne11; src1_col_0 += src1_col_stride) {
+        const int64_t is = used_devices > 1 ? (src1_col_0/src1_col_stride) % GGML_CUDA_MAX_STREAMS : 0;
+        const int64_t src1_ncols = src1_col_0 + src1_col_stride > ne11 ? ne11 - src1_col_0 : src1_col_stride;
+        const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+        for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
+            if (dev[id].row_low == dev[id].row_high) {
+                continue;
+            }
+
+            const bool dst_on_device = id == ctx.device;
+            const int64_t row_diff   = dev[id].row_high - dev[id].row_low;
+
+            ggml_cuda_set_device(id);
+            cudaStream_t stream = ctx.stream(id, is);
+
+            // wait for main GPU data if necessary
+            if (used_devices > 1 && (id != ctx.device || is != 0)) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, src0_extra->events[ctx.device][0], 0));
+            }
+
+            // for split tensors the src0 slice is already on the computing device
+            char * src0_dd_i = (char *) src0_extra->data_device[id];
+
+            // the main device can write its result directly into dst (the per-op kernels offset the
+            // written rows by row_low), all other devices write into a staging buffer
+            float * dst_dd_i = dev[id].dst_dd + (dst_on_device ? src1_col_0*ne0 + dev[id].row_low : src1_col_0*row_diff);
+
+            // stage the src1 columns on a device that does not own src1
+            float * src1_ddf_i = nullptr;
+            if (id != dev_src1) {
+                src1_ddf_i = dev[id].src1_ddf + src1_col_0*ne10;
+                CUDA_CHECK(cudaMemcpyPeerAsync(src1_ddf_i, id,
+                    ((const float *) src1->data) + src1_col_0*ne10, dev_src1,
+                    src1_ncols*ne10*sizeof(float), stream));
+            } else {
+                src1_ddf_i = (float *) src1->data + src1_col_0*ne10;
+            }
+
+            const bool use_mmvq = ggml_cuda_should_use_mmvq(type_src0, cc, ne11);
+            // PR104.2: the slice on this device may be re-quantized to a different type
+            const ggml_type type_slice = src0_extra->slice_type[id] != GGML_TYPE_COUNT ? src0_extra->slice_type[id] : type_src0;
+
+            if (use_mmvq) {
+                ggml_cuda_pool_alloc<char> src1_ddq_alloc;
+                char * src1_ddq_i = src1_ddq_alloc.alloc(ctx.pool(id), src1_ncols*ne10_padded*sizeof(block_q8_1)/QK8_1);
+                quantize_row_q8_1_cuda(src1_ddf_i, nullptr, src1_ddq_i, type_slice, ne10, ne10, 1, 1,
+                    ne10_padded, src1_ncols, 1, 1, stream);
+                CUDA_CHECK(cudaGetLastError());
+
+                ggml_cuda_op_mul_mat_vec_q(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i,
+                    dst_dd_i, dev[id].row_low, dev[id].row_high, src1_ncols, ne10_padded, stream, type_slice, ctx.pool(id));
+            } else {
+                ggml_cuda_op_mul_mat_q(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, dst_dd_i,
+                    dev[id].row_low, dev[id].row_high, src1_ncols, ne10_padded, stream, type_slice, ctx.pool(id));
+            }
+            CUDA_CHECK(cudaGetLastError());
+
+            // copy dst to the main device if necessary
+            if (!dst_on_device) {
+                // src0 is stored row-major, so the outputs of matrix multiplications cannot simply be
+                // concatenated for >1 GPU: they need to be copied to the correct slice in ne0 = dst rows
+                float * dhf_dst_i = (float *) dst->data + src1_col_0*ne0 + dev[id].row_low;
+                CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(
+                    dhf_dst_i, ctx.device, ne0*sizeof(float), dst_dd_i, id,
+                    row_diff*sizeof(float), row_diff*sizeof(float), src1_ncols, stream));
+            }
+
+            // add event for the main device to wait on until other device is done
+            if (used_devices > 1 && (id != ctx.device || is != 0)) {
+                CUDA_CHECK(cudaEventRecord(src0_extra->events[id][is], stream));
+            }
+        }
+    }
+
+    // main device waits for all other devices to be finished
+    if (used_devices > 1) {
+        int64_t is_max = (ne11 + PR104_MUL_MAT_SRC1_COL_STRIDE - 1) / PR104_MUL_MAT_SRC1_COL_STRIDE;
+        is_max = std::min(is_max, (int64_t) GGML_CUDA_MAX_STREAMS);
+
+        ggml_cuda_set_device(ctx.device);
+        for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
+            if (dev[id].row_low == dev[id].row_high) {
+                continue;
+            }
+            for (int64_t isl = 0; isl < is_max; ++isl) {
+                CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), src0_extra->events[id][isl], 0));
+            }
+        }
+    }
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    // PR104.2: split-buffer src0 is dispatched as a partially-mapped native matmul over the per-device
+    // weights slices, no gather needed
+    if (src0->buffer && ggml_backend_buffer_is_cuda_split(src0->buffer)) {
+        ggml_cuda_mul_mat_split(ctx, src0, src1, dst);
+        return;
+    }
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
@@ -2522,9 +2744,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     ggml_tensor * orig_src[4] = {dst->src[0], dst->src[1], dst->src[2], dst->src[3]};
     ggml_tensor src_view[4];
     bool is_split[4] = {};
+    // PR104.2: for MUL_MAT the split src0 dispatch handles the split directly, do not gather it
+    const bool mul_mat_split_src0 = dst->op == GGML_OP_MUL_MAT && orig_src[0] && orig_src[0]->buffer &&
+        ggml_backend_buffer_is_cuda_split(orig_src[0]->buffer);
     for (int i = 0; i < 4; ++i) {
         ggml_tensor * src = orig_src[i];
         if (src && src->buffer && ggml_backend_buffer_is_cuda_split(src->buffer)) {
+            if (mul_mat_split_src0 && i == 0) {
+                continue;
+            }
             is_split[i] = true;
             ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) src->extra;
             GGML_LOG_INFO("PR104 split gather: op=%s src%d type=%s contiguous=%p dev=%d ctx=%d\n",
