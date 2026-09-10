@@ -65,6 +65,17 @@ Must be **OFF** for every measurement run. (PR103's rig build violated this
 Rule of thumb: debug builds answer "does it work" (correctness, fusion
 matching); Release without debug answers "how fast". Never mix the two.
 
+## Launch-flag landmines
+
+### D. `-sm row` together with `--rpc`
+
+Symptom (reproduced 2026-09-10, PR103 rig boot): model load fails with
+`device RPC0 does not support split buffers` — row-split buffers are not
+supported across an RPC peer, hard abort before serving. Use the default
+layer split for any RPC topology (the production 747.4 pin has no
+`split_mode`, i.e. layer split — that is correct, not an omission). `-sm row`
+is only valid in-process (`-dev CUDA0,CUDA1`, no `--rpc`), as in PR105.0.
+
 ## Known gaps in existing arm docs (flag only, owners to fix)
 
 - `pr104-mixed-quant-row-sharding.md` (PR104.0/104.1 results): records

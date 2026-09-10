@@ -1,5 +1,14 @@
 # PR103.0 — CUDA GDN cache-cpy fusion arm
 
+> **Premise revised 2026-09-10 (see Rig Validation Results below):** the
+> fusion this arm set out to port already exists on CUDA in baseline —
+> upstream #23940 (5a460dea9), written for exactly this model ("with MTP
+> draft length 3, target decode uses K=4"). The Metal commit d011a214b this
+> spec was modeled on is newer and not in baseline. PR #115 therefore ships
+> only an env toggle (`GGML_CUDA_FUSE_GDN_CACHE`) + backend-op tests, and
+> the Rig Validation Results section is an A/B of the *existing* fusion,
+> not a port.
+
 Port the Metal `GGML_METAL_FUSE_GDN_CACHE` semantics (upstream d011a214b) to
 the CUDA backend: when the `gated_delta_net` kernel is followed by a cpy that
 scatters its recurrent-state snapshots into the state/cache buffer, the kernel
