@@ -117,17 +117,48 @@ if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
 }
 ```
 
-i.e. for the production shape (`kv_unified off`, hybrid arch, whatever the
-`get_can_shift()` gate rejects — not statically pinned to a single cause on
-baseline `d50efc6f0`), production's `--context-shift on` has been
+i.e. for the production shape, production's `--context-shift on` has been
 **silently converted to OFF at every boot**. This means:
 
 - we have near-zero production evidence that context-shift even fires for
   Qwen3.8, let alone that it is correct;
-- this arm MUST run a Gate-0 boot-log check and attempt small alternate
-  shapes to find a config where the shift is actually left enabled — a shape
-  where shift is enabled but the recurrent rollback is silently broken is
-  exactly the live-fire hazard we care about.
+- this arm MUST run a Gate-0 boot-log check and, because of the mechanism
+  pinned below, needs a **test-only patch** to exercise the gate at all
+  (see "Gate 0 revision" and the patch file).
+
+### Root cause of the boot-time disable (pinned to one line, independently verified)
+
+Traced end to end on baseline @ `d50efc6f0`:
+
+1. `src/llama-model.cpp`, `llama_model_rope_type()` — `LLM_ARCH_QWEN35`
+   and `LLM_ARCH_QWEN35MOE` are grouped with `QWEN3VL`/`QWEN3VLMOE` and
+   return `LLAMA_ROPE_TYPE_IMROPE` **unconditionally** (not gated on
+   mmproj/vision being loaded). This is baked into the architecture table.
+2. `llama_hparams::n_pos_per_embd()` — returns `4` for
+   `MROPE`/`IMROPE` rope types (all 4 M-RoPE axes), so qwen35 has
+   `n_pos_per_embd() = 4`.
+3. `src/llama-kv-cache.cpp`, `llama_kv_cache::get_can_shift()` —
+   `if (hparams.n_pos_per_embd() > 1) { return false; }` fires
+   unconditionally for every qwen35/qwen35moe boot, regardless of ctx size,
+   kv_unified, SWA shape, or any launch flag.
+4. Confirmed against the actual production GGUF: the GGUF header at
+   `/mnt/SSD/Qwen3.8-27B-UD-Q5_K_M.gguf` declares
+   `general.architecture = qwen35` (read directly from the GGUF header).
+
+**Conclusion: no config lever exists to enable the shift for this model —
+it is an architectural hard gate, not a runtime toggle.** This resolves the
+arm's H0 in favor of "config no-op is real, and now has a precise cause".
+Consequences for the arm:
+
+- Gate 0 as originally scoped (find a bootable shape with shift enabled)
+  can never succeed as written, since no shape change affects the RoPE
+  type. Gate 0 is therefore revised below to use a **test-only local
+  patch** that bypasses this specific check.
+- One more gate is discovered by this trace: even with `get_can_shift()`
+  bypassed, `llama_kv_cache::seq_add()` and `llama_kv_cache::seq_div()`
+  carry `GGML_ASSERT(hparams.n_pos_per_embd() == 1)`
+  (`llama-kv-cache.cpp` seq_add/seq_div) — the very first shift would
+  hard-abort. The test patch must (and does) cover all three sites.
 
 ## Hypothesis
 
@@ -146,6 +177,11 @@ After a shift fires on Qwen3.8:
   applies to this arm's shape too — then the finding is "ctx_shift is
   config-no-op for Qwen3.8 in every shape we can boot" (diagnosability/config
   bug, still worth a finding; the correctness question stays open).
+  **Status: effectively confirmed and root-caused** — see "Root cause"
+  above (`n_pos_per_embd() = 4` from unconditional IMROPE rope type). With
+  the test-only patch (Gate 0 revised below) the arm still answers H1/H2
+  on the patch-enabled shape; the null-hypothesis resolution stands
+  separately for vanilla production configs.
 
 ## Rig and launch spec
 
@@ -173,8 +209,12 @@ topology, not the RPC topology we use here).
 Launch (cell A):
 
 ```bash
+# test-only patch first, then rebuild (build flags below the command block)
+git apply docs/arms/arm-context-shift-hybrid-testpatch.patch
+
+export LLAMA_TEST_FORCE_SHIFT_QWEN35=1   # TEST HARNESS ONLY — never set in production
 # topology per 747.4: rpc-server on CUDA1 (3060), server on CUDA0 (5060 Ti)
-podman-sourced ggml-rpc-server --host 127.0.0.1 --port 50052 -d 1 2>&1 &
+ggml-rpc-server --host 127.0.0.1 --port 50052 -d 1 2>&1 &
 
 ./build/bin/llama-server \
   -m /mnt/SSD/Qwen3.8-27B-UD-Q5_K_M.gguf \
@@ -197,29 +237,71 @@ podman-sourced ggml-rpc-server --host 127.0.0.1 --port 50052 -d 1 2>&1 &
 Pre-flight hardware checks: `nvidia-smi` free memory, `/health` 200, both
 devices in boot log, then **Gate 0** below.
 
-## Gate 0 — is the shift even enabled? (before any probe)
+## Test-only patch: `docs/arms/arm-context-shift-hybrid-testpatch.patch`
 
-From the boot log, verify all of:
+To run Gate 0 / A1 / A2 / C1 / C2 at all, the runner applies this patch to
+the baseline tree (`git apply docs/arms/arm-context-shift-hybrid-testpatch.patch`)
+and rebuilds. Spec:
 
-- [ ] No `KV cache shifting is not supported for this context, disabling KV
-      cache shifting` line (i.e. `common/common.cpp:1457` did not trigger).
-  If it DOES fire, launch fallback shape cells until one boots with the
-  warning absent — try in order: (a) `--no-spec` / MTP off, (b) kv_unified
-  on, (c) `-ctk f16 -ctv f16`, (d) `-np 1 -c 8192`, (e) drop `--no-kv-unified`
-  → `-kvu on ...` shape of the 747.3 pin. Record which lever (if any) flips
-  the gate — that lever is itself a finding (as of writing, the *cause* of the
-  prod-shape disable is not pinned to one line in the code audit above).
+- **Env gate**: `LLAMA_TEST_FORCE_SHIFT_QWEN35` (set only in the arm's test
+  launcher; unset = zero behavior change vs vanilla baseline — the patch is
+  also fully dormant at runtime).
+- **Scope, tightly architectural**: only `rope_type == IMROPE &&
+  (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE)`. All three
+  three hard-gate sites are covered:
+  1. `llama_kv_cache::get_can_shift()` — inside the
+     `n_pos_per_embd() > 1` branch, only for the two qwen35 arches,
+     env-gated; every other IMROPE arch (qwen3vl, etc.) stays prohibited.
+  2. `llama_kv_cache::seq_add()` — the `GGML_ASSERT(n_pos_per_embd()==1)`
+     is downgraded to a warning under the env gate (the binary would
+     otherwise abort at the first shift despite the gate above),
+     proceeding with a scalar cell-pos shift.
+  3. `llama_kv_cache::seq_div()` — same downgrade, so the cache-reuse
+     divide path can't abort either.
+- **Why the scalar-pos shift is defensible for this probe (and only
+  there)**: with text-only chats, all four M-RoPE axes hold the same
+  position value; a single scalar shift equals a per-axis shift.
+  Mixed-media content would silently corrupt non-temporal axes — hence
+  the "test harness only" warning, and this is exactly the second,
+  separate risk asked to be flagged: **IMROPE K-shift correctness for the
+  4-axis position case is itself unverified and is a second, separate risk
+  beyond what this arm measures.**
+- **Easy to revert**: 37 inserted lines in one file
+  (`src/llama-kv-cache.cpp`), no headers touched, no behavior change with
+  the env unset; `git checkout -- src/llama-kv-cache.cpp` reverts it.
+  The PR carries the patch un-applied — the arm tree applies it, builds,
+  runs, and drops it in close-out.
+
+## Gate 0 (revised — before any probe)
+
+With the test patch applied and `LLAMA_TEST_FORCE_SHIFT_QWEN35=1` set,
+verify from the boot/probe logs:
+
+- [ ] With the patch applied but `LLAMA_TEST_FORCE_SHIFT_QWEN35` unset:
+      boot must still print the disabling warning (proves the gate is
+      dormant and the vanilla behavior is unchanged — a negative control
+      on the patch itself).
+- [ ] With `LLAMA_TEST_FORCE_SHIFT_QWEN35=1`: the disabling warning line
+      (`common/common.cpp:1457`) is ABSENT (i.e. `common_init_` sees
+      shift-enabled memory) and `llama_kv_cache::get_can_shift()` printed
+      its TEST HARNESS ONLY warning.
+- [ ] Optional shape-lever tracking from the original Gate 0 drafting:
+      try booting one config WITHOUT the patch but with (a) `--no-spec`,
+      (b) kv_unified on, (c) `-ctk f16 -ctv f16`, (d) `-np 1 -c 8192` and
+      record that the disabling warning still fires in every case —
+      confirming the root-cause claim that no config lever exists.
 - [ ] `n_rs_seq` reported in the `llama_context` init INFO line is the
       expected 3 for spec-on cells and 0 for spec-off cells (`ctx.cpp` logs
       `n_rs_seq = %u`). This confirms the snapshot-window premise.
 - [ ] Boot INFO shows `n_parallel = 2`, `n_ctx_slot = 8192`.
-- [ ] No Xid errors / OOM.
+- [ ] No Xid errors / OOM, no `GGML_ABORT` from `seq_add`/`seq_div` at the
+      first shift event (if one aborts, the patch's third site is
+      incomplete — stop and fix the patch, do not proceed).
 
-If NO cell candidate can boot with shift left enabled, STOP: record the arm
-as `GATE-0 BLOCKED` with the disable-line as evidence — this is itself a
-diagnosability finding (upstream issue candidate) and the correctness probe
-stays deferred. Do not fake-observe a probe on a server where shift was
-silently disabled.
+If any Gate-0 checklist item fails, STOP: record it and fix the patch (or
+file the bug) before any probe run. Do not observe a probe on a server
+where the shift is silently disabled or abort-prone — all probe verdicts
+would be uninterpretable.
 
 ## Test cells
 
@@ -385,9 +467,15 @@ Additionally, at run time, count for the record:
 
 **FAIL ("disable / flag as broken")** — ANY of:
 
-1. Gate 0 blocked: no bootable shape can leave the shift on — verdict is
-   "ctx_shift is NOT actionable for Qwen3.8; needs upstream/infra fix
-   before being a safe production toggle" + diagnosability finding.
+1. Gate 0 fails after the patch (negative control broken, disabling
+   warning still fires under the env, or `seq_add`/`seq_div` aborts at the
+   first shift) — verdict is
+   "ctx_shift is NOT actionable for Qwen3.8 in any bootable/repaired form;
+   needs an upstream fix (IMROPE-shift correctness or an architecture-level
+   shift path) before it can be a safe production toggle" + diagnosability
+   finding. NOTE: the original "Gate 0 blocked" version (no bootable
+   shape) is now superseded by the pinned root cause — no shape ever boots
+   with shift enabled without the test patch.
 2. **Recall does not separate by boundary** (the classic silent-corruption
    signature): M2 (never evicted) and M1 (evicted) recall are statistically
    indistinguishable — M2 flaky while M1 gets confident "hologram" hits —
