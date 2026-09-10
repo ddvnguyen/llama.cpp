@@ -372,3 +372,61 @@ stdout, both sessions full tables + `concurrency check: PASS`),
 `pod-inspect-before.json`. Production restore verified twice.
 
 
+
+## Rig Validation Results — 2026-09-10 (bare-metal re-measurement)
+
+B01-compliant build (Release, arch 86;120, FA_ALL_QUANTS=ON, FORCE_CUBLAS=OFF,
+GGML_CUDA_DEBUG off, toolkit /opt/software/cuda/13.2.2), binary at 8f8af8c2c.
+Same decode methodology as PR103.0's cells (26-token prompt, greedy,
+n_predict 256, x3, after warmup). MTP acceptance 0.58-0.60 in both bootable
+cells (normal).
+
+### Spec deviations (forced)
+
+- `-sm row` **cannot load on this build at all** — in-process it aborts with
+  `device CUDA0 does not support split buffers` (and over RPC:
+  `device RPC0 does not support split buffers`). Row split is unsupported on
+  CUDA in v0.4.0 @ 8f8af8c2c, period. All cells below use the default layer
+  split, keeping the 27/38 ratio where stated.
+- `-m /mnt/SSD/Qwen3.8-27B-UD-Q5_K_M.gguf` instead of `-hf` (identical
+  weights, no download in-window).
+
+### Cells
+
+| cell | split | UM | ctx | result |
+|---|---|---|---|---|
+| A: production ratio | 27,38 | on | 296k | **2.39 / 2.46 / 2.46 t/s (mean 2.44)** — 14x collapse |
+| B: no-UM, spec ratio | 27,38 | off | 296k | unloadable — CUDA1 KV alloc OOM |
+| C: no-UM, balanced | 33,32 | off | 224k | unloadable — CUDA1 OOM (3175 MiB short) |
+| D: UM, balanced | 33,32 | on | 296k | **33.25 / 33.68 / 33.63 (mean 33.52)** — healthy; VRAM 15645/11911 |
+
+### Comparison
+
+| reference | value | cell D delta |
+|---|---|---|
+| PR105.0 bar (747.0-derived single) | 40.1 t/s | **−16%** |
+| PR103.0 RPC topology, fusion ON | 35.54 t/s | **−5.7%** |
+| live pod (747.4, RPC) same prompt | 35.78 t/s | −6.3% |
+
+### Verdict
+
+1. **The single-machine (in-process) topology loses to the RPC process split
+   on this rig** — 33.5 vs 35.5 t/s at matched flags (−5.7%). The RPC hop is
+   not overhead here; per-process device isolation is worth more than the
+   transport cost.
+2. **New landmine (reproduced): in-process multi-GPU + UM + imbalanced
+   -ts.** The production ratio 27,38 collapses decode 14x (2.44 t/s) while
+   GPU0 shows 8 GB spare — CUDA1's true demand exceeds its ~11.3 GB usable
+   and managed pages spill to host RAM, thrashing per token. Balanced 33,32
+   keeps CUDA1 resident and decode is normal. Mechanism is a hypothesis;
+   the reproduction is not.
+3. No-UM in-process cannot fit this model+ctx on 16+12 GB at any split
+   tried — the VRAM wall is why the rig runs UM at all.
+4. Consistent with the earlier 30.16 t/s PR105.0 run (also below RPC).
+5. The 40.1-bar gap is **not** a topology effect — in-process is slower, so
+   the RPC split cannot be the cause. Reference-bar provenance (prompt /
+   MTP-acceptance profile) remains the leading suspect for the gap.
+
+PR105.0's premise (dropping RPC should be faster) is empirically false on
+this rig. Recommend closing the arm as REJECTED with these cells as
+evidence; keep the production RPC topology pinned.
