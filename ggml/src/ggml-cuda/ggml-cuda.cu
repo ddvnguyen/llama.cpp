@@ -1118,6 +1118,10 @@ static void ggml_backend_cuda_split_buffer_free_buffer(ggml_backend_buffer_t buf
 }
 
 static void * ggml_backend_cuda_split_buffer_get_base(ggml_backend_buffer_t buffer) {
+    // Split storage never aliases buffer base memory: per-device slices + the cached contiguous copy
+    // live in tensor extra. The fake base only exists to satisfy the assertions in ggml_tallocr_alloc /
+    // ggml_backend_tensor_alloc (addr range >= base and <= base + size); no code must dereference
+    // split tensor->data directly - compute paths must use the cached contiguous copy instead.
     return (void *)0x1000;
     GGML_UNUSED(buffer);
 }
@@ -2501,14 +2505,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     // PR104 mixed-quant: generic gather for any split src (SCALE, etc. also need it)
-    // Disable CUDA graph for split src - host staging and peer copies are not graph-capture safe
+    // Split-src nodes must never be captured: the gather overrides src data pointers with
+    // evaluation-local views, so a replayed graph would read dead pointers. graph_check_compability
+    // disables capture for split-src nodes; this guard is a backstop.
     {
         cudaStreamCaptureStatus cap_status;
         if (cudaStreamIsCapturing(ctx.stream(), &cap_status) == cudaSuccess && cap_status == cudaStreamCaptureStatusActive) {
             for (int i = 0; i < 4; ++i) {
                 ggml_tensor * src = dst->src[i];
                 if (src && src->buffer && ggml_backend_buffer_is_cuda_split(src->buffer)) {
-                    return false;
+                    GGML_ABORT("split-buffer src during CUDA graph capture - graph compat gate missed this node");
                 }
             }
         }
@@ -2531,8 +2537,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 GGML_ABORT("contiguous null");
             }
             if (extra->contiguous_device != ctx.device) {
-                GGML_LOG_WARN("PR104 split gather: contiguous on %d but ctx %d, peer copy needed\n", extra->contiguous_device, ctx.device);
-                // for now, just use it anyway (peer access may be needed, but try)
+                GGML_LOG_ERROR("PR104 split gather: contiguous on %d but ctx %d, cross-device read without peer access\n",
+                    extra->contiguous_device, ctx.device);
+                GGML_ABORT("split contiguous copy on wrong device");
             }
             src_view[i] = *src;
             src_view[i].data = extra->contiguous_data;
@@ -3057,6 +3064,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 use_cuda_graph = false;
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+#endif
+            }
+        }
+
+        // PR104 mixed-quant: split-src ops must not be captured - per-node gather replacements in
+        // compute_forward decay after this evaluation, so replayed graphs would read stale pointers
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * src = node->src[j];
+            if (src && src->buffer && ggml_backend_buffer_is_cuda_split(src->buffer)) {
+                use_cuda_graph = false;
+#ifndef NDEBUG
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to split buffer src on node %s\n", __func__, node->name);
 #endif
             }
         }
@@ -3667,6 +3686,22 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
 
+    // PR104 mixed-quant: fused kernels read tensor->data of the participating nodes' srcs directly
+    // and bypass the per-op gather in compute_forward that substitutes the cached contiguous copy for
+    // split tensors. Refuse any fusion window covered by a split-backed src.
+    for (int k = node_idx; k < node_idx + (int) ops.size() && k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (!n || (n->buffer && ggml_backend_buffer_is_cuda_split(n->buffer))) {
+            return false;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * s = n->src[j];
+            if (s && s->buffer && ggml_backend_buffer_is_cuda_split(s->buffer)) {
+                return false;
+            }
+        }
+    }
+
     const auto is_equal = [](const std::initializer_list<enum ggml_op> & list1,
                              const std::initializer_list<enum ggml_op> & list2) {
         return std::equal(list1.begin(), list1.end(), list2.begin(), list2.end());
@@ -3917,13 +3952,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 0;
     }
 
+    // PR104 mixed-quant: fused kernels read tensor->data of the participating nodes' srcs directly
+    // and bypass the per-op gather in compute_forward that substitutes the cached contiguous copy for
+    // split tensors. Returns true when the nodes in [node_idx, node_idx + span) are free of split refs.
+    auto span_open = [cgraph](int node_idx, int span) -> bool {
+        for (int k = node_idx; k < node_idx + span && k < cgraph->n_nodes; ++k) {
+            ggml_tensor * n = cgraph->nodes[k];
+            if (!n) return false;
+            if (n->buffer && ggml_backend_buffer_is_cuda_split(n->buffer)) return false;
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                const ggml_tensor * s = n->src[j];
+                if (s && s->buffer && ggml_backend_buffer_is_cuda_split(s->buffer)) return false;
+            }
+        }
+        return true;
+    };
+
     ggml_tensor * node = cgraph->nodes[i];
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1) && span_open(i, match.node_count)) {
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
@@ -3935,7 +3986,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
-        if (nodes_to_skip > 0) {
+        if (nodes_to_skip > 0 && span_open(i, nodes_to_skip + 1)) {
 #ifdef GGML_CUDA_DEBUG
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
@@ -3998,7 +4049,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true) &&
+                        span_open(i, (int) ops.size())) {
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
                 }
@@ -4013,7 +4065,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 int out_nodes[2] = { i + 1, i + 5 };
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true) &&
+                        span_open(i, (int) ops.size())) {
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
                 }
@@ -4071,7 +4124,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const bool contig_ok = ggml_is_contiguous(x) && ggml_is_contiguous(add) &&
                                ggml_is_contiguous(a) && ggml_is_contiguous(inv_b);
 
-        if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
+        if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x && span_open(i, 5)) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
         }
@@ -4097,7 +4150,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         n_fuse++;
 
-        if (n_fuse > 1) {
+        if (n_fuse > 1 && span_open(i, n_fuse + 1)) {
             ggml_tensor fused_node;
             memcpy(&fused_node, node, sizeof(ggml_tensor));
             for (int j = 0; j < n_fuse - 1; ++j) {
@@ -4202,7 +4255,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const int n_ops = with_bias ? 7 : 5;
 
                 if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1) ||
-                        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
+                        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1) ||
+                        !span_open(i, n_ops)) {
                     continue;
                 }
 
@@ -4498,10 +4552,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
             }
 
-            if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1) ||
-                    !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
-                continue;
-            }
+                if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1) ||
+                        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1) ||
+                        !span_open(i, n_ops)) {
+                    continue;
+                }
 
             ggml_tensor * mm_node    = cgraph->nodes[i];
             ggml_tensor * scale_node = op == GGML_OP_MUL_MAT ? cgraph->nodes[i + 1] : cgraph->nodes[i + 4];
@@ -4556,7 +4611,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
-        if (!ggml_can_fuse(cgraph, i, { op, bias_op })) {
+        if (!ggml_can_fuse(cgraph, i, { op, bias_op }) || !span_open(i, 2)) {
             continue;
         }
 
