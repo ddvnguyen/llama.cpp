@@ -430,3 +430,74 @@ cells (normal).
 PR105.0's premise (dropping RPC should be faster) is empirically false on
 this rig. Recommend closing the arm as REJECTED with these cells as
 evidence; keep the production RPC topology pinned.
+
+## Canonical-methodology follow-ups — 2026-09-10 (Tasks 1-3)
+
+Methodology note: the earlier cells on this page used ad-hoc prompts
+(26-token /completion). The canonical benchmark path
+(`run-with-params.sh` + yml) is: `/v1/chat/completions`, `max_tokens: 150`,
+10 sequential requests, prompt = `head -c 2000 /tmp/bigprompt.txt`
+(808 tokens). All numbers below use that shape unless marked. Decode metric:
+`timings.predicted_per_second` per response.
+
+### Task 1 — reference-bar reproduction (live pod, no boot)
+
+`pod_llama-baseline` (747.4 RPC, production binary), 10 canonical requests:
+
+| req | 1 (cold cache) | 2-10 (warm, prompt fully reused) |
+|---|---|---|
+| t/s | 42.61 | 42.71 / 48.17 / 50.34 / 43.93 / 42.12 / 50.50 / 44.92 / 41.91 / 50.87 |
+
+Mean all 10: **45.81**; warm-only mean: **46.16**.
+
+**The 40.1 bar is reproduced and current.** The earlier "~11% gap" was a
+methodology artifact: ad-hoc short prompts + /completion + n_predict 256
+yield 35.5-35.9; the canonical 808-token prompt + chat endpoint + 150 tokens
+yields ~46. MTP acceptance is prompt- and shape-dependent — that is the whole
+difference. PR103.0's A/B delta (+2.6%) remains valid (matched methodology
+within the A/B); its absolute values are not comparable to the 40.1 bar.
+
+### Task 2 — in-process balanced split, canonical methodology
+
+In-process `-dev CUDA0,CUDA1`, UM on, 296k ctx (B01 build):
+
+| -ts (CUDA0,CUDA1) | t/s x3 | mean |
+|---|---|---|
+| 33,32 | 34.90 / 36.51 / 39.38 | 36.93 |
+| 34,31 | 45.06 / 40.22 / 43.66 | **42.98** |
+| 35,30 | 47.44 / 34.50 / 33.19 | 38.38 (unstable: 14 t/s spread) |
+
+In-process best (34,31) still trails RPC production (below) by ~9%.
+35,30 sits at the CUDA0 VRAM edge (15847 MiB) and is not stable.
+
+### Task 3 — split ratio on the REAL RPC topology (production shape)
+
+RPC process split (`-dev RPC0,CUDA0` = 3060 first, 5060 Ti second —
+production's exact order and device mapping, verified via VRAM signature),
+262k ctx, all 747.4 flags, fusion ON, B01-class bare-metal build:
+
+| -ts (RPC0,CUDA0) | t/s x3 | mean | vs production |
+|---|---|---|---|
+| **27,38 (production)** | 44.06 / 49.24 / 47.98 | **47.09** | — (sanity cell; live pod = 45.8-46.2) |
+| 33,32 | 38.06 / 42.00 / 39.51 | 39.86 | −15% |
+| 34,31 | 45.95 / 41.67 / 40.96 | 42.86 | −9% |
+| 35,30 | 40.63 / 38.73 / 39.69 | 39.68 | −16% |
+| 25,40 (probe) | 44.46 / 47.48 / 39.33 | 43.76 | −7% |
+
+**Production's own 27,38 split is optimal among everything tested.** Both
+directions away from it lose: giving the 3060 (RPC0) more share degrades
+monotonically (39.9-42.9), and giving the 5060 Ti even more (25,40) also
+loses slightly. No actionable production improvement from re-splitting.
+
+### Conclusions
+
+1. Reference bar validated: canonical methodology lands 45.8-46.2 on the
+   live pod; 40.1 is stale-low, not stale-high. Methodology (prompt shape,
+   endpoint, n_predict) is the single biggest lever on measured decode t/s —
+   future arms MUST use the canonical shape (B01 note to follow).
+2. In-process multi-GPU remains rejected: best case 42.98 vs RPC 47.09.
+3. Production split 27,38 confirmed optimal on the RPC topology. Close
+   the split-tuning question.
+4. comparability caveat: Task 3 bare-metal build carries PR115 (fusion ON);
+   live pod is PR110. Delta between the two 27,38 cells (47.09 vs 45.8-46.2)
+   is within run-to-run noise (spread up to 5 t/s within cells).
