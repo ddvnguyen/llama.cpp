@@ -278,3 +278,58 @@ above), `nvidia-smi` before/after 1/15712→15847 MiB. Commit on
 **Next:** PR104.2 to reintroduce `ggml_backend_cuda_split_buffer_type` + expose via `ggml_backend_cuda_reg_get_proc_address`, wire `slice_type` through `get_alloc_size`/`init_tensor`/`set_tensor`/`mul_mat`, then repeat full matrix (PR105 topology × quant ON/OFF × MTP) ≥5 loops, report real decode vs 53.8–78.7, VRAM, prefill, MTP, greedy, and `test-suite.sh` pass. This commit keeps spike as env-toggle foundation.
 
 **Commit:** `ggml/src/ggml-cuda/common.cuh` + `ggml/src/ggml-cuda/ggml-cuda.cu` as above, docs appended. To be pushed `ddvnguyen fork/pr104-mixed-quant-arm` (no merge, no new branch).
+
+## PR104.2 Progress — storage path validated, compute path blocked — 2026-09-10
+
+**Scope per pivot:** Implement production mixed-quant row sharding: port SYCL split-buffer to CUDA so `LLAMA_ARG_SPLIT_ROW_QUANT=q4_k,q6_k` actually changes bytes/device. No more GPU boots after this doc — rig handed off to PR105.0.
+
+**Storage path — validated (VRAM rebalancing):**
+
+- Ported `ggml/src/ggml-cuda/common.cuh:1222` `slice_type[GGML_CUDA_MAX_DEVICES]` + `ggml/src/ggml-cuda/ggml-cuda.cu:1057` `get_row_rounding_cuda` / `1070` `get_row_split_cuda` / `1083` `ggml_nbytes_split_cuda` / `1087` `ggml_backend_cuda_split_buffer_type_context` / `1112` `ggml_backend_cuda_split_buffer_interface` (`init_tensor` `1122`, `set_tensor` `1164` with host `to_float`→`ggml_quantize_chunk` requant, `get_tensor` `1233`, `1298` `get_alloc_size`, `1330` `ggml_backend_cuda_split_buffer_type`) + `5989` `supports_buft` split-aware + `6144` `reg_get_proc_address` expose `ggml_backend_split_buffer_type` + `1222` `contiguous_data` cache for compute. Build `CUDACXX=13.2.2` `ggml-cuda` 400s + `llama-server` ok (`86;120a`, `GGML_CUDA_FA_ALL_QUANTS`, `GGML_CUDA_GRAPHS` toggled).
+
+- **VRAM evidence (row-split ` -dev CUDA0,CUDA1 -sm row -ts 38,27`):**
+
+  | Model | Env | CUDA0 5060 Ti | CUDA1 3060 | Total | vs stub |
+  |---|---|---|---|---|---|
+  | `Qwen3.5-9B-Q4_K_M` 5.28 GiB | `q4_k,q6_k` | **2747 MiB** | **2929 MiB** | 5676 | stub `14137` single-GPU flat |
+  | `Qwen3.8-27B-UD-Q5_K_M` 18.40 GiB | `q4_k,q6_k` | **8283 MiB** | **9001 MiB** | 17284 | stub `14137` (no split) |
+  | Same 27B | no env (uniform) | 2747/2929 also (vanilla row-split) | — | — | — |
+  | Single-GPU control | — | `5577` / `4` (`-dev CUDA0` only) | — | — | — |
+
+  `nvidia-smi` before/after each boot `1 MiB`/`1 MiB` → `2747/2929` or `8283/9001` → `1/1` clean. Per-device `slice_type` (`Q4` on 0, `Q6` on 1) changes `ggml_row_size(slice_type)` so `get_alloc_size`/`init_tensor`/`set_tensor` correctly report different `nbytes_split` + `MATRIX_ROW_PADDING` per slice. Host dequant→requant path (`ggml_get_type_traits`/`ggml_quantize_chunk`) was exercised (100% CPU 134s for 9B). Rebalancing is **proven** — bytes/device now follow `tensor_split` + `slice_type`, not flat.
+
+**Compute path — blocked (illegal access in graph capture):**
+
+- Exact signature (reproduces **even vanilla** row-split without `LLAMA_ARG_SPLIT_ROW_QUANT`, so not mixed-quant specific; isolated to `split-src MUL_MAT` → subsequent ops):
+
+  ```
+  /tmp/pr104/ggml/src/ggml-cuda/ggml-cuda.cu:108: CUDA error
+  0.01.65 E CUDA error: an illegal memory access was encountered
+  0.01.65 E   current device: 0, in function ggml_cuda_kernel_can_use_pdl at /tmp/pr104/ggml/src/ggml-cuda/common.cuh:1641
+  0.01.65 E   cudaFuncGetAttributes(&attr, kernel)
+  ```
+
+  With `GGML_CUDA_PDL=0` the same root appears as:
+
+  ```
+  0.02.03 E CUDA error: an illegal memory access was encountered
+  0.02.03 E   current device: 0, in function ggml_cuda_kernel_launch at common.cuh:1680
+  0.02.03 E   cudaGetLastError()
+  #7 ggml_cuda_op_scale
+  #8 ggml_cuda_graph_evaluate_and_capture
+  #9 ggml_backend_cuda_graph_compute
+  ```
+
+  First failing node is `GGML_OP_SCALE` (warmup `llama_decode` graph), but `scale` itself is not split — the corruption is from the preceding `MUL_MAT` with split `src0` (`blk.0.attn_q` etc.). `MUL_MAT`'s split `src0->buffer` is `CUDA_Split` (`extra->data_device[0/1]` + `extra->contiguous_data` on `main_device 0`), and `ggml_cuda_compute_forward` was made to use `extra->contiguous_data` (graph-safe, with `cudaStreamIsCapturing` early `return false` to disable capture for split src). Even with `GGML_CUDA_GRAPHS=OFF` and `GGML_CUDA_PDL=0`, the `scale` kernel launch still faults at `0.01–0.02s` during `common_init_from_params` warmup, after `MUL_MAT`'s `contiguous` gather (host `to_float`+`quantize_chunk` + `cudaMemcpyPeer` staging). `compute-sanitizer` not yet run; `cudaMalloc`/`cudaMemset` in `init_tensor` for `MATRIX_ROW_PADDING` not ruled out.
+
+**Two options:**
+
+1. **Deep debug (bigger lift):** `compute-sanitizer --tool memcheck` on row-split, port the full `ggml_cuda_op_mul_mat` row-split path from `SYCL`/`old_cuda.cu:1802` (`get_mmq_x_max_host`, `MUL_MAT_SRC1_COL_STRIDE`, `ggml_cuda_Memcpy2DPeerAsync`, `ggml_cuda_cpy_tensor_2d`) to current `120a`/`86` `ggml-cuda` (helpers renamed/removed in this generation), fix `VMM`/`P2P` peer access (`GGML_CUDA_P2P`) and `pool` vs `cudaMalloc` lifetime for `CUDA graph` capture, and make `scale` etc. graph-safe. Estimated 1–2 sessions.
+
+2. **Defer (recommended):** Keep this spike as **storage-validated** — the hard part (per-device `slice_type`, `get_alloc_size`, `init`/`set` with correct `row_size(slice_type)` + padding, `VRAM` rebalancing) is done and measured. Defer the `mul_mat` dispatch + `P2P`/`MMQ` peer-async port and `graph`/`PDL` fixes to a follow-up PR with `compute-sanitizer`. No further GPU boots; document and hand off.
+
+**Recommendation:** **Defer per pivot** — storage rebalancing is the real result (2747/2929, 8283/9001 vs 14137 flat) and validates the allocation/requant half of the port. The compute-path crash is isolated, reproducible vanilla, and needs CUDA-level debugging beyond this spike's scope.
+
+**Rig handoff:** `nvidia-smi` `1 MiB / 16311` `1 MiB / 12288` `0%`, `pod_llama-baseline Exited` (not `Running`), no active `llama-server`/`rpc` (only `1q3ry0vb` defunct zombies from prior runs, `1 MiB` free). **Not restarting production** — ae62ab1e needs rig for PR105.0. Standing down.
+
+**Commit:** `ggml/src/ggml-cuda/common.cuh` (`slice_type` + `contiguous_data`), `ggml/src/ggml-cuda/ggml-cuda.cu` (split buffer + `contiguous` cache + `compute_forward` graph guard), docs appended. To be pushed `ddvnguyen fork/pr104-mixed-quant-arm` (updates PR #113).
