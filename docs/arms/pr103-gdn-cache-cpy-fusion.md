@@ -122,3 +122,60 @@ The upstream fusion (#23940) is active and beneficial in the production
 topology: +2.6% single decode, no gate regressions, byte-identical outputs.
 Keep `GGML_CUDA_FUSE_GDN_CACHE` default-on; the toggle stays as a diagnostic
 kill-switch and A/B tool.
+
+### Build provenance
+
+The build command was originally not recorded here (process gap — see
+`docs/arms/build-params.md`). Reconstructed from `build-pr103/CMakeCache.txt`
+(the original shell line predates log retention; the build was configured in
+two passes — initial configure, then a rebuild adding
+`-DGGML_CUDA_FA_ALL_QUANTS=ON` after the fattn.cu:707 abort below):
+
+```bash
+# pass 1 (initial configure, from /tmp/opencode/pr103-impl)
+export PATH=/usr/local/cuda/bin:$PATH
+cmake -B build-pr103 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DCMAKE_CUDA_ARCHITECTURES="86;120" -DGGML_CUDA=ON -DGGML_RPC=ON \
+  -DGGML_CUDA_DEBUG=ON
+# pass 2 (after GGML_ABORT at fattn.cu:707; cache-preserving reconfigure)
+cmake -B build-pr103 -DGGML_CUDA_FA_ALL_QUANTS=ON
+cmake --build build-pr103 --target llama-server ggml-rpc-server -j$(nproc)
+```
+
+Final verified cache state: `CMAKE_BUILD_TYPE=Release`,
+`CMAKE_CUDA_ARCHITECTURES=86;120`, `GGML_CUDA=ON`, `GGML_RPC=ON`,
+`GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_FORCE_CUBLAS=OFF` (default),
+`GGML_CUDA_DEBUG=ON`, toolkit `/usr/local/cuda` (CUDA 13.2).
+
+**`GGML_CUDA_DEBUG` was ON for every bare-metal measurement in this doc** (it
+persisted through the pass-2 reconfigure). Plainly: that is a confound for
+the absolute throughput level — the numbers below cannot be treated as clean
+decode-speed measurements, only as an A/B pair, because both cells share the
+identical (debug-built) binary so the confound cancels in the ON-vs-OFF
+delta. The live-pod numbers are the pod's own binary and are unaffected by
+this build's flags. Canonical future builds: `docs/arms/build-params.md`
+(Build Params B01 — debug OFF, pinned toolkit).
+
+### Absolute-gap follow-up (2026-09-10, later the same day)
+
+Live-pod re-measurement (same methodology against the running
+`pod_llama-baseline`, no rebuild): 35.94 / 35.67 / 35.73 t/s (mean 35.78) —
+matches bare-metal ON (35.54) within noise and reproduces the ~11% gap vs
+the 40.1 reference on the actual production container. Not a bare-metal
+artifact.
+
+Two confounds now identified for the absolute level:
+
+1. `GGML_CUDA_DEBUG=ON` in the bare-metal build (above) — affects only the
+   bare-metal cells, not the pod.
+2. **Prompt-dependent MTP acceptance** (leader's finding): the same live pod
+   measured 40.7-40.8 t/s x3 with a different prompt ("quick brown fox"
+   style) vs 35.78 with this doc's combustion-engine prompt — draft
+   acceptance is highly prompt-dependent, and this doc's runs logged
+   acceptance rates anywhere from 0.18 to 0.95 per request. The 40.1
+   reference bar's provenance (prompt + acceptance profile) is now the
+   leading suspect for the gap, ahead of build drift.
+
+The ON/OFF A/B conclusion stands regardless of either confound: fusion
+active (546 RPC-peer fusions ON vs 0 OFF), +2.6% single decode, parity
+byte-identical, all suite gates pass in both cells.
