@@ -110,3 +110,22 @@ instead of the pinned `/opt/software/cuda/13.2.2`; no explicit
 `CUDAToolkit_ROOT`; `GGML_CUDA_DEBUG=ON` left on. Final cache state
 (verified `CMakeCache.txt`): Release, `86;120`, FA_ALL_QUANTS=ON,
 FORCE_CUBLAS=OFF, GGML_RPC=ON. Future arms must run B01 verbatim.
+
+## Measurement Params M01 — canonical decode methodology
+
+Build flags are half the reproducibility story; the request shape is the
+other half. Pinning the measurement side after the reference-bar
+reproduction (2026-09-10, see `pr105-single-machine-baseline.md` Task 1):
+prompt shape alone moved decode from 35.5 to ~46 t/s on the same pod.
+
+Canonical decode measurement (matches `run-with-params.sh` + arm ymls):
+
+- Endpoint: `/v1/chat/completions`, `model: local`, `stream: false`
+- Prompt: `head -c 2000 /tmp/bigprompt.txt` (~808 tokens), single user message
+- `max_tokens: 150`, 10 sequential requests; report cold (req 1) and
+  warm-cache (reqs 2-10) means separately
+- Decode metric: `timings.predicted_per_second` from each response
+
+Rule: never compare decode t/s across different prompts, endpoints, or
+n_predict. MTP draft acceptance is prompt-dependent — an ad-hoc one-liner
+prompt measures a different model than the production workload does.
