@@ -65,3 +65,60 @@ Same standard as PR #110's self-determinism claims.
 
 PR105.0 first (reference topology + bars), then this arm. The mixed-quant
 PR104.x series builds on top of this PR's base.
+
+## Rig Validation Results (2026-09-10)
+
+Live A/B on the production rig (2 GPUs: 16GB CUDA0 + 12GB RPC peer CUDA1),
+747.4 production shape (default layer split -ts 27,38, UM on, MTP draft-mtp,
+262k ctx). Build: baseline+PR115, Release, GGML_CUDA_FA_ALL_QUANTS=ON,
+GGML_CUDA_DEBUG=ON. Toggle `GGML_CUDA_FUSE_GDN_CACHE` = only variable.
+
+### Fusion activity proof (RPC peer log)
+
+- ON: 546x `ggml_cuda_try_fuse: fused gated_delta_net snapshot copies` and
+  `nodes_fused: 4, first: GATED_DELTA_NET (node_53), last: CPY (cache_s_l0 (view))`.
+- OFF: 0 hits. Toggle proven as a clean kill-switch in the real topology.
+
+Note: llama-server suppresses ggml-layer INFO lines; the rpc-server log is the
+evidence source. GDN layers execute in the RPC peer subgraph under layer split.
+
+### Single decode (fixed 26-token prompt, greedy, n_predict 256, x3)
+
+| cell | t/s x3 | mean |
+|---|---|---|
+| ON | 35.25 / 35.68 / 35.70 | 35.54 |
+| OFF | 34.54 / 34.62 / 34.77 | 34.64 |
+
+Delta: +0.90 t/s (+2.6%), every ON run above every OFF run. MTP draft
+acceptance 0.58-0.95 in both cells (mean len 2.7-3.9).
+
+### test-suite.sh gates (12 turns)
+
+| gate | ON | OFF |
+|---|---|---|
+| health | PASS | PASS |
+| single-session mean (turn1) | 20.45 (31.39) | 20.10 (30.82) |
+| concurrency-2 session means | 7.77 / 9.95 | 9.41 / 8.28 |
+| overall | PASS (exit 0) | PASS (exit 0) |
+
+Single-session direction favors ON (+1.7% mean); concurrency-2 is even
+(noise-level). No regression in any gate.
+
+### Correctness gate
+
+Greedy output ON vs OFF: **byte-identical** (1209 chars, `cmp` clean).
+
+### Absolute-level caveat
+
+Both cells land ~11% under the 40.1 single-decode reference (bar >= 41.5)
+despite MTP engaged, Release build, and production-identical flags. Suspects:
+bare-metal vs podman environment, CUDA 13 toolkit build vs the pod image's
+toolchain, or reference measurement provenance. Flagged for leader
+adjudication; does not affect the ON/OFF delta conclusion.
+
+### Verdict
+
+The upstream fusion (#23940) is active and beneficial in the production
+topology: +2.6% single decode, no gate regressions, byte-identical outputs.
+Keep `GGML_CUDA_FUSE_GDN_CACHE` default-on; the toggle stays as a diagnostic
+kill-switch and A/B tool.
