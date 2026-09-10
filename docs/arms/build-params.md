@@ -67,14 +67,28 @@ matching); Release without debug answers "how fast". Never mix the two.
 
 ## Launch-flag landmines
 
-### D. `-sm row` together with `--rpc`
+### D. `-sm row` on CUDA at all (this build)
 
-Symptom (reproduced 2026-09-10, PR103 rig boot): model load fails with
-`device RPC0 does not support split buffers` — row-split buffers are not
-supported across an RPC peer, hard abort before serving. Use the default
-layer split for any RPC topology (the production 747.4 pin has no
-`split_mode`, i.e. layer split — that is correct, not an omission). `-sm row`
-is only valid in-process (`-dev CUDA0,CUDA1`, no `--rpc`), as in PR105.0.
+Symptom (reproduced 2026-09-10, twice): model load aborts before serving.
+Over RPC: `device RPC0 does not support split buffers`. **In-process too**:
+`device CUDA0 does not support split buffers`. Row-split buffers are
+unsupported on CUDA in v0.4.0 @ 8f8af8c2c, full stop — the launch-flag
+guidance is: default layer split everywhere on this rig. (An earlier revision
+of this doc claimed row split was fine in-process; the PR105.0 re-measurement
+disproved that.)
+
+### E. In-process multi-GPU + UM + imbalanced `-ts`
+
+Symptom (reproduced 2026-09-10, PR105.0 re-measurement): with
+`GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` and one process driving both GPUs,
+the production ratio `-ts 27,38` collapses decode **14x** (2.44 t/s vs
+33.52 balanced) while GPU0 shows ~8 GB spare — the overloaded device's
+managed pages spill to host RAM and thrash per token (mechanism hypothesis;
+reproduction is solid). Balanced `-ts 33,32` runs healthy at 33.5 t/s
+(still −5.7% vs the RPC process split). Without UM the same model+ctx does
+not fit on 16+12 GB at any split tried (CUDA1 OOM). Guidance: in-process
+multi-GPU on this rig needs balanced `-ts` and still loses to the RPC
+topology — use the RPC process split (as production does).
 
 ## Known gaps in existing arm docs (flag only, owners to fix)
 
