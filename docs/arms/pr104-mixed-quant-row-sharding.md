@@ -361,3 +361,21 @@ above), `nvidia-smi` before/after 1/15712→15847 MiB. Commit on
 4. Keep: capture gate, fusion gates, gather for non-MUL_MAT split sources. Then 27B mixed-quant boot + `LLAMA_ARG_SPLIT_ROW_QUANT=q4_k,q6_k` MTP production run, `test-suite.sh <port>`, decode t/s vs ≥45 bar, PR104.0 projection comparison, fork push.
 
 **Commit:** fix 1-3 + validation is `40ea56978 cuda: harden split-buffer compute path` on `fork/pr104-mixed-quant-arm` (PR #113). Production pod lifecycle protocol followed this session: `podman pod stop pod_llama-baseline` before test boots (VRAM drained 15847/11911 → 1/1 MiB), `podman pod start` restored — health 200 on :18081, VRAM back to 15847/11911 MiB.
+
+## PR104.2 Progress 3 — per-op row-split MUL_MAT lands; 27B mixed-quant fits and runs correct at 12.2 t/s (perf gap open) — 2026-09-11 (session 3)
+
+**What shipped (commit `a38976d98`, branch `fork/pr104-mixed-quant-arm` on ddvnguyen):**
+
+1. `ggml_cuda_mul_mat_split` (ggml-cuda.cu ~2262): full port of the removed per-op `ggml_cuda_op_mul_mat` — per-device weights slices, `PR104_MUL_MAT_SRC1_COL_STRIDE 128` col chunking, per-device staging of src1 f32 chunks (`cudaMemcpyPeerAsync`), per-op local quantization, event-based cross-device sync (`events[dev][is]`), token-major dst partials stitched via `ggml_cuda_Memcpy2DPeerAsync` (`cudaMemcpy3DPeerAsync`, vmm-safe). No contiguous gather or weight copies in this path.
+2. Per-op `ggml_cuda_op_mul_mat_q` (mmq.cu) and slice-type support added to per-op `ggml_cuda_op_mul_mat_vec_q` (mmvq.cu): both switch on the **per-device slice type** (`extra->slice_type[id]`, mixed-quant q4_K/q6_K slices), take an explicit per-device pool (`ctx.pool(id)`) — the naive `ctx.pool()` was the main-device pool crash reported as memset "invalid argument" at mmq.cu:291.
+3. `compute_forward`: MUL_MAT with split src0 now skips the per-op contiguous gather; `ggml_cuda_mul_mat` dispatches to the split path first.
+4. `init_tensor`/`set_tensor`: contiguous copies gated by `GGML_SPLIT_CONTIG_MAX_BYTES` (default 16 MiB). The earlier default (256 MiB/tensor → 256MiB×61 weights ≈ +12 GB) was the first 27B OOM; with 16 MiB, only tiny f32 norm/bias tensors get gathers.
+
+**Empirical results:**
+
+- 9B mixed-quant (`q4_K,q6_K`, `-sm row -ts 38,27`): boots, correct completions, VRAM **7373/3163 MiB** (down from 8089/3109 — big tensors no longer duplicated), decode **~30 t/s** (was 41.7 with the gather path; per-op overhead costs ~12 t/s on 9B), no CUDA errors after row-length sanity (`nlices` miscount fix). The q4_K/q6_K slices are consumed by their matching per-op kernels.
+- **27B mixed-quant row-split fits and runs for the first time**: VRAM **8283/9001 MiB** (matches the PR104.0 budget table), health 200, completions correct and coherent ("The capital of France is Paris. The capital of Germany is Berlin. The capital of Italy is Rome. ..."), decode **12.16 t/s** over 192-token run.
+
+**Open: perf.** The per-op path decodes the 27B at 12.2 t/s (82 ms/token) vs the PR104.0 projection ≥45 (41.4 raw × MTP). Both 9B (30 vs 41.7) and 27B (12.2) show the per-op path slower than expected, so something structural dominates beyond per-launch overhead. Suspects queued (next session, one ~14-min 27B boot each): (a) graphs disabled by the split gate — measure `GGML_CUDA_GRAPHS=1` impact (the split path was designed graph-free; recorded events/streams make capture impossible as coded — the real fix may be a "capture inside the split op so the whole graph can be reused via `cudaGraph` per layer" variant); (b) per-op event `cudaStreamWaitEvent` serialization on shared events indices; (c) `cudaSetDevice` thrash (every op × 2 devices); (d) the dst staging buffer being pool-reallocated per op. The 9B (─14 t/s) and 27B (─29 t/s) deltas differ: the 27B delta includes MMQ processing on prompt chunks of 128 (the 9B's slower q4_K/q6_K slices cost less there).
+
+**Session state:** the pod test cycle is clean (tests then production restore). `test-suite.sh`, MTP, and the ≥45 bar are still open — this session's correctness milestone is the mixed-quant row-split boot itself.
