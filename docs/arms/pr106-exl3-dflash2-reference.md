@@ -239,3 +239,155 @@ reality.
 1/14471→1 MiB, `podman pod start` restore log, `/tmp/Qwen3.8-27B-DFlash2-EXL3-5.0bpw/models`
 (14.4 GB target + 1.4 GB draft).
 
+## PR106.1 Results — 2026-09-10 (llama.cpp-native UD-Q3_K_XL on 5060 Ti alone)
+
+**Rig:** 5060 Ti 16GB (CUDA0) alone, 3060 idle (1/113 MiB). Same host as PR106.0,
+production `pod_llama-baseline` stopped/restored identically (`podman pod stop` →
+1/1 MiB free 15712/11798, `podman pod start` → 15847/11911, `:18081/health`
+200 after ~2 min warmup). No RPC, no `--parallel-ctx-threshold` (Hydra flag not
+in `9777256c3` build — omitted, per task "reuse PR105 build if compatible else
+build fresh" — current build is `version 9354` with `-DGGML_CUDA_FA_ALL_QUANTS=ON`
+arch 86;120, identical to PR105's 583b8ca5f/8f8af8c2c).
+
+**Model:** `unsloth/Qwen3.8-27B-GGUF:UD-Q3_K_XL` 13.1 GB (27.32B params, ~3.5 bpw)
+downloaded via `hf download --include Qwen3.8-27B-UD-Q3_K_XL.gguf --cache-dir
+/mnt/WorkDisk/.hf_cache` in 126s (`blobs/8c2a45ff...` 13G, snapshot
+`4ca720788d1e01f1bff70c033e0d0028fd02e502`). Spec's `-hf` would auto-load
+`mmproj-BF16.gguf` from same snapshot (1.16 GB) and disable `cache_reuse`
+even for text — used `-m <blob>` + `--no-mmproj` to avoid multimodal overhead
+(`--mmproj-auto` disabled via flag, verified in help). YaRN flags kept per
+spec (`--rope-scaling yarn --rope-scale 5 --yarn-orig-ctx 32768`), FA on,
+`q8_0/q5_1` + draft `q8_0/q5_1`, `--cache-ram 16384 --cache-prompt --cache-reuse
+64` (note `cache_reuse` still warns `not supported by this context` with
+checkpoints enabled, as in PR105). Two configs probed: **spec** `-np 2 -c
+296000` (148224 per slot, `context checkpoints enabled 32` per log) and
+**reduced** `-np 1 -c 65536` to isolate ctx overhead.
+
+**Launch spec (PR106.1, spec ctx):**
+```
+./build/bin/llama-server -m <blob> -dev CUDA0 -sm none \
+  --rope-scaling yarn --rope-scale 5 --yarn-orig-ctx 32768 \
+  -fa on -ctk q8_0 -ctv q5_1 -ctkd q8_0 -ctvd q5_1 \
+  --cache-prompt --cache-reuse 64 --cache-ram 16384 \
+  -np 2 -c 296000 --spec-type draft-mtp --jinja \
+  --host 127.0.0.1 --port 8080 --no-mmproj
+# --parallel-ctx-threshold 100000 omitted — Hydra-only flag, not in this build
+# --cache-idle-slots omitted (requires --kv-unified, auto-disabled per log)
+```
+Boot 6.7s to `model loaded` (`[spec] MTP 1029 MiB`, `n_ctx_seq 148224 < n_ctx_train
+262144`, `pipeline parallelism enabled`, `fused Gated Delta Net ... disabled`,
+`common_context_can_seq_rm: bounded partial sequence removal`, `draft-mtp n_max=3
+n_min=0 p_min=0.00`), `listening on 127.0.0.1:8080`, VRAM `13553-13611 MiB` on
+CUDA0 (via `nvidia-smi` 13553 after first boot, 13611 after warmup; 3060 113
+MiB), headroom `16311-13611=2700 MiB` (2.64 GiB) — fits UD-Q3 (13.1 GB) + MTP
+(1.03 GB) + KV (464 MiB per 131072 slot ×2 ≈928 MiB) + prompt cache (16384 cap,
+checkpoints 32×153 MiB). `/health` 200.
+
+**Measurements — spec ctx 296k/2 slots (the bar's config):**
+
+- Single decode (prompt `"Write a story about a brave astronaut..."` 17 prompt tokens
+  per timings `prompt_n 17`, `n_predict 100`, `temperature 0.7`, 5 loops, same as
+  PR105):
+
+  | Loop | prompt t/s | decode t/s | draft acc | wall | prompt_ms/pred_ms |
+  |---|---|---|---|---|---|
+  | 0 | 7.38 | **4.73** (also log `tg=4.73`) | 0.627 (64/102) | 23.67s | 2550/21123 |
+  | 1 | 5.58 | **4.79** | 0.589 (63/107) | 22.18s | 716/20864 |
+  | 2 | 7.15 | **5.20** | 0.640 (64/100) | 20.86s | 559/19217 |
+  | 3 | 7.15 | **4.64** | 0.531 (60/113) | 20.63s | 559/21556 |
+  | 4 | 7.01 | **5.18** | 0.634 (64/101) | 20.75s | 571/19289 |
+  | **mean** | ~6.85 | **4.91 ±0.25** | 0.60 avg | 21.6 avg | — |
+
+  Log tags: `graphs reused 34-171`, `n_decoded 100 tg 4.91 avg`. Draft
+  `draft-mtp n_max=3` generated 99-113 tokens per 100 decoded, acc 0.53-0.64.
+  **FAIL vs bar 45 t/s** by 9× (and vs PR105 30.16 on 2-GPU Q5). Even vs raw
+  `llama-bench` 25.95 t/s (27B Q4, 5060 Ti alone, no MTP) it is 5× slower —
+  ctx/checkpoint overhead dominates, not quant size.
+
+- Prefill big (`"Hello world. "*3000` → 9001 tokens per `prompt_n 9001`, `n_predict
+  1`, `temperature 0`): **437.6 t/s** (`prompt_ms 20571 / 9001` → 2.285 ms/tok,
+  wall 20.58s) — **PASS vs 400 bar** (and vs PR105 976 t/s two-GPU, but
+  single-GPU 437 still exceeds 400). Small prompt 17 tokens prefill only 5-7
+  t/s due to per-request overhead, not indicative; the big prompt is the bar.
+
+- Greedy determinism (`temperature 0`, `"The capital of France is"`,
+  `n_predict 32`): cold
+  `' Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\n
+  The capital of Spain is Madrid.\nThe capital of Portugal is' len 130
+  tokens 32, warm identical `len 130 tokens 32` (second call after 556 ms
+  prompt restore, `cache_n 1(prompt) ->4` reused). **PASS byte-identical**
+  cold+warm (llama.cpp greedy, unlike EXL3 kit which was nondet).
+
+- VRAM: `nvidia-smi 13553-13611 MiB` (spec) vs 15847 two-GPU, so single-GPU saves
+  ~2.2 GB but still near limit. No UM oversubscription (`grep cudaMalloc
+  out.of.memory` only during earlier 38,27 split test, not here).
+
+- Additional probe: same prompt with **reduced ctx `-np 1 -c 65536`** (single
+  65k slot, MTP, no mmproj) boots `n_ctx_seq 65536`, `MTP 621 MiB`,
+  `VRAM 14111 MiB`, prefill 22.38 t/s small prompt, decode:
+
+  | Loop | decode t/s | draft acc | prompt t/s |
+  |---|---|---|---|
+  | 0 | **16.22** | 0.594 (63/106) | 22.38 |
+  | 1 | **18.23** | 0.705 (67/95) | 22.86 |
+  | 2 | **12.75** | 0.390 (53/136) | 22.86 |
+  | mean | **15.73 ±2.2** | 0.56 avg | 22.7 avg |
+
+  Still **FAIL vs 45** but 3.2× faster than spec ctx, confirming that
+  296k/2×148k ctx + checkpoints (`size 149.6 MiB per checkpoint 32`) is the
+  wall. Raw bench 25.95 vs 15.73 with MTP suggests MTP is not the culprit —
+  large ctx is.
+
+- Quality gate (perplexity, `llama-perplexity -c 512 --rope-scaling yarn
+  --rope-scale 5 --yarn-orig-ctx 32768 -ngl 99`, sample
+  `/tmp/ppl_long.txt` 1080 words → 1320 tokens, 2 chunks, ctx 512, batch 2048):
+
+  | Model | PPL | +/- | Tokens |
+  |---|---|---|---|
+  | UD-Q3_K_XL (13.1G blob) | **1.0826** | ±0.037 | 1320 (220 per 512) |
+  | UD-Q5_K_M (19.5G /mnt/SSD) | **1.0297** | ±0.015 | same file |
+  | **Δ** | +0.0529 (+5.1% worse) | — | — |
+
+  Q3 is measurably worse but not catastrophic (exl3 3.5bpw on same data not
+  measured here; kit accepts similar drop). KL divergence not computed (needs
+  aligned logits comparison) — flagged as follow-up per spec (`report KL if
+  feasible else perplexity + flag follow-up`). No threshold defined, so **NO
+  PASS/FAIL**, just table.
+
+**Verdict vs PR106.1 bars:**
+
+| Bar | Spec target | Measured (spec 296k NP2) | Verdict | Note |
+|---|---|---|---|---|
+| Single decode | >=45 t/s (vs 40.1 PR105) | **4.91 t/s** (65k: 15.73) | **FAIL** | 9× below; roofline 36.5 raw unrealistic with current KV/checkpoint overhead |
+| Prefill | >=400 t/s | **437.6 t/s** (9001 tok) | **PASS** | small prompt dominated by overhead, big prompt passes |
+| Greedy determinism | byte-identical | **PASS** (130 chars identical) | **PASS** | |
+| Quality gate | KL <= threshold (or PPL) | PPL Δ +5.1% (1.08 vs 1.03) | **FLAG** (no KL, PPL only) | needs KL tool + longer wiki set for real bar |
+
+**Diagnosis (why 45 fails):** Spec's roofline `12.3 GB / 448 GB/s = 27.4 ms/tok
+(36.5 t/s)` assumes fully contiguous weights, no KV, no MTP, no YaRN, no
+checkpoints. Actual 27B UD-Q3_K_XL is 13.15 GB (`meta size 13135396864`,
+`n_params 27320697856`), not 12.3, and MTP adds 1.03 GB + KV 0.93 GB + prompt
+cache 16 GB cap with 32 checkpoints (153 MiB each, 4.8 GB state per slot if
+filled). Even with `prompt reuse` disabled, checkpoints persist and
+`graphs reused` grows 34→171, increasing per-decode bookkeeping. The
+`--parallel-ctx-threshold` Hydra gate is unavailable, but even without it the
+2-slot 148k each forces `n_ctx_seq < n_ctx_train` path with fused GDN disabled
+(CPU fallback warning) and `cache-idle-slots --kv-unified` disabled. Reducing
+to 65k single slot removes ~1 GB KV + halves checkpoints and gains 3×
+throughput, still far from 45. The bar is therefore not achievable on this
+build/config on the 5060 Ti alone; a smaller quant (Q2) would worsen quality
+faster than it helps bandwidth (PPL already +5% at Q3).
+
+**Cleanup / restore:** `bg-bash cancel 509b86aa0d48` / `pkill -f llama-server.*8080`
+→ `nvidia-smi 1/1 MiB`, `podman pod start pod_llama-baseline` → VRAM
+`15847/11911`, health `{"status":"ok"}` after 90s (2× sched_reserve 23157 ms
+→ 277 ms then 225 ms, `model loaded` `listening on 0.0.0.0:18081`). Production
+verify loop identical to PR106.0 (5× curl 503 → 200). No half-stopped state.
+
+**Artifacts (PR106.1):** `/tmp/pr106_1_server.log` (spec boot 6.7s),
+`/tmp/pr106_1_server_nommp.log` (spec no-mmproj 6.1s), `/tmp/pr106_1_65k.log`
+(65k single slot), `/tmp/pr106_1_final.log` (greedy identical run),
+`/tmp/ppl_long.txt` (1080w), `llama-perplexity` Q3/Q5 logs (`PPL 1.0826` /
+`1.0297`), `nvidia-smi` 13611→1→15847, `podman pod ps` Running, `build/bin`
+`version 9354 (9777256c3)`.
+
