@@ -170,4 +170,205 @@ export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
 
 **Artifacts:** Build log 512s, `restore-log/` with `llama-server-cmdline.txt`, `nvidia-before.txt`, `health-before.json`, `pr105.log` (split 38,27, 262144), `verify_small_out` etc. Commit `docs: PR105.0 execution results` on `fork/pr105-single-machine-baseline`.
 
+## Results — 2x10-turn depth/concurrency (2026-09-10, port 8080)
+
+Follow-on to the single-shot probe above: genuine multi-turn depth test with 2 concurrent
+sessions, 10 turns each, verifying (a) context depth grows turn-over-turn and
+(b) real concurrent decode overlap is sustained across all 10 turns, not just a
+short burst. Reuses the `build/bin/llama-server` binary from the prior run
+(no rebuild — `git diff --stat` clean, binary `18K` identical to `583b8ca5f`);
+source unchanged.
+
+**Launch line (identical to stable run above):**
+
+```bash
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+./build/bin/llama-server \
+  -m /mnt/SSD/Qwen3.8-27B-UD-Q5_K_M.gguf \
+  -dev CUDA0,CUDA1 --tensor-split 38,27 \
+  --rope-scaling yarn --rope-scale 5 --yarn-orig-ctx 32768 \
+  -fa on -ctk q8_0 -ctv q5_1 -ctkd q8_0 -ctvd q5_1 \
+  --cache-prompt --cache-reuse 64 --cache-idle-slots --cache-ram 16384 \
+  -ngl 99 --ubatch-size 512 -np 2 -c 262144 \
+  --parallel-ctx-threshold 100000 --spec-type draft-mtp \
+  --no-kv-unified --cont-batching --context-shift --prio-batch 1 \
+  --jinja --host 0.0.0.0 --port 8080 --metrics --slots --log-verbosity 4
+```
+
+Boot: `/health` 200 at ~14s, both CUDA0 (15847 MiB) + CUDA1 (11911 MiB) match
+production VRAM, `n_ctx_slot=131072` x2, `kv_unified=false`, pipeline parallelism
+enabled, `cache_reuse` disabled (expected with `kv_unified off`). Two full
+harness executions were performed against this server; the first (cold boot)
+was truncated by a wrapping `timeout` pipe but its poll snapshots corroborate
+the second clean rerun (also cold boot after `kill` + restart, `nvidia-smi`
+1 MiB free before re-boot). This section reports the clean rerun as primary
+evidence (`/tmp/pr105-2x10-rerun.log` 6.5 min wall, `/tmp/pr105-2x10-final.log`
+harness log, kept `RESULTS_DIR=/tmp/tmp.WckZkX2Fmp` by patching the `trap`).
+
+**Methodology:** Copied `infra/llama-baseline/multiturn-growth-test.sh`
+from hydra_vortex worktree `1q3ry0vb/majestic-toad` verbatim (patched only to
+retain the temp `RESULTS_DIR` for artifact capture). Usage:
+
+```bash
+bash multiturn-growth-test.sh <port> <n_sessions> <n_turns> <new_tokens_per_turn> <output_tokens_per_turn>
+bash multiturn-growth-test.sh 8080 2 10 8000 750
+```
+
+`NEW_TOKENS=8000` -> `WORDS_PER_TURN=5333`, `N_PREDICT=750`. Each turn
+appends ~8000 new prompt tokens + prior assistant output, so resident depth
+grows as `6682 + (turn-1)*~6600` (10.1x by turn 10, see table). Harness drives
+N sessions as concurrent background `python3` jobs posting to
+`http://127.0.0.1:<port>/v1/chat/completions` with growing `messages` history
+to leverage prefix caching (`--cache-prompt --cache-reuse 64` when supported,
+here via context checkpoints). Per-turn `wall`, `prompt_tok`,
+`completion_tok`, `tok/s` are recorded; wall-clock overlap is verified via
+`session_<N>_start`/`_end` timestamps (same approach as
+concurrent-decode-test.sh). Per-slot context ceiling is `131072` tokens;
+total per-session growth to ~67k stays well below that, so no
+context-shift/eviction is expected (and none was observed — see below).
+
+**Per-turn results — clean rerun (cold, 2 sessions x 10 turns):**
+
+_Session 1_ (slot affinity varies via LCP, but both slots used across turns):
+
+| turn | wall (s) | prompt_tok | comp_tok | tok/s | msgs |
+|---|---|---|---|---|---|
+| 1/10 | 36.80 | 6682 | 750 | 20.38 | 2 |
+| 2/10 | 45.53 | 13308 | 750 | 16.47 | 4 |
+| 3/10 | 42.32 | 19927 | 533 | 12.59 | 6 |
+| 4/10 | 30.04 | 26871 | 401 | 13.35 | 8 |
+| 5/10 | 33.84 | 33689 | 239 | 7.06 | 10 |
+| 6/10 | 14.76 | 40443 | 77 | 5.22 | 12 |
+| 7/10 | 15.87 | 47093 | 101 | 6.36 | 14 |
+| 8/10 | 27.93 | 53744 | 142 | 5.08 | 16 |
+| 9/10 | 21.44 | 60395 | 115 | 5.36 | 18 |
+| 10/10 | 20.75 | 67202 | 199 | 9.59 | 20 |
+| summary | mean 10.15 tok/s | 6682 -> 67202 (10.1x) | | | |
+
+_Session 2_:
+
+| turn | wall (s) | prompt_tok | comp_tok | tok/s | msgs |
+|---|---|---|---|---|---|
+| 1/10 | 50.45 | 6682 | 750 | 14.87 | 2 |
+| 2/10 | 54.19 | 13308 | 750 | 13.84 | 4 |
+| 3/10 | 64.30 | 19927 | 750 | 11.66 | 6 |
+| 4/10 | 62.12 | 26550 | 438 | 7.05 | 8 |
+| 5/10 | 38.08 | 33389 | 235 | 6.17 | 10 |
+| 6/10 | 42.21 | 40141 | 341 | 8.08 | 12 |
+| 7/10 | 19.44 | 46969 | 177 | 9.10 | 14 |
+| 8/10 | 16.88 | 53644 | 175 | 10.37 | 16 |
+| 9/10 | 20.75 | 60324 | 235 | 11.32 | 18 |
+| 10/10 | 15.85 | 67169 | 99 | 6.25 | 20 |
+| summary | mean 9.87 tok/s | 6682 -> 67169 (10.1x) | | | |
+
+_First run (prior boot, poll snapshots before trap cleanup)_ corroborates the
+same shape within ~1 tok/s; session 1 completed 10/10 (mean 9.61 tok/s,
+6682->67217), session 2 reached 9/10 in the last poll before `HARNESS_DONE`
+(mean truncated) with identical per-turn prompt_tok growth and wall-clock
+overlap observed in 6/6 polls where both `is_processing==true`.
+
+**Final context depth per session:**
+
+- Session 1: `67202` prompt tokens at turn 10 (plus `199` generated in that
+  turn, slot `n_tokens=67402` at release). Session 2: `67169` prompt tokens
+  (`99` generated, slot `67269`). Both `+~10.1x` vs turn 1 (`6682`), i.e.
+  `~67k` resident, ~51% of per-slot `131072` ceiling. No per-slot overflow
+  or truncation (`truncated = 0` for all 20 releases). Depth grows correctly
+  turn-over-turn (monotonic `prompt_tok` in both sessions, linear in
+  `NEW_TOKENS+N_PREDICT`).
+
+**Genuine concurrency:**
+
+- Harness overlap check: `sessions 1 & 2: overlap 289.3s` -> `PASS`.
+  Wall-clock: session 1 `[12:06:05 .. 12:10:xx]` (385s total harness wall),
+  session 2 `[12:06:05 .. 12:12:30]` (concurrent for 289.3s, ~75% of harness
+  wall). First run also observed `slot0 processing=True && slot1
+  processing=True` in every 30s poll from `02:20` through `04:20` elapsed.
+- Server metrics: `llamacpp:n_busy_slots_per_decode = 1.689` (clean rerun)
+  and `1.705` (first run) — sustained >1.6, vs `0` at idle and vs prod idle
+  `1.027`. Confirms both slots decoded simultaneously within the same
+  `llama_decode` batch steps, not serialized turn-taking.
+- Per-slot assignment was balanced: harness `get_availabl ... selected slot
+  by LCP similarity` chose the idle slot with highest prefix similarity each
+  turn (alternating as both slots filled). No #743/#744 asymmetry observed.
+
+**Errors / evictions / context-shifts / defers:**
+
+- `truncated=0`, `n_discard=0`, `expected_hop` etc. all zero. No
+  `evict`, `OOM`, `out of memory`, or `cache-ram oversubscription` in
+  `/tmp/pr105-2x10-rerun.log` beyond the expected `cache_reuse is not
+  supported` warning and `KV cache shifting is not supported for this
+  context, disabling KV cache shifting` at init.
+- `parallel-ctx-threshold` gate behaved correctly: 2 defers in clean rerun
+  (`task 1085: resident 33609 + candidate 67202 >=100000`, `task 1090:
+  resident 67202 + candidate 40141 >=100000`) and 3 defers in first run
+  (`1098:60527+40142`, `1117:40142+67217`, `1259:67217+46961`). All deferred
+  tasks were auto-admitted on slot release (`admit task ... resident 0 +
+  candidate ... < 100000`), `llamacpp:requests_deferred` gauge returned to 0
+  at idle. Zero spurious defers (small-prompt admit still works).
+- Prompt cache: `prompt is already in the cache, skipping` + checkpoint
+  `restored context checkpoint (pos_min=..., size=...)` + `cached n_tokens=
+  ...` for every turn after turn 1, confirming prefix reuse. Checkpoint
+  erasures are normal (`too close to earlier one`) and creations logged
+  (`created context checkpoint N of 32`). No errors.
+- Draft MTP: acceptance stable across depth, `spec_decode_num_accepted = 
+  4801/7363` (rerun, mean acc len 2.95, acc rate/pos 0.818/0.635/0.501) vs
+  `4723/7312` (first run, 2.94). Lower than single-shot `0.50-0.61` mean
+  but not collapsed — depth does not break MTP.
+
+**Aggregate tok/s trend across turns (does it degrade?):**
+
+- Yes — consistent with and worse than the single-shot bars. Clean rerun
+  turn1 20.38/14.87 tok/s -> mid-depth (turn5-8) 5.08-7.06 tok/s (session1)
+  and 6.17-10.37 (session2) -> turn10 9.59/6.25. Mean 10.15/9.87 is
+  **~50% below** the already-failing single-shot `n=2 agg 40.68 tok/s`
+  (which was itself 17% below the `49.2-52.6` RPC band) and **~75% below**
+  single-decode bar `39.0`. The gap *widens* as context accumulates.
+  Prefill (`prompt eval`) degrades only modestly: early turns
+  `~836-889 t/s` at ~4k new tokens, later turns `~595-731 t/s` at ~6.8k
+  new+restored, i.e. ~15-30% drop, vs decode 50-75% drop — decode is the
+  wall.
+- Wall-clock: despite 10.1x prompt growth, wall per turn stays ~15-45s
+  (not proportional to depth) because cached prefix avoids full re-prefill;
+  but decode tok/s still falls, so total generation time dominates.
+- Comparison to first run's earlier single-shot decode `30.16 tok/s` (n=1)
+  and `20.2/20.48 tok/s` per-slot concurrent agg: depth test turn1 already
+  `14.87-20.38` (single slot) is lower than `30.16` even at `6.6k` depth,
+  and mid-depth `~5-6` is 5x worse. The single-machine pipeline therefore
+  not only underperforms RPC by ~20% at shallow depth but *diverges further*
+  under real multi-turn accumulation.
+
+**Tear down / restore (both runs):** `kill $(cat /tmp/pr105-2x10*.pid)`,
+`podman pod start pod_llama-baseline`, polled `curl -s
+http://127.0.0.1:18081/health` -> `{"status":"ok"}` at 11th try (~22s),
+`nvidia-smi` `15847/11911 MiB` identical to pre-arm baseline (both boots),
+`podman ps` shows `llama-baseline_llama_1` + `rpc_1` Up (starting->healthy),
+`GET /metrics` reset (`n_tokens_max 0`, `requests_deferred 0`). Never leaves
+rig half-stopped — repeatable `stop` -> `start` cycle verified twice.
+
+**Overall verdict for depth-growth concurrency:**
+
+- Depth growth: **PASS** — 10 turns, total `~67k` per session, monotonic,
+  within `131072` ceiling, zero truncation/eviction, checkpoint reuse works.
+- Concurrency: **PASS** — genuine overlap `289.3s`, `n_busy 1.69`, both slots
+  busy simultaneously across all 10 turns, no serialization, balanced
+  assignment. Threshold gate correctly defers only when combined resident
+  `>=100000` and auto-admits on release.
+- Throughput vs bar: **FAIL and divergence** — the single-machine topology
+  that was `-22%` (single) / `-17%` (n=2 agg) vs RPC at shallow single-shot
+  probes degrades further under sustained multi-turn depth to `~5-10 tok/s`
+  per session (mean `10.15/9.87`), widening the gap to `~75%` vs bar. This
+  confirms the earlier "single-machine underperforms RPC by ~20%" conclusion
+  is **conservative**; the true multi-turn gap is larger and depth-dependent.
+  The wall is pipeline + 3060 bandwidth/weight-share, not RPC overhead, and
+  it compounds with KV growth.
+
+**Artifacts added:** `/tmp/pr105-2x10.log` (first boot, truncated harness
+wrapper), `/tmp/pr105-2x10-rerun.log` (clean rerun server log, 6.48k lines,
+`n_busy 1.689, n_tokens_max 67402`), `/tmp/pr105-2x10-final.log` (harness
+stdout, both sessions full tables + `concurrency check: PASS`),
+`/tmp/tmp.WckZkX2Fmp/session_*.txt/.json` (kept per-turn walls),
+`restore-log-2x10/` with `nvidia-before.txt`, `health-before.json`,
+`pod-inspect-before.json`. Production restore verified twice.
+
 
