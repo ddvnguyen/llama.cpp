@@ -1222,6 +1222,9 @@ struct ggml_cuda_pool_alloc {
 struct ggml_tensor_extra_gpu {
     void * data_device[GGML_CUDA_MAX_DEVICES]; // 1 pointer for each device for split tensors
     cudaEvent_t events[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS]; // events for synchronizing multiple GPUs
+    ggml_type slice_type[GGML_CUDA_MAX_DEVICES]; // per-device quant for row-split (LLAMA_ARG_SPLIT_ROW_QUANT spike)
+    void * contiguous_data = nullptr; // cached contiguous copy for compute (main device)
+    int contiguous_device = -1;
 };
 
 

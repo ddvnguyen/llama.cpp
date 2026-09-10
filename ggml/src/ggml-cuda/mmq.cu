@@ -256,6 +256,63 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 
+// PR104.2: per-op MUL_MAT for CUDA row-split buffers (port of removed ggml_cuda_op_mul_mat_mmq /
+// SYCL ggml_sycl_op_mul_mat).
+// src0 is split: src0_dd_i is this device's quantized slice [row_low, row_high).
+// src1_ddf_i is a tightly packed f32 chunk of src1_ncols rows (ne10 elements each), already staged on the
+// current device. dst_dd_i is either a direct view into the real dst (main device, global rows) or a
+// token-major partial (pitch row_diff). No source quantization needed: each call quantizes the chunk.
+void ggml_cuda_op_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const char * src0_dd_i, const float * src1_ddf_i, float * dst_dd_i,
+        const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
+        const int64_t src1_padded_row_size, cudaStream_t stream, const ggml_type type_slice, ggml_cuda_pool & pool_slice) {
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const ggml_type type_x = type_slice == GGML_TYPE_COUNT ? src0->type : type_slice;
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t row_diff = row_high - row_low;
+
+    const bool fallback = src0->ne[1] % 128 != 0;
+    const bool use_native_fp4 = blackwell_mma_available(cc) && (type_x == GGML_TYPE_MXFP4 || type_x == GGML_TYPE_NVFP4);
+    if (use_native_fp4) {
+        GGML_ABORT("PR104.2: fp4 mmq split not implemented");
+    }
+
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const int64_t J_max = ggml_cuda_mmq_get_J_max(type_x, fallback, cc, src1_ncols);
+    const size_t nbytes_src1_q8_1 = src1_ncols * ne10_padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ +
+        J_max * sizeof(block_q8_1_mmq);
+
+    ggml_cuda_pool_alloc<char> src1_q8_1(pool_slice, nbytes_src1_q8_1);
+
+    // zero the J tail so the kernel's speculative block reads beyond the padded rows are benign
+    fprintf(stderr, "PR104 mmq split: dev=%d type=%s ncols=%d ne10=%d nbytes=%zu ptr=%p J=%d fallback=%d\n",
+        ggml_cuda_get_device(), ggml_type_name(type_x), (int) src1_ncols, (int) src1->ne[0], nbytes_src1_q8_1, (void *) src1_q8_1.get(), (int) J_max, (int) fallback);
+    CUDA_CHECK(cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream));
+
+    quantize_mmq_q8_1_cuda(src1_ddf_i, nullptr, src1_q8_1.get(), type_x,
+        src1->ne[0], src1->ne[0], 1, 1, ne10_padded, src1_ncols, 1, 1, stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    // stride into this device's real dst region: main device writes global rows in place,
+    // other devices write a token-major partial with pitch row_diff
+    const int id = ggml_cuda_get_device();
+    const int64_t s1 = id == ctx.device ? dst->nb[1] / ggml_type_size(dst->type) : row_diff;
+
+    const mmq_args args = {
+        src0_dd_i, type_x, (const int *) src1_q8_1.get(), nullptr, nullptr, dst_dd_i, nullptr,
+        ne00, row_diff, src1_ncols, src0->nb[1] / ggml_type_size(src0->type), src1_ncols, s1,
+        1, 1, 0, 0, 0,
+        1, 1, 0, 0, 0,
+        1};
+
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+
+    GGML_UNUSED_VARS(src1, dst, src1_padded_row_size);
+}
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
