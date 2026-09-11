@@ -255,6 +255,44 @@ class ServerLogWatcher:
         return bool(self.aborts)
 
 
+def current_shift_window(server_log):
+    """(n_keep, n_discard) of the most recent shift line in the log."""
+    pat = re.compile(r"slot context shift, n_keep = (\d+), n_left = (\d+), n_discard = (\d+)")
+    last = None
+    with open(server_log, errors="replace") as f:
+        for line in f:
+            m = pat.search(line)
+            if m:
+                last = (int(m.group(1)), int(m.group(3)))
+    return last
+
+
+def approx_tokens(text):
+    return max(1, int(len(text) / 3.4))
+
+
+def mirror_trim(msgs, keep):
+    """Drop head messages up to n_keep+n_discard approx tokens.
+
+    Mirrors the server's post-shift cache: the server dropped positions
+    [n_keep, n_keep + n_discard); the client replicates that drop from its
+    own message list (approximate at message granularity; small mismatch is
+    absorbed by prompt-cache reprefill, not semantics).
+    If keep is None (no shift line parsed), keep the whole history."""
+    if not keep:
+        return 0
+    boundary = keep[0] + keep[1]
+    dropped = 0
+    while len(msgs) > 1:
+        n = approx_tokens(msgs[0]["content"] or "")
+        if dropped + n <= boundary:
+            dropped += n
+            msgs.pop(0)
+        else:
+            break
+    return dropped
+
+
 class Sink:
     """Thread-safe turn recorder."""
 
@@ -338,6 +376,13 @@ def run_session(cid, port, watcher, barrier, sink, filler_cap, tag):
         }
 
     # ---------- phase 2: M2 plant immediately after shift 1 ----------
+    # Mirror the server-side shift on the client history: the shift dropped
+    # server positions [n_keep, n_keep+n_discard) (n_keep=0 with this launch
+    # shape); the client must drop the same head span or the next request
+    # re-sends ~8.2K+ tokens and gets a 400 ("exceeds context").
+    first_shift_keep = current_shift_window(server_log)
+    mirror_trim(msgs, first_shift_keep)
+
     r = fire(m2["plant"], 0)
     log("M2-plant", r)
     m2_plant_p = r.get("prompt_tokens")
@@ -354,6 +399,11 @@ def run_session(cid, port, watcher, barrier, sink, filler_cap, tag):
         if n > base:
             second_shift_at = i
             break
+    # probes run immediately after shift 2: with n_keep=0 semantics the
+    # next shift's [0, n_discard) window would otherwise claim M2 (server
+    # position ~5 right after the shift-2 rewrite). Document this margin.
+    second_shift_keep = current_shift_window(server_log)
+    mirror_trim(msgs, second_shift_keep)
 
     # ---------- phase 4: probes ----------
     m1_out = []
