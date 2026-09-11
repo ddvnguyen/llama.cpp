@@ -18,7 +18,7 @@ echo "[$(date)] boot-cell ctx=$CTX_TOTAL stage=$STAGE_MIB port=$PORT np=$NP stre
 
 # peer (3060, CUDA1)
 pkill -f 'ggml-rpc-server.*50052' 2>/dev/null || true
-$ROOT/build/bin/ggml-rpc-server --host 127.0.0.1 --port 50052 -d 1 > arm117-rpc-peer.log 2>&1 &
+$ROOT/build/bin/ggml-rpc-server --host 127.0.0.1 --port 50052 -d CUDA1 > arm117-rpc-peer.log 2>&1 &
 sleep 1
 
 # server (5060 Ti, CUDA0)
