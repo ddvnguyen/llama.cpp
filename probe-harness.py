@@ -255,7 +255,7 @@ class ServerLogWatcher:
         return bool(self.aborts)
 
 
-def current_shift_window(watcher.path):
+def current_shift_window(path):
     """(n_keep, n_discard) of the most recent shift line in the log."""
     pat = re.compile(r"slot context shift, n_keep = (\d+), n_left = (\d+), n_discard = (\d+)")
     last = None
