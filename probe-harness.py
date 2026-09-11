@@ -70,6 +70,11 @@ S2 = {
 
 CASTS = {"s1": S1, "s2": S2}
 
+GROWTH_SUFFIX = (
+    " Answer at length in full flowing prose: at least fourteen complete "
+    "sentences, two paragraphs minimum."
+)
+
 GROWTH_FILLER = [
     "Continue writing a story about the sea. Three paragraphs.",
     "How many legs does a cat have, and why do they have that number on "
@@ -311,7 +316,7 @@ def run_session(cid, port, watcher, barrier, sink, filler_cap, tag):
     base = watcher.shift_count
     first_shift_at = None
     for i in range(filler_cap):
-        r = fire(GROWTH_FILLER[i])
+        r = fire(GROWTH_FILLER[i % len(GROWTH_FILLER)] + GROWTH_SUFFIX, 0.8, 900)
         log(f"growth-{i}", r)
         if not r.get("ok"):
             return {"cid": cid, "fatal": f"chat error phase1: {r.get('error')}"}
@@ -336,7 +341,7 @@ def run_session(cid, port, watcher, barrier, sink, filler_cap, tag):
     base = watcher.shift_count
     second_shift_at = None
     for i in range(filler_cap):
-        r = fire(GROWTH_FILLER[(i + 7) % len(GROWTH_FILLER)])
+        r = fire(GROWTH_FILLER[(i + 7) % len(GROWTH_FILLER)] + GROWTH_SUFFIX, 0.8, 900)
         log(f"growth2-{i}", r)
         if not r.get("ok"):
             return {"cid": cid, "fatal": f"chat error phase3: {r.get('error')}"}
@@ -415,7 +420,7 @@ def main():
         default=None,
         help="result JSON path (default wr-probes/<cells>-<ts>.json)",
     )
-    ap.add_argument("--filler-cap", type=int, default=30)
+    ap.add_argument("--filler-cap", type=int, default=60)
     args = ap.parse_args()
 
     watcher = ServerLogWatcher(args.server_log)
