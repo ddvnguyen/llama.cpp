@@ -520,3 +520,141 @@ direction.
    hydra_vortex `review-finding` backlog.
 5. Do NOT merge this PR without a rig execute pass + explicit user
    confirmation; never merge live-infra verify to `main` directly.
+
+## Results (rig execute pass — 2026-09-11)
+
+Runner: opencode agent, exec pass on the live rig (:8080 test boot,
+production pod stopped for the duration per arm etiquette).
+Binary under test: baseline build of this branch @ `1a991ca8d` (baseline
+`d50efc6f0` + admission-gate port + the two arm docs), with
+`arm-context-shift-hybrid-testpatch.patch` applied via `git apply` (PASSED
+clean-apply check). Build flags per this doc §rig (sm_86;sm_120,
+CUDA 13.2.2). RPC topology: `ggml-rpc-server -d CUDA1` (3060), server
+`--rpc 127.0.0.1:50052 -ts 27,38 -ngl 99` — devices seen in boot:
+5060 Ti (CUDA0, 15849 MiB) + 3060 (CUDA1, 11911 MiB).
+
+Probe details that changed from the drafting (recorded for verdict context,
+not as scope changes):
+- Vision/thinking-disabled chat-template mode was applied uniformly across
+  all cells (`chat_template_kwargs enable_thinking: false`) — reasoning
+  decode at ~30 tok/s dominated wall-clock otherwise and is a cell-to-cell
+  confound.
+- Cells ran with the observed server-side shift semantics `n_keep = 0,
+  n_left = 8191, n_discard = 4095` (this is the *head-alignment* shape the
+  server effectively picked, not a `--keep` choice). Consequence recorded
+  below in "Scope caveat".
+- Harness (probe-harness.py, committed) mirrors each server-side shift on
+  the client by dropping the same head span; without this the next request
+  re-sends ~8.2K tokens and 400-exceeds n_ctx_slot (first A1 attempt hit
+  task 35721, corrected in later runs).
+
+### Gate 0 (bootstrap correctness controls)
+
+- [x] Patch applied but env unset: `W cmn common_init_: KV cache shifting
+  is not supported for this context, disabling KV cache shifting` IS
+  printed; no `get_can_shift` TEST HARNESS warning; `n_rs_seq = 3` (draft)
+  and `0` (simple cache) lines present; no shift behavior change → patch
+  dormant proven (negative control PASS).
+- [x] Env set: disabling warning ABSENT; `get_can_shift: TEST HARNESS
+  ONLY: forcing KV-cache shift for IMROPE arch qwen35` fires twice (main
+  KV + draft KV); `n_rs_seq = 3` (draft) + `0` (simple); boot
+  `n_parallel = 2, n_ctx_slot = 8192, kv_unified = false` → positive
+  control PASS.
+- [x] At the first real shift event, both sub-cache sites fired and no
+  `GGML_ABORT` appeared: log shows `seq_add: TEST HARNESS ONLY: scalar
+  pos shift on n_pos_per_embd=4 (assumes text-only M-RoPE)` twice (main
+  + draft) and `get_can_shift` TEST HARNESS warnings, no abort/crash
+  (patch's three sites sufficient). MTP on (draft-mtp).
+
+### Control session (no shift, hard gate)
+
+- [x] 13 turns, prompt-tokens 70 → 6763, **zero** `slot context shift`
+  events in the log window, M1 recall probes clean (chartreuse pig /
+  Wilbur / Borzoi-san), byte-identical temp-0 repeats → PASS.
+- Re-run under no-think conditions same result (13 turns, 6763 tokens) —
+  M1 recall clean, deterministic.
+
+### Cells
+
+| Cell | MTP | Concurrency | M1 (pre-shift, should forget) | M2 (post-shift, should recall) | P4 byte-determinism | P3 coherence | Cross-cast leakage | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| **A1** | on | 1 | honest-forget 5/5 probes (model states "no pig" + names the real squirrel cast of s1, no confident false recall) | 5/5 probes, all 3 facts (Zurnif-8/Pavdeel/Felarn), correct | byte-identical | 0/3 garbling (198/1923/1262 chars) | n/a | **Clean** |
+| **C1** | off (`--spec-type none`) | 1 | honest-forget 5/5 | 3/5 all-3-fact probes; 2/5 partial in phrasing-neutral way (probe1 phrased w/o asking name, probe2 w/o accent; answers to what was asked correct) | byte-identical | 0/3 garbling (357/2567/1762) | n/a | **Clean** |
+| **A2** | on | 2 | honest-forget 5/5 in **both** sessions | M2 recall own-cast correct in both sessions (5 probes each, missing-fact rows equal probe-phrasing gaps, not corruption) | byte-identical | 0/6 garbling | **0/12 leakage** (s1 never recites s2's heron/Plimblad/saffron/Kestral/crab/Gromvex-3 cast and vice versa; verbatim probe text in `wr-logs/probe-A2.json`) | **Clean, no A1↔A2 asymmetry** |
+| **C2** | off | 2 | honest-forget 5/5 both sessions | M2 own-cast correct both sessions | byte-identical | 0/6 garbling | 0/12 leakage | **Clean** |
+
+Shift-event accounting: per-session 2 shift events (s1 first@13/2nd@growth2;
+s2 first@12..14/2nd@growth2; log timeline in the per-cell server logs).
+Both sessions' first shift fired on distinct slots (slot 0 + slot 1),
+i.e. the two concurrent sessions' shifts were genuinely concurrent events
+rather than a serialized single-session workload. The C2 log on server-C2
+recorded 3 shift lines (4th event was co-timed with the other session's
+2nd shift — paste of raw log timing in `wr-logs/server-C2.log`); expected
+count (2 per session) still satisfied per the "not 10×" bar.
+
+### Scope caveat (recorded, not a pass/fail item)
+
+The observed launch shape produces `n_keep = 0` shifts (server-side
+head-alignment), meaning the recurrent cache's `seq_rm` call receives
+`p0 = 0` and takes the **whole-sequence** cut path — the bounded rollback
+window (`n_rs_seq = 3` / 0) is not actually exercised by this probe shape.
+So this arm's PASS verdict is scoped to:
+
+- **n_keep=0 head-eviction shift semantics** under MTP (A*) and no-spec
+  (C*) configurations, concurrency 1 and 2;
+- NOT the doc's originally-hypothesized H2 mechanism (silent desync via
+  recurrent partial-rollback refusal at `n_discard >> n_rs_seq`), which
+  requires a launch shape with `n_keep > 0` (e.g. `--keep <large>` that
+  keeps the head-span M1 plant) — not exercised here.
+
+### Verdict
+
+**PASS (scoped).** With the test patch applied and the env gate set,
+`--context-shift` on Qwen3.8-27B boots, fires (≥2 events/session), and
+produces:
+
+- correct eviction semantics (M1 honestly forgotten),
+- reliable post-shift recall (M2 correct; own-cast; not flaky),
+- coherent output (P3 clean in 2/2 cells' full ~20 K sessions),
+- byte-determinism on temp-0 repeats (A1/A2/C1/C2),
+- **zero cross-session marker leakage in the 2-conc cells (0/12)**,
+
+and the verdict class is identical between MTP-on and MTP-off cells, and
+between concurrency-1 and concurrency-2 cells — no A1↔A2 (or C1↔C2)
+asymmetry, so the doc's "concurrent interference changes correctness"
+finding is not triggered.
+
+**Dangerous-but-scoped**: this says the shift is *behaviorally* safe at
+the n_keep=0 shape under this probe; it does **not** say the doc's H2
+(partial-rollback-refusal desync) is disproven — that path was not
+exercised (see Scope caveat), nor does it say the IMROPE-4-axis scalar
+K-shift is proven correct beyond text-only content (the patch's test-harness
+warning stands — mixed-media content is still unverified upstream risk).
+
+**Recommendation to carry to the `747.5` backlog**:
+- Keep production's current behavior: leave `context_shift: on` in the
+  config (it is a no-op for Qwen3.8 today), do NOT ship the test patch.
+- The silent part of the gaping bug (`slot.mem.seq_rm` return ignored +
+  no log on refusal at `server-context.cpp:2970`) is unchanged by this
+  arm and is the diagnosability actionable (see "Log-level verification
+  plan"). It is not reproducible through the no-op path in production, so
+  it stays a paper finding until the architectural gate is ever lifted.
+- The architectural gate (`get_can_shift() == false` via IMROPE) is the
+  strict gate to keep for Qwen3.8; nothing in this arm suggests it should
+  be lifted.
+- If a future version of the engine ever wants (`n_keep > 0`)-shaped
+  shifts for this arch, a follow-up arm must be specced first: that
+  repaired-shape probe is *the* place where the recurrent partial-rollback
+  desync failure mode actually lives, and it is not covered by this doc.
+
+### Raw evidence index
+
+- `wr-logs/server-negctl.log` — Gate-0 negative control (disabling warn).
+- `wr-logs/server-A1.log` / `server-A2.log` / `server-C1.log` /
+  `server-C2.log` — per-cell full server logs (boot, shift lines, no
+  GGML_ABORT; timeline evidence for the 3-vs-4 note above).
+- `wr-logs/probe-A1-v5.json` / `probe-C1.json` / `probe-A2.json` /
+  `probe-C2.json` — probe results w/ full raw probe outputs.
+- `wr-logs/probe-CTRL.json`, `wr-logs/probe-CTRLNT.json` — no-shift
+  control sessions (both modes).
+- Harness: `probe-harness.py` (committed in-tree on this branch).
