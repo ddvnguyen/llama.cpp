@@ -522,3 +522,47 @@ Cell shape: ctx 65536, `-ts 27,38`, UM=1, `/mnt/SSD/Qwen3.8-27B-UD-Q5_K_M.gguf`,
 ### Known issue in the boot path (cosmetic but real)
 
 During server boot, `common_fit_params` probe context creation throws my new device-filter error ("block KV streaming enabled but no KV layers on the streaming device") before devices are wired, gets caught by fit-params retry, and the real context then boots fine. Evidence lines survive in every A-on log. Cosmetic-only (retry path works, no user impact), but the filter should tolerate device-less probe contexts — follow-up nit for the port PR.
+
+### Round 2 — root cause, numbers, q8_0 verdict (2026-09-11, later same day)
+
+#### Task 1 — root cause of the np2 crash (instrumented rig repro; fix `ef3b119f`)
+
+Instrumented `ggml_cuda_kv_stream_fattn_fits()` to log K/V buffer pointers + buft names + runtimes on every false return, rebuilt, reproduced live (fresh np2 boot, two concurrent requests). Repro data, verbatim:
+
+```
+E arm117 fits=false: dst=0x614d8c90f8c0 ne=[256,24,2,1] type=f32 k=0x... kbuf="CUDA0" | v="CUDA0" | kr=(nil) vr=(nil)
+```
+
+Two chained mechanisms, both upstream design assumptions, NOT quant-type issues:
+
+1. **Crash (exact mechanism).** `ggml_cuda_kv_stream_fattn_fits` has two failure classes: (a) runtime identity (the doc's printed guard `k_runtime==nullptr || v_runtime==nullptr || k_runtime!=v_runtime`), (b) `ggml_cuda_flash_attn_ext_streamed_supported()` geometry predicates (`fattn.cu:1216`), which require `Q->ne[3]==1 && K->ne[3]==1 && V->ne[3]==1` — a **single-stream ubatch assumption**. Under cont-batching with 2 busy parallel slots, the FA K/V views are 4D over `ne[3] = ns = 2` (the failing probe printed exactly `dst ne=[256,24,2,1]`). Geometry rejection is *not* why the crash surfaced: the CUDA-side dispatcher routes to `ggml_cuda_kv_stream_fattn` **only on buffer membership** (`ggml-cuda.cu:3053`: `runtime_from_tensor(src[1]) != nullptr || src[2]...`), not on the full `fits()` predicate, so the assert at `:1898` fired instead of falling back. Upstream never runs `-np>1`, hence this never triggers there.
+   - **Fix shipped** (`ef3b119f`): dispatch now gates on the full `fits()` predicate and falls back to the ordinary `ggml_cuda_flash_attn_ext` path (the kv-stream buffer is host-mapped pinned storage, so reads are zero-copy and semantically exact) with a WARN line. Post-fix np2 concurrent repro: **no crash** (server survived), both slots returned identical coherent outputs.
+2. **Slot-1 divergence (separate mechanism, same subsystem).** Upstream's resident-page bookkeeping has **no stream dimension**: `ggml_cuda_kv_stream_resident_cache_mark_dirty_rows` maps `row/page_tokens` → page and marks `layer_pages[layer]` for ALL layers without any `stream` axis (…`fattn.cu:709-756`). With `n_stream=2`, slot 0's tokens and slot 1's tokens alias the **same (layer, page) indices**; the physically-stored bytes differ only by the view pointer (`k_data + s*k->nb[2]`), so whichever slot wrote a given page last wins for BOTH streams' reads. This produces exactly the observed signature: slot-1's first decode diverges from the byte-stable slot-0 control; later cached requests that restore slot-0's rows reproduce OFF exactly. Fixing this requires giving the resident cache a real (layer × stream) layout — an upstream-level design change (the README's "one server slot" limitation made concrete), out of port scope.
+   - Consequence: the port keeps `LLAMA_KV_STREAM_ALLOW_MULTISEQ` as a **measurement-only** opt-in with loud warnings; the doc's concurrency FAIL verdict stands, but the failure class changed from "hard abort" to "silent non-exactness" post-fix.
+
+#### Task 2 — real decode throughput (multiturn-growth-test.sh, 1 session × 12 turns, ~8K/turn growth, 750 out)
+
+Identical launch shape both sides (`-ts 27,38`, ctx 65536, np1, UM=1, q8_0/q5_1, cache-prompt etc.). Turns 10-12 = ctx-cap (400) for BOTH configurations, excluded from the mean by the harness itself.
+
+| config | turns 1-9 tok/s | turn 1 | turn 9 (deepest) |
+|---|---|---|---|
+| baseline binary (`d50efc6f`, fully resident) | **mean 24.26** | 31.54 | 21.89 @ 59.7K |
+| port + streaming ON (9/16 layers streamed, stage 2048 MiB) | **mean 17.25** | 31.52 | 21.41 @ 60.5K |
+
+- **Streaming costs ≈ −28.9% mean decode tok/s vs fully resident** at this shape (1× slot).
+- Depth curve: streaming degrades to **8.79–10.78 tok/s at 40–53K resident** (turns 6-8) vs baseline's flat ~21-24 there — the host-side pool/ring round-trips dominate once streaming pressure exceeds the 2048 MiB resident pool. Prefill parities near turn 1 (31.52 vs 31.54) confirm boot-time path is unchanged.
+- Practical read: streaming buys the *capability* (context beyond VRAM) at a real decode cost; the resident-page budget (stage MiB) is the main tunable and was fixed conservative at 2048.
+- Cell A np1 byte-parity unaffected: outputs identical, only alloc/eviction scheduling differs.
+
+#### Task 3 — "uniform q8_0 for K+V" question (definite answer, code + evidence)
+
+- **NO — switching to q8_0/q8_0 will not fix either signature.**
+- Crash: it dies inside `ggml_cuda_kv_stream_fattn_fits()` returning false via `streamed_supported()`'s **geometry** check on 3D stream metadata (`ne[3]==1`), quant-size-independent. Both K and V per layer live in ONE kv-stream buffer (`same buffer pointer 0x...9a0` in the diagnostic print), runtime identity is never the issue (kr/vr non-nil and equal whenever the same buffer is streamed — the printed nil/nil match was the prepare_graph probe on a draft/plain-buffer node). Same-geometry crash reproduces identically if `ctv q8_0` is set — page/dirty and geometry logic are quant-size agnostic.
+- Type-specific codepaths that could have interacted (`ggml_backend_cuda_kv_stream type capabilities (storage/decode_f16/auxiliary)` and the allocator's page_bytes) are quant-size — dependent only in page BYTES (q5_1 vs q8_0 rows differ in stride), and the divisors (`KV_STREAM_HEAD_DIM=256`, FATTN_KQ_STRIDE) are per-head-dim, adjusted automatically by `ggml_cuda_kv_stream_page_bytes()`.
+- The q8_0/q8_0 boot test would only re-produce the pre-fix abort; it is disallowed. The fix is to the geometry gating, not the type.
+
+#### Rig restore log round 2 (protocol)
+
+- Preflight: `:18081 health 200` verified, VRAM 15847/11911, pod Running; `pod stop` → drain verify (1MiB/1MiB, ports clear).
+- Crash diagnostics boot/all perf runs on :8080, split engines `50052`.
+- Restore: all test binaries killed → GPUs 1 MiB/1 MiB → `podman pod start pod_llama-baseline` → health **200 (double-verified)** → VRAM **15847/11911**. Rig clean.
