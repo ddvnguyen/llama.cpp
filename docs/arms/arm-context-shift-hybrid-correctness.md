@@ -649,12 +649,16 @@ warning stands — mixed-media content is still unverified upstream risk).
 
 ### Raw evidence index
 
-- `wr-logs/server-negctl.log` — Gate-0 negative control (disabling warn).
-- `wr-logs/server-A1.log` / `server-A2.log` / `server-C1.log` /
+Raw evidence is committed in-repo at
+`docs/arms/evidence/arm-context-shift-hybrid/` (per-cell server logs,
+probe result JSONs, control sessions, probe harness copy). Highlights:
+
+- `server-negctl.log` — Gate-0 negative control (disabling warn).
+- `server-A1.log` / `server-A2.log` / `server-C1.log` /
   `server-C2.log` — per-cell full server logs (boot, shift lines, no
   GGML_ABORT; timeline evidence for the 3-vs-4 note above).
-- `wr-logs/probe-A1-v5.json` / `probe-C1.json` / `probe-A2.json` /
+- `probe-A1-v5.json` / `probe-C1.json` / `probe-A2.json` /
   `probe-C2.json` — probe results w/ full raw probe outputs.
-- `wr-logs/probe-CTRL.json`, `wr-logs/probe-CTRLNT.json` — no-shift
-  control sessions (both modes).
-- Harness: `probe-harness.py` (committed in-tree on this branch).
+- `probe-CTRL.json`, `probe-CTRLNT.json` — no-shift control sessions
+  (both modes).
+- Harness: `probe-harness.py` (also committed in-tree on this branch).
