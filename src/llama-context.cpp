@@ -408,6 +408,7 @@ llama_context::llama_context(
             /*.single_sequence     =*/ cparams.n_seq_max == 1,
             /*.flash_attention     =*/ cparams.flash_attn,
             /*.kv_offload          =*/ cparams.offload_kqv,
+            /*.multi_sequence_allowed =*/ getenv("LLAMA_KV_STREAM_ALLOW_MULTISEQ") != nullptr,
         };
         const auto stream_validation = llama_kv_stream_config_validate(stream_config);
         if (!stream_validation.valid) {

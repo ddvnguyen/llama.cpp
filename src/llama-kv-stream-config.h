@@ -12,6 +12,12 @@ struct llama_kv_stream_config {
     bool single_sequence = false;
     bool flash_attention = false;
     bool kv_offload      = false;
+
+    // fork (arm: adaptive-KV-streaming, Gate R): upstream hard-rejects
+    // parallel slots (untested there). LLAMA_KV_STREAM_ALLOW_MULTISEQ=1
+    // opts in to -np>1 streaming so the concurrency hypothesis is measurable
+    // on the rig instead of being asserted unbootable.
+    bool multi_sequence_allowed = false;
 };
 
 struct llama_kv_stream_config_result {

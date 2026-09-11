@@ -2,6 +2,8 @@
 
 #include <limits>
 
+#include "llama-impl.h"
+
 llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_stream_config & config) {
     if (config.stage_bytes == 0) {
         return { true, false, {} };
@@ -17,8 +19,14 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
     if (!config.context_default) {
         return invalid("block KV streaming currently supports only the target context, not MTP/draft contexts");
     }
-    if (!config.single_sequence) {
-        return invalid("block KV streaming requires exactly one sequence (-np 1)");
+    if (!config.single_sequence && !config.multi_sequence_allowed) {
+        return invalid("block KV streaming requires exactly one sequence (-np 1); "
+                "set LLAMA_KV_STREAM_ALLOW_MULTISEQ=1 to opt in to parallel-slot streaming (upstream-untested)");
+    }
+    if (!config.single_sequence && config.multi_sequence_allowed) {
+        // surfaced at the validator so the operator sees it on every boot
+        LLAMA_LOG_WARN("block KV streaming: parallel slots enabled via LLAMA_KV_STREAM_ALLOW_MULTISEQ; "
+                "upstream validated single-slot only — concurrent correctness/perf is under test\n");
     }
     if (!config.flash_attention) {
         return invalid("block KV streaming requires Flash Attention");

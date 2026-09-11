@@ -165,14 +165,41 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // fork (arm: adaptive-KV-streaming, Gate R): under the Hydra RPC layer
+    // split, KV layers hosted by the RPC peer have no CUDA backend in this
+    // process, so the stock all-layers-on-one-CUDA-device wiring cannot boot.
+    // LLAMA_KV_STREAM_DEVICE=<name> (e.g. "CUDA0") restricts streaming to the
+    // KV layers whose model layer device matches; unlisted devices keep their
+    // ordinary fully-resident KV path. Unset preserves stock behavior.
+    const char * kv_stream_device_name = nullptr;
+    if (kv_stream_stage_bytes != 0) {
+        kv_stream_device_name = getenv("LLAMA_KV_STREAM_DEVICE");
+    }
+    auto kv_stream_wants_dev = [kv_stream_device_name](ggml_backend_dev_t dev) {
+        if (kv_stream_device_name == nullptr) {
+            return true;
+        }
+        const char * dev_name = ggml_backend_dev_name(dev);
+        return dev_name != nullptr && strcmp(dev_name, kv_stream_device_name) == 0;
+    };
+
     ggml_backend_dev_t kv_stream_dev = nullptr;
     ggml_backend_buffer_type_t kv_stream_buft = nullptr;
     uint32_t kv_stream_layer_count = 0;
     if (kv_stream_stage_bytes != 0) {
         for (uint32_t il = 0; il < n_layer; ++il) {
-            if (hparams.has_kv(il) && (!filter || filter(il))) {
+            if (!hparams.has_kv(il) || (filter && !filter(il))) {
+                continue;
+            }
+            if (offload && !hparams.no_alloc && kv_stream_wants_dev(model.dev_layer(il))) {
                 ++kv_stream_layer_count;
             }
+        }
+        if (kv_stream_layer_count == 0) {
+            throw std::runtime_error("block KV streaming enabled but no KV layers on the streaming device");
+        }
+        if (kv_stream_device_name != nullptr) {
+            LLAMA_LOG_INFO("%s: KV streaming device filter = %s (%u layers)\n", __func__, kv_stream_device_name, kv_stream_layer_count);
         }
     }
 
@@ -233,7 +260,7 @@ llama_kv_cache::llama_kv_cache(
 
             dev_name = ggml_backend_dev_name(dev);
 
-            if (kv_stream_stage_bytes != 0 && !hparams.no_alloc) {
+            if (kv_stream_stage_bytes != 0 && !hparams.no_alloc && kv_stream_wants_dev(dev)) {
                 if (kv_stream_dev != nullptr && kv_stream_dev != dev) {
                     throw std::runtime_error("block KV streaming requires every attention layer on one CUDA device");
                 }
