@@ -439,3 +439,42 @@ split, parallel 2")** — ALL of:
    streamed too, and is draft acceptance affected (they claim "the
    adaptive pool is device-resident", but draft-path probing is unverified
    upstream)?
+
+## Results
+
+### S0 — commit inventory (2026-09-11)
+
+Source: `RaymondHuang210129/llama.cpp-adaptive-kv-streaming@feature/adaptive-kv-stream` = `4ba0b9b25`. Their branch is a **linear rebase-carry** (no merge commits). Critical re-verification vs this doc's design assumptions:
+
+- Their branch's upstream carry does NOT stop at ~2026-08-24: the carries include **`5266f24da` (v0.4.0 bump — this arm's baseline base)** and continue past it to ≈ 2026-09-06 (`73a43d1f` #28475, `d03efa5d` #28402, `7620399f` #28437, `9e0e2205` #28469, …).
+- **Sparse-FA #27970 (`8e93a977`) is already an ancestor of `5266f24da`**, hence already inside our baseline's `fattn.cu`. The "their fattn.cu delta includes pre-sparse-fa structure, hand-merge onto new FA topology" concern does not fire: their `fattn.cu` sits on the SAME post-#27970 FA structure our baseline has. The port was therefore cleaner than the S1 budget assumed.
+- Between the last carry and the first streaming commit (`2646f0aa`) there is exactly ONE feature-dependent commit: `7fa262b3 "baseline: mirror production CUDA unified-memory build"` — its `ggml_backend_cuda_buffer_set_preferred_host/device` definitions are referenced by the streaming feature's proc-address table; **included** in the port. The 6 upstream carries touching llama/ggml (465e49b9, 5fdfa628, 3ad1ba73, 9e0e2205, 7620399f, 49c0dc82) were **excluded** — upstream lineage, not feature.
+
+Port = **61 streaming-series commits cherry-picked in order** (`2646f0aa`…`4ba0b9b2`) onto clean `baseline` (`d50efc6f`). Only 2 trivial conflicts, both empty-HEAD-side conflict-marker noise in `ggml-cuda.cu` (`reg_get_proc_address` block) and `llama-kv-cache.cpp` (buffer-clear hunk); plus one duplicate-definition cleanup after `7fa262b3`.
+
+**Fidelity proof:** all 44 non-carry, non-fork-delta files in the port tree are byte-identical (git blob SHA equal) to the source branch HEAD. Fork delta (PR #110: `--parallel-ctx-threshold` args + UM prefetch net `cudaMemAdvise`) verified intact in the ported tree.
+
+### Gate G — GDN/recurrent untouched (code read)
+
+- Ported diff touches **zero** files matching `recurrent|gated|delta|ssm|mamba` under `ggml/src/ggml-cuda/` or `src/`; `gated_delta_net.cu/.cuh`, `ssm-*.cu/.cuh`, `src/llama-memory-recurrent*.cpp` untouchED. Streaming lives solely in `llama_kv_cache` (attention) + its kv-stream buffer type — never recurrent state.
+- Draft/MTP: their speculative wiring explicitly zeroes `kv_stream_stage_mib` for the draft cache ("MTP keeps its ordinary cache until both contexts can share one pool") — resolves this doc's open-question 4: **draft KV is NOT streamed**.
+- Upstream-carry observation (not ported — upstream lineage, not streaming): `5fdfa628` #28068 fixes GDN normalization `max`→`rsqrt` for the qwen35 family on upstream; our baseline doesn't have it. Potential follow-up for PBpy family correctness, separate issue.
+
+### Gate R — RPC composition (mechanism verdict)
+
+1. **Runtime parameterization is per-CUDA-device, per-process.** `llama_kv_cache` builds the runtime via `ggml_backend_reg_get_proc_address(device_reg, "ggml_backend_cuda_kv_stream_...")`. The `ggml-rpc-server` peer binary has no llama-layer at all (it replays ggml graphs against remote allocations; it never constructs `llama_kv_cache`), so **env-keyed activation inside the peer is a dead end AND a fork-side rpc-server argv extension gains nothing** — streaming semantics (pages, residency, set_rows hooks) live in the llama-layer. Full per-process composition would require a protocol-level extension (stream-reallocation opcodes across the RPC channel) — genuine follow-up fork issue, out of scope here.
+2. **Stock architectural blocker vs the exact production split:** the wiring streams the FIRST kv-layer device's buffer type and APPLIES it to every KV layer; with `-ts 27,38`, layers 0+ are owned by RPC0 ⇒ boot throws "block KV streaming requires the CUDA backend".
+3. **Chosen mechanism (lower-risk, faster to a real number):** env-keyed activation in the llama layer — `LLAMA_KV_STREAM_DEVICE=CUDA0` streams only KV layers whose model-layer device matches; other layers keep ordinary fully-resident KV (the doc's restricted fallback: CUDA0-streaming, 3060 fully resident, production RPC topology intact). Implemented in `src/llama-kv-cache.cpp`. Unset ⇒ stock behavior byte-preserved. The reason not the argv option: the peer has no llama-layer and cannot host the runtime at all, so argv plumbing would be dead code.
+4. **`-np > 1`:** stock validator hard-rejects (single_sequence). Added opt-in `LLAMA_KV_STREAM_ALLOW_MULTISEQ=1` (loud per-boot warning) so the H2 concurrency hypothesis is testable upstream-untested instead of being asserted unbootable. H2 verdict = measurement, still pending rig.
+
+### Gate B — build gate
+
+- [x] llama-server + ggml-rpc-server build OK: CUDA 13.2.2, archs `86;120`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_RPC=ON`, Release, exit 0.
+- [x] Ported feature's CPU-side unit tests: `test-kv-stream-plan` (241 assertions), `test-kv-stream-config` (18), `test-kv-stream-softmax` — 0 failures each.
+- [ ] Vanilla parity control (`--kv-stream-stage-mib 0` vs pre-port baseline binary) — **blocked on rig** (one physical rig; agent 6edd46da / PR #116 currently holds it per "one GPU = one compute task"). No boot until explicit rig release.
+
+### Rig cells status
+
+- **waiting-on-rig** per rig-coordination protocol redux.
+- Prepared: `scripts/arm117/{boot-cell.sh, cell-a-parity.sh, cell-c-longctx.sh, snapshot.sh}` committed to the port branch.
+
