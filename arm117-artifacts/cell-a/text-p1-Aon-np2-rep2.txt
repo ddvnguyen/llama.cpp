@@ -1,0 +1,2 @@
+The user is asking me to reply with exactly the text "PARITY-KERNEL-A" and nothing else. The instruction is clear and explicit: reply with exactly "PARITY-KERNEL-A" and nothing else.
+PARITY-KERNEL-A
