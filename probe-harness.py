@@ -43,7 +43,7 @@ S1 = {
         "facts": ["Zurnif-8", "Pavdeel", "Felarn"],
     },
     "animal": "pig",
-    "second_animal": "crab",
+    "m2_animal": "squirrel",
 }
 
 S2 = {
@@ -65,7 +65,7 @@ S2 = {
         "facts": ["Gromvex-3", "Undshade", "Birser"],
     },
     "animal": "heron",
-    "second_animal": "squirrel",
+    "m2_animal": "crab",
 }
 
 CASTS = {"s1": S1, "s2": S2}
@@ -416,12 +416,12 @@ def run_session(cid, port, watcher, barrier, sink, filler_cap, tag):
     m2_out = []
     m2_p4_pair = []
     for i, fmt in enumerate(M2_PROBE_FMT):
-        r = fire(fmt.format(animal2=cast["second_animal"]), 0, 256)
+        r = fire(fmt.format(animal2=cast["m2_animal"]), 0, 256)
         c = (r.get("content") or "")
         m2_out.append({"i": i, "hits": [f in c for f in m2["facts"]], "out": c})
         log(f"M2-probe-{i}", r)
         if i == 2:  # P4: this exact probe (verbatim, temp0) re-sent once more
-            r2 = fire(fmt.format(animal2=cast["second_animal"]), 0, 256)
+            r2 = fire(fmt.format(animal2=cast["m2_animal"]), 0, 256)
             m2_p4_pair = [(r.get("content") or ""), (r2.get("content") or "")]
             log("P4-repeat", r2)
 
