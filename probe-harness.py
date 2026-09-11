@@ -255,7 +255,7 @@ class ServerLogWatcher:
         return bool(self.aborts)
 
 
-def current_shift_window(server_log):
+def current_shift_window(watcher.path):
     """(n_keep, n_discard) of the most recent shift line in the log."""
     pat = re.compile(r"slot context shift, n_keep = (\d+), n_left = (\d+), n_discard = (\d+)")
     last = None
@@ -380,7 +380,7 @@ def run_session(cid, port, watcher, barrier, sink, filler_cap, tag):
     # server positions [n_keep, n_keep+n_discard) (n_keep=0 with this launch
     # shape); the client must drop the same head span or the next request
     # re-sends ~8.2K+ tokens and gets a 400 ("exceeds context").
-    first_shift_keep = current_shift_window(server_log)
+    first_shift_keep = current_shift_window(watcher.path)
     mirror_trim(msgs, first_shift_keep)
 
     r = fire(m2["plant"], 0)
@@ -402,7 +402,7 @@ def run_session(cid, port, watcher, barrier, sink, filler_cap, tag):
     # probes run immediately after shift 2: with n_keep=0 semantics the
     # next shift's [0, n_discard) window would otherwise claim M2 (server
     # position ~5 right after the shift-2 rewrite). Document this margin.
-    second_shift_keep = current_shift_window(server_log)
+    second_shift_keep = current_shift_window(watcher.path)
     mirror_trim(msgs, second_shift_keep)
 
     # ---------- phase 4: probes ----------
