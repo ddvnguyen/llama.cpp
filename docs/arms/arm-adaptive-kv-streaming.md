@@ -478,3 +478,47 @@ Port = **61 streaming-series commits cherry-picked in order** (`2646f0aa`…`4ba
 - **waiting-on-rig** per rig-coordination protocol redux.
 - Prepared: `scripts/arm117/{boot-cell.sh, cell-a-parity.sh, cell-c-longctx.sh, snapshot.sh}` committed to the port branch.
 
+
+### Gate B — vanilla parity control (rig)
+
+- [x] **PASS — base binary (`d50efc6f`) vs port tree with `--kv-stream-stage-mib 0` (A-off), np1/ctx 65536, RPC `-ts 27,38`:** greedy temp=0 kernel prompt (2208-token prompt, 96-token cap) **byte-identical**; the only textual difference was a trailing-EOF newline from the harness `print()`, not token content.
+
+### Gate T — type-capability probe (code+boot evidence)
+
+- **q8_0/q5_1 → `ATTENTION_DIRECT`.** Both types carry `direct_attention=true` under `GGML_CUDA_FA_ALL_QUANTS=ON` (…`fattn.cu:1120` case Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/F16/BF16). No F16-conversion fallback engaged. Boot log: `KV streaming device filter = CUDA0 (9 layers)`, `CUDA_KV_Stream_Host KV buffer size = 1044.00 MiB`; model has 16 kv layers total at ctx 65536 (9 on CUDA0 streamed + 7 on RPC0 fully resident), draft/MTP context NOT streamed (confirmed in-boot).
+- q4_0 cell not run (primary passes; production types are the mandate). q4_0 remains available per doc as a fallback diagnostic cell.
+
+### Cell A — numerical parity (rig, np1 + np2)
+
+Cell shape: ctx 65536, `-ts 27,38`, UM=1, `/mnt/SSD/Qwen3.8-27B-UD-Q5_K_M.gguf`, stage 0 vs stage 2048, :8080.
+
+**np1 (← the clean verdict):**
+- OFF vs ON (fresh boots, 2 + 1 samples): **byte-identical greedy outputs**.
+- ON self-repeat (same server, 2 samples): byte-identical.
+- OFF cross-boot repeat (2 boots): byte-identical.
+- **Cell A np1 verdict: PASS — streaming is a pure rescheduling + numerically exact at production KV types in single-slot.**
+
+**np2 (parallel: 2 — the upstream-untested gap; exercised via `LLAMA_KV_STREAM_ALLOW_MULTISEQ=1`):**
+- OFF self-repeats across 2 boots and 2 same-server samples: byte-identical (np2-single-slot request confined to one slot → deterministic control valid).
+- ON with `cache_prompt=false`: **byte-identical to OFF** (streaming decode path itself is exact even with slots).
+- ON with `cache_prompt=true` (fresh boot, first request → **slot 1**): diverged reproducibly from OFF (distinct reasoning token list, finish reasons differ) with cached_tokens=0 — i.e. NOT a cache-restore problem (restore with 2204 cached tokens later reproduced OFF text exactly). The first request on a fresh boot went to slot 1 twice; subsequent slot-0 requests were exact. **Probable cause: slot-1-local streaming page/dirty-rows accounting or first-decode layout on a non-zero stream; NOT isolated further in this pass.**
+- **Concurrent 2-slot streaming decode: HARD CRASH** — `GGML_ASSERT(ggml_cuda_kv_stream_fattn_fits(dst)) failed` at `ggml-cuda.cu:1898` (`ggml_cuda_graph_evaluate_and_capture`) during paired requests; server died (abort + backtrace preserved in `arm117-artifacts/`).
+
+**Cell A np2 verdict: FAIL (H2 class).** Two independent signatures: (a) slot-1 first-decode divergence, (b) hard assert crash under genuine 2-slot concurrency. Per this doc's FAIL bar, **concurrency violation stands regardless of single-slot correctness** — streaming's page/dirty-row/layout model is not slot-parallel-safe as ported.
+
+### Overall verdict for this pass
+
+- **Port: clean** (fidelity proof + build gate + CPU unit tests all green; Gate G untouched-scope verified; doc's worst-case S1 fattn.cu skew did not materialize).
+- **Single-slot streaming on the production RPC topology (CUDA0 9/16 streamed-attn layers, 3060 fully resident): numerically exact, boots in production KV types (DIRECT mode), byte-parity with stock.**
+- **Parallel: 2 streaming: NOT usable as ported** (slot-1 divergence + `kv_stream_fattn_fits` assert crash). The `LLAMA_KV_STREAM_ALLOW_MULTISEQ` knob did exactly what it was built for: turned an unproven upstream assumption into a concrete, reproducible failure signature.
+- Gate R: mechanism verdict + device-filter fallback implemented (`LLAMA_KV_STREAM_DEVICE=CUDA0`); full per-process RPC composition (streaming inside the peer) documented as the follow-up fork issue (rpc protocol extension).
+
+### Rig restore log
+
+1. Preflight: prod health 200, VRAM 15847/11911 (exact production signature). `podman pod stop pod_llama-baseline` → drain verified (1 MiB / 1 MiB, ports clear).
+2. All test boots on :8080; test artifacts + per-cell logs under `arm117-artifacts/` in the port branch working tree.
+3. Restore: killed all test binaries → GPUs 1 MiB/1 MiB → `podman pod start pod_llama-baseline` → health 200 (verified twice, including a second recheck) → VRAM 15847/11911. Ports 18081/50052 listening again. **Rig clean.**
+
+### Known issue in the boot path (cosmetic but real)
+
+During server boot, `common_fit_params` probe context creation throws my new device-filter error ("block KV streaming enabled but no KV layers on the streaming device") before devices are wired, gets caught by fit-params retry, and the real context then boots fine. Evidence lines survive in every A-on log. Cosmetic-only (retry path works, no user impact), but the filter should tolerate device-less probe contexts — follow-up nit for the port PR.
