@@ -186,6 +186,11 @@ def chat(port, messages, temp, max_tokens, timeout=900):
         "temperature": temp,
         "max_tokens": max_tokens,
         "stream": False,
+        # Cells run under uniform no-think chat-template conditions; `enable_thinking: false` removes ~550 tok of
+        # decode-only reasoning per turn, which is the wall-clock dominant
+        # cost and was otherwise an uneven confound across cells. Same
+        # template behavior across CTRL/A1/A2/C1/C2.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
