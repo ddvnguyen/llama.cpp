@@ -18,6 +18,14 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+// TEST HARNESS ONLY (arm-context-shift-hybrid) — returns true if the
+// LLAMA_TEST_FORCE_SHIFT_QWEN35 env var is set. Used to bypass the
+// IMROPE shift prohibition below; see docs/arms/
+// arm-context-shift-hybrid-correctness.md. Do not ship to production.
+static bool llama_kv_cache_test_allow_imrope_shift() {
+    return getenv("LLAMA_TEST_FORCE_SHIFT_QWEN35") != nullptr;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -574,7 +582,16 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    if (hparams.n_pos_per_embd() != 1) {
+        // TEST HARNESS ONLY — do not ship to production: for text-only usage
+        // all M-RoPE axes hold the same value, so shifting the scalar cell
+        // pos is well-defined there; mixed-media content will silently
+        // corrupt the non-temporal axes instead of aborting.
+        if (!llama_kv_cache_test_allow_imrope_shift()) {
+            GGML_ABORT("seq_add() is only supported for n_pos_per_embd() == 1");
+        }
+        LLAMA_LOG_WARN("%s: TEST HARNESS ONLY: scalar pos shift on n_pos_per_embd=%d (assumes text-only M-RoPE)\n", __func__, hparams.n_pos_per_embd());
+    }
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -624,7 +641,15 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
+    if (hparams.n_pos_per_embd() != 1) {
+        // TEST HARNESS ONLY — see seq_add() above; required so
+        // cache-reuse div paths do not abort while the test env override
+        // in get_can_shift()/seq_add() is active.
+        if (!llama_kv_cache_test_allow_imrope_shift()) {
+            GGML_ABORT("seq_div() is only supported for n_pos_per_embd() == 1");
+        }
+        LLAMA_LOG_WARN("%s: TEST HARNESS ONLY: scalar pos divide on n_pos_per_embd=%d (assumes text-only M-RoPE)\n", __func__, hparams.n_pos_per_embd());
+    }
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -1191,6 +1216,16 @@ bool llama_kv_cache::get_can_shift() const {
         return false;
     }
     if (hparams.n_pos_per_embd() > 1) {
+        // TEST HARNESS ONLY — do not ship to production: IMROPE K-shift
+        // correctness for the 4-axis position case is itself unverified and
+        // is a second, separate risk beyond what the
+        // arm-context-shift-hybrid arm measures. See
+        // docs/arms/arm-context-shift-hybrid-correctness.md.
+        if ((model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) &&
+                llama_kv_cache_test_allow_imrope_shift()) {
+            LLAMA_LOG_WARN("%s: TEST HARNESS ONLY: forcing KV-cache shift for IMROPE arch %s (LLAMA_TEST_FORCE_SHIFT_QWEN35 is set)\n", __func__, llm_arch_name(model.arch));
+            return true;
+        }
         return false;
     }
     return true;

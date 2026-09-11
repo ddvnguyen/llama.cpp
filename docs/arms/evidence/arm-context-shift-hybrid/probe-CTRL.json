@@ -1,0 +1,160 @@
+{
+ "summary": {
+  "cells": "CTRL",
+  "wall_s": 121.5,
+  "n_sessions": 1,
+  "total_shift_events": 0,
+  "aborts": [],
+  "sessions": [
+   {
+    "cid": "s1",
+    "fatal": "no shift fired within filler cap (12 turns); raise filler turns or n_ctx ratio"
+   }
+  ]
+ },
+ "raw_turns": [
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:18:46",
+   "user": "Here is a story to keep in mind. Once, there was a very small pig named Wilbur w",
+   "ok": true,
+   "wall_s": 3.66,
+   "err": null,
+   "content": "Got it. I\u2019ll remember the story about Wilbur, the very small pig whose favorite color was chartreuse, and his man, Borzoi-san.",
+   "prompt_tokens": 107,
+   "completion_tokens": 116
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:18:57",
+   "user": "Continue writing a story about the sea. Three paragraphs.",
+   "ok": true,
+   "wall_s": 11.18,
+   "err": null,
+   "content": "The sea stretched wide and restless under a pale morning sky, its waves folding and unfolding like slow breath. Far out, the water turned deep blue",
+   "prompt_tokens": 164,
+   "completion_tokens": 320
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:19:08",
+   "user": "How many legs does a cat have, and why do they have that number on this planet? ",
+   "ok": true,
+   "wall_s": 10.19,
+   "err": null,
+   "content": "A cat has four legs.\n\nAs for why four, it really comes down to what worked best over millions of years of evolution. Four legs give a cat a stable base while letting them move fast and change direction quickly. Two legs would make them wobbly and slow. Six would be a lot of extra muscle and energy to maintain without much payoff for a small, agile hunter. Four hits that sweet spot: enough support to crouch, pounce, and scramble up a tree, but not so many that they become clumsy.\n\nSo it's not that the",
+   "prompt_tokens": 231,
+   "completion_tokens": 320
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:19:18",
+   "user": "Name five rivers famous for their width and explain why each has that reputation",
+   "ok": true,
+   "wall_s": 10.38,
+   "err": null,
+   "content": "",
+   "prompt_tokens": 378,
+   "completion_tokens": 0
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:19:28",
+   "user": "What makes a bridge feel solid or unsafe from a pedestrian's intuition, not engi",
+   "ok": true,
+   "wall_s": 9.5,
+   "err": null,
+   "content": "",
+   "prompt_tokens": 403,
+   "completion_tokens": 0
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:19:38",
+   "user": "Name plausible-sounding villages on two coasts and briefly justify the feel of e",
+   "ok": true,
+   "wall_s": 10.77,
+   "err": null,
+   "content": "",
+   "prompt_tokens": 426,
+   "completion_tokens": 0
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:19:48",
+   "user": "When do street markets in large cities open and how does climate change that? Tw",
+   "ok": true,
+   "wall_s": 10.03,
+   "err": null,
+   "content": "",
+   "prompt_tokens": 449,
+   "completion_tokens": 0
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:19:58",
+   "user": "Describe how bread smells at three distinct baking stages \u2014 specific, sensory.",
+   "ok": true,
+   "wall_s": 10.01,
+   "err": null,
+   "content": "",
+   "prompt_tokens": 468,
+   "completion_tokens": 0
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:20:08",
+   "user": "Predict one believable change in daily life five years out and keep the claim me",
+   "ok": true,
+   "wall_s": 9.9,
+   "err": null,
+   "content": "",
+   "prompt_tokens": 489,
+   "completion_tokens": 0
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:20:18",
+   "user": "One paragraph of dialogue between a tired bus driver and a regular passenger. Na",
+   "ok": true,
+   "wall_s": 9.5,
+   "err": null,
+   "content": "",
+   "prompt_tokens": 513,
+   "completion_tokens": 0
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:20:27",
+   "user": "Why do satellite-view maps look different colors over farmland vs city in the sa",
+   "ok": true,
+   "wall_s": 9.23,
+   "err": null,
+   "content": "",
+   "prompt_tokens": 538,
+   "completion_tokens": 0
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:20:35",
+   "user": "Why do some metal pans ring when struck and others just thud? A simple explanati",
+   "ok": true,
+   "wall_s": 8.45,
+   "err": null,
+   "content": "",
+   "prompt_tokens": 561,
+   "completion_tokens": 0
+  },
+  {
+   "cid": "s1",
+   "t": "2026-09-11T09:20:44",
+   "user": "Which gets dirtier faster: windows on a busy road or on a quiet garden wall? One",
+   "ok": true,
+   "wall_s": 8.72,
+   "err": null,
+   "content": "",
+   "prompt_tokens": 587,
+   "completion_tokens": 0
+  }
+ ]
+}
