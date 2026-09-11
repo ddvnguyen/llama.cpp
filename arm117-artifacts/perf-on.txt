@@ -1,0 +1,33 @@
+=== multiturn-growth-test ===
+  port:         8080
+  sessions:     1
+  turns:        12
+  new tok/turn: ~8000 (~5333 words)
+  output/turn:  750 tokens
+  target depth: turn 12 ≈ 103250 resident tokens
+
+Launched 1 sessions, waiting for completion...
+
+  summary: turn1=31.52 turn9=21.41 mean=17.25 tok/s  prompt_tok: 6682 -> 60506 (9.1x)
+
+=== all sessions complete, results ===
+
+session 1 | 12 turns | 5333 words/turn new | 750 output tokens
+----------------------------------------------------------------------
+  turn  1/12  wall= 23.79s  prompt_tok=  6682  comp_tok= 750  tok/s= 31.52  msgs=2
+  turn  2/12  wall= 31.59s  prompt_tok= 13308  comp_tok= 688  tok/s= 21.78  msgs=4
+  turn  3/12  wall= 31.25s  prompt_tok= 19960  comp_tok= 750  tok/s= 24.00  msgs=6
+  turn  4/12  wall= 22.01s  prompt_tok= 27219  comp_tok= 359  tok/s= 16.31  msgs=8
+  turn  5/12  wall= 15.64s  prompt_tok= 33883  comp_tok= 181  tok/s= 11.57  msgs=10
+  turn  6/12  wall= 15.81s  prompt_tok= 40538  comp_tok= 139  tok/s=  8.79  msgs=12
+  turn  7/12  wall= 16.65s  prompt_tok= 47195  comp_tok= 151  tok/s=  9.07  msgs=14
+  turn  8/12  wall= 19.10s  prompt_tok= 53852  comp_tok= 206  tok/s= 10.78  msgs=16
+  turn  9/12  wall= 35.03s  prompt_tok= 60506  comp_tok= 750  tok/s= 21.41  msgs=18
+  turn 10/12  FAILED: HTTP Error 400: Bad Request
+  turn 11/12  FAILED: HTTP Error 400: Bad Request
+  turn 12/12  FAILED: HTTP Error 400: Bad Request
+
+  summary: turn1=31.52 turn9=21.41 mean=17.25 tok/s  prompt_tok: 6682 -> 60506 (9.1x)
+
+=== overlap check ===
+concurrency check: N/A (single session)

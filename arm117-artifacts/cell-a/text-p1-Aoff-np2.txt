@@ -1,0 +1,2 @@
+We need answer user's request. User provided filler sentences and then: "Now reply with exactly this text and nothing else: PARITY-KERNEL-A". Need final exactly PARITY-KERNEL-A. Ensure no extra.
+PARITY-KERNEL-A

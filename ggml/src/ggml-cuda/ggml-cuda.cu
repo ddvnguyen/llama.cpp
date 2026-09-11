@@ -1888,6 +1888,14 @@ static bool ggml_cuda_kv_stream_fattn_fits(const ggml_tensor * dst) {
     auto * k_runtime = ggml_cuda_kv_stream_runtime_from_tensor(k);
     auto * v_runtime = ggml_cuda_kv_stream_runtime_from_tensor(v);
     if (k_runtime == nullptr || v_runtime == nullptr || k_runtime != v_runtime) {
+        // arm117 diagnostics: why did identity fail? (k/v bufts + buffers + geoms)
+        GGML_LOG_ERROR("arm117 fits=false: dst=%p ne=[%lld,%lld,%lld,%lld] type=%s "
+                       "k=%p kbuf=%p %s | v=%p vbuf=%p %s | kr=%p vr=%p\n",
+                (void *) dst, (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                ggml_type_name(dst->type),
+                (void *) k, k ? (void *) k->buffer : nullptr, k && k->buffer ? ggml_backend_buffer_name(k->buffer) : "NULL",
+                (void *) v, v ? (void *) v->buffer : nullptr, v && v->buffer ? ggml_backend_buffer_name(v->buffer) : "NULL",
+                (void *) k_runtime, (void *) v_runtime);
         return false;
     }
     return ggml_cuda_flash_attn_ext_streamed_supported(dst, k_runtime->stage_bytes);
@@ -3050,9 +3058,20 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+            // arm117 fix: gate the streamed dispatch on the full fits()
+            // predicate, not buffer membership alone. A multi-stream ubatch
+            // (parallel slots, K/V 4D views with ne[3] == ns > 1) breaks
+            // flashed_supported's single-stream geometric assumptions
+            // (Q/K/V ne[3] == 1); previously such a node still entered
+            // ggml_cuda_kv_stream_fattn and died on its GGML_ASSERT.
             if (ggml_cuda_kv_stream_runtime_from_tensor(dst->src[1]) != nullptr ||
                     ggml_cuda_kv_stream_runtime_from_tensor(dst->src[2]) != nullptr) {
-                ggml_cuda_kv_stream_fattn(ctx, dst);
+                if (ggml_cuda_kv_stream_fattn_fits(dst)) {
+                    ggml_cuda_kv_stream_fattn(ctx, dst);
+                } else {
+                    GGML_LOG_WARN("kv-stream: FA node not streaming (unsupported geometry, falling back to resident KV path)\n");
+                    ggml_cuda_flash_attn_ext(ctx, dst);
+                }
             } else {
                 ggml_cuda_flash_attn_ext(ctx, dst);
             }
