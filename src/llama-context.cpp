@@ -3288,6 +3288,17 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
 
     llama_memory_context_ptr mctx;
 
+    // grouped MoE verification needs the span grouped by sequence; other backends keep the plain split
+    const bool moe_verification_grouped = required_grouped_execution_flags(
+        model.moe_expert_cache_slots(), moe_required_grouped_execution_supported) !=
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE;
+    const bool use_verification_intent = has_execution_intent &&
+        (execution_intent.domain != GGML_GRAPH_EXECUTION_DOMAIN_MAIN || moe_verification_grouped);
+
+    balloc->set_verification_span(
+        use_verification_intent && execution_intent.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN
+            ? execution_intent.verification_span : 0);
+
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
@@ -3363,7 +3374,7 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
 
     do {
         const auto & ubatch = mctx->get_ubatch();
-        if (has_execution_intent && !ubatch_matches_graph_execution_intent(
+        if (use_verification_intent && !ubatch_matches_graph_execution_intent(
                 cparams.ctx_type, model.moe_expert_cache_slots(), ubatch, execution_intent)) {
             LLAMA_LOG_ERROR("%s: ubatch does not match the validated execution intent\n", __func__);
             return -2;
@@ -3389,7 +3400,7 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
 
         const auto * res = process_ubatch(
             ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
-            has_execution_intent ? &execution_intent : nullptr);
+            use_verification_intent ? &execution_intent : nullptr);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
