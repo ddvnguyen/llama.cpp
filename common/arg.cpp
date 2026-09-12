@@ -872,17 +872,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     arg.c_str(), e.what(), opt.to_string().c_str()));
             }
         }
-
-        // TODO: remove this check after deprecating --mmap|mlock|dio
-        auto has_arg = [&](std::initializer_list<const char *> names) {
-            return std::any_of(names.begin(), names.end(), [&](const char * name) {
-                return seen_args.count(name);
-            });
-        };
-        if (has_arg({"-lm", "--load-mode"}) &&
-            has_arg({"--mlock", "--mmap", "--no-mmap", "-dio", "--direct-io", "-ndio", "--no-direct-io"})) {
-            LOG_WRN("DEPRECATED: `--load-mode` and `--mlock`/`--mmap`/`--direct-io` should not be combined; only the last flag on the command line will take effect\n");
-        }
     };
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
@@ -893,6 +882,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+
+    // default the mmproj device to the global device selection if not set explicitly with -mmdev
+    if (params.mmproj_use_gpu && params.mmproj_device == nullptr && !params.devices.empty()) {
+        params.mmproj_device = params.devices.front();
+        params.mmproj_use_gpu = params.mmproj_device != nullptr;
+    }
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -1308,6 +1303,11 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
+        const int32_t target_ubatch_effective = ctx_arg.params.n_ubatch > 0
+                ? std::min(ctx_arg.params.n_batch, ctx_arg.params.n_ubatch)
+                : ctx_arg.params.n_batch;
+        common_validate_speculative_params(
+                ctx_arg.params.speculative, ctx_arg.params.n_ubatch, target_ubatch_effective);
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -2312,6 +2312,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--decode-overlap"},
+        "experimental: overlap backend-sampled decode or the first MTP draft step with result processing (default: disabled)",
+        [](common_params & params) {
+            params.decode_overlap = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DECODE_OVERLAP"));
+    add_opt(common_arg(
+        {"--decode-boundary-overlap"},
+        "experimental: overlap decode boundary preparation and update CUDA graphs (use with --decode-overlap) (default: disabled)",
+        [](common_params & params) {
+            params.decode_boundary_overlap = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DECODE_BOUNDARY_OVERLAP"));
+    add_opt(common_arg(
+        {"--ple-prefetch"},
+        "experimental: advise lazy row pages before CPU GET_ROWS (Linux; Windows unvalidated) (default: disabled)",
+        [](common_params & params) {
+            params.ple_prefetch = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PLE_PREFETCH"));
+    add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",
         [](common_params & params, const std::string & value) {
@@ -2420,6 +2441,55 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_kv_offload = !value;
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
+    add_opt(common_arg(
+        {"--kv-cpu-pinned"},
+        {"--no-kv-cpu-pinned"},
+        string_format("use pinned host buffers for CPU-resident KV cache storage when available; with operation offload enabled, attention compute can remain on the accelerator (default: %s)",
+                      params.kv_cpu_pinned ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.kv_cpu_pinned = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CPU_PINNED"));
+    add_opt(common_arg(
+        {"--recurrent-state-offload"},
+        {"--no-recurrent-state-offload"},
+        string_format("offload recurrent state independently of attention KV storage (default: %s)",
+                      params.recurrent_state_offload ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.recurrent_state_offload = value;
+        }
+    ).set_env("LLAMA_ARG_RECURRENT_STATE_OFFLOAD"));
+    add_opt(common_arg(
+        {"--phase-aware-workspace"},
+        {"--no-phase-aware-workspace"},
+        string_format("resize compute workspaces between prompt processing and token generation; later prompt turns regrow the prompt reservation (default: %s)",
+                      params.phase_aware_workspace ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.phase_aware_workspace = value;
+        }
+    ).set_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE"));
+    add_opt(common_arg(
+        {"--live-context-workspace"},
+        {"--no-live-context-workspace"},
+        string_format("for supported attention caches, grow the compute workspace reservation with the padded live "
+                      "physical KV extent instead of reserving the full context up front (default: %s)",
+                      params.live_context_workspace ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.live_context_workspace = value;
+        }
+    ).set_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE"));
+    add_opt(common_arg(
+        {"--kv-gpu-layers"}, "N",
+        string_format("with --no-kv-offload, keep the first N independently owned attention KV layers device-resident "
+                      "for standard and direct hybrid caches. Unsupported specialized caches ignore this option "
+                      "(default: %d)", params.kv_gpu_layers),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-gpu-layers must not be negative");
+            }
+            params.kv_gpu_layers = value;
+        }
+    ).set_env("LLAMA_ARG_KV_GPU_LAYERS"));
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
@@ -2620,7 +2690,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
-        "device to use for multimodal projector (none = don't offload, default: auto)\n"
+        "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
@@ -2698,32 +2768,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         ).set_env("LLAMA_ARG_RPC"));
     }
-    add_opt(common_arg(
-        {"--mlock"},
-        "DEPRECATED in favor of `--load-mode`: force system to keep model in RAM rather than swapping or compressing",
-        [](common_params & params) {
-            LOG_WRN("DEPRECATED: --mlock is deprecated. use --load-mode mlock instead\n");
-            params.load_mode = LLAMA_LOAD_MODE_MLOCK;
-        }
-    ).set_env("LLAMA_ARG_MLOCK"));
-    add_opt(common_arg(
-        {"--mmap"},
-        {"--no-mmap"},
-        "DEPRECATED in favor of `--load-mode`: whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock)",
-        [](common_params & params, bool value) {
-            LOG_WRN("DEPRECATED: --mmap and --no-mmap are deprecated. use --load-mode mmap instead\n");
-            params.load_mode = value ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
-        }
-    ).set_env("LLAMA_ARG_MMAP"));
-    add_opt(common_arg(
-        {"-dio", "--direct-io"},
-        {"-ndio", "--no-direct-io"},
-        "DEPRECATED in favor of `--load-mode`: use DirectIO if available",
-        [](common_params & params, bool value) {
-            LOG_WRN("DEPRECATED: --direct-io and --no-direct-io are deprecated. use --load-mode dio instead\n");
-            params.load_mode = value ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_NONE;
-        }
-    ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
         {"-lm", "--load-mode"}, "MODE",
         "model loading mode (default: auto)\n"
@@ -2821,6 +2865,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-size"}, "N",
+        "MoE expert cache: keep N expert slabs per expert tensor on GPU with LRU eviction; "
+        "cold experts live in CPU pinned memory. 0 disables (default). "
+        "When enabled, all MoE expert tensors use the cache regardless of --cpu-moe or --n-cpu-moe.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_moe_expert_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-l2-pinned-mb"}, "N",
+        "MoE expert cache: total mmap-only pinned host L2 cache budget in MiB. 0 disables (default).",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_cache_l2_pinned_size = (size_t) value * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_L2_PINNED_MB"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
@@ -3912,6 +3978,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOG_FILE"));
     add_opt(common_arg(
+        {"--log-jsonl"},
+        {"--no-log-jsonl"},
+        "Log as JSONL (one JSON object per line) to stdout, this also disables colored logging (default: disabled)",
+        [](common_params &, bool value) {
+            common_log_set_jsonl(common_log_main(), value);
+        }
+    ).set_env("LLAMA_ARG_LOG_JSONL"));
+    add_opt(common_arg(
         {"--log-prompts-dir"}, "PATH",
         "Log prompts to directory (auto-created if not present; only used for debugging, default: disabled)",
         [](common_params & params, const std::string & value) {
@@ -3946,6 +4020,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.verbosity = INT_MAX;
             common_log_set_verbosity_thold(INT_MAX);
+        }
+    ));
+    add_opt(common_arg(
+        {"--experimental-logs"},
+        "Enable experimental debug logs",
+        [](common_params & params) {
+            params.experimental_logs = true;
         }
     ));
     add_opt(common_arg(
@@ -4133,6 +4214,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--spec-draft-kv-gpu-layers", "--kv-gpu-layers-draft"}, "N",
+        "override target KV placement for the separate draft context and keep the first N independently owned "
+        "draft attention KV layers device-resident; shared KV layers follow their owner "
+        "(default: inherit target KV placement)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--spec-draft-kv-gpu-layers must not be negative");
+            }
+            params.speculative.draft.kv_gpu_layers = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS"));
+    add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
             parse_tensor_buffer_overrides(value, params.speculative.draft.tensor_buft_overrides);
@@ -4155,6 +4249,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--spec-draft-moe-expert-cache-size"}, "N",
+        "MoE expert cache size for the draft model; 0 disables the draft cache "
+        "(default: inherit --moe-expert-cache-size)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_moe_expert_cache_slots = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_EXPERT_CACHE_SIZE"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
@@ -4173,6 +4279,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-mtp-rs-planes"}, "N",
+        "total target recurrent-state planes for draft-mtp, including the current state (default: 0, allocate spec-draft-n-max + 1)",
+        [](common_params & params, int value) {
+            params.speculative.mtp_rs_planes = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_RS_PLANES"));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch-size", "--ubatch-size-draft", "-ubd"}, "N",
+        "physical maximum batch size for the draft context (default: 0, inherit target ubatch); "
+        "draft-mtp requires 0 or the target ubatch",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH"));
     add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
@@ -4231,7 +4355,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
-        "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
+        "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.devices = parse_device_list(value);

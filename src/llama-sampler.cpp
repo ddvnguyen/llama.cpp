@@ -1006,7 +1006,7 @@ struct llama_sampler * llama_sampler_chain_remove(struct llama_sampler * chain, 
     return result;
 }
 
-int llama_sampler_chain_n(const struct llama_sampler * chain) {
+int32_t llama_sampler_chain_n(const struct llama_sampler * chain) {
     const auto * p = (const llama_sampler_chain *) chain->ctx;
 
     return p->samplers.size();
@@ -2851,6 +2851,15 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, nullptr, 0, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
 }
 
+bool llama_sampler_grammar_is_active(const struct llama_sampler * smpl) {
+    if (!smpl || smpl->iface != &llama_sampler_grammar_i) {
+        return true;
+    }
+
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    return !ctx->grammar || !ctx->grammar->awaiting_trigger;
+}
+
 // penalties
 
 struct llama_sampler_penalties : public llama_sampler_backend {
@@ -2864,6 +2873,7 @@ struct llama_sampler_penalties : public llama_sampler_backend {
 
     // a frequency map to count token occurrences
     std::unordered_map<llama_token, int> token_count;
+    std::vector<int32_t> token_count_dense;
 
     // backend graph inputs
     ggml_tensor * inp_token_ids = nullptr;
@@ -2880,6 +2890,7 @@ struct llama_sampler_penalties : public llama_sampler_backend {
         // note: inp_token_ids/inp_counts belong to the current sampling graph
         prev        = src.prev;
         token_count = src.token_count;
+        token_count_dense = src.token_count_dense;
     }
 
     static bool is_disabled(
@@ -2907,7 +2918,8 @@ struct llama_sampler_penalties : public llama_sampler_backend {
         , penalty_repeat  (penalty_repeat)
         , penalty_freq    (penalty_freq)
         , penalty_present (penalty_present)
-        , prev            (penalty_last_n) {
+        , prev            (penalty_last_n)
+        , token_count_dense(std::max(n_vocab, 0), 0) {
     }
 };
 
@@ -2922,14 +2934,20 @@ static void llama_sampler_penalties_accept(struct llama_sampler * smpl, llama_to
         return;
     }
 
-    ctx->token_count[token]++;
+    const int count = ++ctx->token_count[token];
+    if (token >= 0 && token < ctx->n_vocab) {
+        ctx->token_count_dense[token] = count;
+    }
 
     // if the ring buffer is full, remove the oldest token
     if (ctx->prev.size() >= (size_t) ctx->penalty_last_n) {
         const auto old = ctx->prev.front();
 
-        ctx->token_count[old]--;
-        if (ctx->token_count[old] == 0) {
+        const int old_count = --ctx->token_count[old];
+        if (old >= 0 && old < ctx->n_vocab) {
+            ctx->token_count_dense[old] = old_count;
+        }
+        if (old_count == 0) {
             ctx->token_count.erase(old);
         }
     }
@@ -2956,12 +2974,17 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
 
     // Apply frequency and presence penalties to the cur_p
     for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
+        const llama_token token = cur_p->data[i].id;
+        int count = 0;
+        if (token >= 0 && token < ctx->n_vocab) {
+            count = ctx->token_count_dense[token];
+        } else {
+            const auto token_iter = ctx->token_count.find(token);
+            count = token_iter == ctx->token_count.end() ? 0 : token_iter->second;
+        }
+        if (count == 0) {
             continue;
         }
-
-        const int count = token_iter->second;
 
         assert(count > 0 && count <= ctx->penalty_last_n);
 
@@ -2983,6 +3006,7 @@ static void llama_sampler_penalties_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_penalties *) smpl->ctx;
     ctx->prev.clear();
     ctx->token_count.clear();
+    std::fill(ctx->token_count_dense.begin(), ctx->token_count_dense.end(), 0);
 }
 
 static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_sampler * smpl) {
@@ -3000,6 +3024,7 @@ static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_s
 
         result_ctx->prev        = ctx->prev;
         result_ctx->token_count = ctx->token_count;
+        result_ctx->token_count_dense = ctx->token_count_dense;
     }
 
     return result;
@@ -3887,6 +3912,7 @@ struct llama_sampler_logit_bias : public llama_sampler_backend {
     const int32_t n_vocab;
 
     const std::vector<llama_logit_bias> logit_bias;
+    const std::vector<llama_logit_bias> backend_bias;
 
     std::vector<llama_logit_bias> to_search;
 
@@ -3954,7 +3980,7 @@ static void llama_sampler_logit_bias_backend_apply(
         return;
     }
 
-    const size_t n = sctx->logit_bias.size();
+    const size_t n = sctx->backend_bias.size();
 
     if (sctx->inp_logit_bias == nullptr) {
         GGML_ASSERT(sctx->inp_logit_idxs == nullptr);
@@ -3986,12 +4012,12 @@ static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * sm
     GGML_ASSERT(sctx->inp_logit_bias != nullptr);
     GGML_ASSERT(sctx->inp_logit_idxs != nullptr);
 
-    const size_t n = sctx->logit_bias.size();
+    const size_t n = sctx->backend_bias.size();
 
     std::vector<float>   data_logit_bias(n, 0.0f);
     std::vector<int32_t> data_logit_idxs(n, 0);
     for (size_t i = 0; i < n; ++i) {
-        const auto & lb = sctx->logit_bias[i];
+        const auto & lb = sctx->backend_bias[i];
         GGML_ASSERT(lb.token >= 0 && lb.token < (int32_t) sctx->n_vocab);
         data_logit_bias[i] = lb.bias;
         data_logit_idxs[i] = lb.token;
@@ -4050,12 +4076,25 @@ struct llama_sampler * llama_sampler_init_logit_bias(
         return llama_sampler_init_empty("?logit-bias");
     }
 
+    // SET_ROWS requires unique indices. Add duplicate biases before uploading them.
+    std::vector<llama_logit_bias> backend_bias;
+    std::unordered_map<llama_token, size_t> indices;
+    for (int32_t i = 0; i < n_logit_bias; ++i) {
+        const auto inserted = indices.emplace(logit_bias[i].token, backend_bias.size());
+        if (inserted.second) {
+            backend_bias.push_back(logit_bias[i]);
+        } else {
+            backend_bias[inserted.first->second].bias += logit_bias[i].bias;
+        }
+    }
+
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_logit_bias_i,
         /* .ctx   = */ new llama_sampler_logit_bias {
             ("logit-bias"),
             /* .n_vocab        = */ n_vocab,
             /* .logit_bias     = */ std::vector<llama_logit_bias>(logit_bias, logit_bias + n_logit_bias),
+            /* .backend_bias   = */ std::move(backend_bias),
             /* .to_search      = */ {},
             /* .inp_logit_bias = */ nullptr,
             /* .inp_logit_idxs = */ nullptr,

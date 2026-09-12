@@ -6,8 +6,11 @@
 //    cmake -B build && cmake --build build --parallel && ./build/bin/test-chat ../minja/build/tests/*.jinja 2>/dev/null
 //
 #include "../src/llama-grammar.h"
+#include "../src/llama-model.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-speculative-replay.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -15,6 +18,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <fstream>
 #include <functional>
@@ -152,6 +156,272 @@ static common_chat_templates_ptr read_templates(const std::string & path) {
 static std::unique_ptr<llama_grammar> build_grammar(const std::string & grammar_str) {
     return std::unique_ptr<llama_grammar>(
         llama_grammar_init_impl(nullptr, grammar_str.c_str(), "root", false, nullptr, 0, nullptr, 0));
+}
+
+static void test_speculative_replay_state_transitions() {
+    server_speculative_replay_state state;
+
+    assert_equals(false, state.mtp_gpu_snapshots_armed());
+    assert_equals(false, state.mtp_gpu_replay_pending());
+    assert_equals(false, state.excludes_replayed_token_from_acceptance());
+
+    state.arm_mtp_gpu_snapshots();
+    state.arm_mtp_gpu_snapshots();
+    assert_equals(true, state.mtp_gpu_snapshots_armed());
+    state.discard_mtp_gpu_snapshot_arm();
+    assert_equals(false, state.mtp_gpu_snapshots_armed());
+
+    state.begin_checkpoint_replay();
+    state.begin_checkpoint_replay();
+    assert_equals(true, state.excludes_replayed_token_from_acceptance());
+    state.discard_mtp_gpu_snapshot_arm();
+    assert_equals(true, state.excludes_replayed_token_from_acceptance());
+    state.finish_verification();
+    assert_equals(false, state.excludes_replayed_token_from_acceptance());
+
+    const llama_tokens expected_tokens = { 11, 22, 33 };
+    llama_model_ptr sampler_model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+    common_params_sampling sampler_params;
+    sampler_params.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+    common_sampler_ptr sampler(common_sampler_init(sampler_model.get(), sampler_params));
+    common_sampler * sampler_ptr = sampler.get();
+
+    state.arm_mtp_gpu_snapshots();
+    state.begin_mtp_gpu_replay(expected_tokens, std::move(sampler), 2);
+    const bool sampler_moved = sampler == nullptr;
+    const bool replay_pending = state.mtp_gpu_replay_pending();
+    const uint32_t selected_token = state.mtp_gpu_replay_selected_token();
+
+    llama_tokens replayed_tokens = { 99 };
+    common_sampler_ptr replayed_sampler;
+    const uint32_t accepted = state.consume_mtp_gpu_replay(replayed_tokens, replayed_sampler);
+    const bool sampler_transferred = replayed_sampler.get() == sampler_ptr;
+    state.reset();
+
+    assert_equals(true, sampler_moved);
+    assert_equals(true, replay_pending);
+    assert_equals(uint32_t(2), selected_token);
+    assert_equals(true, replayed_tokens == expected_tokens);
+    assert_equals(true, sampler_transferred);
+    assert_equals(uint32_t(2), accepted);
+    assert_equals(false, state.mtp_gpu_replay_pending());
+    assert_equals(false, state.mtp_gpu_snapshots_armed());
+
+    state.arm_mtp_gpu_snapshots();
+    state.reset();
+    assert_equals(false, state.mtp_gpu_snapshots_armed());
+
+    llama_tokens pending_prompt = { 44, 55 };
+    std::vector<uint8_t> pending_mtp = { 6, 7 };
+    state.arm_mtp_gpu_snapshots();
+    state.begin_mtp_gpu_replay({ 66 }, std::move(replayed_sampler), 0);
+    const bool cleared_pending = server_clear_pending_mtp_gpu_replay_on_release(state, [&]() {
+        pending_prompt.clear();
+        pending_mtp.clear();
+    });
+    state.reset();
+    assert_equals(true, cleared_pending);
+    assert_equals(true, pending_prompt.empty());
+    assert_equals(true, pending_mtp.empty());
+    assert_equals(false, state.mtp_gpu_replay_pending());
+}
+
+static void test_server_slot_state_lifecycle_helpers() {
+    assert_equals(true, server_slot_state_file_io_supported(false));
+    assert_equals(false, server_slot_state_file_io_supported(true));
+
+    server_prompt_cache_state entry;
+    entry.prompt.tokens.push_back(9);
+    entry.data = {
+        /*.main =*/ { 1, 2, 3 },
+        /*.drft =*/ { 4, 5 },
+        /*.mtp  =*/ { 6, 7, 8 },
+    };
+    const server_prompt_data expected = entry.data;
+    int target_calls = 0;
+    int draft_calls = 0;
+    int mtp_calls = 0;
+    bool fail_draft = true;
+
+    auto restore = [&]() {
+        return server_prompt_cache_restore_data(
+            entry.data,
+            [&](const std::vector<uint8_t> & state) {
+                target_calls++;
+                return state == expected.main;
+            },
+            [&](const std::vector<uint8_t> & state) {
+                draft_calls++;
+                return state == expected.drft && !fail_draft;
+            },
+            [&](const std::vector<uint8_t> & state) {
+                mtp_calls++;
+                return state == expected.mtp;
+            });
+    };
+
+    assert_equals(false, restore());
+    assert_equals(size_t(1), entry.prompt.tokens.size());
+    assert_equals(llama_token(9), entry.prompt.tokens[0]);
+    assert_equals(true, entry.data.main == expected.main);
+    assert_equals(true, entry.data.drft == expected.drft);
+    assert_equals(true, entry.data.mtp == expected.mtp);
+    assert_equals(1, target_calls);
+    assert_equals(1, draft_calls);
+    assert_equals(0, mtp_calls);
+
+    fail_draft = false;
+    assert_equals(true, restore());
+    assert_equals(size_t(1), entry.prompt.tokens.size());
+    assert_equals(llama_token(9), entry.prompt.tokens[0]);
+    assert_equals(true, entry.data.main == expected.main);
+    assert_equals(true, entry.data.drft == expected.drft);
+    assert_equals(true, entry.data.mtp == expected.mtp);
+    assert_equals(2, target_calls);
+    assert_equals(2, draft_calls);
+    assert_equals(1, mtp_calls);
+}
+
+static void test_speculative_failed_batch_helpers() {
+    struct test_token {
+        int32_t id_slot;
+    };
+    struct test_case {
+        int32_t replay_slot_id;
+        bool include_batch_slots;
+        std::array<bool, 5> affected;
+    };
+
+    const std::vector<test_token> tokens = { { 1 }, { 3 }, { 1 } };
+    const std::array<test_case, 4> cases = {
+        test_case {  2, false, { false, false, true,  false, false } },
+        test_case {  2, true,  { false, false, true,  false, false } },
+        test_case { -1, true,  { false, true,  false, true,  false } },
+        test_case { -1, false, { false, false, false, false, false } },
+    };
+
+    for (const auto & test : cases) {
+        std::array<server_speculative_replay_state, 5> states;
+        std::array<std::vector<uint8_t>, 5> mtp_states;
+        for (auto & state : states) {
+            state.arm_mtp_gpu_snapshots();
+        }
+        for (size_t slot_id = 0; slot_id < states.size(); ++slot_id) {
+            mtp_states[slot_id] = { uint8_t(slot_id + 1) };
+            if (server_failed_batch_slot_is_affected(
+                        test.replay_slot_id, test.include_batch_slots, tokens, int32_t(slot_id))) {
+                states[slot_id].reset();
+                const bool cleared = server_clear_mtp_slot_state([&](const std::vector<uint8_t> & data) {
+                    mtp_states[slot_id] = data;
+                    return true;
+                });
+                assert_equals(true, cleared);
+            }
+        }
+        for (size_t slot_id = 0; slot_id < states.size(); ++slot_id) {
+            assert_equals(test.affected[slot_id], !states[slot_id].mtp_gpu_snapshots_armed());
+            assert_equals(test.affected[slot_id], mtp_states[slot_id].empty());
+        }
+    }
+
+    std::vector<uint8_t> parent_state = { 1, 2, 3, 4 };
+    std::vector<uint8_t> child_state  = { 9 };
+    bool copied = server_copy_mtp_slot_state(
+        [&](std::vector<uint8_t> & data) {
+            data = parent_state;
+            return true;
+        },
+        [&](const std::vector<uint8_t> & data) {
+            child_state = data;
+            return true;
+        });
+    assert_equals(true, copied);
+    assert_equals(true, parent_state == child_state);
+
+    child_state = { 9 };
+    copied = server_copy_mtp_slot_state(
+        [&](std::vector<uint8_t> & data) {
+            data = { 8, 8 };
+            return false;
+        },
+        [&](const std::vector<uint8_t> & data) {
+            child_state = data;
+            return true;
+        });
+    assert_equals(false, copied);
+    assert_equals(true, child_state.empty());
+
+    child_state = { 9 };
+    copied = server_copy_mtp_slot_state(
+        [&](std::vector<uint8_t> & data) {
+            data.clear();
+            return true;
+        },
+        [&](const std::vector<uint8_t> & data) {
+            child_state = data;
+            return true;
+        });
+    assert_equals(true, copied);
+    assert_equals(true, child_state.empty());
+
+    int restore_calls = 0;
+    child_state = { 9 };
+    copied = server_copy_mtp_slot_state(
+        [&](std::vector<uint8_t> & data) {
+            data = parent_state;
+            return true;
+        },
+        [&](const std::vector<uint8_t> & data) {
+            restore_calls++;
+            child_state = data;
+            return data.empty();
+        });
+    assert_equals(false, copied);
+    assert_equals(3, restore_calls);
+    assert_equals(true, child_state.empty());
+    const bool cleared = server_clear_mtp_slot_state([&](const std::vector<uint8_t> &) {
+        return false;
+    });
+    assert_equals(false, cleared);
+
+    common_prompt_checkpoint checkpoint;
+    checkpoint.data_tgt  = { 1 };
+    checkpoint.data_dft  = { 2 };
+    checkpoint.data_spec = { 3 };
+    checkpoint.data_mtp  = { 4, 5 };
+    assert_equals(size_t(5), checkpoint.size());
+    checkpoint.clear_dft();
+    assert_equals(size_t(1), checkpoint.size());
+    assert_equals(true, checkpoint.data_mtp.empty());
+
+    assert_equals(false, server_batch_range_has_slot(tokens, 1, 1, 1));
+    assert_equals(true,  server_batch_range_has_slot(tokens, 1, 1, 3));
+    assert_equals(true,  server_batch_range_has_slot(tokens, 2, 1, 1));
+    assert_equals(true,  server_batch_range_has_slot(tokens, 1, 2, 1));
+    assert_equals(true,  server_batch_range_has_slot(tokens, 1, 2, 3));
+    assert_equals(false, server_batch_range_has_slot(tokens, 0, 2, 4));
+
+    struct retry_case {
+        int32_t n_batch;
+        int32_t span;
+        int32_t expected;
+    };
+    const std::array<retry_case, 6> retry_cases = {
+        retry_case { 24, 6, 12 },
+        retry_case { 18, 6,  6 },
+        retry_case { 12, 6,  6 },
+        retry_case {  8, 6,  0 },
+        retry_case {  6, 6,  0 },
+        retry_case { 25, 6, 12 },
+    };
+    for (const auto & test : retry_cases) {
+        assert_equals(test.expected, server_atomic_batch_retry_size(test.n_batch, test.span));
+    }
+
+    assert_equals(true,  server_atomic_batch_decode_is_retryable(1));
+    assert_equals(false, server_atomic_batch_decode_is_retryable(2));
+    assert_equals(false, server_atomic_batch_decode_is_retryable(-1));
+    assert_equals(false, server_atomic_batch_decode_is_retryable(-2));
 }
 
 // Helper to format a code point as a readable string
@@ -4405,6 +4675,100 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // Spark2.5 uses tagged arguments with forced-open thinking.
+    {
+        auto tst = peg_tester("models/templates/Spark2.5.jinja", detailed_debug);
+
+        tst.test("Hello, world!\nWhat's up?")
+            .enable_thinking(false)
+            .expect(message_assist)
+            .expect_reconstruction()
+            .run();
+
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "<tool_call>special_function"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "</tool_call>")
+            .enable_thinking(false)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "I'm\nthinking</think>"
+               "<tool_call>special_function"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "<tool_call>special_function"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "</tool_call>"
+               "<tool_call>special_function_with_opt"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "<arg_key>arg2</arg_key><arg_value>2</arg_value>"
+               "</tool_call>")
+            .enable_thinking(false)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, special_function_tool_with_optional_param })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "Preparing updates."
+               "<tool_call>magic_int"
+               "<arg_key>ref</arg_key><arg_value>42</arg_value>"
+               "<arg_key>name</arg_key><arg_value>上海</arg_value>"
+               "</tool_call>"
+               "<tool_call>amount"
+               "<arg_key>orig</arg_key><arg_value>2.5</arg_value>"
+               "</tool_call>"
+               "<tool_call>toggle"
+               "<arg_key>enabled</arg_key><arg_value>true</arg_value>"
+               "</tool_call>"
+               "<tool_call>set_config"
+               "<arg_key>config</arg_key><arg_value>{\"source\": \"spark\", \"options\": {\"strict\": true}}</arg_value>"
+               "</tool_call>"
+               "<tool_call>nested_args"
+               "<arg_key>tags</arg_key><arg_value>[\"alpha\", \"测试\"]</arg_value>"
+               "<arg_key>entries</arg_key><arg_value>[{\"id\": 1, \"label\": \"first\"}, {\"id\": 2, \"label\": \"第二\"}]</arg_value>"
+               "</tool_call>"
+               "<tool_call>empty_args"
+               "</tool_call>")
+            .enable_thinking(false)
+            .parallel_tool_calls(true)
+            .tools({ magic_int_tool, amount_tool, toggle_tool, config_tool, nested_args_tool, empty_args_tool })
+            .expect_content("Preparing updates.")
+            .expect_tool_calls({
+                { "magic_int", R"({"ref": 42, "name": "上海"})", {} },
+                { "amount", R"({"orig": 2.5})", {} },
+                { "toggle", R"({"enabled": true})", {} },
+                { "set_config", R"({"config": {"source": "spark", "options": {"strict": true}}})", {} },
+                { "nested_args", R"({"tags": ["alpha", "测试"], "entries": [{"id": 1, "label": "first"}, {"id": 2, "label": "第二"}]})", {} },
+                { "empty_args", "{}", {} },
+            })
+            .expect_reconstruction()
+            .run();
+    }
+
     // Verify the throw path produces a readable error message, not std::out_of_range.
     // #20424 introduced effective_input = generation_prompt + input, but the throw
     // uses input.substr(result.end) where result.end is in effective_input space.
@@ -7238,6 +7602,9 @@ int main(int argc, char ** argv) {
         test_reasoning_effort_caps();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_speculative_replay_state_transitions();
+        test_server_slot_state_lifecycle_helpers();
+        test_speculative_failed_batch_helpers();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }

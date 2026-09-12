@@ -18,6 +18,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+                     bool   offload_attn,
+ llama_memory_placement_options placement,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
@@ -25,7 +27,6 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -37,7 +38,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         type_k,
         type_v,
         v_trans,
-        offload,
+        offload_attn,
         unified,
         kv_size,
         n_seq_max,
@@ -49,13 +50,14 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        placement
     )),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,
         type_s,
-        offload,
+        placement.recurrent_offload,
         rs_size,
         n_seq_max,
         n_rs_seq,
@@ -126,6 +128,14 @@ llama_memory_context_ptr llama_memory_hybrid::init_full() {
     return std::make_unique<llama_memory_hybrid_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid::init_reserve(uint32_t n_kv) {
+    return std::make_unique<llama_memory_hybrid_context>(this, mem_attn->init_reserve(n_kv));
+}
+
+uint32_t llama_memory_hybrid::get_attn_reserve_capacity() const {
+    return mem_attn->get_attn_reserve_capacity();
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
@@ -135,9 +145,26 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid::recurrent_sparse_snapshots_supported() const {
+    return mem_recr->recurrent_sparse_snapshots_supported();
+}
+
+bool llama_memory_hybrid::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) {
+    return mem_recr->recurrent_set_sparse_snapshot_mode(enabled, selected_token);
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
+}
+
+bool llama_memory_hybrid::can_decode_sampled() const {
+    return mem_attn->can_decode_sampled() && mem_recr->can_decode_sampled();
+}
+
+void llama_memory_hybrid::seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) {
+    mem_attn->seq_set_last_token(seq_id, pos, token);
+    mem_recr->seq_set_last_token(seq_id, pos, token);
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -218,6 +245,14 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * m
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(
+              llama_memory_hybrid * mem,
+        llama_memory_context_ptr   ctx_attn) :
+    ctx_attn(std::move(ctx_attn)),
+    ctx_recr(mem->get_mem_recr()->init_full()),
+    status(llama_memory_status_combine(this->ctx_attn->get_status(), ctx_recr->get_status())) {
+}
+
+llama_memory_hybrid_context::llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
               llama_context * lctx,
                        bool   optimize) :
@@ -268,6 +303,10 @@ llama_memory_status llama_memory_hybrid_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+uint32_t llama_memory_hybrid_context::get_attn_reserve_n_kv() const {
+    return ctx_attn->get_attn_reserve_n_kv();
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {

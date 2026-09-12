@@ -1091,6 +1091,10 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         if (op->ne[3] != 1) {
             return {false, "GET_ROWS/SET_ROWS with ne[3] != 1 (ne[3]=" + std::to_string(op->ne[3]) + ") is not supported"};
         }
+        if (op->op == GGML_OP_GET_ROWS && ggml_is_quantized(op->src[0]->type) &&
+            op->src[0]->view_src != nullptr && op->src[0]->view_offs != 0) {
+            return {false, "GET_ROWS with a nonzero quantized src0 view offset is not supported"};
+        }
         if (op->op == GGML_OP_GET_ROWS && ggml_openvino_get_device_name() == "GPU" &&
             op->src[0]->type == GGML_TYPE_BF16) {
             return {false, "GET_ROWS with BF16 src0 is not supported on GPU"};
@@ -1311,6 +1315,9 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_GATED_DELTA_NET: {
+        if (!ggml_gated_delta_net_has_default_snapshot_params(op)) {
+            return true;
+        }
         // enable after https://github.com/openvinotoolkit/openvino/pull/35917 is included in OV release
         // return true;
         // if (ggml_openvino_get_device_name() == "GPU" && op->src[0]->ne[2] > 1) {

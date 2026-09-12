@@ -116,6 +116,8 @@ enum llm_type {
     LLM_TYPE_17B_16E, // llama4 Scout
     LLM_TYPE_17B_128E, // llama4 Maverick
     LLM_TYPE_A13B,
+    LLM_TYPE_1B_A400M, // Granite3 MoE
+    LLM_TYPE_3B_A800M, // Granite3 MoE
     LLM_TYPE_7B_A1B,
     LLM_TYPE_8B_A1B, // lfm2moe
     LLM_TYPE_7_9B_A1_3B, // Ling-3.0-tiny
@@ -126,6 +128,7 @@ enum llm_type {
     LLM_TYPE_26B_A4B, // Gemma4
     LLM_TYPE_30B_A3B,
     LLM_TYPE_31B_A3_5B,
+    LLM_TYPE_32B_A9B, // Granite4 Hybrid
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
     LLM_TYPE_75B_A9B, // Nemotron 3 Puzzle
@@ -229,6 +232,7 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
 
+    // qwen4exp: the MTP head's mixer; collapses the streams and stands in for the output norm
     struct ggml_tensor * hc_head_norm          = nullptr;
     struct ggml_tensor * hc_head_down          = nullptr;
     struct ggml_tensor * hc_head_up            = nullptr;
@@ -747,6 +751,10 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+    int32_t moe_expert_cache_slots() const;
+
+    void prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) const;
+    void prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
@@ -768,6 +776,8 @@ struct llama_model {
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+
+    virtual bool graph_supports_recurrent_sparse_snapshots() const;
 
 protected:
     llama_model_params params;

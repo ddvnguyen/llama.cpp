@@ -14,6 +14,12 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+struct llama_memory_placement_options {
+    bool cpu_pinned = false;
+    uint32_t gpu_resident_layers = 0;
+    bool recurrent_offload = false;
+};
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
@@ -64,6 +70,9 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // Maximum physical attention-KV extent needed by every ubatch prepared in this context. Zero means the memory type does not expose a bounded view.
+    virtual uint32_t get_attn_reserve_n_kv() const { return 0; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -93,12 +102,36 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // Simulate an attention cache whose graph-visible physical extent is bounded by n_kv. Unsupported memory types retain full reservation.
+    virtual llama_memory_context_ptr init_reserve(uint32_t n_kv) {
+        GGML_UNUSED(n_kv);
+        return init_full();
+    }
+
+    // Nonzero only when init_reserve() implements a bounded attention layout.
+    virtual uint32_t get_attn_reserve_capacity() const { return 0; }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
 
     // getters
     virtual bool get_can_shift() const = 0;
+
+    // Allow a deferred token value and removal of the last decoded position.
+    virtual bool can_decode_sampled() const { return false; }
+    virtual void seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(pos);
+        GGML_UNUSED(token);
+    }
+
+    virtual bool recurrent_sparse_snapshots_supported() const { return false; }
+    virtual bool recurrent_set_sparse_snapshot_mode(bool, int32_t) { return false; }
+
+    virtual bool get_supports_partial_kv() const {
+        return false;
+    }
 
     //
     // ops

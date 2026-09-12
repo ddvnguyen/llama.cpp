@@ -31,6 +31,8 @@ bool llama_batch_allocr::init(
         bool output_all) {
     clear();
 
+    verification_span = 0;
+
     batch = batch_inp;
 
     this->vocab = &vocab;
@@ -456,6 +458,14 @@ std::vector<int32_t> & llama_batch_allocr::get_out_ids() {
     return out_ids;
 }
 
+void llama_batch_allocr::set_verification_span(uint32_t span) {
+    verification_span = span;
+}
+
+uint32_t llama_batch_allocr::get_verification_span() const {
+    return verification_span;
+}
+
 llama_pos llama_batch_allocr::seq_pos_min(llama_seq_id seq_id) const {
     return seq_pos[seq_id].empty() ? -1 : *seq_pos[seq_id].begin();
 }
@@ -474,6 +484,11 @@ void llama_batch_allocr::split_reset() {
 }
 
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+    // atomic target-verification batches must keep each span in one ubatch
+    if (verification_span > 1) {
+        return split_equal(n_ubatch, false, 0);
+    }
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {

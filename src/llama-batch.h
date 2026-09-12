@@ -92,6 +92,11 @@ public:
     // the array of output indices in the order they were encountered during the ubatch splitting
     std::vector<int32_t> & get_out_ids();
 
+    // atomic target-verification batches must keep each sequence's span in one ubatch
+    // and group the rows by sequence; set the span before calling the split methods
+    void set_verification_span(uint32_t span);
+    uint32_t get_verification_span() const;
+
     // min/max positions of each sequence in the current ubatch
     llama_pos seq_pos_min(llama_seq_id seq_id) const;
     llama_pos seq_pos_max(llama_seq_id seq_id) const;
@@ -166,6 +171,9 @@ private:
     std::vector<int32_t> out_ids;
 
     uint32_t n_used;
+
+    // when > 1, the batch is an atomic target-verification batch of that span and must be split grouped by sequence
+    uint32_t verification_span = 0;
 
     // used[i] indicates if token i has already been used in a previous ubatch
     std::vector<bool> used;

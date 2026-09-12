@@ -48,6 +48,13 @@ typedef struct ggml_gallocr * ggml_gallocr_t;
 GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
+// A NULL owner creates the shared-buffer owner. Otherwise, galloc attaches as the only borrower for matching buffer types.
+// Shared buffers use the largest published requirement and shrink after every active role republishes.
+// A generation change invalidates graph addresses. A shrink-generation change invalidates cached reserve plans.
+// Shared buffers remain valid until both roles detach.
+GGML_API bool           ggml_gallocr_set_resizable(ggml_gallocr_t galloc, ggml_gallocr_t owner);
+GGML_API void           ggml_gallocr_get_resizable_state(ggml_gallocr_t galloc, uint64_t * generation, uint64_t * shrink_generation);
+GGML_API void           ggml_gallocr_request_shrink(ggml_gallocr_t galloc);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations
@@ -62,6 +69,14 @@ GGML_API void ggml_gallocr_reserve_n_size(
     const int * leaf_buffer_ids,
     size_t * sizes);
 GGML_API bool ggml_gallocr_reserve_n(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph,
+    const int * node_buffer_ids,
+    const int * leaf_buffer_ids);
+
+// Replan without allocating, freeing or resizing buffers. False requires a regular reserve before allocation.
+// Shared/resizable buffers are not supported. A failed attempt may change the allocation plan.
+GGML_API bool ggml_gallocr_reserve_n_if_fits(
     ggml_gallocr_t galloc,
     struct ggml_cgraph * graph,
     const int * node_buffer_ids,

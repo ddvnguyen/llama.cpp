@@ -10,7 +10,7 @@ function(llama_build source)
     endif()
 
     add_executable(${TEST_TARGET} ${TEST_SOURCES})
-    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common) # TODO: [TAG_TESTS_LLAMA_LINK]
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
@@ -152,6 +152,8 @@ llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(test-recurrent-state-rollback PRIVATE LLAMA_TEST_RECURRENT_INTERNALS)
+
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
     llama_build_and_test(test-sampling.cpp)
@@ -196,7 +198,28 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-    llama_build_and_test(test-llama-archs.cpp)
+    llama_build(test-llama-archs.cpp)
+
+    llama_test(
+        test-llama-archs
+        NAME test-phase-aware-workspace
+        LABEL main
+        ARGS --test-phase-workspace
+    )
+
+    llama_test(
+        test-llama-archs
+        NAME test-live-context-workspace
+        LABEL main
+        ARGS --test-live-context-workspace
+    )
+
+    llama_test(
+        test-llama-archs
+        NAME test-speculative-limits
+        LABEL main
+        ARGS --test-speculative-limits
+    )
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -238,6 +261,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-kimi-k3
+        LABEL main
+        ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
 
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
@@ -246,6 +278,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --models "${MODEL_DIR}"
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    llama_build(test-fusion.cpp)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
@@ -267,6 +301,8 @@ llama_build_and_test(
     peg-parser/test-unicode.cpp
     peg-parser/tests.h
 )
+target_precompile_headers(test-peg-parser PRIVATE peg-parser/tests.h)
+
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
@@ -297,14 +333,14 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
-llama_build_and_test(test-backend-ops.cpp)
 
-# the tensor API kernels come from a separate metallib - check they produce correct results
-# ref: https://github.com/ggml-org/llama.cpp/issues/27473
-if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)
-    llama_test(test-backend-ops NAME test-backend-ops-metallib-tensor
-               ARGS test -b MTL0 -o MUL_MAT -p type_a=q6_K)
-    set_tests_properties(test-backend-ops-metallib-tensor PROPERTIES ENVIRONMENT GGML_METAL_TENSOR_ENABLE=1)
+# TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
+llama_build(test-backend-ops.cpp)
+if (GGML_RPC AND UNIX)
+    target_compile_definitions(test-backend-ops PRIVATE GGML_TEST_RPC)
+    target_link_libraries(test-backend-ops PRIVATE ggml-rpc)
+    llama_test(test-backend-ops NAME test-backend-ops-rpc-gdn-rejection LABEL main ARGS --rpc-gdn-rejection)
+    set_tests_properties(test-backend-ops-rpc-gdn-rejection PROPERTIES TIMEOUT 15)
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
@@ -376,4 +412,19 @@ llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+endif()
+
+# This test uses internal symbols that are not exported from Windows DLLs.
+#
+# The test is a plain .cpp (no device kernels, only host-side cudaMalloc /
+# cudaMemcpyAsync calls), so it does not require enable_language(CUDA) in
+# this directory scope. CUDA headers + libcudart come in via CUDA::cudart.
+if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(test-moe-cache test-moe-cache.cpp)
+    target_compile_features(test-moe-cache PRIVATE cxx_std_17)
+    target_link_libraries(test-moe-cache PRIVATE llama ggml-cuda ggml-base CUDA::cudart)
+    target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-moe-cache COMMAND test-moe-cache)
+    set_property(TEST test-moe-cache PROPERTY LABELS "main")
 endif()

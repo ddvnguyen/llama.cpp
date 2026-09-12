@@ -191,7 +191,7 @@ ggml_tensor * llama_model_minimax_m3::graph::build_attn_msa_fa(
 
     ggml_tensor * o = ggml_flash_attn_ext(ctx0, q, k, v, mask, kq_scale,
                                           hparams.f_max_alibi_bias, 0.0f);
-    ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+    ggml_prec_set_acc(o, GGML_PREC_F32);
     cb(o, "msa_fattn", il);
 
     // [D, Gp, R, C] -> [D, Gp, C, R] -> [n_embd, T]
@@ -365,8 +365,8 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                 ggml_build_forward_expand(gf, Qcur);
                 ggml_build_forward_expand(gf, Kcur);
                 ggml_build_forward_expand(gf, Vcur);
-                ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
-                ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+                mctx_cur->build_kv_store(
+                        gf, ctx0, Kcur, inp_attn->get_k_idxs(), Vcur, inp_attn->get_v_idxs(), il);
                 ggml_tensor * k = mctx_cur->get_k(ctx0, il);
                 ggml_tensor * v = mctx_cur->get_v(ctx0, il);
                 GGML_ASSERT(!(v->nb[1] > v->nb[2]) && "MSA assumes v_trans=false (FA on)");
@@ -389,7 +389,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                     ggml_tensor * iq4 = ggml_reshape_4d(ctx0, iq, n_idx_dim, Hd, 1, ns);
                     ggml_tensor * sc  = ggml_mul_mat(ctx0,
                             ggml_reshape_4d(ctx0, ikp, n_idx_dim, n_ps, 1, ns), iq4);
-                    ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+                    ggml_prec_set_acc(sc, GGML_PREC_F32);
                     // unmapped positions come out -inf, so they can never rank into the top-k
                     sc = ggml_add_inplace(ctx0, sc,
                             ggml_reshape_4d(ctx0, msa->pos_mask, n_ps, 1, 1, ns));
@@ -471,7 +471,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                         ggml_tensor * sc = ggml_mul_mat(ctx0, ikp,
                                 ggml_reshape_2d(ctx0, iq_s, n_idx_dim, Hd*n_tps));
                         // indexer scores run in F32
-                        ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+                        ggml_prec_set_acc(sc, GGML_PREC_F32);
                         sc = ggml_reshape_3d(ctx0, sc, n_ps, Hd, n_tps);
                         // unmapped positions (holes, padding, empty cells) come out -inf
                         sc = ggml_add_inplace(ctx0, sc, pm_s);

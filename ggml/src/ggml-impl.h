@@ -28,6 +28,8 @@
 extern "C" {
 #endif
 
+GGML_API bool ggml_gated_delta_net_validate(const struct ggml_tensor * tensor);
+
 void ggml_print_backtrace(void);
 
 uint64_t ggml_graph_next_uid(void);
@@ -160,6 +162,18 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
     return ((const float *)(tensor->op_params))[i];
 }
 
+// [TAG_GGML_PREC]
+// - GGML_OP_MUL_MAT
+//   0 - acc
+//   1 - hint
+//   2 - src0 precision
+//   3 - src1 precision
+//
+// - GGML_OP_MUL_MAT_ID
+//   0 - acc
+//   1 - hint
+//   2 - src0 precision
+//   3 - src1 precision
 static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int32_t value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
     ((int32_t *)(tensor->op_params))[i] = value;
@@ -344,6 +358,9 @@ struct ggml_cgraph {
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored
     uint64_t uid;
+
+    // execution-only metadata; it is not part of the graph topology
+    struct ggml_graph_execution_certificate execution_certificate;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)

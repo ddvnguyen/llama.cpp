@@ -18,6 +18,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                  uint32_t   kv_size,
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
+                     bool   offload_attn,
+ llama_memory_placement_options placement,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
@@ -25,7 +27,6 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -36,7 +37,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         type_k,
         type_v,
         v_trans,
-        offload,
+        offload_attn,
         swa_full,
         unified,
         kv_size,
@@ -48,13 +49,14 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        placement
     )),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,
         type_s,
-        offload,
+        placement.recurrent_offload,
         rs_size,
         n_seq_max,
         n_rs_seq,
@@ -129,6 +131,14 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_full() {
     return std::make_unique<llama_memory_hybrid_iswa_context>(this);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_iswa::init_reserve(uint32_t n_kv) {
+    return std::make_unique<llama_memory_hybrid_iswa_context>(this, mem_attn->init_reserve(n_kv));
+}
+
+uint32_t llama_memory_hybrid_iswa::get_attn_reserve_capacity() const {
+    return mem_attn->get_attn_reserve_capacity();
 }
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * lctx, bool optimize) {
@@ -223,6 +233,14 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_
 }
 
 llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
+              llama_memory_hybrid_iswa * mem,
+        llama_memory_context_ptr          ctx_attn) :
+    ctx_attn(std::move(ctx_attn)),
+    ctx_recr(mem->get_mem_recr()->init_full()),
+    status(llama_memory_status_combine(this->ctx_attn->get_status(), ctx_recr->get_status())) {
+}
+
+llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
         llama_memory_hybrid_iswa * mem,
                    llama_context * lctx,
                             bool   optimize) :
@@ -274,6 +292,10 @@ llama_memory_status llama_memory_hybrid_iswa_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_iswa_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+uint32_t llama_memory_hybrid_iswa_context::get_attn_reserve_n_kv() const {
+    return ctx_attn->get_attn_reserve_n_kv();
 }
 
 const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn() const {

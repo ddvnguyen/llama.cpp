@@ -5149,6 +5149,10 @@ void ggml_compute_forward_get_rows(
 
     const ggml_tensor * src0 = dst->src[0];
 
+    if (params->get_rows_callback && params->ith == 0) {
+        params->get_rows_callback(src0, dst->src[1], params->get_rows_callback_data);
+    }
+
     switch (src0->type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
@@ -5288,12 +5292,59 @@ static void ggml_compute_forward_set_rows_impl(
     }
 }
 
+template<typename idx_t>
+static void ggml_compute_forward_set_rows_copy_impl(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(ne0 == ne00 && ne2 == ne02 && ne3 == ne03);
+    GGML_ASSERT(ne02 % ne11 == 0 && ne03 % ne12 == 0);
+
+    const int64_t dr  = (ne01 + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = std::min(ir0 + dr, ne01);
+    const size_t row_bytes = ggml_row_size(src0->type, ne00);
+
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            for (int64_t i = ir0; i < ir1; ++i) {
+                const int64_t i12 = i03 % ne12;
+                const int64_t i11 = i02 % ne11;
+                const int64_t i1 = *(const idx_t *) ((const char *) src1->data +
+                        i*nb10 + i11*nb11 + i12*nb12);
+
+                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+
+                memcpy((char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3,
+                       (const char *) src0->data + i*nb01 + i02*nb02 + i03*nb03,
+                       row_bytes);
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_set_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    if (src0->type == dst->type) {
+        if (src1->type == GGML_TYPE_I64) {
+            ggml_compute_forward_set_rows_copy_impl<int64_t>(params, dst);
+        } else if (src1->type == GGML_TYPE_I32) {
+            ggml_compute_forward_set_rows_copy_impl<int32_t>(params, dst);
+        } else {
+            GGML_ABORT("src1->type = %d (%s) not supported", src1->type, ggml_type_name(src1->type));
+        }
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32:
@@ -8611,6 +8662,11 @@ void ggml_compute_forward_top_k(
     }
 }
 
+static int64_t ggml_flash_attn_causal_prefix_bound(const ggml_tensor * mask, int64_t row) {
+    GGML_ASSERT(mask->type == GGML_TYPE_I64);
+    return *(const int64_t *) ((const char *) mask->data + row*mask->nb[0]) + 1;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8624,6 +8680,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const bool compact_causal_prefix = mask && mask->type == GGML_TYPE_I64;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8718,7 +8775,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const ggml_fp16_t * mp = mask && !compact_causal_prefix ?
+            (const ggml_fp16_t *) ((const char *) mask->data + iq1*mask->nb[1] +
+                (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
+        const int64_t causal_prefix_bound = compact_causal_prefix ? ggml_flash_attn_causal_prefix_bound(mask, iq1) : 0;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8736,7 +8796,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            float mv = 0.0f;
+            if (compact_causal_prefix) {
+                mv = ic < causal_prefix_bound ? 0.0f : -INFINITY;
+            } else if (mp) {
+                mv = slope*GGML_CPU_FP16_TO_FP32(mp[ic]);
+            }
             if (mv == -INFINITY) {
                 continue;
             }
@@ -8858,6 +8923,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const bool compact_causal_prefix = mask && mask->type == GGML_TYPE_I64;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8999,11 +9065,22 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             if (mask) {
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
-                    for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
-                        if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
-                            can_skip = false;
+                    if (compact_causal_prefix) {
+                        const int64_t causal_prefix_bound = ggml_flash_attn_causal_prefix_bound(mask, iq1 + tq);
+                        for (int tk = 0; tk < kv_tile; tk++) {
+                            mask32[tq * KV_TILE_SZ + tk] = ic + tk < causal_prefix_bound ? 0.0f : -INFINITY;
+                            if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                                can_skip = false;
+                            }
+                        }
+                    } else {
+                        const ggml_fp16_t * mp_row = (const ggml_fp16_t *) ((const char *) mask->data +
+                                (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                        for (int tk = 0; tk < kv_tile; tk++) {
+                            mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                            if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                                can_skip = false;
+                            }
                         }
                     }
                     // Pad remaining mask entries with -inf
@@ -10934,6 +11011,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
+    const int32_t trailing_snapshots = ggml_get_op_params_i32(dst, 1);
+    const int32_t selected_token = ggml_get_op_params_i32(dst, 2);
+    const bool reserve_input = ggml_get_op_params_i32(dst, 3) != 0;
     GGML_ASSERT(K >= 1);
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
@@ -10946,14 +11026,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
-    // new_states:  S_v * S_v * H * n_seqs * K     floats  (K snapshot slots; last min(n_tokens, K))
+    // new_states:  S_v * S_v * H * n_seqs * K     floats  (K physical snapshot slots)
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
 
-    // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
-    // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+    // Slots not selected by the snapshot parameters are caller-owned.
 
     const float * state_in_base = (const float *)src_state->data;
 
@@ -10984,6 +11063,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+
+        if (K > 1 && reserve_input) {
+            float * input_state_o = state_out_base + (K - 1) * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
+            memcpy(input_state_o, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -11034,8 +11118,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             attn_data += S_v * H; // advance to next token
 
             if (K > 1) {
-                const int64_t target_slot = n_tokens - 1 - t;
-                if (target_slot >= 0 && target_slot < K) {
+                const int64_t target_slot = selected_token >= 0 ? (t == selected_token ? 0 : -1) : n_tokens - 1 - t;
+                const int32_t snapshot_slots = selected_token >= 0 ? 1 : trailing_snapshots;
+                if (target_slot >= 0 && target_slot < snapshot_slots) {
                     float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
                                      (iv3 * H + iv1) * S_v * S_v;
                     memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
@@ -11090,6 +11175,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
 void ggml_compute_forward_gated_delta_net(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    GGML_ASSERT(ggml_gated_delta_net_validate(dst));
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {

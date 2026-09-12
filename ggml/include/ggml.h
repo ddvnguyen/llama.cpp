@@ -385,6 +385,47 @@ extern "C" {
     struct ggml_context;
     struct ggml_cgraph;
 
+#define GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC 0x47455831u
+#define GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION 1u
+
+    enum ggml_graph_execution_domain {
+        GGML_GRAPH_EXECUTION_DOMAIN_INVALID = 0,
+        GGML_GRAPH_EXECUTION_DOMAIN_MAIN    = 1,
+        GGML_GRAPH_EXECUTION_DOMAIN_DRAFT   = 2,
+        GGML_GRAPH_EXECUTION_DOMAIN_MTP     = 3,
+    };
+
+    enum ggml_graph_execution_row_semantics {
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID     = 0,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT = 1,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL  = 2,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE = 3,
+    };
+
+    enum ggml_graph_execution_certificate_flag {
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE             = 0,
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED = 1u << 0,
+    };
+
+    // Callers initialize all fields except source_graph_uid and split_graph_uid, which must be zero.
+    // owner_namespace isolates an owner; owner_generation changes when that owner's reusable state is replaced.
+    // The scheduler stamps the graph UIDs for each backend split. Invalid input is treated as uncertified execution.
+    struct ggml_graph_execution_certificate {
+        uint32_t magic;
+        uint32_t abi_version;
+        uint32_t struct_size;
+        uint32_t flags;
+        uint32_t domain;
+        uint32_t row_semantics;
+        uint32_t n_rows;
+        uint32_t n_sequences;
+        uint64_t owner_namespace;
+        uint64_t owner_generation;
+        uint64_t source_graph_uid;
+        uint64_t split_graph_uid;
+        uint64_t reserved[4];
+    };
+
     // NOTE: always add types at the end of the enum to keep backward compatibility
     enum ggml_type {
         GGML_TYPE_F32     = 0,
@@ -433,10 +474,21 @@ extern "C" {
         GGML_TYPE_COUNT   = 43,
     };
 
-    // precision
+    // [TAG_GGML_PREC]
+    // this enum is used to declare the allowed numerical precision/data-types types that can be used during the compute of an op
+    // the declared types can be:
+    //  - result accumulation type
+    //  - source tensor data representation type
+    //  - etc.
+    // the precision parameters are stored as ggml_tensor.op_params to the respective ops
     enum ggml_prec {
-        GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
-        GGML_PREC_F32     = 10,
+        GGML_PREC_UNDEFINED = 0,
+        GGML_PREC_DEFAULT   = 0,  // note: deprecated, use GGML_PREC_UNDEFINED
+        GGML_PREC_F32       = 10,
+        GGML_PREC_BF16      = 15,
+        GGML_PREC_F16       = 20,
+        GGML_PREC_Q8        = 30,
+        GGML_PREC_Q4        = 40,
     };
 
     // op hint
@@ -654,6 +706,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_MOE_ROUTER = 32, // ...describes routed-expert scores
     };
 
     enum ggml_tri_type {
@@ -1429,6 +1482,42 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 eps);
 
+    // [TAG_GGML_PREC]
+    // set the minimum required accumulator type for the implementation to use during the compute
+    // for example:
+    //  - GGML_PREC_F32  - requires accumulation of the results in F32
+    //  - GGML_PREC_BF16 - can accumulate the results in BF16, F32
+    //  - GGML_PREC_F16  - can accumulate the results in F16, F32
+    //  - GGML_PREC_Q8   - not allowed
+    //  - GGML_PREC_Q4   - not allowed
+    //
+    // return false on faliure
+    GGML_API bool ggml_prec_set_acc(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    // [TAG_GGML_PREC]
+    // set the smallest rank that the implementation can use to internally convert the src[idx] data to
+    // ranks in decreasing order:
+    //  - GGML_PREC_F32  - GGML_TYPE_F32
+    //  - GGML_PREC_BF16 - GGML_TYPE_BF16
+    //  - GGML_PREC_F16  - GGML_TYPE_F16,
+    //  - GGML_PREC_Q8   - GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, etc.
+    //  - GGML_PREC_Q4   - GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, etc.
+    //
+    // for example:
+    //   - ggml_prec_set_src(a, GGML_PREC_Q8, 1):
+    //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to GGML_TYPE_Q8_0
+    //     - cannot quantize it down to GGML_TYPE_Q4_0 or GGML_TYPE_NVFP4
+    //   - ggml_prec_set_src(a, GGML_PREC_Q4, 1):
+    //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as GGML_TYPE_Q4_K, GGML_TYPE_NVFP4 etc.
+    //
+    // return false on faliure
+    GGML_API bool ggml_prec_set_src(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec,
+            int                  idx);
+
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
@@ -1439,9 +1528,10 @@ extern "C" {
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
-    GGML_API void ggml_mul_mat_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(
@@ -2428,7 +2518,8 @@ extern "C" {
     // q:    [n_embd_k, n_batch, n_head,    ne3 ]
     // k:    [n_embd_k, n_kv,    n_head_kv, ne3 ]
     // v:    [n_embd_v, n_kv,    n_head_kv, ne3 ] !! not transposed !!
-    // mask: [n_kv,     n_batch, ne32,      ne33]
+    // mask: [n_kv, n_batch, ne32, ne33] F16, or [n_batch] I64 consecutive write indices
+    // The I64 causal bound for query i is mask[i] + 1 and requires max_bias == 0
     // res:  [n_embd_v, n_head,  n_batch,   ne3 ] !! permuted !!
     //
     // broadcast:
@@ -2446,9 +2537,10 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
-    GGML_API void ggml_flash_attn_ext_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
@@ -2590,16 +2682,20 @@ extern "C" {
     // TODO: add ggml_gated_delta_net_set_bcast() to be able to configure Q, K broadcast type: tiled vs interleaved [TAG_GGML_GDN_BCAST]
     // ref: https://github.com/ggml-org/llama.cpp/pull/19468#discussion_r2786394306
     //
-    // tensor shapes (S_k == S_v, H_v % H_k == 0):
-    //   q, k  : [S_k, H_k, n_tokens, n_seqs]
+    // tensor shapes (S_k == S_v, H_v % H_k == 0, n_seqs % n_seqs_qk == 0):
+    //   q, k  : [S_k, H_k, n_tokens, n_seqs_qk]
     //   v     : [S_v, H_v, n_tokens, n_seqs]
     //   g     : [1, H_v, n_tokens, n_seqs] (scalar gate) or [S_v, H_v, n_tokens, n_seqs] (KDA)
     //   beta  : [1, H_v, n_tokens, n_seqs]
     //   state : [S_v, S_v, H_v, n_seqs] -- initial recurrent state s0
     //
-    // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
-    // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
-    // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // The output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state slots [S_v, S_v, H_v, n_seqs].
+    // By default, slot 0 is the final state and up to min(n_tokens, K) trailing states are written most-recent first.
+    // For K > 1, trailing-only mode accepts (trailing_snapshots, selected_token, reserve_input) == ([0, K], -1, false) and writes up to min(n_tokens, trailing_snapshots) states most-recent first.
+    // Selected-token mode requires (trailing_snapshots, selected_token, reserve_input) == (0, [0, n_tokens), false) and writes only the state after selected_token to slot 0.
+    // Reserved-input mode requires (trailing_snapshots, selected_token, reserve_input) == (min(n_tokens, K - 1), -1, true) and writes the input state to slot K - 1 and trailing states most-recent first from slot 0.
+    // State slots not selected by these modes stay untouched.
+    // K == 1 requires (trailing_snapshots, selected_token, reserve_input) == (1, -1, false) and writes the final state to slot 0.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2609,6 +2705,15 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    GGML_API void ggml_gated_delta_net_set_snapshots(
+            struct ggml_tensor * tensor,
+            int32_t              trailing_snapshots,
+            int32_t              selected_token,
+            bool                 reserve_input);
+
+    GGML_API bool ggml_gated_delta_net_has_default_snapshot_params(
+            const struct ggml_tensor * tensor);
 
     // DSA lightning indexer
     //

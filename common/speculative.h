@@ -23,6 +23,11 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
+void common_validate_speculative_params(
+        const common_params_speculative & params,
+        int32_t target_ubatch_raw,
+        int32_t target_ubatch_effective);
+
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 
@@ -61,7 +66,7 @@ struct common_speculative_draft_params {
     // can be used to constraint the max draft based on the remaining context size
     int32_t n_max = -1;
 
-    llama_pos   n_past;
+    llama_pos   pos0;
     llama_token id_last;
 
     // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
@@ -82,12 +87,42 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+struct common_speculative_draft_input {
+    llama_seq_id seq_id;
+    llama_pos n_past;
+    llama_token id_last;
+};
+
+bool common_speculative_draft_overlap_supported(const common_speculative * spec);
+// Queue the first MTP step after acceptance and rollback. The draft cache must support one-token removal.
+bool common_speculative_queue_draft_overlap(common_speculative * spec, const std::vector<common_speculative_draft_input> & inputs);
+// A changed sequence invalidates the queued batch. A negative seq_id discards every queued sequence.
+void common_speculative_discard_draft_overlap(common_speculative * spec, llama_seq_id seq_id = -1);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// retain an eligible draft sequence until target verification is sampled
+bool common_speculative_retain_draft_state(common_speculative * spec, llama_seq_id seq_id);
+
+// complete any deferred draft-context update after acceptance
+struct common_speculative_finish_accept_params {
+    llama_seq_id seq_id;
+    uint16_t n_accepted;
+};
+
+bool common_speculative_has_deferred_accept(const common_speculative * spec, llama_seq_id seq_id);
+bool common_speculative_finish_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted);
+bool common_speculative_finish_accept(common_speculative * spec, const std::vector<common_speculative_finish_accept_params> & params);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
+bool common_speculative_has_mtp_state(const common_speculative * spec);
+// Empty data is a valid result when no MTP implementation is active.
+bool common_speculative_get_mtp_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
+bool common_speculative_set_mtp_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

@@ -841,6 +841,9 @@ class GGUFWriter:
         else:
             self.add_array(key, value)
 
+    def add_recurrent_layers(self, value: Sequence[bool]) -> None:
+        self.add_array(Keys.Attention.RECURRENT_LAYERS.format(arch=self.arch), value)
+
     def add_rope_pattern(self, value: Sequence[bool]) -> None:
         self.add_array(Keys.Attention.ROPE_PATTERN.format(arch=self.arch), value)
 
@@ -910,6 +913,9 @@ class GGUFWriter:
 
     def add_nextn_predict_layers(self, count: int) -> None:
         self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
+
+    def add_nextn_shared_target_tensors(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.NEXTN_SHARED_TARGET_TENSORS.format(arch=self.arch), value)
 
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)
@@ -1054,6 +1060,9 @@ class GGUFWriter:
 
     def add_hyper_connection_epsilon(self, value: float) -> None:
         self.add_float32(Keys.HyperConnection.EPSILON.format(arch=self.arch), value)
+
+    def add_hyper_connection_magnitude(self, value: float) -> None:
+        self.add_float32(Keys.HyperConnection.MAGNITUDE.format(arch=self.arch), value)
 
     def add_hyper_connection_low_rank(self, value: int) -> None:
         self.add_uint32(Keys.HyperConnection.LOW_RANK.format(arch=self.arch), value)

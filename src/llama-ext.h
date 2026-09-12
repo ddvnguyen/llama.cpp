@@ -16,6 +16,35 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Configure lazy row page advice (default: false) while idle, before the first staged decode attempt.
+// Returns false without changes if the CPU extension is unavailable or staged inputs were already checked.
+LLAMA_API bool llama_set_ple_prefetch(struct llama_context * ctx, bool enabled);
+
+LLAMA_API bool llama_recurrent_sparse_snapshots_supported(const struct llama_context * ctx);
+LLAMA_API bool llama_recurrent_set_sparse_snapshot_mode(
+        struct llama_context * ctx, bool enabled, int32_t selected_token);
+
+// Queue one decode using the previous backend-sampled token as device input.
+// Requires synchronized output and supported backend sampling. On success, normal output access refers to the new decode.
+// Stochastic sampling requires n_outputs_max_per_seq = 1. Discarding a queued position also requires restoring the sampler state saved before this call.
+// Returns 0 if queued, 1 if unsupported without changing memory, or a negative value on decode failure.
+LLAMA_API int32_t llama_decode_sampled(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
+// Queue the next decode before waiting for the preceding sampled token, returned in previous.
+// Uses the same return codes as llama_decode_sampled. On success, only previous is ready; the new decode can still be running.
+LLAMA_API int32_t llama_decode_sampled_async(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos, llama_token * previous);
+
+struct llama_sampled_decode_item {
+    llama_seq_id seq_id;
+    llama_pos pos;
+};
+
+// Queue one token per sequence from the preceding output at (seq_id, pos - 1).
+// Items may select a subset of the preceding batch. previous follows item order.
+// Return codes and completion rules match llama_decode_sampled_async.
+LLAMA_API int32_t llama_decode_sampled_batch_async(
+        struct llama_context * ctx, const llama_sampled_decode_item * items, int32_t n_items, llama_token * previous);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
@@ -115,6 +144,16 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+// Returns 1 when shared, 0 for incompatible placement, and -1 with an empty borrower scheduler after failure.
+LLAMA_API int32_t llama_attach_shared_workspace(
+              struct llama_context * borrower,
+              struct llama_context * owner);
+LLAMA_API bool llama_contexts_share_workspace(
+        const struct llama_context * ctx_a,
+        const struct llama_context * ctx_b);
+
+// Synchronize the context and ask capable backends to release cached transient physical mappings. This is a no-op unless live-context sizing is effective.
+LLAMA_API uint64_t llama_trim_transient_memory(struct llama_context * ctx);
 
 //
 // model/context data extraction

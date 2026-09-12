@@ -65,10 +65,13 @@ enum llama_vocab_pre_type {
     LLAMA_VOCAB_PRE_TYPE_GRANITE_EMB_MULTI = 54,
     LLAMA_VOCAB_PRE_TYPE_MELLUM2           = 55,
     LLAMA_VOCAB_PRE_TYPE_LAGUNA            = 56,
+    LLAMA_VOCAB_PRE_TYPE_HY_V4             = 57,
+    LLAMA_VOCAB_PRE_TYPE_SPARK2_5          = 58,
 };
 
 struct LLM_KV;
 struct llama_model_loader;
+struct llama_vocab_test_access;
 
 struct llama_vocab {
     struct token_data {
@@ -198,6 +201,12 @@ struct llama_vocab {
     void print_info() const;
 
 private:
+    friend struct llama_vocab_test_access;
+
     struct impl;
     std::unique_ptr<impl> pimpl;
+};
+
+struct llama_vocab_test_access {
+    static void add_dummy_token(llama_vocab & vocab);
 };

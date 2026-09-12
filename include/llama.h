@@ -223,6 +223,7 @@ extern "C" {
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
+        LLAMA_CONTEXT_TYPE_DRAFT   = 2,
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
@@ -269,6 +270,27 @@ extern "C" {
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
     } llama_batch;
+
+#define LLAMA_DECODE_EXECUTION_INTENT_MAGIC   0x4c444931u
+#define LLAMA_DECODE_EXECUTION_INTENT_VERSION 1u
+
+    enum llama_decode_execution_intent_type {
+        LLAMA_DECODE_EXECUTION_INTENT_TARGET_VERIFICATION = 1,
+    };
+
+    enum llama_decode_execution_intent_flag {
+        LLAMA_DECODE_EXECUTION_INTENT_FLAG_NONE = 0,
+    };
+
+    typedef struct llama_decode_execution_intent {
+        uint32_t magic;
+        uint32_t abi_version;
+        uint32_t struct_size;
+        uint32_t type;
+        uint32_t flags;
+        uint32_t verification_span;
+        uint64_t reserved[4];
+    } llama_decode_execution_intent;
 
     enum llama_model_kv_override_type {
         LLAMA_KV_OVERRIDE_TYPE_INT,
@@ -318,6 +340,7 @@ extern "C" {
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
+        int32_t moe_expert_cache_slots; // # of MoE expert slabs to keep cached on GPU (LRU). 0 = disabled.
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
 
@@ -339,6 +362,9 @@ extern "C" {
 
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
+
+        // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
+        const struct llama_model * model_shared;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -364,6 +390,7 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+        uint32_t kv_gpu_layers;         // with offload_kqv=false, keep this many standard or direct hybrid attention KV layers on their assigned devices
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 
@@ -406,6 +433,11 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool kv_cpu_pinned;           // use pinned host buffers for CPU-resident KV cache storage when available
+        bool recurrent_state_offload; // offload recurrent state independently of attention KV storage
+        bool phase_aware_workspace;   // resize this context's compute scheduler between prompt processing and token generation
+        bool live_context_workspace;  // grow supported attention workspace plans with the padded live physical KV extent
+        bool decode_boundary_overlap; // experimental: overlap decode boundary preparation and update CUDA graphs
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -413,8 +445,7 @@ extern "C" {
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
 
-        // a source/target/parent context
-        // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+        // A source/target/parent context that can share results or llama_memory.
         struct llama_context * ctx_other;
     };
 
@@ -970,6 +1001,7 @@ extern "C" {
     // For encode-decoder contexts, processes the batch using the encoder.
     // Can store the encoder output internally for later use by the decoder's cross-attention layers.
     //   0 - success
+    //  -2 - failed to prepare or allocate execution resources
     // < 0 - error. the memory state is restored to the state before this call
     LLAMA_API int32_t llama_encode(
             struct llama_context * ctx,
@@ -986,10 +1018,17 @@ extern "C" {
     //    1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
     //    2 - aborted     (processed ubatches will remain in the context's memory)
     //   -1 - invalid input batch
+    //   -2 - failed to prepare or allocate execution resources
     // < -1 - fatal error (processed ubatches will remain in the context's memory)
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // A null intent has the same behavior as llama_decode().
+    LLAMA_API int32_t llama_decode_ext(
+            struct llama_context *                  ctx,
+              struct llama_batch                    batch,
+        const struct llama_decode_execution_intent * intent);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
@@ -1357,7 +1396,7 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_chain_get(      struct llama_sampler * chain, int32_t i);
 
     // the total number of samplers in the chain
-    LLAMA_API int                    llama_sampler_chain_n  (const struct llama_sampler * chain);
+    LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
@@ -1448,6 +1487,9 @@ extern "C" {
                             size_t num_trigger_patterns,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
+
+    /// Returns true when a grammar sampler is currently constraining candidates.
+    LLAMA_API bool llama_sampler_grammar_is_active(const struct llama_sampler * smpl);
 
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.

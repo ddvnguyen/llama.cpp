@@ -806,6 +806,8 @@ struct ggml_backend_sched {
 
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
+    struct ggml_cgraph * source_graph;
+    uint64_t source_graph_uid;
 
     // graph splits
     struct ggml_backend_sched_split * splits;
@@ -849,7 +851,7 @@ static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
     if (split->inputs_capacity > 0) {
         new_cap = 2*split->inputs_capacity;
-        GGML_LOG_WARN("%s: increasing split inputs capacity from %d to %d\n", __func__, split->inputs_capacity, new_cap);
+        GGML_LOG_DEBUG("%s: increasing split inputs capacity from %d to %d\n", __func__, split->inputs_capacity, new_cap);
     }
     auto * pnew = (struct ggml_tensor **) realloc((void *) split->inputs, new_cap * sizeof(struct ggml_tensor *));
     if (pnew == NULL) {
@@ -864,7 +866,7 @@ static void ggml_backend_sched_graph_inputs_grow(ggml_backend_sched_t sched) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
     if (sched->graph_inputs_capacity > 0) {
         new_cap = 2*sched->graph_inputs_capacity;
-        GGML_LOG_WARN("%s: increasing graph inputs capacity from %d to %d\n", __func__, sched->graph_inputs_capacity, new_cap);
+        GGML_LOG_DEBUG("%s: increasing graph inputs capacity from %d to %d\n", __func__, sched->graph_inputs_capacity, new_cap);
     }
     auto * pnew = (struct ggml_tensor **) realloc((void *) sched->graph_inputs, new_cap * sizeof(struct ggml_tensor *));
     if (pnew == NULL) {
@@ -1083,6 +1085,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     graph->uid = ggml_graph_next_uid();
+    sched->source_graph = graph;
+    sched->source_graph_uid = graph->uid;
 
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -1338,17 +1342,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             break;
                         }
                     }
-                    // check if the split has too many inputs
-                    // FIXME: count the number of inputs instead of only checking when full
-                    if (split->n_inputs >= split->inputs_capacity) {
-                        const size_t id = hash_id(src);
-                        int src_backend_id = sched->hv_tensor_backend_ids[id];
-                        bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
-                        if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
-                            need_new_split = true;
-                            break;
-                        }
-                    }
                 }
             }
 
@@ -1599,7 +1592,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
-static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched, bool reuse_async) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -1619,7 +1612,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    const bool can_allocate = !backend_ids_changed && (!reuse_async ||
+        ggml_gallocr_reserve_n_if_fits(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids));
+    if (!can_allocate || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -1641,7 +1636,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            return false;
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -1651,9 +1649,114 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+// How a split input breaks into the ranges a graph reads.
+// A window over a cache split into streams is one range per stream, keyed on the last dimension: the ranges sit a fixed stride apart and the bytes between them are never read.
+// Anything else is one flat range of ggml_nbytes().
+struct ggml_backend_sched_ranges {
+    int64_t n;      // ranges to deliver
+    size_t  stride; // bytes from one range to the next
+    size_t  used;   // bytes of a range this graph reads
+};
+
+static void ggml_backend_sched_input_ranges(const struct ggml_tensor * input, struct ggml_backend_sched_ranges * out) {
+    out->n      = 1;
+    out->stride = 0;
+    out->used   = ggml_nbytes(input);
+
+    // a range is one stream's byte span, which is what the tensor covers below dimension 3
+    const size_t rows = ggml_nbytes(input) - (size_t) (input->ne[3] - 1)*input->nb[3];
+    const size_t offs = input->view_src ? input->view_offs : 0;
+    if (input->nb[3] < rows || (offs != 0 && (input->nb[3] == 0 || offs % input->nb[3] != 0))) {
+        return;
+    }
+
+    if (input->ne[3] > 1) {
+        out->n      = input->ne[3];
+        out->stride = input->nb[3];
+        out->used   = rows;
+    }
+}
+
+static bool ggml_backend_sched_execution_certificate_valid(const struct ggml_graph_execution_certificate * certificate) {
+    static_assert(sizeof(struct ggml_graph_execution_certificate) == 96, "unexpected graph execution certificate size");
+
+    if (certificate == nullptr ||
+            certificate->magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC ||
+            certificate->abi_version != GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION ||
+            certificate->struct_size != sizeof(*certificate) ||
+            (certificate->flags & ~GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0 ||
+            certificate->domain < GGML_GRAPH_EXECUTION_DOMAIN_MAIN ||
+            certificate->domain > GGML_GRAPH_EXECUTION_DOMAIN_MTP ||
+            certificate->row_semantics < GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ||
+            certificate->row_semantics > GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE ||
+            certificate->n_rows == 0 || certificate->n_sequences == 0 ||
+            certificate->owner_namespace == 0 || certificate->owner_generation == 0 ||
+            certificate->source_graph_uid != 0 || certificate->split_graph_uid != 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < sizeof(certificate->reserved)/sizeof(certificate->reserved[0]); ++i) {
+        if (certificate->reserved[i] != 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static enum ggml_status ggml_backend_sched_dispatch_split(
+        ggml_backend_t backend,
+        struct ggml_cgraph * graph,
+        uint64_t source_graph_uid,
+        const struct ggml_graph_execution_certificate & certificate) {
+    graph->execution_certificate = {};
+    if (certificate.magic == GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC) {
+        graph->execution_certificate = certificate;
+        graph->execution_certificate.source_graph_uid = source_graph_uid;
+        graph->execution_certificate.split_graph_uid = graph->uid;
+    }
+
+    const enum ggml_status status = ggml_backend_graph_compute_async(backend, graph);
+    graph->execution_certificate = {};
+    return status;
+}
+
+static enum ggml_status ggml_backend_sched_compute_splits(
+        ggml_backend_sched_t sched,
+        uint64_t source_graph_uid,
+        struct ggml_graph_execution_certificate certificate) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    const bool required_grouped =
+        (certificate.flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
+    const auto fail = [&](enum ggml_status status) {
+        if (required_grouped) {
+            for (int i = 0; i < sched->n_backends; ++i) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
+        }
+        return status;
+    };
+
+    if (certificate.magic == GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC) {
+        if (source_graph_uid == 0) {
+            if (required_grouped) {
+                GGML_LOG_ERROR("%s: required grouped execution has no source graph UID\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
+            certificate = {};
+        }
+        for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+            if (splits[split_id].graph.uid == 0) {
+                if (required_grouped) {
+                    GGML_LOG_ERROR("%s: required grouped execution split %d has no graph UID\n", __func__, split_id);
+                    return GGML_STATUS_FAILED;
+                }
+                certificate = {};
+                break;
+            }
+        }
+    }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1715,6 +1818,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
                     ggml_backend_t ids_backend = split_backend;
+
+                    if (ggml_nelements(ids_tensor) == 0) {
+                        continue;
+                    }
 
                     // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
                     // in that case, we use the original ids tensor
@@ -1784,27 +1891,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    // ggml_backend_tensor_copy moves ggml_nbytes(), which for a window over several streams is the span the ranges are cut from, gaps and all
+                    ggml_backend_buffer_t src_buf = input->view_src ? input->view_src->buffer : input->buffer;
+                    struct ggml_backend_sched_ranges rg;
+                    ggml_backend_sched_input_ranges(input, &rg);
+                    const bool ranged = rg.n > 1 && src_buf != NULL && ggml_backend_buffer_is_host(src_buf);
+
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    if (ranged || !split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
+                        if (ranged) {
+                            // blocking like the copy it replaces: the split backend is idle here, so the ranges go on its own stream and the host waits for them
+                            ggml_backend_tensor_set_2d_async(split_backend, input_cpy, input->data, 0, rg.used, rg.n, rg.stride, rg.stride);
+                            ggml_backend_synchronize(split_backend);
+                        } else {
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        }
                     }
                 }
             }
         }
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec = ggml_backend_sched_dispatch_split(
+                split_backend, &split->graph, source_graph_uid, certificate);
             if (ec != GGML_STATUS_SUCCESS) {
-                return ec;
+                return fail(ec);
             }
         } else {
+            split->graph.execution_certificate = {};
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
@@ -1950,6 +2071,24 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched);
 }
 
+bool ggml_backend_sched_set_resizable(ggml_backend_sched_t sched, ggml_backend_sched_t owner) {
+    GGML_ASSERT(sched != nullptr);
+    return ggml_gallocr_set_resizable(sched->galloc, owner ? owner->galloc : nullptr);
+}
+
+void ggml_backend_sched_get_buffer_state(
+        ggml_backend_sched_t sched,
+        uint64_t * generation,
+        uint64_t * shrink_generation) {
+    GGML_ASSERT(sched != nullptr);
+    ggml_gallocr_get_resizable_state(sched->galloc, generation, shrink_generation);
+}
+
+void ggml_backend_sched_request_buffer_shrink(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    ggml_gallocr_request_shrink(sched->galloc);
+}
+
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run
@@ -1960,6 +2099,8 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+    sched->source_graph = nullptr;
+    sched->source_graph_uid = 0;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -1993,7 +2134,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     return true;
 }
 
-bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+static bool ggml_backend_sched_alloc_graph_impl(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool reuse_async) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
@@ -2003,7 +2144,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     ggml_backend_sched_split_graph(sched, graph);
 
-    if (!ggml_backend_sched_alloc_splits(sched)) {
+    if (!ggml_backend_sched_alloc_splits(sched, reuse_async)) {
         return false;
     }
 
@@ -2012,14 +2153,52 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     return true;
 }
 
+bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return ggml_backend_sched_alloc_graph_impl(sched, graph, false);
+}
+
+bool ggml_backend_sched_alloc_graph_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return ggml_backend_sched_alloc_graph_impl(sched, graph, true);
+}
+
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
-    enum ggml_status err = ggml_backend_sched_graph_compute_async(sched, graph);
+    return ggml_backend_sched_graph_compute_ext(sched, graph, nullptr);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_ext(
+        ggml_backend_sched_t sched,
+        struct ggml_cgraph * graph,
+        const struct ggml_graph_execution_certificate * certificate) {
+    enum ggml_status err = ggml_backend_sched_graph_compute_async_ext(sched, graph, certificate);
     ggml_backend_sched_synchronize(sched);
     return err;
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return ggml_backend_sched_graph_compute_async_ext(sched, graph, nullptr);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async_ext(
+        ggml_backend_sched_t sched,
+        struct ggml_cgraph * graph,
+        const struct ggml_graph_execution_certificate * certificate) {
     GGML_ASSERT(sched);
+    struct ggml_graph_execution_certificate certificate_value = {};
+    const bool certificate_valid = ggml_backend_sched_execution_certificate_valid(certificate);
+    const bool required_grouped = certificate != nullptr &&
+        (certificate->flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
+    if (required_grouped && !certificate_valid) {
+        GGML_LOG_ERROR("%s: invalid required grouped execution certificate\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    if (required_grouped && sched->callback_eval != nullptr) {
+        GGML_LOG_ERROR("%s: required grouped execution does not support callback evaluation\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    if (certificate_valid) {
+        certificate_value = *certificate;
+    }
+
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
@@ -2030,7 +2209,15 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    if (graph != sched->source_graph || graph->uid != sched->source_graph_uid) {
+        if (required_grouped) {
+            GGML_LOG_ERROR("%s: required grouped execution certificate does not match the source graph\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+        certificate_value = {};
+    }
+
+    return ggml_backend_sched_compute_splits(sched, sched->source_graph_uid, certificate_value);
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

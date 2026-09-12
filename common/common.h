@@ -325,6 +325,8 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_ubatch = 0; // physical draft batch size (0 = inherit target)
+    int32_t kv_gpu_layers = -1; // independently owned draft KV layers on GPU (-1 = inherit target policy)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -337,6 +339,7 @@ struct common_params_speculative_draft {
     llama_context * ctx_dft = nullptr;
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
+    int32_t n_moe_expert_cache_slots = -1; // MoE expert cache slots for the draft model (-1 = inherit target)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -383,8 +386,14 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    int32_t mtp_rs_planes = 0; // total target recurrent planes (0 = draft.n_max + 1)
+
     bool has_dft() const {
         return !draft.mparams.empty();
+    }
+
+    bool is_mtp_rs_capped() const {
+        return mtp_rs_planes > 0 && int64_t(mtp_rs_planes) < int64_t(draft.n_max) + 1;
     }
 
     bool has_synth() const {
@@ -396,7 +405,12 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        const bool has_mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
+        if (has_mtp && mtp_rs_planes > 0) {
+            return uint32_t(mtp_rs_planes - 1);
+        }
+
+        return needs_rs_seq ? uint32_t(std::max(0, draft.n_max)) : 0u;
     }
 };
 
@@ -526,6 +540,8 @@ struct common_params {
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+    int32_t n_moe_expert_cache_slots = 0; // --moe-expert-cache-size: GPU LRU cache for MoE experts; 0 = off
+    size_t moe_expert_cache_l2_pinned_size = 0;
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -533,6 +549,10 @@ struct common_params {
     std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
 
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
+    bool    experimental_logs          = false;
+    bool    decode_overlap             = false;
+    bool    decode_boundary_overlap    = false;
+    bool    ple_prefetch               = false;
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;
@@ -577,6 +597,11 @@ struct common_params {
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
+    bool kv_cpu_pinned     = false; // use pinned host buffers for CPU-resident KV cache storage
+    bool recurrent_state_offload = false; // offload recurrent state independently of attention KV storage
+    int32_t kv_gpu_layers  = 0;     // with no_kv_offload, keep this many attention KV layers device-resident
+    bool phase_aware_workspace = false; // resize compute schedulers between prompt and generation phases
+    bool live_context_workspace = false; // size supported attention workspaces from the padded live KV extent
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
@@ -1178,6 +1203,9 @@ struct common_prompt_checkpoint {
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
+
+    // (optional) MTP hidden-state boundary
+    std::vector<uint8_t> data_mtp;
 
     size_t size() const;
 

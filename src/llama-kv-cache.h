@@ -113,6 +113,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
+        llama_memory_placement_options placement,
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
@@ -129,9 +130,17 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
+
+    uint32_t get_attn_reserve_capacity() const override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+
+    bool get_supports_partial_kv() const override {
+        return true;
+    }
 
     void clear(bool data) override;
 
@@ -167,6 +176,8 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+    bool can_decode_sampled() const override { return !other && (swa_type == LLAMA_SWA_TYPE_NONE || swa_type == LLAMA_SWA_TYPE_STANDARD); }
+    void seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) override;
 
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
@@ -184,14 +195,15 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_reserve_n_kv(const slot_info_vec_t & sinfos) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, ggml_tensor ** store_stage = nullptr) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, ggml_tensor ** store_stage = nullptr) const;
 
     //
     // preparation API
@@ -220,6 +232,13 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+
+    bool can_use_compact_causal_mask(
+            const llama_ubatch & ubatch,
+                         bool   causal_attn,
+                     uint32_t   n_kv,
+                         bool   is_reserve,
+            const slot_info   * sinfo = nullptr) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
@@ -254,6 +273,9 @@ private:
 
         ggml_tensor * k;
         ggml_tensor * v;
+
+        bool k_store_quantize;
+        bool v_store_quantize;
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -318,6 +340,13 @@ private:
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
 
+    ggml_tensor * stage_store_rows(
+            ggml_context * ctx,
+            ggml_tensor  * source,
+                 ggml_type type,
+                    int32_t il,
+                const char * side) const;
+
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
                    ggml_context * ctx,
@@ -360,6 +389,10 @@ public:
     llama_kv_cache_context(
             llama_kv_cache * kv);
 
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t n_kv);
+
     // used to create an update context
     llama_kv_cache_context(
             llama_kv_cache * kv,
@@ -384,6 +417,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_attn_reserve_n_kv() const override;
 
     //
     // llama_kv_cache_context specific API
@@ -404,8 +438,17 @@ public:
     //   - k_idxs [n_tokens]
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, ggml_tensor ** store_stage = nullptr) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, ggml_tensor ** store_stage = nullptr) const;
+
+    void build_kv_store(
+            ggml_cgraph  * gf,
+            ggml_context * ctx,
+            ggml_tensor  * k_cur,
+            ggml_tensor  * k_idxs,
+            ggml_tensor  * v_cur,
+            ggml_tensor  * v_idxs,
+            int32_t        il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
@@ -420,6 +463,7 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
+    bool can_use_compact_causal_mask(const llama_ubatch & ubatch, bool causal_attn, bool is_reserve) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
@@ -460,5 +504,6 @@ private:
 
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
-    int32_t n_kv;
+    int32_t n_kv = 0;
+    uint32_t reserve_n_kv = 0;
 };

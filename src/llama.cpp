@@ -316,10 +316,61 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+        // If the user enabled the MoE expert cache (--moe-expert-cache-size > 0)
+        // and CUDA is available, *prepend* a tensor_buft_override that routes
+        // every expert tensor to the CUDA_MoE_Cached buffer type. Prepending
+        // matters because the loader's match loop is first-match-wins -- we
+        // need the cache override to catch expert tensors before any earlier
+        // --cpu-moe / --n-cpu-moe overrides do. The vector owns the storage
+        // for the duration of this function, which outlives the loader's use
+        // of the pointer.
+        std::vector<llama_model_tensor_buft_override> effective_overrides;
+        const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
+        if (params.moe_expert_cache_slots > 0) {
+            ggml_backend_moe_cache_set_slots_t set_slots_fn = nullptr;
+            ggml_backend_moe_cache_buffer_type_t buffer_type_fn = nullptr;
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+                auto candidate_set_slots_fn = (ggml_backend_moe_cache_set_slots_t) ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME);
+                auto candidate_buffer_type_fn = (ggml_backend_moe_cache_buffer_type_t) ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME);
+                if (candidate_set_slots_fn != nullptr && candidate_buffer_type_fn != nullptr) {
+                    set_slots_fn = candidate_set_slots_fn;
+                    buffer_type_fn = candidate_buffer_type_fn;
+                    break;
+                }
+            }
+            if (set_slots_fn == nullptr || buffer_type_fn == nullptr) {
+                throw std::runtime_error("--moe-expert-cache-size requires a backend with MoE cache support");
+            }
+            set_slots_fn(params.moe_expert_cache_slots);
+            // Pattern matches the same expert tensors that --cpu-moe / --n-cpu-moe target.
+            // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
+            static const char * MOE_EXPS_PATTERN =
+                "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+            effective_overrides.push_back({MOE_EXPS_PATTERN, buffer_type_fn()});
 
-        ml.lazy.mode = params.lazy_mode;
+            bool had_user_overrides = false;
+            if (params.tensor_buft_overrides) {
+                for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                    effective_overrides.push_back(*o);
+                    had_user_overrides = true;
+                }
+            }
+            if (had_user_overrides) {
+                LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
+                               "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
+            }
+            effective_overrides.push_back({nullptr, nullptr});
+            effective_overrides_ptr = effective_overrides.data();
+        }
+
+        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, effective_overrides_ptr);
+
+        ml.lazy.mode    = params.lazy_mode;
+        ml.model_shared = params.model_shared;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -617,4 +668,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

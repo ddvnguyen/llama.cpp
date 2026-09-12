@@ -32,6 +32,7 @@ public:
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                      bool   offload,
+llama_memory_placement_options placement,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -53,6 +54,8 @@ public:
     llama_memory_context_ptr init_full() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
+
+    bool can_decode_sampled() const override { return false; }
 
     void clear(bool data) override;
 

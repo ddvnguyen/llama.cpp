@@ -34,6 +34,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                      bool   offload,
+llama_memory_placement_options placement,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -41,9 +42,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     const layer_filter_cb & filter_idx) :
     llama_memory_hybrid(
         model,
-        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type, offload, placement,
         type_r, type_s, rs_size,
-        n_seq_max, n_rs_seq, offload, unified,
+        n_seq_max, n_rs_seq, unified,
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
@@ -55,12 +56,16 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // K-shift must not rotate them while the stream copies in the same update still apply
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
 
+        // fool llama_kv_cache into thinking this is a MLA cache, so it won't cache V tensors
+        hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
+        hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
+
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, placement, "idx_");
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

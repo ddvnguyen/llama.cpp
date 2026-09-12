@@ -3024,6 +3024,7 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
+                        GGML_ASSERT(ggml_gated_delta_net_validate(node));
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
@@ -3118,6 +3119,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.get_rows_callback =*/ cplan->get_rows_callback,
+        /*.get_rows_callback_data =*/ cplan->get_rows_callback_data,
     };
 
 #ifdef GGML_USE_OPENMP
