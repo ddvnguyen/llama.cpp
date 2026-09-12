@@ -3052,7 +3052,7 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
     ggml_tensor * ids = dst->src[2];
     if (src0 == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32 || src0->ne[2] <= 0 ||
             ids->ne[0] <= 0 || ids->ne[1] <= 0 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
-            ids->ne[0] > SIZE_MAX / static_cast<size_t>(ids->ne[1])) {
+            static_cast<size_t>(ids->ne[0]) > SIZE_MAX / static_cast<size_t>(ids->ne[1])) {
         return false;
     }
     const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
@@ -5483,6 +5483,7 @@ static int ggml_cuda_try_fuse(
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
+        ops.reserve(16); // enough for every branch below; avoids a GCC 13 -Wstringop-overflow false positive
 
         if (can_fuse) {
             const ggml_tensor * logits  = node->src[0];
