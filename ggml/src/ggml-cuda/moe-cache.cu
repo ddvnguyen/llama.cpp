@@ -81,7 +81,11 @@ static size_t moe_cache_quantized_source_padding(uint32_t type, int64_t ne0) {
 }
 
 static bool moe_cache_mm_debug_enabled() {
-    return g_moe_cache_mm_debug.load(std::memory_order_relaxed);
+    static const bool from_env = [] {
+        const char * value = getenv("GGML_CUDA_MOE_MM_DEBUG");
+        return value != nullptr && strcmp(value, "1") == 0;
+    }();
+    return from_env || g_moe_cache_mm_debug.load(std::memory_order_relaxed);
 }
 
 static bool moe_cache_mm_verbose_enabled() {
@@ -8774,10 +8778,23 @@ void ggml_cuda_moe_grouped_context::configure_early_router(
     }
     // Eager warmup can allocate while the worker has pending CUDA submissions.
     if (moe_early_router_copy_engine() && !capture) {
+        static bool diagnosed = false;
+        if (!diagnosed) {
+            diagnosed = true;
+            fprintf(stderr, "moe-early-router: dormant awaiting captured graph (copy_engine=1, capture=0; one-time)\n");
+        }
         return;
     }
     if (execution == nullptr || execution->plan_ == nullptr ||
             execution->outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
+        static bool diagnosed = false;
+        if (!diagnosed) {
+            diagnosed = true;
+            fprintf(stderr, "moe-early-router: dormant reason=%s outcome=%u (one-time)\n",
+                execution == nullptr ? "null-execution" :
+                execution->plan_ == nullptr ? "null-plan" : "outcome-not-decode-grouped",
+                execution != nullptr ? (unsigned) execution->outcome() : 0u);
+        }
         return;
     }
     const auto & certificate = execution->plan_->execution_certificate_;
