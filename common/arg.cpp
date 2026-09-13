@@ -2887,6 +2887,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_expert_cache_l2_pinned_size = (size_t) value * 1024 * 1024;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_L2_PINNED_MB"));
+    add_opt(common_arg(
+        {"--moe-lookahead"}, "N",
+        "MoE look-ahead: prefetch N predicted experts for the next layer during decode. "
+        "0 disables (default). Requires --moe-expert-cache-size > 0.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_moe_lookahead = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_LOOKAHEAD"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

@@ -1,0 +1,308 @@
+# Decode look-ahead expert prefetch for llama.cpp - design note
+
+Goal: hide the host/NVMe -> GPU transfer of MoE experts behind compute on the
+2-GPU rig, porting the mechanisms used by colibri and FreeToken.
+
+Status: design only, no code. Requesting review of the approach and the scope
+boundary before implementing.
+
+## Current-state evidence (why the obvious path is closed)
+
+The fork already has a grouped early-router, but on this rig it cannot be used:
+
+- Decode runs the legacy cached MMID path (`DECODE_LEGACY`), not `DECODE_GROUPED`.
+  The certified decode group reason is `route(8)` (`GROUP_REASON_ROUTE`).
+- Cause: on layer-split, the routing `argsort` (the source of the top-K ids) lives
+  in the other GPU's split, so `moe_candidate_discover_route` cannot find the ids
+  nodes before the MMID node in the same split graph. The fork then deliberately
+  fails closed to the cached MMID (layer-split keeps argsort on one device).
+- Conclusion: `DECODE_GROUPED` is intentionally disabled for layer-split, not
+  broken. Enabling it is not a toggle; it needs the ids on the MoE split.
+
+Also, the expert cache is currently almost empty at decode:
+
+- `--fit on` with `--moe-expert-cache-size` does NOT work: the cache installs a
+  tensor buft override, and `common_fit_params` aborts with
+  `failed to fit params ... tensor_buft_overrides already set by user, abort`.
+  So fit does not run and placement falls back to the default offload.
+- With `--fit on` alone, only 1 of 48 layers (`blk.47`) lands in the cached
+  buffer, so there is nothing for a prefetcher to feed.
+- The working combination must be `--fit off` plus manual placement, keeping the
+  28.8 GB PLE embedding host-side (`--n-cpu-moe`, `--override-tensor`) and setting
+  `--moe-expert-cache-size` by hand. Establishing this residency is a prerequisite
+  for both halves below.
+
+## What the references actually do
+
+### colibri (C, JustVugg/colibri) - router-driven look-ahead (PILOT)
+
+Source: `c/colibri.c`.
+
+- `la_predict(m, target, h, kind)` (c:6343): predicts a layer's top-K by running the
+  SAME routing pipeline on a hidden state: `rmsnorm(h, layer.post_ln)` -> `router`
+  matmul -> `sigmoid + router_bias` -> greedy top-K.
+  - kind 1 = PILOT: `target = L+1`, using L's post-attention state (stale, before
+    MoE(L)). Measured recall 71.6% (GLM-5.2), 75.8% on its trace; previous-token
+    routing only 41.3%.
+  - kind 2 = PILOT_TWO: approximate MoE(L) by computing only L's SHARED expert on the
+    normalized state (resident, no disk), add it to h, then run L+1's router. Corrects
+    the dominant part the stale state is missing; +2.3-3.1%.
+- Invocation (c:6979): inside the per-layer loop, immediately AFTER attention, when
+  `li+1` is sparse: `pilot_prefetch(m, li+1, x, S)`.
+- `pilot_prefetch` (c:6690): for each position, run the predicted router, then for each
+  predicted expert NOT already resident in the FUTURE layer's cache, enqueue (layer, eid)
+  onto a lock-free SPMC ring; dedicated I/O worker threads consume it and issue WILLNEED
+  (`PILOT=1`, hint-only default) or a real cross-layer `pread` into `ecache[L+1]`
+  (`PILOT_REAL=1`).
+- Knobs: `PILOT`, `PILOT_K` (prefetch only top-k, head of ranking more reliable; default 6
+  real / 8 hint), `PILOT_TWO`, `PILOT_REAL`, `PILOT_WORKERS`, `PILOT_EVICT_GUARD=1`.
+- Safety invariants (c:1462-1478):
+  1. pilot writes ONLY future layers (`layer > g_cur_moe_layer`); it never touches the
+     layer the main thread is computing.
+  2. main waits (cond var) for in-flight pilot loads on the layer it is about to compute.
+  3. eviction guard: a speculative load may evict a resident expert only if the resident
+     is not genuinely warm (>=2 demand accesses and hotter than the speculation by
+     hysteresis).
+
+### FreeToken (Python/CUDA, local) - cache + overlap, look-ahead only in prefill
+
+Source: `freetoken/python/freetoken`.
+
+- `OffloadMoeCache` (`moe/offload_cache.py`): slot cache keyed by flat `id = layer*E +
+  expert`, LRU, bank-layout aware (nvfp4 etc.).
+- Prefill: explicit one-layer look-ahead double buffering - `_prefill_routed`
+  (`layers/moe.py:388`) calls `cache.prefetch_prefill_layer(L)`;
+  `prefetch_prefill_layer(L+1)`; `wait_prefill_layer` before use. `prefill_hit_d2d`
+  gathers already-resident experts device-side instead of re-streaming them.
+- Decode: NO cross-layer look-ahead. `_decode_routed` (`layers/moe.py:279`) calls
+  `cache.ensure_experts(L, topk_ids)` on demand: hits served from the slot cache, misses
+  streamed over PCIe (fused multi-bank `cudaMemcpyBatchAsync`).
+- Hybrid: `decode_target="hybrid"` fans each layer's misses out - a capped/fractional
+  subset is fetched over PCIe, the rest computed on CPU; `hybrid_fetch_fraction =
+  pcie_bw/cpu_bw` balances fetch time and CPU GEMV time for perfect overlap. Deep
+  principle: every decode miss is ultimately a PCIe transfer, so latency is bounded by
+  the link - look-ahead cannot remove it unless the prediction is cheap and early enough.
+
+Take-aways for us:
+
+- Cross-layer look-ahead helps only if the prediction is computed EARLY (during L's
+  attention/MoE) and the transfer overlaps existing compute.
+- colibri's predictive router is the transferable decode mechanism; FreeToken's
+  double-buffer and PCIe/CPU split bound the misses that prediction does not cover.
+- Both keep the idea device-agnostic: prediction produces (layer, expert) ids; a loader
+  moves bytes. That maps cleanly onto llama.cpp.
+
+### Upstream context (ggml-org discussion #24528, leloch's RFC)
+
+The fork's expert cache descends from this RFC; upstream never merged it, which is why
+the fork carries it. Its comment thread produced measurements that directly shape this
+design:
+
+- Decode routing skew is real and independently corroborated: top 10% of experts take
+  ~80% of hits (Gini ~0.76, issue #20757). But noonghunna's capacity sweep shows the
+  demand LRU keeps improving nearly linearly to ~31% pool coverage before flattening
+  (~0.56 -> 0.29 -> 0.01 marginal t/s per GB) - the hot head is NOT a small fixed set
+  (SharkWipf's "top ~1000 experts" reading was an under-warming artifact). So a warmed
+  demand cache already absorbs most of the win; look-ahead prefetch's job is the miss
+  TAIL, and its expected gain is bounded by that residual. Validate against a warmed
+  pool, never a cold one.
+- Sync points kill: the RFC's Metal slot-pool experiment was 2x slower than vanilla at
+  97-99% hit rate, purely from per-layer syncs; batot1's GTX 1080 Ti sweep regressed at
+  every budget. Direct constraint on PR-A: no full-stream synchronize in any demand or
+  prefetch path; dependency on in-flight prefetch copies must be event-based only.
+- leloch's v2 ablation: packing two H2D copies per dispatch into one removed ~40,000
+  H2D ops from matched traces. PR-A must use the cache's batched copy path
+  (`cudaMemcpyBatchAsync`, moe-cache.cu:5033) instead of one copy per eid where the
+  banks allow it.
+- Hybrid hit/miss execution (hits on GPU, misses stay on CPU) is measured, not
+  hypothetical: +10-57% across 13 models with prefill bit-untouched. This is measured
+  evidence for the FreeToken-bound follow-up below, and it composes with speculation:
+  MTP worth +28% without the cache, +51% with it.
+- Benchmark footguns to bake into our validation: an under-warmed pool reads as
+  saturated; requested budgets are silently VRAM-capped (read the granted-capacity log,
+  not the flag); the cache must never silently bypass (upstream added a one-shot warning
+  for batch-bound bypass; our consumer must log, not no-op silently, when a prefetch
+  target cannot be cached).
+
+## Mapping onto the llama.cpp fork
+
+Existing machinery already present:
+
+- CUDA slot cache with a real prefetch consumer:
+  `ggml_cuda_moe_cache_acquire_locked(..., is_prefetch, ...)` (moe-cache.cu:13186)
+  schedules the H2D on a dedicated `copy_stream`, tracks `slot_prefetched`, and exposes
+  `phase_prefetch_*` counters.
+- Producer entry point stub (zero callers):
+  `ggml_backend_cuda_moe_prefetch_experts(device, tensor_name, eids, n_eids, use_l2,
+  is_decode)` declared in ggml/include/ggml-cuda.h:68 and implemented as a no-op at
+  moe-cache.cu:14683.
+- Legacy cached decode path `ggml_cuda_mul_mat_id_cached` (ggml-cuda.cu:3261) is what
+  actually runs on this rig; grouped/early-router is disabled for layer-split.
+- CLI: `--moe-expert-cache-size` / `--moe-expert-cache-l2-pinned-mb`;
+  `mparams.moe_expert_cache_slots`.
+- Gating: the entire feature (consumer + producer) ships behind a new `--moe-lookahead`
+  CLI param, default off. No env master switch. See "Param gates" below.
+
+Proposed implementation, two halves:
+
+A. Consumer (self-contained, low risk)
+
+   Implement `ggml_backend_cuda_moe_prefetch_experts`: resolve the per-device cache for
+   `tensor_name`, and for each eid call `ggml_cuda_moe_cache_acquire_locked(...,
+   is_prefetch=true, wait_for_compute=false)` with the expert row pointer obtained from
+   the registered tensor base + eid * expert_stride. Reuse the eviction guard semantics
+   (never evict a slot that a running GEMM is reading; do not clobber warmer residents).
+
+B. Producer (the real work, two options)
+
+   Option P1 - graph-level look-ahead (colibri PILOT, layer device-agnostic):
+
+   In the decode graph, right after attention of layer L, add: `rms_norm(x, L+1.post_ln)`
+   -> `mul_mat(L+1.router)` -> (sigmoid + bias) -> `top_k` -> a new `GGML_OP_MOE_PREFETCH`
+   node carrying the predicted ids for layer L+1. In the CUDA backend that node calls
+   `ggml_backend_cuda_moe_prefetch_experts` before layer L's MoE runs. Cost: about 4-5
+   small matmul nodes per layer (shared-expert two-step optional). Pros: works on
+   layer-split, matches colibri, no grouped-path dependency. Cons: touches
+   llama-graph.cpp + a new op + backend dispatch.
+
+   Option P2 - reuse the fork's early-router, but for the LEGACY path: teach the legacy
+   cached mmid to consume a next-layer prediction instead of requiring DECODE_GROUPED.
+   Smaller graph change but entangled with the grouped plan; does not help layer-split
+   route ids.
+
+Recommendation: P1 + A. P1 is the faithful port of colibri's PILOT and sidesteps the
+layer-split grouped blocker entirely. Add FreeToken's bound as a follow-up: when predicted
+misses exceed what PCIe can move in the layer's compute window, route the overflow to CPU
+(the existing legacy host path already computes experts on the host, so this is a policy
+knob, not new math). Upstream RFC #24528 measured exactly this hybrid: +10-57% decode on
+13 models forced to spill, prefill bit-untouched - and confirmed the levers compose with
+speculative decoding (MTP +28% standalone, +51% with the cache active).
+
+## Invariants to preserve (from colibri)
+
+1. Prefetch MUST target only future layers; never mutate the cache slots of the layer
+   being computed.
+2. Never let a speculative fill evict a slot the current GEMM is reading; never evict a
+   genuinely warm resident for a speculation.
+3. A missed prediction must be harmless (fall back to the demand path); a failed
+   speculative load must not abort the request.
+4. Prediction must be cheap relative to the layer's compute (about 4 small matmuls), and
+   must run EARLY (right after attention) so the copy overlaps the MoE.
+5. Bound speculative bandwidth (`PILOT_K` / fraction) so wrong predictions do not starve
+   demand.
+
+## Validation plan
+
+- Unit: predict-then-check recall on a captured decode graph vs. the demand routing ids
+  (expect about 70-76% top-K on this model; compare to the previous-token baseline).
+- Instrumented run: `phase_prefetch_hits/used/h2d_bytes` from the existing telemetry;
+  assert prefetch_used > 0 and decode t/s improves on the warm apex config (baseline
+  21 t/s plain / 26 t/s MTP, 0 disk I/O).
+- A/B with `--moe-lookahead 0` (param default) to isolate the gain; guard against
+  regressions on non-MoE models.
+- All decode A/B arms MUST run on a warmed pool (per upstream #24528: an under-warmed
+  cache reads as saturated; bigger pools need proportionally more varied traffic).
+  Measure the granted pool size from the cache log, not the flag value.
+- Prefill/prompt-processing regression check on every A/B (upstream comparison showed
+  PP can regress in cache builds even when prefill is bit-untouched: -6% to -14% PP).
+  Our contract: PP unchanged when the switch is off, PP unchanged when on
+  (look-ahead emits decode-only graph nodes).
+
+## Risks / open questions
+
+- Expert tensors must actually be in the CUDA-MoE-cached buffer for any of this to matter.
+  Today with `--fit on` only 1 of 48 layers is; host-resident experts must be routed
+  through the cache (the loader warns to use `--fit off` + manual cache size). This is a
+  prerequisite for both A and P1 and should be verified first.
+- Layer-split: the router/`post_ln` tensors of L+1 and the hidden state x must be on
+  (or reachable from) the device issuing the prefetch. If x is on the other GPU's split,
+  the prediction needs a small D2D/peer transfer of the hidden state (1 x D floats) -
+  cheap.
+- The prediction graph nodes add per-layer overhead; must confirm it stays under the win.
+- Fork policy: this is a new op + multi-file change; needs maintainer-facing design
+  scrutiny and an explicit go-ahead before coding.
+
+## Implementation plan (PR-A consumer + PR-P1 producer)
+
+Both PRs stack on `feat/763-reconcile-qwen4exp-mtp` (PR #120) and target the epic
+`baseline-flash-next` after #120 lands. Both default OFF. The consumer is inert
+until the producer exists. Line numbers below are on the feat/763 tip.
+
+Param gates (CLI, not env; follows the `--moe-expert-cache-*` knob conventions):
+
+- `--moe-lookahead N` master gate and predicted width in one knob, default 0 = off.
+  N > 0 enables look-ahead for main target decode with predicted width N
+  (colibri: 6 real / 8 hint; recommended first A/B value 8).
+- `--moe-lookahead-two` PILOT_TWO shared-expert correction, default off.
+- Arg validation: error if `--moe-lookahead > 0` and `--moe-expert-cache-size` is 0
+  (residency is the prerequisite; fail loudly, no silent no-op).
+- Plumbing: `common_params::n_moe_lookahead` beside `n_moe_expert_cache_slots`
+  (common.h:543), `mparams.moe_lookahead` at common.cpp:1713, then a backend setter
+  `ggml_backend_cuda_moe_set_lookahead()` mirroring
+  `ggml_backend_cuda_moe_set_l2_pinned_cache_size()`. No draft inherit
+  (no `--spec-draft-moe-lookahead`): look-ahead is main-target-only, matching the
+  grouped-decode restriction.
+- Debug-only env (never a gate): `GGML_CUDA_MOE_LOOKAHEAD_DEBUG=1` recall + prefetch
+  telemetry. Env cannot flip behavior.
+
+### PR-A - consumer (self-contained, low risk)
+
+Template: `ggml_cuda_moe_grouped_context::prefetch_legacy_siblings` (moe-cache.cu:8529).
+It already does the acquire loop we need. P1 only changes the target from same-layer
+siblings to the next layer's expert tensors.
+
+1. `moe-cache.cuh` - add to `ggml_cuda_moe_grouped_context`:
+   `void prefetch_legacy_layer(const ggml_tensor * experts, const int32_t * eids, int n_eids, bool use_l2, bool is_decode);`
+2. `moe-cache.cu` - implement it:
+   - `auto lease = acquire_legacy_cache(experts);` installs the next layer's per-layer
+     pool on demand (needs `op == GGML_OP_NONE`, `ne[2] > 0`, `nb[2] > 0`).
+   - `cudaStream_t cs = ggml_cuda_moe_cache_copy_stream(cache);`
+   - for each eid: `ggml_cuda_moe_cache_acquire(cache, data + eid*nb[2], nb[2], cs, use_l2, is_decode, /*is_prefetch=*/true, /*pin=*/false);`
+   - prefetch the gate/up/down siblings too via `prefetch_legacy_siblings` on the lease.
+   - batch the H2D: prefer one batched copy (the demand path's `cudaMemcpyBatchAsync`
+     pattern, moe-cache.cu:5033) over one async copy per eid - upstream v2 removed
+     ~40k H2D ops by packing copies per dispatch.
+3. `moe-cache.cu:14629` - replace the no-op `ggml_backend_cuda_moe_prefetch_experts`:
+   resolve the device's `ggml_cuda_moe_grouped_context` and call `prefetch_legacy_layer`.
+   Keep the exported signature (`ggml/include/ggml-cuda.h:68`).
+
+Invariants: `is_prefetch=true` (drives the `phase_prefetch_*` counters),
+`wait_for_compute=false`, `pin=false`; an acquire returning -1 is ignored; never touch
+the cache of the layer being computed.
+
+Acceptance A: built and run with `--moe-lookahead 8`; `phase_prefetch_hits/used` and
+`phase_prefetch_h2d_bytes` move; decode output is byte-identical (prefetch cannot change
+results); with the param at its default there is no hit-rate regression.
+
+### PR-P1 - producer (graph-level PILOT)
+
+1. Predicted ids reuse existing ops, no new math:
+   `rms_norm(cur, L+1.ffn_norm)` -> `build_lora_mm(L+1.ffn_gate_inp, .)` -> `sigmoid`
+   (+`ffn_gate_inp_b`) -> `top_k`. This mirrors `build_moe_ffn` (llama-graph.cpp:2067,
+   gate at :2099, sigmoid at :2122).
+2. New side-effect op `GGML_OP_MOE_PREFETCH`:
+   - `src[0]` = next layer's expert tensor (`ffn_gate_up_exps` or `ffn_gate_exps`),
+     `src[1]` = predicted ids (i32).
+   - constructor in `ggml.h`; CPU backend no-op; CUDA dispatch in
+     `ggml_cuda_compute_forward`: read `src[1]` D2H, call `prefetch_legacy_layer`.
+   - output aliases `src[1]` so the scheduler keeps the node in order (no dead-node removal).
+3. Graph insertion in the per-model layer loop (`llm_build_*`), decode only, only when
+   `il+1` is MoE: emit the prediction + op right after layer L's attention residual,
+   before L's MoE, so the H2D overlaps L's MoE.
+4. PILOT_TWO (optional): add L's shared-expert output to `cur` before the norm.
+
+Open questions to settle before P1 coding:
+
+- Q1: can `acquire_legacy_cache` install L+1's pool while L executes (generation/epoch
+  guards)? Probe first.
+- Q2: layer-split - L and L+1 can be on different devices; the op must run where L+1's
+  cache lives (device 0 today). `cur` may need a 1 x n_embd peer copy.
+- Q3: CUDA graph capture - keep the side-effect op out of captured graphs first
+  (steady-state capture is already off in this config).
+- Q4: draft/MTP contexts - gate to target decode only.
+
+### Validation
+
+- recall (predicted vs demand ids), `phase_prefetch_used`, decode t/s on fit-off
+  N=144 (baseline 32.66 t/s), sdb read 0. Warm the pool first; log granted slots.
+- A/B with `--moe-lookahead 0`; no regression on dense models; PP unchanged on/off.

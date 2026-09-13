@@ -421,6 +421,24 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-2, nullptr};
         }
 
+        // MoE look-ahead gate. Applied after load so every entry point sees
+        // one fail-loud check: a prediction width without expert cache
+        // residency would prefetch into nothing.
+        if (params.moe_lookahead < 0) {
+            throw std::runtime_error("--moe-lookahead requires a non-negative width");
+        }
+        if (params.moe_lookahead > 0 && params.moe_expert_cache_slots == 0) {
+            throw std::runtime_error("--moe-lookahead requires --moe-expert-cache-size > 0");
+        }
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            auto set_lookahead_fn = (ggml_backend_moe_cache_set_lookahead_t) ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_MOE_CACHE_SET_LOOKAHEAD_PROC_NAME);
+            if (set_lookahead_fn != nullptr) {
+                set_lookahead_fn(params.moe_lookahead);
+            }
+        }
+
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
