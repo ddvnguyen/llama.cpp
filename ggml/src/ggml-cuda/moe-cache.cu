@@ -71,6 +71,54 @@ static constexpr uint64_t MOE_ORIGINAL_DIRECT_AUX_MAX_BYTES = 4 * 1024;
 static constexpr size_t MOE_PREFILL_RESIDENT_AUX_BUDGET = 32 * 1024 * 1024;
 static std::atomic<bool> g_moe_cache_mm_debug{false};
 static std::atomic<size_t> g_moe_cache_l2_pinned_size{0};
+static std::atomic<int> g_moe_cache_lookahead{0};
+
+static int moe_cache_lookahead_width() {
+    return g_moe_cache_lookahead.load(std::memory_order_relaxed);
+}
+
+// One-shot warn for prefetch path misuse. Never per-step spam.
+static void moe_cache_prefetch_warn_once(std::atomic<bool> & flag, const char * msg) {
+    bool expected = false;
+    if (flag.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        GGML_LOG_WARN("%s\n", msg);
+    }
+}
+
+// Device -> latest grouped context, so the exported string-keyed prefetch
+// entry point can find the cache owner. Backend contexts own the objects;
+// this map never owns. Multiple contexts per device may exist in tests; the
+// latest registered wins, which matches single-context production use.
+static std::mutex g_moe_prefetch_registry_mu;
+static std::unordered_map<int, ggml_cuda_moe_grouped_context *> g_moe_prefetch_registry;
+
+static void moe_cache_prefetch_register(int device, ggml_cuda_moe_grouped_context * context) {
+    if (device < 0 || context == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_moe_prefetch_registry_mu);
+    g_moe_prefetch_registry[device] = context;
+}
+
+static void moe_cache_prefetch_unregister(ggml_cuda_moe_grouped_context * context) {
+    if (context == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_moe_prefetch_registry_mu);
+    for (auto it = g_moe_prefetch_registry.begin(); it != g_moe_prefetch_registry.end();) {
+        if (it->second == context) {
+            it = g_moe_prefetch_registry.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static ggml_cuda_moe_grouped_context * moe_cache_prefetch_context(int device) {
+    std::lock_guard<std::mutex> lock(g_moe_prefetch_registry_mu);
+    auto it = g_moe_prefetch_registry.find(device);
+    return it != g_moe_prefetch_registry.end() ? it->second : nullptr;
+}
 
 static size_t moe_cache_quantized_source_padding(uint32_t type, int64_t ne0) {
     if (type >= GGML_TYPE_COUNT || ne0 <= 0 || !ggml_is_quantized((ggml_type) type)) {
@@ -6716,9 +6764,11 @@ ggml_cuda_moe_grouped_context::ggml_cuda_moe_grouped_context(ggml_backend_dev_t 
     auto & telemetry = moe_cache_owner_telemetry_state();
     std::lock_guard<std::mutex> lock(telemetry.mutex);
     telemetry.active.insert(this);
+    moe_cache_prefetch_register(device, this);
 }
 
 ggml_cuda_moe_grouped_context::~ggml_cuda_moe_grouped_context() {
+    moe_cache_prefetch_unregister(this);
     shutdown();
 }
 
@@ -13256,6 +13306,263 @@ int ggml_cuda_moe_cache_acquire(
     return slot;
 }
 
+// MoE look-ahead prefetch: reserve slots for a batch of experts with prefetch
+// accounting, then issue the H2D copies. Caller must hold cache->mu; all
+// copies are enqueued on copy_stream before the lock is released, so a
+// concurrent demand acquire cannot reuse a reserved slot mid-batch. Like
+// acquire_locked with is_prefetch=true, wait_for_compute=false, pin=false:
+// no stream wait, no sync, a failed copy rolls its booking back and the miss
+// is left for the demand path. Unknown eids are skipped, never fatal.
+static void ggml_cuda_moe_cache_prefetch_locked(
+    struct ggml_cuda_moe_cache * cache,
+    const void * base,
+    size_t stride,
+    size_t byte_count,
+    const int32_t * expert_ids,
+    int n_expert_ids,
+    int64_t n_experts,
+    cudaStream_t copy_stream,
+    bool use_l2,
+    bool is_decode) {
+    if (byte_count == 0 || byte_count > cache->slot_size_bytes) {
+        return;
+    }
+    const int phase = moe_cache_phase_index(is_decode);
+    const bool debug_mm = cache->debug_mm;
+    const int64_t enqueue_start_us = debug_mm ? ggml_time_us() : 0;
+    std::vector<std::pair<int, const void *>> reserved;
+    reserved.reserve(n_expert_ids);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    std::vector<void *> batch_dsts;
+    std::vector<const void *> batch_srcs;
+    std::vector<size_t> batch_sizes;
+    batch_dsts.reserve(n_expert_ids);
+    batch_srcs.reserve(n_expert_ids);
+    batch_sizes.reserve(n_expert_ids);
+#endif
+    auto rollback_one = [&](int slot, const void * host_src) {
+        cache->slot_to_host[slot] = nullptr;
+        cache->host_to_slot.erase(host_src);
+        cache->slot_prefetched[slot] = 0;
+    };
+    uint64_t ok_copies = 0;
+    for (int i = 0; i < n_expert_ids; ++i) {
+        const int32_t expert = expert_ids[i];
+        if (expert < 0 || (n_experts > 0 && (int64_t) expert >= n_experts)) {
+            continue;
+        }
+        const void * host_src = (const char *) base + (size_t) expert * stride;
+        ggml_cuda_moe_cache_record_expert_access(cache, host_src, phase);
+        auto hit = cache->host_to_slot.find(host_src);
+        if (hit != cache->host_to_slot.end()) {
+            const int slot = hit->second;
+            cache->last_used[slot] = ++cache->access_counter;
+            cache->slot_hit_count[slot]++;
+            cache->hits.fetch_add(1, std::memory_order_relaxed);
+            cache->phase_hits[phase].fetch_add(1, std::memory_order_relaxed);
+            cache->phase_prefetch_hits[phase].fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        int lru_slot = -1;
+        uint64_t lru_t = std::numeric_limits<uint64_t>::max();
+        for (int s = 0; s < cache->n_slots; ++s) {
+            if (cache->slot_pin_count[s] != 0) {
+                continue;
+            }
+            if (cache->last_used[s] < lru_t) {
+                lru_t = cache->last_used[s];
+                lru_slot = s;
+            }
+        }
+        if (lru_slot < 0) {
+            continue;
+        }
+        const void * evicted = cache->slot_to_host[lru_slot];
+        if (evicted != nullptr) {
+            cache->host_to_slot.erase(evicted);
+            cache->evictions.fetch_add(1, std::memory_order_relaxed);
+            cache->phase_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+            cache->phase_prefetch_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+            if (cache->slot_prefetched[lru_slot]) {
+                cache->phase_evicted_prefetched[phase].fetch_add(1, std::memory_order_relaxed);
+            }
+            if (cache->slot_hit_count[lru_slot] <= 1) {
+                cache->phase_evicted_hit_count_le1[phase].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                cache->phase_evicted_hit_count_ge2[phase].fetch_add(1, std::memory_order_relaxed);
+            }
+            const uint64_t age = cache->access_counter >= cache->slot_fill_access[lru_slot] ?
+                cache->access_counter - cache->slot_fill_access[lru_slot] : 0;
+            if (age <= (uint64_t) cache->n_slots) {
+                cache->phase_evicted_age_le_l1[phase].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                cache->phase_evicted_age_gt_l1[phase].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        cache->slot_to_host[lru_slot] = host_src;
+        cache->host_to_slot[host_src] = lru_slot;
+        cache->last_used[lru_slot] = ++cache->access_counter;
+        cache->slot_prefetched[lru_slot] = 1;
+        cache->slot_hit_count[lru_slot] = 0;
+        cache->slot_fill_access[lru_slot] = cache->access_counter;
+        cache->misses.fetch_add(1, std::memory_order_relaxed);
+        cache->phase_misses[phase].fetch_add(1, std::memory_order_relaxed);
+        cache->phase_prefetch_misses[phase].fetch_add(1, std::memory_order_relaxed);
+        const void * copy_src = use_l2 ?
+            ggml_cuda_moe_cache_l2_source(cache, host_src, byte_count, is_decode, copy_stream) : host_src;
+        if (debug_mm && copy_src == host_src) {
+            const uint64_t miss_index = g_moe_cache_mm_miss_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((miss_index % MOE_CACHE_MM_SAMPLE_RATE) == 0) {
+                moe_cache_mm_sample_mincore(
+                    host_src,
+                    byte_count,
+                    cache->sampled_mincore_checks,
+                    cache->sampled_pages_total,
+                    cache->sampled_pages_resident,
+                    cache->sampled_nonresident_expert_count,
+                    cache->mincore_failures);
+            }
+        }
+        void * dst = (char *) cache->slot_pool_d + (size_t) lru_slot * cache->slot_size_bytes;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+        batch_dsts.push_back(dst);
+        batch_srcs.push_back(copy_src);
+        batch_sizes.push_back(byte_count);
+#else
+        if (cudaMemcpyAsync(dst, copy_src, byte_count, cudaMemcpyHostToDevice, copy_stream) != cudaSuccess) {
+            fprintf(stderr, "moe-cache: prefetch copy failed, miss left for demand path\n");
+            rollback_one(lru_slot, host_src);
+            continue;
+        }
+        ok_copies++;
+#endif
+        reserved.emplace_back(lru_slot, host_src);
+    }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    if (!batch_srcs.empty()) {
+        cudaMemcpyAttributes attributes = {};
+        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+        size_t attributes_index = 0;
+        cudaError_t err;
+#if CUDART_VERSION < 13000
+        size_t fail_index = SIZE_MAX;
+        err = cudaMemcpyBatchAsync(batch_dsts.data(), batch_srcs.data(), batch_sizes.data(),
+            batch_srcs.size(), &attributes, &attributes_index, 1, &fail_index, copy_stream);
+#else
+        err = cudaMemcpyBatchAsync(batch_dsts.data(), batch_srcs.data(), batch_sizes.data(),
+            batch_srcs.size(), &attributes, &attributes_index, 1, copy_stream);
+#endif
+        if (err != cudaSuccess) {
+            fprintf(stderr, "moe-cache: prefetch batch copy failed: %s, misses left for demand path\n",
+                cudaGetErrorString(err));
+            for (const auto & entry : reserved) {
+                rollback_one(entry.first, entry.second);
+            }
+            return;
+        }
+        ok_copies = batch_srcs.size();
+    }
+#endif
+    if (debug_mm && ok_copies > 0) {
+        const uint64_t h2d_enqueue_time_us = (uint64_t) (ggml_time_us() - enqueue_start_us);
+        const uint64_t ok_bytes = ok_copies * byte_count;
+        cache->h2d_copy_count.fetch_add(ok_copies, std::memory_order_relaxed);
+        cache->h2d_copy_bytes.fetch_add(ok_bytes, std::memory_order_relaxed);
+        cache->phase_h2d_copy_count[phase].fetch_add(ok_copies, std::memory_order_relaxed);
+        cache->phase_h2d_copy_bytes[phase].fetch_add(ok_bytes, std::memory_order_relaxed);
+        cache->phase_h2d_enqueue_time_us[phase].fetch_add(h2d_enqueue_time_us, std::memory_order_relaxed);
+        cache->phase_prefetch_h2d_copy_count[phase].fetch_add(ok_copies, std::memory_order_relaxed);
+        cache->phase_prefetch_h2d_copy_bytes[phase].fetch_add(ok_bytes, std::memory_order_relaxed);
+        cache->phase_prefetch_h2d_enqueue_time_us[phase].fetch_add(h2d_enqueue_time_us, std::memory_order_relaxed);
+    }
+}
+
+void ggml_cuda_moe_grouped_context::prefetch_legacy_layer(
+        const ggml_tensor * experts,
+        const int32_t * expert_ids,
+        int n_expert_ids,
+        bool use_l2,
+        bool is_decode) {
+    if (experts == nullptr || expert_ids == nullptr || n_expert_ids <= 0) {
+        return;
+    }
+    if (moe_cache_lookahead_width() <= 0) {
+        return;
+    }
+    if (ggml_n_dims(experts) < 3 || experts->ne[2] <= 0 || experts->nb[2] == 0 || experts->data == nullptr) {
+        return;
+    }
+    if (experts->buffer == nullptr ||
+            !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(experts->buffer))) {
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned, "moe-cache: look-ahead prefetch target is not MoE-cached, skip");
+        return;
+    }
+    // Installs the next layer's pool on demand. The lease holds the pool
+    // alive; it targets a future layer, never the one being computed.
+    auto lease = acquire_legacy_cache(experts);
+    ggml_cuda_moe_cache * cache = lease.get();
+    if (cache == nullptr) {
+        return;
+    }
+    cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache);
+    if (copy_stream == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(cache->mu);
+        ggml_cuda_moe_cache_prefetch_locked(
+            cache, experts->data, experts->nb[2], experts->nb[2],
+            expert_ids, n_expert_ids, experts->ne[2], copy_stream, use_l2, is_decode);
+    }
+    prefetch_legacy_siblings(lease, expert_ids, n_expert_ids, use_l2, is_decode);
+}
+
+void ggml_cuda_moe_grouped_context::prefetch_legacy_layer_by_name(
+        const char * tensor_name,
+        const int32_t * expert_ids,
+        int n_expert_ids,
+        bool use_l2,
+        bool is_decode) {
+    if (tensor_name == nullptr || tensor_name[0] == '\0' || expert_ids == nullptr || n_expert_ids <= 0) {
+        return;
+    }
+    if (moe_cache_lookahead_width() <= 0) {
+        return;
+    }
+    const ggml_tensor * target = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        for (const auto & entry : impl_->legacy_records) {
+            const ggml_tensor * tensor = entry.first;
+            if (tensor != nullptr && strncmp(tensor->name, tensor_name, GGML_MAX_NAME) == 0) {
+                target = tensor;
+                break;
+            }
+        }
+        if (target == nullptr && impl_->state.accepted) {
+            for (const auto & group : impl_->table.groups) {
+                for (const auto & bank : group.banks) {
+                    const ggml_tensor * tensor = bank.info.tensor;
+                    if (tensor != nullptr && strncmp(tensor->name, tensor_name, GGML_MAX_NAME) == 0) {
+                        target = tensor;
+                        break;
+                    }
+                }
+                if (target != nullptr) {
+                    break;
+                }
+            }
+        }
+    }
+    if (target == nullptr) {
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned, "moe-cache: look-ahead prefetch cannot resolve tensor name, skip");
+        return;
+    }
+    prefetch_legacy_layer(target, expert_ids, n_expert_ids, use_l2, is_decode);
+}
+
 extern "C"
 void ggml_cuda_moe_cache_release_slots(
     struct ggml_cuda_moe_cache * cache,
@@ -13844,6 +14151,29 @@ static moe_cache_phase_stats ggml_cuda_moe_cache_phase_stats(const struct ggml_c
         s.l2_fill_time_us = cache->l2.phase_fill_time_us[phase].load(std::memory_order_relaxed);
     }
     return s;
+}
+
+extern "C"
+void ggml_cuda_moe_cache_prefetch_stats_for_test(
+    const struct ggml_cuda_moe_cache * cache,
+    bool is_decode,
+    uint64_t * out_hits,
+    uint64_t * out_misses,
+    uint64_t * out_used,
+    uint64_t * out_h2d_bytes) {
+    const int phase = moe_cache_phase_index(is_decode);
+    if (out_hits != nullptr) {
+        *out_hits = cache != nullptr ? cache->phase_prefetch_hits[phase].load(std::memory_order_relaxed) : 0;
+    }
+    if (out_misses != nullptr) {
+        *out_misses = cache != nullptr ? cache->phase_prefetch_misses[phase].load(std::memory_order_relaxed) : 0;
+    }
+    if (out_used != nullptr) {
+        *out_used = cache != nullptr ? cache->phase_prefetch_used[phase].load(std::memory_order_relaxed) : 0;
+    }
+    if (out_h2d_bytes != nullptr) {
+        *out_h2d_bytes = cache != nullptr ? cache->phase_prefetch_h2d_copy_bytes[phase].load(std::memory_order_relaxed) : 0;
+    }
 }
 
 static moe_cache_phase_stats moe_cache_take_op_stats(moe_cache_op_phase_stats & op, bool reset) {
@@ -14545,6 +14875,19 @@ size_t ggml_backend_cuda_moe_get_l2_pinned_cache_size(void) {
 }
 
 extern "C"
+void ggml_backend_cuda_moe_set_lookahead(int n) {
+    if (n < 0) {
+        n = 0;
+    }
+    g_moe_cache_lookahead.store(n, std::memory_order_relaxed);
+}
+
+extern "C"
+int ggml_backend_cuda_moe_get_lookahead(void) {
+    return g_moe_cache_lookahead.load(std::memory_order_relaxed);
+}
+
+extern "C"
 void ggml_backend_cuda_moe_set_debug_mm(bool enabled) {
     g_moe_cache_mm_debug.store(enabled, std::memory_order_relaxed);
 }
@@ -14583,12 +14926,47 @@ void ggml_backend_cuda_moe_prefetch_experts(
     int             n_eids,
     bool            use_l2,
     bool            is_decode) {
-    GGML_UNUSED(device);
-    GGML_UNUSED(tensor_name);
-    GGML_UNUSED(eids);
-    GGML_UNUSED(n_eids);
-    GGML_UNUSED(use_l2);
-    GGML_UNUSED(is_decode);
+    // Inert until the lookahead gate is on. The graph-level producer (a later
+    // PR) is the only caller; with the default 0 this is stock behavior.
+    if (eids == nullptr || n_eids <= 0 || moe_cache_lookahead_width() <= 0) {
+        return;
+    }
+    if (tensor_name == nullptr || tensor_name[0] == '\0') {
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned, "moe-cache: look-ahead prefetch called without tensor name, skip");
+        return;
+    }
+    // The observation hook carries no tensor pointers, so resolution goes
+    // through the device's grouped context (known expert tensors). Logs
+    // loudly when nothing can serve the request.
+    ggml_cuda_moe_grouped_context * context = moe_cache_prefetch_context(device);
+    if (context == nullptr) {
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned, "moe-cache: look-ahead prefetch has no grouped context for device, skip");
+        return;
+    }
+    context->prefetch_legacy_layer_by_name(tensor_name, eids, n_eids, use_l2, is_decode);
+}
+
+// Pointer-based entry for the in-tree producer. Same gate, no name lookup.
+extern "C"
+void ggml_backend_cuda_moe_prefetch_experts_tensor(
+    int device,
+    const ggml_tensor * experts,
+    const int32_t * expert_ids,
+    int n_expert_ids,
+    bool use_l2,
+    bool is_decode) {
+    if (experts == nullptr || expert_ids == nullptr || n_expert_ids <= 0 || moe_cache_lookahead_width() <= 0) {
+        return;
+    }
+    ggml_cuda_moe_grouped_context * context = moe_cache_prefetch_context(device);
+    if (context == nullptr) {
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned, "moe-cache: look-ahead prefetch has no grouped context for device, skip");
+        return;
+    }
+    context->prefetch_legacy_layer(experts, expert_ids, n_expert_ids, use_l2, is_decode);
 }
 
 // Deprecated singular-pool entry point; superseded by preallocate_pools (plural).

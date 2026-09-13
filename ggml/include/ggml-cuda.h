@@ -52,6 +52,10 @@ GGML_BACKEND_API void ggml_backend_cuda_moe_set_cache_slots(int n_slots);
 GGML_BACKEND_API int  ggml_backend_cuda_moe_get_cache_slots(void);
 GGML_BACKEND_API void ggml_backend_cuda_moe_set_l2_pinned_cache_size(size_t bytes);
 GGML_BACKEND_API size_t ggml_backend_cuda_moe_get_l2_pinned_cache_size(void);
+// MoE look-ahead prefetch gate: predicted width, 0 = off (default). Takes
+// effect on the next prefetch call; prefetch with the gate off is a no-op.
+GGML_BACKEND_API void ggml_backend_cuda_moe_set_lookahead(int n);
+GGML_BACKEND_API int ggml_backend_cuda_moe_get_lookahead(void);
 GGML_BACKEND_API void ggml_backend_cuda_moe_set_debug_mm(bool enabled);
 GGML_BACKEND_API bool ggml_backend_cuda_moe_get_debug_mm(void);
 

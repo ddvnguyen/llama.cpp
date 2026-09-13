@@ -824,6 +824,24 @@ public:
             int n_expert_ids,
             bool use_l2,
             bool is_decode);
+    // MoE look-ahead consumer (PR-A): page the next layer's experts for the
+    // predicted eids into this context's legacy pools. No-op when the
+    // lookahead gate is off, the tensor is not MoE-cached, or no pool exists.
+    // Never touches the layer being computed, never synchronizes.
+    void prefetch_legacy_layer(
+            const ggml_tensor * experts,
+            const int32_t * expert_ids,
+            int n_expert_ids,
+            bool use_l2,
+            bool is_decode);
+    // Name-based adapter for the exported prefetch entry point. Resolves the
+    // tensor within this context's known expert tensors, then prefetches.
+    void prefetch_legacy_layer_by_name(
+            const char * tensor_name,
+            const int32_t * expert_ids,
+            int n_expert_ids,
+            bool use_l2,
+            bool is_decode);
     void record_legacy_op(
             bool is_decode,
             bool staged,
@@ -1094,6 +1112,25 @@ int ggml_cuda_moe_cache_acquire(
     bool         is_decode,
     bool         is_prefetch,
     bool         pin);
+
+// MoE look-ahead consumer (PR-A): pointer-based prefetch for the device's
+// grouped context. Future graph-level producer calls this with the next
+// layer's expert tensor directly. No-op when the lookahead gate is off.
+void ggml_backend_cuda_moe_prefetch_experts_tensor(
+    int device,
+    const ggml_tensor * experts,
+    const int32_t * expert_ids,
+    int n_expert_ids,
+    bool use_l2,
+    bool is_decode);
+// Prefetch phase counters for tests: hits, misses, used, evicted, h2d bytes.
+void ggml_cuda_moe_cache_prefetch_stats_for_test(
+    const struct ggml_cuda_moe_cache * cache,
+    bool is_decode,
+    uint64_t * out_hits,
+    uint64_t * out_misses,
+    uint64_t * out_used,
+    uint64_t * out_h2d_bytes);
 
 void ggml_cuda_moe_cache_release_slots(
     struct ggml_cuda_moe_cache * cache,

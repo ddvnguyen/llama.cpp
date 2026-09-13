@@ -12925,6 +12925,110 @@ static void test_strided_copy_graph_update(int device, bool enabled) {
     fprintf(stderr, "test-moe-cache: strided copy graph height update exact OK\n");
 }
 
+// PR-A consumer: prefetch_legacy_layer pages predicted experts with prefetch
+// accounting and leaves demand-path slot state intact. Uses a real device pool
+// on `device`, so it needs a CUDA device like the other active tests below.
+static void test_lookahead_prefetch_legacy_layer(int device) {
+    CHECK(ggml_backend_cuda_moe_get_lookahead() == 0);
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    candidate_test_fixture fixture;
+    const int64_t gate_up_ne[] = {64, 64, 8};
+    const int64_t down_ne[] = {32, 64, 8};
+    ggml_tensor * gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_set_name(gate_up, "test.lookahead.gate_up");
+    for (int64_t expert = 0; expert < 8; ++expert) {
+        memset(static_cast<char *>(gate_up->data) + (size_t) expert * gate_up->nb[2], (int) (expert + 1), gate_up->nb[2]);
+    }
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> banks = {{
+        {gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 group = {banks.data(), banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0};
+    const auto snapshot = candidate_snapshot(8, &group, 1);
+    ggml_cuda_moe_grouped_context registry(&fixture.owner, device);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    auto lease = registry.acquire_legacy_cache(gate_up);
+    CHECK(lease && lease.get() != nullptr);
+    ggml_cuda_moe_cache * cache = lease.get();
+    cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache);
+    CHECK(copy_stream != nullptr);
+    auto prefetch_stats = [&](uint64_t * hits, uint64_t * misses, uint64_t * used, uint64_t * h2d) {
+        ggml_cuda_moe_cache_prefetch_stats_for_test(cache, true, hits, misses, used, h2d);
+    };
+    auto totals = [&]() {
+        uint64_t hits = 0, misses = 0, evictions = 0;
+        ggml_cuda_moe_cache_stats(cache, &hits, &misses, &evictions);
+        return std::array<uint64_t, 3>{hits, misses, evictions};
+    };
+    // Gate off: prefetch is a no-op, zero extra work.
+    const int32_t first_ids[] = {0, 1, 2, 3};
+    registry.prefetch_legacy_layer(gate_up, first_ids, 4, false, true);
+    CUDA_OK(cudaStreamSynchronize(copy_stream));
+    uint64_t hits = 0, misses = 0, used = 0, h2d = 0;
+    prefetch_stats(&hits, &misses, &used, &h2d);
+    CHECK(hits == 0 && misses == 0 && used == 0 && h2d == 0);
+    CHECK(totals() == (std::array<uint64_t, 3>{0, 0, 0}));
+    // Demand baseline on experts 0,1. Pool holds 8, so nothing evicts below.
+    ggml_backend_cuda_moe_set_lookahead(8);
+    for (int32_t expert : {0, 1}) {
+        const void * src = static_cast<const char *>(gate_up->data) + (size_t) expert * gate_up->nb[2];
+        CHECK(ggml_cuda_moe_cache_acquire(cache, src, gate_up->nb[2], copy_stream, false, true, false, false) >= 0);
+    }
+    CUDA_OK(cudaStreamSynchronize(copy_stream));
+    CHECK(totals() == (std::array<uint64_t, 3>{0, 2, 0}));
+    // Prefetch experts 2,3 (misses) plus resident 0 (prefetch hit).
+    const int32_t predicted[] = {2, 3, 0};
+    registry.prefetch_legacy_layer(gate_up, predicted, 3, false, true);
+    CUDA_OK(cudaStreamSynchronize(copy_stream));
+    prefetch_stats(&hits, &misses, &used, &h2d);
+    CHECK(hits == 1 && misses == 2 && used == 0);
+    CHECK(h2d == 2 * gate_up->nb[2]);
+    CHECK(totals() == (std::array<uint64_t, 3>{1, 4, 0}));
+    // Demand now hits the prefetched experts and marks them used.
+    std::vector<uint8_t> readback(gate_up->nb[2]);
+    for (int32_t expert : {2, 3}) {
+        const char * src = static_cast<const char *>(gate_up->data) + (size_t) expert * gate_up->nb[2];
+        const int slot = ggml_cuda_moe_cache_acquire(cache, src, gate_up->nb[2], copy_stream, false, true, false, false);
+        CHECK(slot >= 0);
+        CUDA_OK(cudaStreamSynchronize(copy_stream));
+        CUDA_OK(cudaMemcpy(readback.data(), ggml_cuda_moe_cache_slot_ptr(cache, slot), gate_up->nb[2], cudaMemcpyDeviceToHost));
+        CHECK(std::all_of(readback.begin(), readback.end(), [&](uint8_t value) { return value == (uint8_t) (expert + 1); }));
+    }
+    prefetch_stats(&hits, &misses, &used, &h2d);
+    CHECK(used == 2);
+    // Earlier demand residents are untouched: still hits.
+    for (int32_t expert : {0, 1}) {
+        const void * src = static_cast<const char *>(gate_up->data) + (size_t) expert * gate_up->nb[2];
+        CHECK(ggml_cuda_moe_cache_acquire(cache, src, gate_up->nb[2], copy_stream, false, true, false, false) >= 0);
+    }
+    CHECK(totals() == (std::array<uint64_t, 3>{5, 4, 0}));
+    // Out-of-range eids are harmless misses, never fatal.
+    const int32_t bad_ids[] = {-1, 8, 100};
+    registry.prefetch_legacy_layer(gate_up, bad_ids, 3, false, true);
+    prefetch_stats(&hits, &misses, &used, &h2d);
+    CHECK(misses == 2);
+    // Non-cached tensors cannot be prefetched: one-shot gate, no state change.
+    ggml_tensor * plain = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    registry.prefetch_legacy_layer(plain, first_ids, 4, false, true);
+    CHECK(totals() == (std::array<uint64_t, 3>{5, 4, 0}));
+    // Exported string entry resolves the same tensor by name.
+    const int32_t more_ids[] = {4, 5};
+    ggml_backend_cuda_moe_prefetch_experts(device, "test.lookahead.gate_up", more_ids, 2, false, true);
+    CUDA_OK(cudaStreamSynchronize(copy_stream));
+    prefetch_stats(&hits, &misses, &used, &h2d);
+    CHECK(misses == 4);
+    // Unknown names and a zero gate are silent no-ops.
+    ggml_backend_cuda_moe_prefetch_experts(device, "test.lookahead.missing", more_ids, 2, false, true);
+    ggml_backend_cuda_moe_set_lookahead(0);
+    ggml_backend_cuda_moe_prefetch_experts(device, "test.lookahead.gate_up", more_ids, 2, false, true);
+    prefetch_stats(&hits, &misses, &used, &h2d);
+    CHECK(misses == 4);
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+    fprintf(stderr, "test-moe-cache: lookahead prefetch legacy layer OK\n");
+}
+
 int main(int argc, char ** argv) {
     if (argc == 2 && strcmp(argv[1], "--early-grouped-only") == 0) {
         test_early_grouped_graphs();
@@ -12961,9 +13065,16 @@ int main(int argc, char ** argv) {
     const bool legacy_phase_telemetry_only = argc == 2 && strcmp(argv[1], "--legacy-phase-telemetry-only") == 0;
     const bool gemma_q4_parity_only = argc == 2 && strcmp(argv[1], "--gemma-q4-parity-only") == 0;
     const bool prefill_resident_only = argc == 2 && strcmp(argv[1], "--prefill-resident-only") == 0;
+    const bool lookahead_prefetch_only = argc == 2 && strcmp(argv[1], "--lookahead-prefetch-only") == 0;
     test_moe_cache_proc_api();
     if (prefill_resident_only) {
         test_prefill_resident_biases();
+        return 0;
+    }
+    if (lookahead_prefetch_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_lookahead_prefetch_legacy_layer(dev);
         return 0;
     }
     if (gemma_q4_parity_only) {
@@ -13049,6 +13160,7 @@ int main(int argc, char ** argv) {
     test_strided_copy_graph_update(dev, true);
     test_active_grouped_multirow_graph_modes(dev);
     test_active_grouped_dispatch();
+    test_lookahead_prefetch_legacy_layer(dev);
 
     // Toy parameters. Small enough to run in a few ms on any CUDA device,
     // large enough that LRU has work to do.
