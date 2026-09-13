@@ -12586,6 +12586,7 @@ static void show_test_coverage() {
             op == GGML_OP_TRANSPOSE ||
             op == GGML_OP_CONT      ||
             op == GGML_OP_GLU       ||
+            op == GGML_OP_MOE_PREFETCH ||
             op == GGML_OP_UNARY) {
             continue;
         }

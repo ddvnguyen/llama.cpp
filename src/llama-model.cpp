@@ -2257,6 +2257,10 @@ int32_t llama_model::moe_expert_cache_slots() const {
     return params.moe_expert_cache_slots;
 }
 
+int32_t llama_model::moe_lookahead() const {
+    return params.moe_lookahead;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {

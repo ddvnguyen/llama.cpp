@@ -203,6 +203,23 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         cur = ggml_add(ctx0, cur, inpSA);
         cb(cur, "attn_residual", il);
 
+        // MoE look-ahead: predict layer il+1's experts from this layer's post-attention
+        // state and page them while this layer's MoE still computes, so the H2D overlaps
+        // compute instead of stalling it. Placed immediately after attention and before
+        // this layer's post-attention norm so the router chain stays contiguous for the
+        // router fusions.
+        if (il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr && moe_lookahead_enabled()) {
+            ggml_tensor * lookahead_state = build_norm(cur,
+                    model.layers[il + 1].attn_post_norm, nullptr, LLM_NORM_RMS, il + 1);
+            ggml_tensor * lookahead = build_moe_lookahead(lookahead_state,
+                    model.layers[il + 1].ffn_gate_inp,
+                    model.layers[il + 1].ffn_up_exps,
+                    il + 1);
+            if (lookahead != nullptr) {
+                ggml_build_forward_expand(gf, lookahead);
+            }
+        }
+
         // Save the tensor before post-attention norm for residual connection
         ggml_tensor * ffn_residual = cur;
 

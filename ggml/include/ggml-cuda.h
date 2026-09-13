@@ -69,6 +69,11 @@ GGML_BACKEND_API void ggml_backend_cuda_moe_reset_expert_size_observation(void);
 
 GGML_BACKEND_API void ggml_backend_cuda_moe_preallocate_pools(int device);
 
+// Installs the MoE expert cache pools for every look-ahead target up front so a
+// look-ahead prediction can never find an uninstalled pool. Returns the number of
+// pools that could not be installed (0 on success, 0 when look-ahead is disabled).
+GGML_BACKEND_API int ggml_backend_cuda_moe_preinstall_lookahead_pools(void);
+
 GGML_BACKEND_API void ggml_backend_cuda_moe_prefetch_experts(
     int           device,
     const char *  tensor_name,

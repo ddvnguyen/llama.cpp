@@ -1202,6 +1202,23 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
+    // MoE look-ahead (producer). True when this graph should emit prediction nodes:
+    // look-ahead is on, this is the MAIN target context (not a draft or MTP context)
+    // and the batch holds decode rows only.
+    bool moe_lookahead_enabled() const;
+
+    // Predict layer il_next's top-K experts from `nextn_state` and emit a side-effect
+    // GGML_OP_MOE_PREFETCH node that pages them into that layer's MoE cache pool.
+    // `nextn_state` must be layer il_next's normalized MoE input, computed from the
+    // current layer's post-attention state (the caller applies il_next's norm).
+    // Returns the node to keep alive with ggml_build_forward_expand, or nullptr when
+    // look-ahead is disabled.
+    ggml_tensor * build_moe_lookahead(
+            ggml_tensor * nextn_state,
+            ggml_tensor * gate_inp,
+            ggml_tensor * layer_experts,
+                    int   il_next) const;
+
     //
     // inputs
     //

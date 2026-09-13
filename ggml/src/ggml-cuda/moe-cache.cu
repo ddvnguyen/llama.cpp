@@ -13569,6 +13569,32 @@ void ggml_cuda_moe_grouped_context::prefetch_legacy_layer(
     auto lease = acquire_legacy_cache(experts);
     ggml_cuda_moe_cache * cache = lease.get();
     if (cache == nullptr) {
+        // A pool can only be installed once the candidate snapshot is published, which is
+        // after the reserve-time attempt, so that attempt can legitimately find nothing
+        // yet. Retry here behind a cooldown, bounded: enough to catch the first decode
+        // step, not enough to pay for a configuration that never permits an install.
+        constexpr int max_install_attempts = 8;
+        static std::atomic<int> install_attempts{0};
+        static std::atomic<int64_t> last_attempt_us{0};
+        const int64_t now_us = ggml_time_us();
+        int64_t prev_us = last_attempt_us.load(std::memory_order_relaxed);
+        if (install_attempts.load(std::memory_order_relaxed) < max_install_attempts &&
+                now_us - prev_us > 200000 &&
+                last_attempt_us.compare_exchange_strong(prev_us, now_us, std::memory_order_relaxed)) {
+            install_attempts.fetch_add(1, std::memory_order_relaxed);
+            if (preinstall_legacy_pools() >= 0) {
+                lease = acquire_legacy_cache(experts);
+                cache = lease.get();
+            }
+        }
+    }
+    if (cache == nullptr) {
+        // Never silent: an empty lease means the target layer's pool is not installed, so
+        // the whole prediction is dropped. Reachable while the candidate snapshot is not
+        // published yet and whenever the target layer is not under legacy cache authority.
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned,
+            "moe-cache: look-ahead prefetch found no installed pool for the target layer, prediction dropped");
         return;
     }
     cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache);
@@ -13627,6 +13653,82 @@ void ggml_cuda_moe_grouped_context::prefetch_legacy_layer_by_name(
         return;
     }
     prefetch_legacy_layer(target, expert_ids, n_expert_ids, use_l2, is_decode);
+}
+
+int ggml_cuda_moe_grouped_context::preinstall_legacy_pools() {
+    if (moe_cache_lookahead_width() <= 0) {
+        return 0;
+    }
+    // legacy_records is only populated lazily by acquire_legacy_cache, so the
+    // tensors to install come from the published candidate snapshot itself.
+    std::vector<const ggml_tensor *> targets;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->state.generation == 0 || impl_->state.n_slots == 0) {
+            // Not ready, not a shortfall: the caller has to retry once the snapshot is
+            // published, so this must be distinguishable from installing zero pools.
+            return -1;
+        }
+        if (impl_->state.accepted) {
+            for (const auto & group : impl_->table.groups) {
+                for (const auto & bank : group.banks) {
+                    const ggml_tensor * tensor = bank.info.tensor;
+                    if (tensor != nullptr) {
+                        targets.push_back(tensor);
+                    }
+                }
+            }
+        }
+        for (const auto & entry : impl_->legacy_records) {
+            if (entry.first != nullptr) {
+                targets.push_back(entry.first);
+            }
+        }
+    }
+
+    int failed = 0;
+    for (const ggml_tensor * tensor : targets) {
+        // acquire_legacy_cache installs the per-layer pool on first use and keeps it
+        // for the context lifetime; the lease is dropped immediately.
+        auto lease = acquire_legacy_cache(tensor);
+        if (lease.get() == nullptr) {
+            failed++;
+        }
+    }
+    if (failed > 0) {
+        // A pool can only be installed while its group is under legacy cache authority
+        // with admission open. When the certified grouped path owns the group, no pool can
+        // ever be installed and the look-ahead has nothing to page into, so report the
+        // shortfall once rather than on every retry.
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_ERROR("moe-cache: look-ahead could not install %d of %zu MoE expert cache pools; the target "
+                    "layers are not under legacy cache authority, so look-ahead prefetch is inert\n",
+                    failed, targets.size());
+        }
+    }
+    return failed;
+}
+
+extern "C"
+int ggml_backend_cuda_moe_preinstall_lookahead_pools(void) {
+    if (moe_cache_lookahead_width() <= 0) {
+        return 0;
+    }
+    int failed = 0;
+    const int n_devices = ggml_backend_cuda_get_device_count();
+    for (int device = 0; device < n_devices; ++device) {
+        ggml_cuda_moe_grouped_context * context = moe_cache_prefetch_context(device);
+        if (context == nullptr) {
+            continue;
+        }
+        const int device_failed = context->preinstall_legacy_pools();
+        if (device_failed < 0) {
+            return -1;
+        }
+        failed += device_failed;
+    }
+    return failed;
 }
 
 extern "C"

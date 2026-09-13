@@ -3280,6 +3280,76 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
 //      expert's resident copy).
 //   6. Swap synthetics into dst, call the impl, restore.
 //
+// Debug-only look-ahead telemetry, enabled with GGML_CUDA_MOE_LOOKAHEAD_DEBUG=1.
+// The producer records the experts it predicted per layer; the demand path scores
+// those predictions against the ids the router actually selected. Purely
+// observational: it never gates, delays or alters execution.
+#define GGML_CUDA_MOE_LOOKAHEAD_DEBUG_MAX_LAYERS 1024
+
+struct ggml_cuda_moe_lookahead_debug {
+    std::mutex mu;
+    std::vector<int32_t> predicted[GGML_CUDA_MOE_LOOKAHEAD_DEBUG_MAX_LAYERS];
+    uint64_t calls           = 0;
+    uint64_t predicted_ids   = 0;
+    uint64_t checks          = 0;
+    uint64_t matches         = 0;
+};
+
+static bool ggml_cuda_moe_lookahead_debug_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MOE_LOOKAHEAD_DEBUG") != nullptr;
+    return enabled;
+}
+
+static ggml_cuda_moe_lookahead_debug & ggml_cuda_moe_lookahead_debug_state() {
+    static ggml_cuda_moe_lookahead_debug state;
+    return state;
+}
+
+// Producer side: remember what was predicted for `layer`.
+static void ggml_cuda_moe_lookahead_debug_record(int layer, const int32_t * ids, int n_ids) {
+    if (layer < 0 || layer >= GGML_CUDA_MOE_LOOKAHEAD_DEBUG_MAX_LAYERS) {
+        return;
+    }
+    auto & state = ggml_cuda_moe_lookahead_debug_state();
+    std::lock_guard<std::mutex> lk(state.mu);
+    state.predicted[layer].assign(ids, ids + n_ids);
+    state.calls++;
+    state.predicted_ids += (uint64_t) n_ids;
+}
+
+// Demand side: score the stored prediction for `layer` against the ids the router
+// routed to. Each layer is scored once per expert tensor, so `checks` counts
+// layer/tensor pairs while the recall ratio stays per-prediction.
+static void ggml_cuda_moe_lookahead_debug_score(int layer, const std::vector<int32_t> & actual) {
+    if (layer < 0 || layer >= GGML_CUDA_MOE_LOOKAHEAD_DEBUG_MAX_LAYERS) {
+        return;
+    }
+    auto & state = ggml_cuda_moe_lookahead_debug_state();
+    std::lock_guard<std::mutex> lk(state.mu);
+    const std::vector<int32_t> & predicted = state.predicted[layer];
+    if (predicted.empty()) {
+        return;
+    }
+    uint64_t hits = 0;
+    for (const int32_t eid : predicted) {
+        if (std::find(actual.begin(), actual.end(), eid) != actual.end()) {
+            hits++;
+        }
+    }
+    state.checks++;
+    state.matches += hits;
+    if (state.checks % 512 == 0) {
+        const double recall = 100.0 * (double) state.matches /
+            (double) (state.checks * (uint64_t) predicted.size());
+        GGML_LOG_INFO("moe-cache-lookahead-debug: prefetch_calls=%llu predicted_ids=%llu "
+            "checks=%llu recall=%.2f%%\n",
+            (unsigned long long) state.calls,
+            (unsigned long long) state.predicted_ids,
+            (unsigned long long) state.checks,
+            recall);
+    }
+}
+
 // Cache misses cost one cudaMemcpyAsync per slab (slot_size bytes on PCIe).
 // Cache hits cost zero PCIe traffic; only the kernel reads the resident slot.
 static void ggml_cuda_mul_mat_id_cached(
@@ -3354,6 +3424,10 @@ static void ggml_cuda_mul_mat_id_cached(
                 unique_eids.push_back(eid);
             }
         }
+    }
+
+    if (ggml_cuda_moe_lookahead_debug_enabled()) {
+        ggml_cuda_moe_lookahead_debug_score(ggml_cuda_moe_layer_from_name(src0->name), unique_eids);
     }
 
     if (overflow) {
@@ -3799,6 +3873,58 @@ static bool ggml_cuda_mul_mat_id(
     return true;
 }
 
+// MoE look-ahead producer (PR-P1): page a future layer's predicted experts into
+// that layer's MoE cache pool while the current layer still computes, so the H2D
+// overlaps the current layer's MoE instead of stalling it.
+//
+// This is a side-effect op. Its output aliases src[1], so it produces no new
+// values and must never change numerics or abort a request: a prediction that
+// cannot be served is simply dropped by the consumer.
+static void ggml_cuda_moe_prefetch(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    const ggml_tensor * experts = dst->src[0];
+    const ggml_tensor * ids     = dst->src[1];
+    if (experts == nullptr || ids == nullptr || ids->data == nullptr) {
+        return;
+    }
+    if (ggml_backend_cuda_moe_get_lookahead() <= 0) {
+        return;
+    }
+    if (ids->type != GGML_TYPE_I32 || ids->ne[0] <= 0) {
+        return;
+    }
+    // Only tensors that live in the MoE cache buffer can be paged. A dense FFN, a
+    // host-resident expert bank or a layer the cache does not own makes this a no-op.
+    if (experts->buffer == nullptr ||
+            !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(experts->buffer))) {
+        return;
+    }
+    const int64_t n_ids = ids->ne[0] * ids->ne[1] * ids->ne[2] * ids->ne[3];
+    if (n_ids <= 0 || n_ids > INT32_MAX) {
+        return;
+    }
+    // The cache consumer selects source rows from host pointers, so the predicted
+    // ids have to be visible to the host. Decode predicts a handful of ids per
+    // layer; the staging buffer is reused across steps.
+    if ((int64_t) ctx.moe_lookahead_ids.size() != n_ids) {
+        ctx.moe_lookahead_ids.resize((size_t) n_ids);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(ctx.moe_lookahead_ids.data(), ids->data,
+                (size_t) n_ids * sizeof(int32_t), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+    // Same decode test the cached demand path uses: a single row of ids per token.
+    const bool is_decode = ids->ne[1] * ids->ne[2] * ids->ne[3] == 1;
+
+    if (ggml_cuda_moe_lookahead_debug_enabled()) {
+        ggml_cuda_moe_lookahead_debug_record(
+                ggml_cuda_moe_layer_from_name(experts->name), ctx.moe_lookahead_ids.data(), (int) n_ids);
+    }
+
+    ggml_backend_cuda_moe_prefetch_experts_tensor(
+            ggml_cuda_get_device(), experts, ctx.moe_lookahead_ids.data(), (int) n_ids,
+            /*use_l2=*/ true, is_decode);
+}
+
 static bool ggml_cuda_compute_forward(
         ggml_backend_cuda_context & ctx,
         struct ggml_tensor * dst,
@@ -4170,6 +4296,9 @@ static bool ggml_cuda_compute_forward(
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
+        case GGML_OP_MOE_PREFETCH:
+            ggml_cuda_moe_prefetch(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -4424,6 +4553,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, bool * has_c
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
+        }
+
+        // A look-ahead prefetch reads the predicted expert ids back to the host in order
+        // to enqueue the copies, which synchronizes the stream, so the graph cannot be
+        // captured. Same rule as the mul_mat_id fallback above.
+        if (node->op == GGML_OP_MOE_PREFETCH) {
+            use_cuda_graph = false;
         }
 
         if (!use_cuda_graph) {
@@ -8107,6 +8243,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_MOE_PREFETCH:
+            // Side-effect prefetch: always schedulable on CUDA, and a no-op when the
+            // target is not a MoE-cached tensor, so it needs no capability probe.
+            // Other backends keep the CPU no-op.
+            return op->src[0] != nullptr && op->src[1] != nullptr &&
+                   op->src[1]->type == GGML_TYPE_I32;
 
         default:
             return false;
@@ -8345,6 +8487,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
 
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_LOOKAHEAD_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_lookahead;
+    }
+
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_PREINSTALL_LOOKAHEAD_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_preinstall_lookahead_pools;
     }
 
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME) == 0) {

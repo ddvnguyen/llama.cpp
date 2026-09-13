@@ -458,6 +458,26 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         res_hc = build_hc_combine(res_hc, cur, inject, il);
 
+        // MoE look-ahead: predict layer il+1's experts from this layer's post-attention
+        // state and page them while this layer's MoE still computes, so the H2D overlaps
+        // compute instead of stalling it. Placed immediately after attention and before
+        // the FFN so the layer's own router chain stays contiguous for the router fusions.
+        if (il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr && moe_lookahead_enabled()) {
+            ggml_tensor * lookahead_state = build_hc_mix(res_hc,
+                    model.layers[il + 1].hc_ffn_norm,
+                    model.layers[il + 1].hc_ffn_down,
+                    model.layers[il + 1].hc_ffn_up,
+                    model.layers[il + 1].hc_ffn_inject,
+                    nullptr, il + 1);
+            ggml_tensor * lookahead = build_moe_lookahead(lookahead_state,
+                    model.layers[il + 1].ffn_gate_inp,
+                    model.layers[il + 1].ffn_up_exps,
+                    il + 1);
+            if (lookahead != nullptr) {
+                ggml_build_forward_expand(gf, lookahead);
+            }
+        }
+
         cur = build_hc_mix(res_hc,
                 model.layers[il].hc_ffn_norm,
                 model.layers[il].hc_ffn_down,

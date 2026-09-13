@@ -774,6 +774,7 @@ llama_context::llama_context(
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type          = params.ctx_type;
+    cparams.moe_lookahead     = model.moe_lookahead();
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
 
@@ -1485,6 +1486,32 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     synchronize();
     refresh_moe_candidates();
 
+    // MoE look-ahead: install every target layer's expert cache pool now, while the
+    // candidate snapshot is known to be published. This makes the empty-lease prefetch
+    // no-op unreachable and turns a VRAM budget shortfall into a failure here rather
+    // than a silent degradation mid-decode. Model load is too early: the per-device
+    // grouped context and its snapshot do not exist until the context is reserved.
+    if (model.moe_lookahead() > 0 && !moe_lookahead_pools_ready) {
+        bool ready = true;
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            auto preinstall_fn = (ggml_backend_moe_cache_preinstall_lookahead_t) ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_MOE_CACHE_PREINSTALL_LOOKAHEAD_PROC_NAME);
+            if (preinstall_fn == nullptr) {
+                continue;
+            }
+            const int failed = preinstall_fn();
+            if (failed > 0) {
+                throw std::runtime_error(format("%s: --moe-lookahead could not install %d MoE expert cache pools; "
+                        "the expert cache budget does not fit", __func__, failed));
+            }
+            // -1 means the candidate snapshot is not published yet, so nothing was
+            // attempted. Leave the flag clear and retry on the next reserve instead of
+            // recording a success that never happened.
+            ready = ready && failed == 0;
+        }
+        moe_lookahead_pools_ready = ready;
+    }
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;

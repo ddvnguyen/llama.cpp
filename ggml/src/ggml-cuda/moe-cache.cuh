@@ -834,6 +834,10 @@ public:
             int n_expert_ids,
             bool use_l2,
             bool is_decode);
+    // Installs the legacy pools for every expert tensor the published candidate
+    // snapshot knows about, so a look-ahead prefetch cannot find an empty lease.
+    // Returns the number of pools that could not be installed.
+    int preinstall_legacy_pools();
     // Name-based adapter for the exported prefetch entry point. Resolves the
     // tensor within this context's known expert tensors, then prefetches.
     void prefetch_legacy_layer_by_name(
