@@ -306,3 +306,102 @@ Open questions to settle before P1 coding:
 - recall (predicted vs demand ids), `phase_prefetch_used`, decode t/s on fit-off
   N=144 (baseline 32.66 t/s), sdb read 0. Warm the pool first; log granted slots.
 - A/B with `--moe-lookahead 0`; no regression on dense models; PP unchanged on/off.
+
+## PR-P1 outcome (measured) - 2026-09-14
+
+PR-P1 is implemented, measured and **stopped**. Branch `feat/moe-lookahead-p1`
+(tip `4f681738b`, 21 files, +464/-5) is pushed and PR #127 is open against
+`feat/763-reconcile-qwen4exp-mtp` as an unmerged experimental record. Everything
+below was measured on the rig (Qwen3.8-Flash-Next-APEX-I-Mini, RTX 5060 Ti,
+`--moe-expert-cache-size 84`, `-b 1 -ub 1` so every ubatch is a decode row,
+`--moe-lookahead 8`).
+
+Decision: park. The three blockers stack and each alone disqualifies the current
+shape. Blocker 3 is structural rather than tuning, blocker 2 leaves nothing to feed,
+and blocker 1 is a numerics-contract violation whose fix lives outside the prediction.
+Deep surgery in three independent subsystems is not justified by a gain bounded to the
+residual miss tail.
+
+### Blocker 1 - the producer changes model output
+
+Same prompt and flags, only `--moe-lookahead` differs. Isolation matrix, one build per
+row:
+
+| configuration | PPL | all-logits md5 |
+| --- | --- | --- |
+| look-ahead 0 (baseline) | 3.0613 | `fc1da5b9e41d249e7da51791a934d561` |
+| look-ahead 8, full producer | 2.9434 | `8e0a9d10e9095ce7806f645e7edbba0e` |
+| look-ahead 8, prediction only, prefetch op removed | 2.9434 | `8e0a9d10e9095ce7806f645e7edbba0e` |
+| look-ahead 8, prediction reads a trunk tensor, no extra chain | 3.1849 | `4ba9f8e7a60ca9830b0dcbed073ffc3e` |
+| look-ahead 8, gate MUL_MAT only, no argsort, no op | 3.1377 | `9bbf44eb3b98b5503ed2d1f9b028dda3` |
+| look-ahead 8, neutral COPY node only | 3.0613 | `fc1da5b9e41d249e7da51791a934d561` |
+| look-ahead 0, `GGML_CUDA_DISABLE_GRAPHS=1` | 3.0613 | `fc1da5b9e41d249e7da51791a934d561` |
+
+All deterministic across reruns. Conclusions:
+
+- The trigger is the extra `MUL_MAT` that reads `ffn_gate_inp`. Removing the argsort and
+  the prefetch op does not remove the divergence; the op itself contributes nothing.
+- The neutral-COPY row is byte-identical to the baseline, so the backend is not merely
+  shape-sensitive. The divergence tracks readers of a router weight specifically, not
+  node count - consistent with a router census perturbation rather than a scheduling one.
+- Disabling CUDA graphs on the baseline reproduces the baseline exactly, so lost graph
+  capture is not the cause.
+
+Fix location, if this track is ever revisited: an exclusion mechanism for
+prediction-subgraph nodes in the route/candidate census (the
+`moe_candidate_discover_route` / `use_counts` machinery that also had to be taught to
+ignore `GGML_OP_MOE_PREFETCH` sources, otherwise the grouped-decode certificate rejects
+the graph with `graph=unproven(14)`). It is not a prediction-math problem.
+
+The earlier byte-identical-logits reading recorded in this document is refuted. It came
+from a build in which the producer never ran.
+
+### Blocker 2 - the producer is inert; Q1 answered negatively
+
+`acquire_legacy_cache()` installs a new pool only while the target group's authority is
+`GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY` with admission open. On this rig it is not, so the
+reserve-time preinstall fails for all 144 targets and every prediction is dropped:
+
+```
+E moe-cache: look-ahead could not install 144 of 144 MoE expert cache pools;
+             the target layers are not under legacy cache authority, so look-ahead prefetch is inert
+W moe-cache: look-ahead prefetch found no installed pool for the target layer, prediction dropped
+```
+
+Q1 (can `acquire_legacy_cache` install the next layer's pool while the current layer
+executes?) is therefore answered **no**, not because of the generation/epoch guards, but
+because the authority regime refuses the install outright. The plan's "preinstall every
+pool at model load" is also wrong as written: the candidate snapshot does not exist until
+after `sched_reserve()`, so the install has to be attempted there or later.
+
+### Blocker 3 - throughput, and it is structural
+
+| arm | decode t/s |
+| --- | --- |
+| look-ahead 0 | 43.23 |
+| look-ahead 8 | 37.71 (37.57 / 37.61 / 37.68 across runs) |
+
+The ids readback synchronizes the stream, which forces `use_cuda_graph = false` for every
+graph containing the op - the precedent is `ggml_cuda_mul_mat_id_needs_sync` at the same
+decision point. Without the exclusion the run dies:
+`E CUDA error: operation not permitted when stream is capturing`.
+
+### Future direction (not now)
+
+If the track is re-approached, the only architecture-level fix for blocker 3 is the
+fork's own early-router copy-worker plus device-to-host mailbox pattern (poll worker with
+`cuStreamWriteValue32`, no in-graph readback, `moe-cache.cu` around the copy-stream
+setup). That makes the producer a side-channel that the legacy path consumes, which this
+document originally rejected - the measured cost of the in-graph readback flips that
+judgment, but the work stays gated on grouped-plan / layer-split work.
+
+### Corrections this round made to the plan above
+
+- `ffn_gate_up_exps` is null for every layer of this model, so the producer targets
+  `ffn_up_exps`. The consumer resolves the layer by tensor name, so any of the layer's
+  cached expert tensors works.
+- Q3: capture is not merely "already off in this config"; the op has to force it off.
+- Q4: the draft/MTP gate is `cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT`, because the
+  execution certificate that encodes the same distinction is assembled at compute time.
+- `qwen35moe.cpp` is wired mechanically and is unvalidated - no model on this rig to test
+  it against. It stays in the branch as part of the experimental record.
