@@ -12545,6 +12545,7 @@ struct ggml_cuda_moe_cache {
     std::atomic<uint64_t> phase_prefetch_misses[2];
     std::atomic<uint64_t> phase_prefetch_used[2];
     std::atomic<uint64_t> phase_prefetch_evictions[2];
+    std::atomic<uint64_t> phase_prefetch_dropped[2];
     std::atomic<uint64_t> phase_demand_evictions[2];
     std::atomic<uint64_t> phase_evicted_prefetched[2];
     std::atomic<uint64_t> phase_evicted_hit_count_le1[2];
@@ -12559,6 +12560,14 @@ struct ggml_cuda_moe_cache {
     std::atomic<uint64_t> sampled_pages_resident{0};
     std::atomic<uint64_t> sampled_nonresident_expert_count{0};
     std::atomic<uint64_t> mincore_failures{0};
+
+    // LFRU eviction guard state (colibri PILOT_EVICT_GUARD port). Demand-only
+    // per-expert heat: speculative accesses are deliberately excluded so a
+    // prediction can never inflate the score that decides whether it may
+    // displace a resident.
+    std::vector<uint32_t> guard_heat;
+    std::vector<uint32_t> guard_last;
+    uint32_t guard_clock = 0;
 
     bool source_is_mmap = false;
     bool debug_mm = false;
@@ -12801,6 +12810,7 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         c->phase_prefetch_misses[phase].store(0, std::memory_order_relaxed);
         c->phase_prefetch_used[phase].store(0, std::memory_order_relaxed);
         c->phase_prefetch_evictions[phase].store(0, std::memory_order_relaxed);
+        c->phase_prefetch_dropped[phase].store(0, std::memory_order_relaxed);
         c->phase_demand_evictions[phase].store(0, std::memory_order_relaxed);
         c->phase_evicted_prefetched[phase].store(0, std::memory_order_relaxed);
         c->phase_evicted_hit_count_le1[phase].store(0, std::memory_order_relaxed);
@@ -13129,6 +13139,140 @@ static void ggml_cuda_moe_cache_record_expert_access(ggml_cuda_moe_cache * cache
     }
 }
 
+// Least-Frequently-Recently-Used score, ported from colibri's tier_pick_lfru
+// (c/tier.h:40-43): frequency dominates, recency is the low byte and saturates
+// after 255 ticks so a merely recent expert cannot displace a hotter one.
+static uint64_t ggml_cuda_moe_cache_lfru_score(uint32_t heat, uint32_t last, uint32_t clock) {
+    const uint32_t age = clock - last;
+    const uint32_t recent = age < 255 ? 255 - age : 0;
+    return ((uint64_t) heat << 8) | recent;
+}
+
+// Demand-side heat for the eviction guard. Speculative accesses are excluded on
+// purpose: an expert that is only ever predicted has not proven demand value,
+// and counting predictions would let a speculation inflate the very score that
+// decides whether it may displace a warm resident (colibri counts demand
+// accesses only; see the "demand=0" speculative load path).
+static void ggml_cuda_moe_cache_record_demand_heat(ggml_cuda_moe_cache * cache, const void * host_src) {
+    if (cache->n_experts <= 0) {
+        return;
+    }
+    if (cache->guard_heat.empty()) {
+        cache->guard_heat.assign((size_t) cache->n_experts, 0);
+        cache->guard_last.assign((size_t) cache->n_experts, 0);
+    }
+    const int64_t eid = ggml_cuda_moe_cache_expert_id(cache, host_src);
+    if (eid < 0) {
+        return;
+    }
+    cache->guard_clock++;
+    cache->guard_heat[(size_t) eid]++;
+    cache->guard_last[(size_t) eid] = cache->guard_clock;
+}
+
+// Whether a speculative fill must NOT displace the resident currently in
+// `victim`. Ports colibri's PILOT_EVICT_GUARD (tier.h/c: a resident is
+// protected only when it is genuinely warm - at least 2 demand accesses - AND
+// clearly hotter than the speculation, by the 25% + 4-frequency hysteresis in
+// score units). When the victim is protected the speculation is dropped rather
+// than thrashing a warm, demand-loaded expert.
+static bool ggml_cuda_moe_cache_evict_guard_blocks(
+        const ggml_cuda_moe_cache * cache,
+        int                         victim,
+        int64_t                     speculative_eid) {
+    const void * resident = cache->slot_to_host[victim];
+    if (resident == nullptr || cache->guard_heat.empty() || speculative_eid < 0) {
+        return false;   // free slot, or no demand history yet: nothing warm to protect
+    }
+    const int64_t resident_eid = ggml_cuda_moe_cache_expert_id(cache, resident);
+    if (resident_eid < 0) {
+        return false;
+    }
+    const uint32_t heat = cache->guard_heat[(size_t) resident_eid];
+    if (heat < 2) {
+        return false;   // never demanded twice: not genuinely warm
+    }
+    const uint64_t victim_score =
+        ggml_cuda_moe_cache_lfru_score(heat, cache->guard_last[(size_t) resident_eid], cache->guard_clock);
+    const uint64_t spec_score =
+        ggml_cuda_moe_cache_lfru_score(cache->guard_heat[(size_t) speculative_eid],
+                                       cache->guard_last[(size_t) speculative_eid],
+                                       cache->guard_clock);
+    return victim_score + (victim_score >> 2) + (4u << 8) > spec_score;
+}
+
+// Shared victim selection for the demand and speculative paths. Picks the LRU
+// unpinned slot; a speculative fill additionally has to clear the eviction
+// guard and returns -1 (drop the speculation) when it does not.
+static int ggml_cuda_moe_cache_select_victim_locked(
+        ggml_cuda_moe_cache * cache,
+        bool                  speculative,
+        int64_t               speculative_eid) {
+    int      victim   = -1;
+    uint64_t victim_t = std::numeric_limits<uint64_t>::max();
+    for (int i = 0; i < cache->n_slots; ++i) {
+        if (cache->slot_pin_count[i] != 0) {
+            continue;   // pinned: a running GEMM is reading this slot
+        }
+        if (cache->last_used[i] < victim_t) {
+            victim_t = cache->last_used[i];
+            victim   = i;
+        }
+    }
+    if (victim < 0 || !speculative) {
+        return victim;
+    }
+    return ggml_cuda_moe_cache_evict_guard_blocks(cache, victim, speculative_eid) ? -1 : victim;
+}
+
+// Shared fill install: records the eviction telemetry for `victim`, publishes
+// `host_src` into it and bumps the LRU clock. `is_prefetch` only selects the
+// prefetch-vs-demand telemetry buckets; the placement itself is identical.
+static void ggml_cuda_moe_cache_install_fill_locked(
+        ggml_cuda_moe_cache * cache,
+        int                   victim,
+        const void *          host_src,
+        bool                  is_prefetch,
+        int                   phase) {
+    const void * evicted = cache->slot_to_host[victim];
+    if (evicted != nullptr) {
+        cache->host_to_slot.erase(evicted);
+        cache->evictions.fetch_add(1, std::memory_order_relaxed);
+        cache->phase_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+        if (is_prefetch) {
+            cache->phase_prefetch_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            cache->phase_demand_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (cache->slot_prefetched[victim]) {
+            cache->phase_evicted_prefetched[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (cache->slot_hit_count[victim] <= 1) {
+            cache->phase_evicted_hit_count_le1[phase].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            cache->phase_evicted_hit_count_ge2[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+        const uint64_t age = cache->access_counter >= cache->slot_fill_access[victim] ?
+            cache->access_counter - cache->slot_fill_access[victim] : 0;
+        if (age <= (uint64_t) cache->n_slots) {
+            cache->phase_evicted_age_le_l1[phase].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            cache->phase_evicted_age_gt_l1[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    cache->slot_to_host[victim]     = host_src;
+    cache->host_to_slot[host_src]   = victim;
+    cache->last_used[victim]        = ++cache->access_counter;
+    cache->slot_prefetched[victim]  = is_prefetch ? 1 : 0;
+    cache->slot_hit_count[victim]   = 0;
+    cache->slot_fill_access[victim] = cache->access_counter;
+    cache->misses.fetch_add(1, std::memory_order_relaxed);
+    cache->phase_misses[phase].fetch_add(1, std::memory_order_relaxed);
+    if (is_prefetch) {
+        cache->phase_prefetch_misses[phase].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 static int ggml_cuda_moe_cache_acquire_locked(
     struct ggml_cuda_moe_cache * cache,
     const void * host_src,
@@ -13146,6 +13290,11 @@ static int ggml_cuda_moe_cache_acquire_locked(
 
     const int phase = moe_cache_phase_index(is_decode);
     ggml_cuda_moe_cache_record_expert_access(cache, host_src, phase);
+    if (!is_prefetch) {
+        // Demand-only heat for the LFRU eviction guard that later decides
+        // whether a speculation may displace this expert.
+        ggml_cuda_moe_cache_record_demand_heat(cache, host_src);
+    }
 
     // Hit path: O(1) hash lookup.
     auto it = cache->host_to_slot.find(host_src);
@@ -13165,60 +13314,11 @@ static int ggml_cuda_moe_cache_acquire_locked(
     }
 
     // Miss: pick the LRU slot. Empty slots (last_used==0) win automatically.
-    int      lru_slot = -1;
-    uint64_t lru_t    = std::numeric_limits<uint64_t>::max();
-    for (int i = 0; i < cache->n_slots; ++i) {
-        if (cache->slot_pin_count[i] != 0) {
-            continue;
-        }
-        if (cache->last_used[i] < lru_t) {
-            lru_t    = cache->last_used[i];
-            lru_slot = i;
-        }
-    }
+    const int lru_slot = ggml_cuda_moe_cache_select_victim_locked(cache, false, -1);
     if (lru_slot < 0) {
         return -1;
     }
-
-    const void * evicted = cache->slot_to_host[lru_slot];
-    if (evicted != nullptr) {
-        cache->host_to_slot.erase(evicted);
-        cache->evictions.fetch_add(1, std::memory_order_relaxed);
-        cache->phase_evictions[phase].fetch_add(1, std::memory_order_relaxed);
-        if (is_prefetch) {
-            cache->phase_prefetch_evictions[phase].fetch_add(1, std::memory_order_relaxed);
-        } else {
-            cache->phase_demand_evictions[phase].fetch_add(1, std::memory_order_relaxed);
-        }
-        if (cache->slot_prefetched[lru_slot]) {
-            cache->phase_evicted_prefetched[phase].fetch_add(1, std::memory_order_relaxed);
-        }
-        const uint64_t hit_count = cache->slot_hit_count[lru_slot];
-        if (hit_count <= 1) {
-            cache->phase_evicted_hit_count_le1[phase].fetch_add(1, std::memory_order_relaxed);
-        } else {
-            cache->phase_evicted_hit_count_ge2[phase].fetch_add(1, std::memory_order_relaxed);
-        }
-        const uint64_t age = cache->access_counter >= cache->slot_fill_access[lru_slot] ?
-            cache->access_counter - cache->slot_fill_access[lru_slot] : 0;
-        if (age <= (uint64_t) cache->n_slots) {
-            cache->phase_evicted_age_le_l1[phase].fetch_add(1, std::memory_order_relaxed);
-        } else {
-            cache->phase_evicted_age_gt_l1[phase].fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
-    cache->slot_to_host[lru_slot] = host_src;
-    cache->host_to_slot[host_src] = lru_slot;
-    cache->last_used[lru_slot]    = ++cache->access_counter;
-    cache->slot_prefetched[lru_slot] = is_prefetch ? 1 : 0;
-    cache->slot_hit_count[lru_slot] = 0;
-    cache->slot_fill_access[lru_slot] = cache->access_counter;
-    cache->misses.fetch_add(1, std::memory_order_relaxed);
-    cache->phase_misses[phase].fetch_add(1, std::memory_order_relaxed);
-    if (is_prefetch) {
-        cache->phase_prefetch_misses[phase].fetch_add(1, std::memory_order_relaxed);
-    }
+    ggml_cuda_moe_cache_install_fill_locked(cache, lru_slot, host_src, is_prefetch, phase);
     auto rollback_miss = [&]() {
         cache->slot_to_host[lru_slot] = nullptr;
         cache->host_to_slot.erase(host_src);
@@ -13363,51 +13463,17 @@ static void ggml_cuda_moe_cache_prefetch_locked(
             cache->phase_prefetch_hits[phase].fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        int lru_slot = -1;
-        uint64_t lru_t = std::numeric_limits<uint64_t>::max();
-        for (int s = 0; s < cache->n_slots; ++s) {
-            if (cache->slot_pin_count[s] != 0) {
-                continue;
-            }
-            if (cache->last_used[s] < lru_t) {
-                lru_t = cache->last_used[s];
-                lru_slot = s;
-            }
-        }
+        // A speculative fill has to clear the LFRU eviction guard: a warm
+        // resident that is clearly hotter than this prediction must not be
+        // displaced for it (colibri PILOT_EVICT_GUARD). A blocked prediction is
+        // dropped rather than thrashing a demand-loaded expert.
+        const int lru_slot = ggml_cuda_moe_cache_select_victim_locked(
+            cache, true, ggml_cuda_moe_cache_expert_id(cache, host_src));
         if (lru_slot < 0) {
+            cache->phase_prefetch_dropped[phase].fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        const void * evicted = cache->slot_to_host[lru_slot];
-        if (evicted != nullptr) {
-            cache->host_to_slot.erase(evicted);
-            cache->evictions.fetch_add(1, std::memory_order_relaxed);
-            cache->phase_evictions[phase].fetch_add(1, std::memory_order_relaxed);
-            cache->phase_prefetch_evictions[phase].fetch_add(1, std::memory_order_relaxed);
-            if (cache->slot_prefetched[lru_slot]) {
-                cache->phase_evicted_prefetched[phase].fetch_add(1, std::memory_order_relaxed);
-            }
-            if (cache->slot_hit_count[lru_slot] <= 1) {
-                cache->phase_evicted_hit_count_le1[phase].fetch_add(1, std::memory_order_relaxed);
-            } else {
-                cache->phase_evicted_hit_count_ge2[phase].fetch_add(1, std::memory_order_relaxed);
-            }
-            const uint64_t age = cache->access_counter >= cache->slot_fill_access[lru_slot] ?
-                cache->access_counter - cache->slot_fill_access[lru_slot] : 0;
-            if (age <= (uint64_t) cache->n_slots) {
-                cache->phase_evicted_age_le_l1[phase].fetch_add(1, std::memory_order_relaxed);
-            } else {
-                cache->phase_evicted_age_gt_l1[phase].fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-        cache->slot_to_host[lru_slot] = host_src;
-        cache->host_to_slot[host_src] = lru_slot;
-        cache->last_used[lru_slot] = ++cache->access_counter;
-        cache->slot_prefetched[lru_slot] = 1;
-        cache->slot_hit_count[lru_slot] = 0;
-        cache->slot_fill_access[lru_slot] = cache->access_counter;
-        cache->misses.fetch_add(1, std::memory_order_relaxed);
-        cache->phase_misses[phase].fetch_add(1, std::memory_order_relaxed);
-        cache->phase_prefetch_misses[phase].fetch_add(1, std::memory_order_relaxed);
+        ggml_cuda_moe_cache_install_fill_locked(cache, lru_slot, host_src, true, phase);
         const void * copy_src = use_l2 ?
             ggml_cuda_moe_cache_l2_source(cache, host_src, byte_count, is_decode, copy_stream) : host_src;
         if (debug_mm && copy_src == host_src) {
@@ -14160,7 +14226,8 @@ void ggml_cuda_moe_cache_prefetch_stats_for_test(
     uint64_t * out_hits,
     uint64_t * out_misses,
     uint64_t * out_used,
-    uint64_t * out_h2d_bytes) {
+    uint64_t * out_h2d_bytes,
+    uint64_t * out_dropped) {
     const int phase = moe_cache_phase_index(is_decode);
     if (out_hits != nullptr) {
         *out_hits = cache != nullptr ? cache->phase_prefetch_hits[phase].load(std::memory_order_relaxed) : 0;
@@ -14173,6 +14240,9 @@ void ggml_cuda_moe_cache_prefetch_stats_for_test(
     }
     if (out_h2d_bytes != nullptr) {
         *out_h2d_bytes = cache != nullptr ? cache->phase_prefetch_h2d_copy_bytes[phase].load(std::memory_order_relaxed) : 0;
+    }
+    if (out_dropped != nullptr) {
+        *out_dropped = cache != nullptr ? cache->phase_prefetch_dropped[phase].load(std::memory_order_relaxed) : 0;
     }
 }
 
@@ -14511,6 +14581,7 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache) {
         cache->phase_prefetch_misses[phase].store(0, std::memory_order_relaxed);
         cache->phase_prefetch_used[phase].store(0, std::memory_order_relaxed);
         cache->phase_prefetch_evictions[phase].store(0, std::memory_order_relaxed);
+        cache->phase_prefetch_dropped[phase].store(0, std::memory_order_relaxed);
         cache->phase_demand_evictions[phase].store(0, std::memory_order_relaxed);
         cache->phase_evicted_prefetched[phase].store(0, std::memory_order_relaxed);
         cache->phase_evicted_hit_count_le1[phase].store(0, std::memory_order_relaxed);

@@ -1123,14 +1123,17 @@ void ggml_backend_cuda_moe_prefetch_experts_tensor(
     int n_expert_ids,
     bool use_l2,
     bool is_decode);
-// Prefetch phase counters for tests: hits, misses, used, evicted, h2d bytes.
+// Prefetch phase counters for tests: hits, misses, used, h2d bytes, and the
+// number of predictions dropped because the LFRU eviction guard protected a
+// warm resident (or no victim slot was available).
 void ggml_cuda_moe_cache_prefetch_stats_for_test(
     const struct ggml_cuda_moe_cache * cache,
     bool is_decode,
     uint64_t * out_hits,
     uint64_t * out_misses,
     uint64_t * out_used,
-    uint64_t * out_h2d_bytes);
+    uint64_t * out_h2d_bytes,
+    uint64_t * out_dropped = nullptr);
 
 void ggml_cuda_moe_cache_release_slots(
     struct ggml_cuda_moe_cache * cache,

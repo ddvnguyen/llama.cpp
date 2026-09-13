@@ -13029,6 +13029,93 @@ static void test_lookahead_prefetch_legacy_layer(int device) {
     fprintf(stderr, "test-moe-cache: lookahead prefetch legacy layer OK\n");
 }
 
+// The LFRU eviction guard: a speculative fill must never displace a genuinely
+// warm resident (>= 2 demand accesses) that is clearly hotter than the
+// prediction. A blocked prediction is dropped, not forced in, and must leave
+// the pool byte-for-byte as it was.
+static void test_lookahead_prefetch_eviction_guard(int device) {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    ggml_backend_cuda_moe_set_lookahead(8);
+    candidate_test_fixture fixture;
+    const int64_t gate_up_ne[] = {64, 64, 8};
+    const int64_t down_ne[] = {32, 64, 8};
+    ggml_tensor * gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_set_name(gate_up, "test.lookahead.guard");
+    // Three slots for eight experts, so a speculative fill must evict to land.
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> banks = {{
+        {gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 group = {banks.data(), banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0};
+    const auto snapshot = candidate_snapshot(3, &group, 1);
+    ggml_cuda_moe_grouped_context registry(&fixture.owner, device);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    auto lease = registry.acquire_legacy_cache(gate_up);
+    CHECK(lease && lease.get() != nullptr);
+    ggml_cuda_moe_cache * cache = lease.get();
+    cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache);
+    CHECK(copy_stream != nullptr);
+    auto demand = [&](int32_t expert) {
+        const void * src = static_cast<const char *>(gate_up->data) + (size_t) expert * gate_up->nb[2];
+        return ggml_cuda_moe_cache_acquire(cache, src, gate_up->nb[2], copy_stream, false, true, false, false);
+    };
+    auto predict = [&](int32_t expert) {
+        const int32_t ids[] = {expert};
+        registry.prefetch_legacy_layer(gate_up, ids, 1, false, true);
+        CUDA_OK(cudaStreamSynchronize(copy_stream));
+    };
+    auto prefetch_stats = [&](uint64_t * dropped) {
+        uint64_t hits = 0, misses = 0, used = 0, h2d = 0;
+        ggml_cuda_moe_cache_prefetch_stats_for_test(cache, true, &hits, &misses, &used, &h2d, dropped);
+        return std::array<uint64_t, 3>{hits, misses, h2d};
+    };
+    auto cache_stats = [&]() {
+        uint64_t hits = 0, misses = 0, evictions = 0;
+        ggml_cuda_moe_cache_stats(cache, &hits, &misses, &evictions);
+        return std::array<uint64_t, 3>{hits, misses, evictions};
+    };
+
+    // Fill the pool: expert 0 is demanded three times (genuinely warm), then 1
+    // and 2 once each, which leaves 0 as the least recently used slot.
+    CHECK(demand(0) >= 0);
+    CHECK(demand(0) >= 0);
+    CHECK(demand(0) >= 0);
+    CHECK(demand(1) >= 0);
+    CHECK(demand(2) >= 0);
+    CUDA_OK(cudaStreamSynchronize(copy_stream));
+
+    // A prediction for a never-seen expert would have to evict warm 0. The
+    // guard refuses: no copy, no miss, no eviction, 0 still resident.
+    uint64_t dropped = 0;
+    predict(3);
+    CHECK(prefetch_stats(&dropped) == (std::array<uint64_t, 3>{0, 0, 0}));
+    CHECK(dropped == 1);
+    const auto before = cache_stats();
+    CHECK(before[2] == 0);
+    CHECK(demand(0) >= 0);
+    CUDA_OK(cudaStreamSynchronize(copy_stream));
+    const auto after_warm = cache_stats();
+    CHECK(after_warm[0] == before[0] + 1 && after_warm[2] == 0);
+
+    // Contrast: the least recently used slot now holds expert 1, demanded only
+    // once. A cold resident is not worth protecting, so the prediction lands
+    // and evicts it.
+    predict(4);
+    CHECK(prefetch_stats(&dropped) == (std::array<uint64_t, 3>{0, 1, gate_up->nb[2]}));
+    CHECK(dropped == 1);
+    const auto after_cold = cache_stats();
+    CHECK(after_cold[2] == 1);
+    CHECK(demand(4) >= 0);
+    CUDA_OK(cudaStreamSynchronize(copy_stream));
+    CHECK(cache_stats()[0] == after_cold[0] + 1);
+
+    ggml_backend_cuda_moe_set_lookahead(0);
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+    fprintf(stderr, "test-moe-cache: lookahead prefetch eviction guard OK\n");
+}
+
 int main(int argc, char ** argv) {
     if (argc == 2 && strcmp(argv[1], "--early-grouped-only") == 0) {
         test_early_grouped_graphs();
@@ -13075,6 +13162,7 @@ int main(int argc, char ** argv) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));
         test_lookahead_prefetch_legacy_layer(dev);
+        test_lookahead_prefetch_eviction_guard(dev);
         return 0;
     }
     if (gemma_q4_parity_only) {
@@ -13161,6 +13249,7 @@ int main(int argc, char ** argv) {
     test_active_grouped_multirow_graph_modes(dev);
     test_active_grouped_dispatch();
     test_lookahead_prefetch_legacy_layer(dev);
+    test_lookahead_prefetch_eviction_guard(dev);
 
     // Toy parameters. Small enough to run in a few ms on any CUDA device,
     // large enough that LRU has work to do.
