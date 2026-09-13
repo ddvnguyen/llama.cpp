@@ -178,3 +178,75 @@ knob, not new math).
 - The prediction graph nodes add per-layer overhead; must confirm it stays under the win.
 - Fork policy: this is a new op + multi-file change; needs maintainer-facing design
   scrutiny and an explicit go-ahead before coding.
+
+## Implementation plan (PR-A consumer + PR-P1 producer)
+
+Both PRs stack on `feat/763-reconcile-qwen4exp-mtp` (PR #120) and target the epic
+`baseline-flash-next` after #120 lands. Both default OFF. The consumer is inert
+until the producer exists. Line numbers below are on the feat/763 tip.
+
+Env gates:
+
+- `GGML_CUDA_MOE_LOOKAHEAD=1` master switch (default off).
+- `GGML_CUDA_MOE_LOOKAHEAD_TOPK=N` predicted width, default 8 (colibri uses 6 real / 8 hint).
+- `GGML_CUDA_MOE_LOOKAHEAD_TWO=1` PILOT_TWO shared-expert correction.
+- `GGML_CUDA_MOE_LOOKAHEAD_DEBUG=1` recall + prefetch telemetry.
+
+### PR-A - consumer (self-contained, low risk)
+
+Template: `ggml_cuda_moe_grouped_context::prefetch_legacy_siblings` (moe-cache.cu:8529).
+It already does the acquire loop we need. P1 only changes the target from same-layer
+siblings to the next layer's expert tensors.
+
+1. `moe-cache.cuh` - add to `ggml_cuda_moe_grouped_context`:
+   `void prefetch_legacy_layer(const ggml_tensor * experts, const int32_t * eids, int n_eids, bool use_l2, bool is_decode);`
+2. `moe-cache.cu` - implement it:
+   - `auto lease = acquire_legacy_cache(experts);` installs the next layer's per-layer
+     pool on demand (needs `op == GGML_OP_NONE`, `ne[2] > 0`, `nb[2] > 0`).
+   - `cudaStream_t cs = ggml_cuda_moe_cache_copy_stream(cache);`
+   - for each eid: `ggml_cuda_moe_cache_acquire(cache, data + eid*nb[2], nb[2], cs, use_l2, is_decode, /*is_prefetch=*/true, /*pin=*/false);`
+   - prefetch the gate/up/down siblings too via `prefetch_legacy_siblings` on the lease.
+3. `moe-cache.cu:14629` - replace the no-op `ggml_backend_cuda_moe_prefetch_experts`:
+   resolve the device's `ggml_cuda_moe_grouped_context` and call `prefetch_legacy_layer`.
+   Keep the exported signature (`ggml/include/ggml-cuda.h:68`).
+
+Invariants: `is_prefetch=true` (drives the `phase_prefetch_*` counters),
+`wait_for_compute=false`, `pin=false`; an acquire returning -1 is ignored; never touch
+the cache of the layer being computed.
+
+Acceptance A: built and run with the switch on; `phase_prefetch_hits/used` and
+`phase_prefetch_h2d_bytes` move; decode output is byte-identical (prefetch cannot change
+results); with the switch off there is no hit-rate regression.
+
+### PR-P1 - producer (graph-level PILOT)
+
+1. Predicted ids reuse existing ops, no new math:
+   `rms_norm(cur, L+1.ffn_norm)` -> `build_lora_mm(L+1.ffn_gate_inp, .)` -> `sigmoid`
+   (+`ffn_gate_inp_b`) -> `top_k`. This mirrors `build_moe_ffn` (llama-graph.cpp:2067,
+   gate at :2099, sigmoid at :2122).
+2. New side-effect op `GGML_OP_MOE_PREFETCH`:
+   - `src[0]` = next layer's expert tensor (`ffn_gate_up_exps` or `ffn_gate_exps`),
+     `src[1]` = predicted ids (i32).
+   - constructor in `ggml.h`; CPU backend no-op; CUDA dispatch in
+     `ggml_cuda_compute_forward`: read `src[1]` D2H, call `prefetch_legacy_layer`.
+   - output aliases `src[1]` so the scheduler keeps the node in order (no dead-node removal).
+3. Graph insertion in the per-model layer loop (`llm_build_*`), decode only, only when
+   `il+1` is MoE: emit the prediction + op right after layer L's attention residual,
+   before L's MoE, so the H2D overlaps L's MoE.
+4. PILOT_TWO (optional): add L's shared-expert output to `cur` before the norm.
+
+Open questions to settle before P1 coding:
+
+- Q1: can `acquire_legacy_cache` install L+1's pool while L executes (generation/epoch
+  guards)? Probe first.
+- Q2: layer-split - L and L+1 can be on different devices; the op must run where L+1's
+  cache lives (device 0 today). `cur` may need a 1 x n_embd peer copy.
+- Q3: CUDA graph capture - keep the side-effect op out of captured graphs first
+  (steady-state capture is already off in this config).
+- Q4: draft/MTP contexts - gate to target decode only.
+
+### Validation
+
+- recall (predicted vs demand ids), `phase_prefetch_used`, decode t/s on fit-off
+  N=144 (baseline 32.66 t/s), sdb read 0.
+- A/B with the switch off; no regression on dense models.
