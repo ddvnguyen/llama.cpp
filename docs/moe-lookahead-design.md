@@ -108,6 +108,8 @@ Existing machinery already present:
   actually runs on this rig; grouped/early-router is disabled for layer-split.
 - CLI: `--moe-expert-cache-size` / `--moe-expert-cache-l2-pinned-mb`;
   `mparams.moe_expert_cache_slots`.
+- Gating: the entire feature (consumer + producer) ships behind a new `--moe-lookahead`
+  CLI param, default off. No env master switch. See "Param gates" below.
 
 Proposed implementation, two halves:
 
@@ -162,7 +164,7 @@ knob, not new math).
 - Instrumented run: `phase_prefetch_hits/used/h2d_bytes` from the existing telemetry;
   assert prefetch_used > 0 and decode t/s improves on the warm apex config (baseline
   21 t/s plain / 26 t/s MTP, 0 disk I/O).
-- A/B with prediction disabled (env kill-switch) to isolate the gain; guard against
+- A/B with `--moe-lookahead 0` (param default) to isolate the gain; guard against
   regressions on non-MoE models.
 
 ## Risks / open questions
@@ -185,12 +187,22 @@ Both PRs stack on `feat/763-reconcile-qwen4exp-mtp` (PR #120) and target the epi
 `baseline-flash-next` after #120 lands. Both default OFF. The consumer is inert
 until the producer exists. Line numbers below are on the feat/763 tip.
 
-Env gates:
+Param gates (CLI, not env; follows the `--moe-expert-cache-*` knob conventions):
 
-- `GGML_CUDA_MOE_LOOKAHEAD=1` master switch (default off).
-- `GGML_CUDA_MOE_LOOKAHEAD_TOPK=N` predicted width, default 8 (colibri uses 6 real / 8 hint).
-- `GGML_CUDA_MOE_LOOKAHEAD_TWO=1` PILOT_TWO shared-expert correction.
-- `GGML_CUDA_MOE_LOOKAHEAD_DEBUG=1` recall + prefetch telemetry.
+- `--moe-lookahead N` master gate and predicted width in one knob, default 0 = off.
+  N > 0 enables look-ahead for main target decode with predicted width N
+  (colibri: 6 real / 8 hint; recommended first A/B value 8).
+- `--moe-lookahead-two` PILOT_TWO shared-expert correction, default off.
+- Arg validation: error if `--moe-lookahead > 0` and `--moe-expert-cache-size` is 0
+  (residency is the prerequisite; fail loudly, no silent no-op).
+- Plumbing: `common_params::n_moe_lookahead` beside `n_moe_expert_cache_slots`
+  (common.h:543), `mparams.moe_lookahead` at common.cpp:1713, then a backend setter
+  `ggml_backend_cuda_moe_set_lookahead()` mirroring
+  `ggml_backend_cuda_moe_set_l2_pinned_cache_size()`. No draft inherit
+  (no `--spec-draft-moe-lookahead`): look-ahead is main-target-only, matching the
+  grouped-decode restriction.
+- Debug-only env (never a gate): `GGML_CUDA_MOE_LOOKAHEAD_DEBUG=1` recall + prefetch
+  telemetry. Env cannot flip behavior.
 
 ### PR-A - consumer (self-contained, low risk)
 
@@ -214,9 +226,9 @@ Invariants: `is_prefetch=true` (drives the `phase_prefetch_*` counters),
 `wait_for_compute=false`, `pin=false`; an acquire returning -1 is ignored; never touch
 the cache of the layer being computed.
 
-Acceptance A: built and run with the switch on; `phase_prefetch_hits/used` and
+Acceptance A: built and run with `--moe-lookahead 8`; `phase_prefetch_hits/used` and
 `phase_prefetch_h2d_bytes` move; decode output is byte-identical (prefetch cannot change
-results); with the switch off there is no hit-rate regression.
+results); with the param at its default there is no hit-rate regression.
 
 ### PR-P1 - producer (graph-level PILOT)
 
@@ -249,4 +261,4 @@ Open questions to settle before P1 coding:
 
 - recall (predicted vs demand ids), `phase_prefetch_used`, decode t/s on fit-off
   N=144 (baseline 32.66 t/s), sdb read 0.
-- A/B with the switch off; no regression on dense models.
+- A/B with `--moe-lookahead 0`; no regression on dense models.
