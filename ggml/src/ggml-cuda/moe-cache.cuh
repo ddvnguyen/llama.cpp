@@ -524,6 +524,7 @@ public:
     ggml_cuda_moe_graph_outcome outcome() const;
     bool has_certified_complete_mmid_inventory() const;
     const ggml_cuda_moe_graph_coverage_diagnostics & coverage_diagnostics() const;
+    static const char * group_reason_name(uint32_t reason);
 
 private:
     static constexpr uint32_t MAX_NODE_BINDINGS = GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * 3;

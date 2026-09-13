@@ -4346,6 +4346,28 @@ const ggml_cuda_moe_graph_coverage_diagnostics & ggml_cuda_moe_graph_plan::cover
     return coverage_diagnostics_;
 }
 
+const char * ggml_cuda_moe_graph_plan::group_reason_name(uint32_t reason) {
+    switch (reason) {
+        case GROUP_REASON_ELIGIBLE:             return "eligible";
+        case GROUP_REASON_PREFILL:              return "prefill";
+        case GROUP_REASON_EXECUTION:            return "execution";
+        case GROUP_REASON_DESCRIPTOR:           return "descriptor";
+        case GROUP_REASON_SOURCE:               return "source";
+        case GROUP_REASON_GEOMETRY:             return "geometry";
+        case GROUP_REASON_CAPABILITY:           return "capability";
+        case GROUP_REASON_CONSUMER_EQUIVALENCE: return "consumer_equivalence";
+        case GROUP_REASON_ROUTE:                return "route";
+        case GROUP_REASON_DUPLICATE_ROLE:       return "duplicate_role";
+        case GROUP_REASON_MIXED_IDS:            return "mixed_ids";
+        case GROUP_REASON_AUXILIARY:            return "unsupported_auxiliary";
+        case GROUP_REASON_EXTERNAL_CONSUMER:    return "external_consumer";
+        case GROUP_REASON_MISSING_ROLE:         return "missing_role";
+        case GROUP_REASON_UNPROVEN:             return "unproven";
+        case GROUP_REASON_MATERIALIZATION:      return "materialization";
+        default:                                return "unknown";
+    }
+}
+
 ggml_cuda_moe_graph_execution::ggml_cuda_moe_graph_execution() :
         plan_(nullptr), owner_(nullptr), n_groups_(0), dispatch_mode_(GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY), dispatch_active_(false) {
 }
@@ -8787,13 +8809,42 @@ void ggml_cuda_moe_grouped_context::configure_early_router(
     }
     if (execution == nullptr || execution->plan_ == nullptr ||
             execution->outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
-        static bool diagnosed = false;
-        if (!diagnosed) {
-            diagnosed = true;
-            fprintf(stderr, "moe-early-router: dormant reason=%s outcome=%u (one-time)\n",
-                execution == nullptr ? "null-execution" :
-                execution->plan_ == nullptr ? "null-plan" : "outcome-not-decode-grouped",
-                execution != nullptr ? (unsigned) execution->outcome() : 0u);
+        static int diagnosed_calls = 0;
+        const uint32_t outcome = execution != nullptr ? (unsigned) execution->outcome() : UINT32_MAX;
+        const bool has_moe = execution != nullptr && execution->plan_ != nullptr &&
+            execution->plan_->coverage_diagnostics_.cached_mmid != 0;
+        if (has_moe && diagnosed_calls < 24) {
+            diagnosed_calls++;
+            const auto & diagnostics = execution->plan_->coverage_diagnostics_;
+            fprintf(stderr, "moe-early-router: dormant outcome=%u cached_mmid=%u groups=%u coverage:",
+                outcome, diagnostics.cached_mmid, (unsigned) execution->plan_->n_groups_);
+            for (uint32_t reason = 0; reason < GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT; ++reason) {
+                if (diagnostics.counts[reason] != 0) {
+                    fprintf(stderr, " %s=%u", moe_candidate_coverage_reason_name(reason), diagnostics.counts[reason]);
+                }
+            }
+            fprintf(stderr, "\n");
+            ggml_graph_execution_certificate cert;
+            uint64_t cert_key = 0;
+            const bool cert_ok = moe_candidate_execution_certificate(graph, &cert, &cert_key);
+            fprintf(stderr, "moe-early-router: cert_ok=%d magic=%u ver=%u size=%zu flags=%u domain=%u row_sem=%u "
+                    "n_rows=%u n_seq=%u owner_ns=%llu owner_gen=%llu src_uid=%llu split_uid=%llu graph_uid=%llu\n",
+                (int) cert_ok, cert.magic, cert.abi_version, cert.struct_size, cert.flags, cert.domain,
+                cert.row_semantics, cert.n_rows, cert.n_sequences,
+                (unsigned long long) cert.owner_namespace, (unsigned long long) cert.owner_generation,
+                (unsigned long long) cert.source_graph_uid, (unsigned long long) cert.split_graph_uid,
+                (unsigned long long) (graph != nullptr ? graph->uid : 0));
+            for (const auto & record : execution->plan_->groups_) {
+                if (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE ||
+                        record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL) {
+                    continue;
+                }
+                const char * tensor = record.authority_node != nullptr && record.authority_node->src[0] != nullptr ?
+                    record.authority_node->src[0]->name : "unknown";
+                fprintf(stderr, "moe-early-router: group=%u layout=%u reason=%s(%u) tensor=%s\n",
+                    record.candidate.group_index, record.layout,
+                    ggml_cuda_moe_graph_plan::group_reason_name(record.reason), record.reason, tensor);
+            }
         }
         return;
     }
@@ -11218,25 +11269,7 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
         }
         if (grouped_enabled && outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR) {
             const auto graph_reason_name = [](uint32_t reason) {
-                switch (reason) {
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE:             return "eligible";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL:              return "prefill";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_EXECUTION:            return "execution";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_DESCRIPTOR:           return "descriptor";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_SOURCE:               return "source";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_GEOMETRY:             return "geometry";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_CAPABILITY:           return "capability";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_CONSUMER_EQUIVALENCE: return "consumer_equivalence";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_ROUTE:                return "route";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_DUPLICATE_ROLE:       return "duplicate_role";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_MIXED_IDS:            return "mixed_ids";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_AUXILIARY:            return "unsupported_auxiliary";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_EXTERNAL_CONSUMER:    return "external_consumer";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_MISSING_ROLE:         return "missing_role";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_UNPROVEN:             return "unproven";
-                    case ggml_cuda_moe_graph_plan::GROUP_REASON_MATERIALIZATION:      return "materialization";
-                    default:                                                          return "unknown";
-                }
+                return ggml_cuda_moe_graph_plan::group_reason_name(reason);
             };
             for (const auto & record : execution->plan_->groups_) {
                 for (uint32_t bank_index = 0; bank_index < record.n_banks; ++bank_index) {
