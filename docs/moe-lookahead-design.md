@@ -92,6 +92,38 @@ Take-aways for us:
 - Both keep the idea device-agnostic: prediction produces (layer, expert) ids; a loader
   moves bytes. That maps cleanly onto llama.cpp.
 
+### Upstream context (ggml-org discussion #24528, leloch's RFC)
+
+The fork's expert cache descends from this RFC; upstream never merged it, which is why
+the fork carries it. Its comment thread produced measurements that directly shape this
+design:
+
+- Decode routing skew is real and independently corroborated: top 10% of experts take
+  ~80% of hits (Gini ~0.76, issue #20757). But noonghunna's capacity sweep shows the
+  demand LRU keeps improving nearly linearly to ~31% pool coverage before flattening
+  (~0.56 -> 0.29 -> 0.01 marginal t/s per GB) - the hot head is NOT a small fixed set
+  (SharkWipf's "top ~1000 experts" reading was an under-warming artifact). So a warmed
+  demand cache already absorbs most of the win; look-ahead prefetch's job is the miss
+  TAIL, and its expected gain is bounded by that residual. Validate against a warmed
+  pool, never a cold one.
+- Sync points kill: the RFC's Metal slot-pool experiment was 2x slower than vanilla at
+  97-99% hit rate, purely from per-layer syncs; batot1's GTX 1080 Ti sweep regressed at
+  every budget. Direct constraint on PR-A: no full-stream synchronize in any demand or
+  prefetch path; dependency on in-flight prefetch copies must be event-based only.
+- leloch's v2 ablation: packing two H2D copies per dispatch into one removed ~40,000
+  H2D ops from matched traces. PR-A must use the cache's batched copy path
+  (`cudaMemcpyBatchAsync`, moe-cache.cu:5033) instead of one copy per eid where the
+  banks allow it.
+- Hybrid hit/miss execution (hits on GPU, misses stay on CPU) is measured, not
+  hypothetical: +10-57% across 13 models with prefill bit-untouched. This is measured
+  evidence for the FreeToken-bound follow-up below, and it composes with speculation:
+  MTP worth +28% without the cache, +51% with it.
+- Benchmark footguns to bake into our validation: an under-warmed pool reads as
+  saturated; requested budgets are silently VRAM-capped (read the granted-capacity log,
+  not the flag); the cache must never silently bypass (upstream added a one-shot warning
+  for batch-bound bypass; our consumer must log, not no-op silently, when a prefetch
+  target cannot be cached).
+
 ## Mapping onto the llama.cpp fork
 
 Existing machinery already present:
@@ -142,7 +174,9 @@ Recommendation: P1 + A. P1 is the faithful port of colibri's PILOT and sidesteps
 layer-split grouped blocker entirely. Add FreeToken's bound as a follow-up: when predicted
 misses exceed what PCIe can move in the layer's compute window, route the overflow to CPU
 (the existing legacy host path already computes experts on the host, so this is a policy
-knob, not new math).
+knob, not new math). Upstream RFC #24528 measured exactly this hybrid: +10-57% decode on
+13 models forced to spill, prefill bit-untouched - and confirmed the levers compose with
+speculative decoding (MTP +28% standalone, +51% with the cache active).
 
 ## Invariants to preserve (from colibri)
 
@@ -166,6 +200,13 @@ knob, not new math).
   21 t/s plain / 26 t/s MTP, 0 disk I/O).
 - A/B with `--moe-lookahead 0` (param default) to isolate the gain; guard against
   regressions on non-MoE models.
+- All decode A/B arms MUST run on a warmed pool (per upstream #24528: an under-warmed
+  cache reads as saturated; bigger pools need proportionally more varied traffic).
+  Measure the granted pool size from the cache log, not the flag value.
+- Prefill/prompt-processing regression check on every A/B (upstream comparison showed
+  PP can regress in cache builds even when prefill is bit-untouched: -6% to -14% PP).
+  Our contract: PP unchanged when the switch is off, PP unchanged when on
+  (look-ahead emits decode-only graph nodes).
 
 ## Risks / open questions
 
@@ -218,6 +259,9 @@ siblings to the next layer's expert tensors.
    - `cudaStream_t cs = ggml_cuda_moe_cache_copy_stream(cache);`
    - for each eid: `ggml_cuda_moe_cache_acquire(cache, data + eid*nb[2], nb[2], cs, use_l2, is_decode, /*is_prefetch=*/true, /*pin=*/false);`
    - prefetch the gate/up/down siblings too via `prefetch_legacy_siblings` on the lease.
+   - batch the H2D: prefer one batched copy (the demand path's `cudaMemcpyBatchAsync`
+     pattern, moe-cache.cu:5033) over one async copy per eid - upstream v2 removed
+     ~40k H2D ops by packing copies per dispatch.
 3. `moe-cache.cu:14629` - replace the no-op `ggml_backend_cuda_moe_prefetch_experts`:
    resolve the device's `ggml_cuda_moe_grouped_context` and call `prefetch_legacy_layer`.
    Keep the exported signature (`ggml/include/ggml-cuda.h:68`).
@@ -260,5 +304,5 @@ Open questions to settle before P1 coding:
 ### Validation
 
 - recall (predicted vs demand ids), `phase_prefetch_used`, decode t/s on fit-off
-  N=144 (baseline 32.66 t/s), sdb read 0.
-- A/B with `--moe-lookahead 0`; no regression on dense models.
+  N=144 (baseline 32.66 t/s), sdb read 0. Warm the pool first; log granted slots.
+- A/B with `--moe-lookahead 0`; no regression on dense models; PP unchanged on/off.
