@@ -434,6 +434,13 @@ Random overlap for 10 of 256 experts is 3.9% of the predicted width, so width 8 
 22x chance - the prediction is genuinely informative, not noise. RTX 3060 (same model, same
 prompts, width 8): 85.85% recall / 68.68% coverage, the same within numerical noise.
 
+Reference point from this design's own source: colibri reports 71.6% PILOT recall on
+GLM-5.2 (75.8% on its trace), using the same stale state - layer L's post-attention hidden
+state, before L's MoE. The model and its expert count differ, so this is not a like-for-like
+comparison, but at comparable prediction widths the producer here is at least in that range
+(91.50% at width 6, 86.21% at width 8). Prediction quality is therefore not a reason to keep
+the track parked; the blockers are.
+
 Two traps found while making this measurable, both of which had kept it unmeasured:
 
 - The committed debug instrument logs with `GGML_LOG_INFO`, which never reached the server
