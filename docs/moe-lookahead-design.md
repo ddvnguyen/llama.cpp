@@ -405,3 +405,45 @@ judgment, but the work stays gated on grouped-plan / layer-split work.
   execution certificate that encodes the same distinction is assembled at compute time.
 - `qwen35moe.cpp` is wired mechanically and is unvalidated - no model on this rig to test
   it against. It stays in the branch as part of the experimental record.
+
+### Prediction accuracy (measured 2026-09-14)
+
+Horizon: the producer looks ahead exactly **one MoE layer, never a token**. Layer L's
+post-attention state predicts layer L+1's selection for the same token, at each of the
+model's 47 layer transitions per decode step, so one prediction per layer per step.
+`--moe-lookahead N` is the number of experts predicted per layer, not a token count.
+
+Method: the demand path cannot score this. During decode only one layer (`blk.47`, the
+layer holding the legacy cache lease at `--moe-expert-cache-size 84`) reaches the
+host-visible ids read; every other layer executes in the certified grouped path and its
+selection never surfaces to the host. The ground truth was therefore built in-graph: each
+layer's own router matmul on its real FFN input, top-k, routed through a measurement node
+and compared against the prediction recorded for that same layer. Decode rows only, ground
+truth pinned at the model's real selection (`n_expert_used = 10`), 23,936 scored
+(step, layer) pairs per run, 2 x 256-token generations.
+
+| predicted width | recall (of predicted) | coverage (of the 10 actually used) |
+| --- | --- | --- |
+| 2 | 97.37% | 19.47% |
+| 4 | 95.13% | 38.05% |
+| 6 | 91.50% | 54.90% |
+| 8 | 86.21% | 68.97% |
+| 10 | 79.26% | 79.26% |
+
+Random overlap for 10 of 256 experts is 3.9% of the predicted width, so width 8 is about
+22x chance - the prediction is genuinely informative, not noise. RTX 3060 (same model, same
+prompts, width 8): 85.85% recall / 68.68% coverage, the same within numerical noise.
+
+Two traps found while making this measurable, both of which had kept it unmeasured:
+
+- The committed debug instrument logs with `GGML_LOG_INFO`, which never reached the server
+  log at default verbosity; only `fprintf(stderr, ...)` appeared. The env gate itself was
+  fine. Any future recall work should use a log path that is actually emitted.
+- Scoring inside `ggml_cuda_mul_mat_id_cached` only ever saw `blk.47`, because every other
+  layer takes the `cache == nullptr` early return during decode. Recall must be scored
+  outside that path.
+
+Refinement implied by the numbers: the model routes to **10** experts, so `--moe-lookahead
+8` predicts fewer experts than are used - 69% coverage - while width 10 reaches 79%. Note
+also that the measurement runs add graph nodes and are therefore valid only for the recall
+numbers, not as output-equivalence runs (see blocker 1).
