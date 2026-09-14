@@ -411,6 +411,63 @@ certification time, where the full layer inventory and the slot budget are known
 `sched_reserve()`). That is a deliberate change to the certification contract and needs its
 own review, which is one more reason this producer stays parked rather than patched.
 
+### Reopen-transport ruling (mailbox vs device-side) - 2026-09-14
+
+Reviewer/decider ruling on how blocker 3 would be fixed if the track reopens.
+
+**(a) Mailbox approved as the transport; device-side gather rejected for this codebase.** The
+mailbox reuses two components the fork already ships and exercises: the early-router copy worker
+(`moe-cache.cu:4913-5140` - `cudaHostAllocMapped` buffers, `moe_early_router_publish_copy`,
+`cuda::atomic_ref<..., thread_scope_system>` poll, `cuStreamWriteValue32` / `cuStreamWaitValue32`)
+and the async paging half (`ggml_cuda_moe_cache_prefetch_locked`). The transport work is then
+glue, not architecture. The FreeToken-style alternative - a device kernel that reads the
+predicted ids from device memory and gathers slabs from host-mapped banks - is architecturally
+superior but requires device-resident slot management: LRU selection, the LFRU eviction guard,
+and slot booking/rollback are host-side logic under `cache->mu` today (`select_victim_locked`,
+`install_fill_locked`). A gather kernel therefore means a second cache implementation and
+reintroduces the demand/speculative drift that sharing those two functions eliminated. FreeToken
+built its device-side cache from day one; this fork did not. Revisit only if slot management ever
+moves to the device wholesale. Supporting fact: recall is not the weak part (86.21% at width 8,
+about 22x chance), so the next unit of work belongs to transport and authority, not prediction.
+
+**(b) Deleting the `use_cuda_graph = false` rule does not suffice.** The op is structurally
+capture-incompatible as written, and capture-compatible after the redesign. The graph must not
+contain the pageable D2H memcpy, `cudaStreamSynchronize`, or any host-side slot booking. It may
+contain the prediction subgraph, a publish kernel writing ids into `cudaHostAllocMapped` memory,
+and capture-legal stream memory ops. The `ggml_cuda_mul_mat_id_needs_sync` precedent forces
+no-capture because the demand path performs the readback; a mailbox producer has no in-graph
+readback and does not need the exclusion, but the exclusion must remain for any non-mailbox
+fallback. Capture-replay hazard: a captured `cuStreamWaitValue32` bakes an expected value, so on
+replay it either spins forever (value not yet reached) or passes instantly (already passed). It
+must be refreshed per step through graph exec update - the fork already runs a per-step update
+for MoE graphs - or replaced by a polling kernel reading a monotonic device counter. Never
+capture a raw static-value wait.
+
+**(c) Minimal change set.** `ggml-cuda.cu`: rewrite `ggml_cuda_moe_prefetch` (3883-3926) to
+publish instead of reading back, and gate the capture exclusion (4561) on mailbox mode rather
+than on op presence. `moe-cache.cu` / `.cuh`: add a prefetch job type to the early-router copy
+worker - the worker resolves the target tensor, calls `acquire_legacy_cache` (authority still
+gates, by design), runs the existing paging path, and records a per-job event on the copy stream
+that the demand path consumes through its existing `cudaStreamWaitEvent`. Untouched: the paging
+half, the cache authority machinery, the route/candidate census exclusion, `build_moe_lookahead`,
+and the consumer surface.
+
+**(d) Required guards and instrumentation.** Bounded job ring (depth about 2) with drop-newest and
+a one-shot log; counters for published / dropped_overflow / dropped_authority / consumed.
+Sequence-keyed ring slots, replay-idempotent publish, recycle only after consumption is
+confirmed. Ordering: `__threadfence_system()` before the sequence write on the device side,
+acquire through `cuda::atomic_ref<..., thread_scope_system>` on the worker. No unconditional
+waits: a dropped prediction must never leave the demand path waiting on a semaphore that will
+never be published, hence per-job events recorded only when copies were enqueued, plus a
+`waited_empty` counter. Verify ordering when a prefetch batch and a demand staged batch are in
+flight on the same copy stream. Graph churn: the per-step `graph_update_required` rate must
+settle to zero in steady state.
+
+**Sequencing (unchanged).** The mailbox fixes blocker 3 only; blocker 2 (authority) and blocker 1
+(census) still gate. Reopening is three ordered workstreams: (1) census exclusion for the
+prediction subgraph (issue #128), (2) authority publication at graph reserve/certification time
+(the seam above), (3) the mailbox transport. One review, not three PRs. The track stays parked.
+
 ### Corrections this round made to the plan above
 
 - `ffn_gate_up_exps` is null for every layer of this model, so the producer targets
