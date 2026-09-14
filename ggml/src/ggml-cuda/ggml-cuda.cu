@@ -3350,6 +3350,466 @@ static void ggml_cuda_moe_lookahead_debug_score(int layer, const std::vector<int
     }
 }
 
+// ---------------------------------------------------------------------------
+// Decode phase attribution probe (diagnostic, off unless GGML_CUDA_MOE_PHASE_PROBE=1).
+//
+// It answers one question: on a decode step, how much time is MoE expert execution,
+// how much is attention, how much is everything else, and which dispatch mode
+// produced the step. One CUDA event pair is recorded per maximal run of consecutive
+// same-(phase, layer) nodes (~150 pairs per step instead of ~1000), and they are read
+// back once per step after a single stream sync (measured cost ~2.6% of decode
+// throughput on the RTX 3060: 10.58/9.23 t/s instrumented against 10.98/9.47 clean).
+//
+// Two properties matter when reading its output, both measured:
+//   - Events cannot be recorded on a capturing stream, so the probe disables itself
+//     with a one-line note instead of breaking CUDA graph capture; during replay the
+//     host never visits the dispatch loop either, so a graphs-enabled run reports
+//     nothing for replayed steps. Use GGML_CUDA_DISABLE_GRAPHS=1 for an attribution.
+//   - Steps are classified as prefill or decode by inter-step wall time, not by graph
+//     shape: the backend receives scheduler slices that carry no leafs and whose
+//     matmuls report ne[1] == 1 in both regimes. Prefill ubatches here take ~4.6 s
+//     against ~97 ms for a decode step, so a 500 ms boundary separates them cleanly.
+// ---------------------------------------------------------------------------
+#define GGML_CUDA_MOE_PHASE_MAX_LAYERS 64
+#define GGML_CUDA_MOE_PHASE_MAX_RUNS   4096
+
+enum ggml_cuda_moe_phase {
+    GGML_CUDA_MOE_PHASE_ATTN = 0,
+    GGML_CUDA_MOE_PHASE_MOE,
+    GGML_CUDA_MOE_PHASE_PLE,
+    GGML_CUDA_MOE_PHASE_DENSE,
+    GGML_CUDA_MOE_PHASE_OTHER,
+    GGML_CUDA_MOE_PHASE_COUNT,
+};
+
+static bool ggml_cuda_moe_phase_probe_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MOE_PHASE_PROBE") != nullptr;
+    return enabled;
+}
+
+static int ggml_cuda_moe_phase_classify(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_LINEAR_ATTN:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_WIN_PART:
+        case GGML_OP_WIN_UNPART:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_ROPE:
+        case GGML_OP_DIAG_MASK_INF:
+            return GGML_CUDA_MOE_PHASE_ATTN;
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MOE_PREFETCH:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_TOP_K:
+            return GGML_CUDA_MOE_PHASE_MOE;
+        case GGML_OP_GET_ROWS:
+            return node->src[0] != nullptr &&
+                    strstr(node->src[0]->name, "per_layer_token_embd") != nullptr ?
+                GGML_CUDA_MOE_PHASE_PLE : GGML_CUDA_MOE_PHASE_DENSE;
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_SET_ROWS:
+            return GGML_CUDA_MOE_PHASE_OTHER;
+        default:
+            return GGML_CUDA_MOE_PHASE_DENSE;
+    }
+}
+
+// Node names here are "<op>-<layer>" (e.g. ffn_moe_gate-35) or "blk.N.<tensor>";
+// the MoE tensor helper only understands the latter.
+static int ggml_cuda_moe_phase_layer(const char * name) {
+    if (name == nullptr) {
+        return -1;
+    }
+    const int blk_layer = ggml_cuda_moe_layer_from_name(name);
+    if (blk_layer >= 0) {
+        return blk_layer;
+    }
+    const char * dash = strrchr(name, '-');
+    if (dash == nullptr || dash[1] == '\0') {
+        return -1;
+    }
+    for (const char * c = dash + 1; *c != '\0'; ++c) {
+        if (*c < '0' || *c > '9') {
+            return -1;
+        }
+    }
+    const long parsed = strtol(dash + 1, nullptr, 10);
+    if (parsed < 0 || parsed >= GGML_CUDA_MOE_PHASE_MAX_LAYERS) {
+        return -1;
+    }
+    return (int) parsed;
+}
+
+struct ggml_cuda_moe_phase_probe {
+    cudaEvent_t starts[GGML_CUDA_MOE_PHASE_MAX_RUNS] = {};
+    cudaEvent_t ends  [GGML_CUDA_MOE_PHASE_MAX_RUNS] = {};
+    int         phases[GGML_CUDA_MOE_PHASE_MAX_RUNS] = {};
+    int         layers[GGML_CUDA_MOE_PHASE_MAX_RUNS] = {};
+    int         n_runs   = 0;
+    int         open     = -1;
+    bool        disabled = false;
+
+    double   phase_ms[2][GGML_CUDA_MOE_PHASE_COUNT] = {};
+    double   layer_ms[2][GGML_CUDA_MOE_PHASE_MAX_LAYERS][GGML_CUDA_MOE_PHASE_COUNT] = {};
+    uint64_t layer_steps[2][GGML_CUDA_MOE_PHASE_MAX_LAYERS] = {};
+    uint64_t steps[2]      = {};
+    uint64_t rows_min[2]   = {};
+    uint64_t rows_max[2]   = {};
+    uint64_t mode_legacy[2]  = {};
+    uint64_t mode_direct[2]  = {};
+    uint64_t mode_capture[2] = {};
+    uint64_t mode_replay[2]  = {};
+    double   interval_ms[2]  = {};
+    int64_t  last_step_us[2] = {};
+    int64_t  last_any_us     = 0;
+    int      prev_cls        = -1;
+};
+
+static ggml_cuda_moe_phase_probe & ggml_cuda_moe_phase_probe_state() {
+    static ggml_cuda_moe_phase_probe state;
+    return state;
+}
+
+// Records an event, and turns the probe off (once, with a note) if the stream is
+// capturing or the event is otherwise unusable: a diagnostic must never be able to
+// break a run.
+static bool ggml_cuda_moe_phase_probe_record(ggml_cuda_moe_phase_probe & p, cudaEvent_t ev, cudaStream_t stream) {
+    if (cudaEventRecord(ev, stream) == cudaSuccess) {
+        return true;
+    }
+    const cudaError_t err = cudaGetLastError();
+    p.disabled = true;
+    fprintf(stderr, "moe-phase-probe: disabled, cudaEventRecord failed (%s)\n", cudaGetErrorString(err));
+    return false;
+}
+
+static void ggml_cuda_moe_phase_probe_begin_node(int phase, int layer, cudaStream_t stream) {
+    auto & p = ggml_cuda_moe_phase_probe_state();
+    if (p.disabled) {
+        return;
+    }
+    if (p.open >= 0 && p.phases[p.open] == phase && p.layers[p.open] == layer) {
+        return;   // the run continues; its end event is recorded when the run closes
+    }
+    if (p.open >= 0) {
+        // This node belongs to a new run, so the previous run is complete.
+        if (!ggml_cuda_moe_phase_probe_record(p, p.ends[p.open], stream)) {
+            return;
+        }
+        p.open = -1;
+    }
+    if (p.n_runs >= GGML_CUDA_MOE_PHASE_MAX_RUNS) {
+        return;   // more runs in one step than the buffer holds: the excess is dropped
+    }
+    const int run = p.n_runs;
+    if (p.starts[run] == nullptr || p.ends[run] == nullptr) {
+        if (cudaEventCreateWithFlags(&p.starts[run], cudaEventDefault) != cudaSuccess ||
+                cudaEventCreateWithFlags(&p.ends[run], cudaEventDefault) != cudaSuccess) {
+            cudaGetLastError();
+            p.disabled = true;
+            fprintf(stderr, "moe-phase-probe: disabled, cudaEventCreate failed\n");
+            return;
+        }
+    }
+    if (!ggml_cuda_moe_phase_probe_record(p, p.starts[run], stream)) {
+        return;
+    }
+    p.phases[run] = phase;
+    p.layers[run] = layer;
+    p.n_runs++;
+    p.open = run;
+}
+
+static void ggml_cuda_moe_phase_probe_end_step(cudaStream_t stream, int dispatch_mode, const ggml_cgraph * cgraph) {
+    if (!ggml_cuda_moe_phase_probe_enabled()) {
+        return;
+    }
+    auto & p = ggml_cuda_moe_phase_probe_state();
+    if (p.disabled) {
+        return;
+    }
+
+    // Step class from the inter-step wall time: prefill ubatches take seconds here and
+    // decode steps ~90 ms, a ~50x gap, so the boundary is unambiguous.
+    const int64_t now_us = ggml_time_us();
+    const double delta_ms = p.last_any_us != 0 ? (double) (now_us - p.last_any_us) / 1000.0 : 0.0;
+    p.last_any_us = now_us;
+    const int cls = delta_ms < 500.0 ? 0 : 1;
+
+    // Token count of the step, best effort. The scheduler slice carries no leafs, so
+    // the input tensor is not visible; the smallest dense matmul in the slice stands in
+    // for the batch size. Both regimes report 1 here on this model, which is why the
+    // class above is decided by wall time, not by rows.
+    int64_t n_rows = 0;
+    if (cgraph != nullptr) {
+        bool found = false;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op != GGML_OP_MUL_MAT) {
+                continue;
+            }
+            if (!found || node->ne[1] < n_rows) {
+                n_rows = node->ne[1];
+                found  = true;
+            }
+        }
+    }
+
+    if (cgraph != nullptr && p.steps[cls] % 32 == 1) {
+        fprintf(stderr, "moe-phase-probe-diag[%s]: delta_ms=%.1f n_rows=%lld n_nodes=%d n_leafs=%d",
+                cls == 0 ? "decode" : "prefill", delta_ms, (long long) n_rows, cgraph->n_nodes, cgraph->n_leafs);
+        int shown = 0;
+        for (int i = 0; i < cgraph->n_nodes && shown < 6; ++i) {
+            const ggml_tensor * nd = cgraph->nodes[i];
+            if (nd->op == GGML_OP_MUL_MAT || nd->op == GGML_OP_MUL_MAT_ID || nd->op == GGML_OP_GET_ROWS) {
+                fprintf(stderr, " %s:%s(%lldx%lld)", ggml_op_name(nd->op), nd->name,
+                        (long long) nd->ne[0], (long long) nd->ne[1]);
+                shown++;
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (p.open >= 0) {
+        if (!ggml_cuda_moe_phase_probe_record(p, p.ends[p.open], stream)) {
+            p.n_runs = 0;
+            return;
+        }
+        p.open = -1;
+    }
+    if (p.n_runs > 0 && cudaStreamSynchronize(stream) != cudaSuccess) {
+        cudaGetLastError();
+        p.n_runs = 0;
+        return;
+    }
+
+    bool seen_layer[GGML_CUDA_MOE_PHASE_MAX_LAYERS] = {};
+    for (int i = 0; i < p.n_runs; ++i) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, p.starts[i], p.ends[i]) != cudaSuccess) {
+            cudaGetLastError();
+            continue;
+        }
+        const int phase = p.phases[i];
+        const int layer = p.layers[i];
+        p.phase_ms[cls][phase] += (double) ms;
+        if (layer >= 0 && layer < GGML_CUDA_MOE_PHASE_MAX_LAYERS) {
+            p.layer_ms[cls][layer][phase] += (double) ms;
+            if (!seen_layer[layer]) {
+                seen_layer[layer] = true;
+                p.layer_steps[cls][layer]++;
+            }
+        }
+    }
+    p.n_runs = 0;
+
+    // Only same-class neighbours contribute: bridging the other regime would add the
+    // whole prefill to the first decode interval.
+    if (p.last_step_us[cls] != 0 && p.prev_cls == cls) {
+        p.interval_ms[cls] += (double) (now_us - p.last_step_us[cls]) / 1000.0;
+    }
+    p.last_step_us[cls] = now_us;
+    p.prev_cls = cls;
+
+    p.steps[cls]++;
+    if (p.steps[cls] == 1) {
+        p.rows_min[cls] = (uint64_t) n_rows;
+    } else if ((uint64_t) n_rows < p.rows_min[cls]) {
+        p.rows_min[cls] = (uint64_t) n_rows;
+    }
+    if ((uint64_t) n_rows > p.rows_max[cls]) {
+        p.rows_max[cls] = (uint64_t) n_rows;
+    }
+    switch (dispatch_mode) {
+        case 0: p.mode_legacy[cls]++;  break;
+        case 1: p.mode_direct[cls]++;  break;
+        case 2: p.mode_capture[cls]++; break;
+        case 3: p.mode_replay[cls]++;  break;
+        default: break;
+    }
+
+    static const char * class_name[2] = { "decode", "prefill" };
+    const double s = (double) p.steps[cls];
+    const double den = s - 1.0 > 0.0 ? s - 1.0 : 1.0;
+    if (p.steps[cls] % (cls == 0 ? 16 : 4) == 0) {
+        fprintf(stderr, "moe-phase-probe[%s]: steps=%llu rows=%llu..%llu interval_ms=%.2f attn_ms=%.2f moe_ms=%.2f "
+            "ple_ms=%.2f dense_ms=%.2f other_ms=%.2f mode_legacy=%llu mode_direct=%llu mode_capture=%llu mode_replay=%llu\n",
+            class_name[cls], (unsigned long long) p.steps[cls],
+            (unsigned long long) p.rows_min[cls], (unsigned long long) p.rows_max[cls],
+            p.interval_ms[cls] / den,
+            p.phase_ms[cls][GGML_CUDA_MOE_PHASE_ATTN]  / s,
+            p.phase_ms[cls][GGML_CUDA_MOE_PHASE_MOE]   / s,
+            p.phase_ms[cls][GGML_CUDA_MOE_PHASE_PLE]   / s,
+            p.phase_ms[cls][GGML_CUDA_MOE_PHASE_DENSE] / s,
+            p.phase_ms[cls][GGML_CUDA_MOE_PHASE_OTHER] / s,
+            (unsigned long long) p.mode_legacy[cls], (unsigned long long) p.mode_direct[cls],
+            (unsigned long long) p.mode_capture[cls], (unsigned long long) p.mode_replay[cls]);
+    }
+    if (p.steps[cls] % (cls == 0 ? 128 : 16) == 0) {
+        for (int layer = 0; layer < GGML_CUDA_MOE_PHASE_MAX_LAYERS; ++layer) {
+            if (p.layer_steps[cls][layer] == 0) {
+                continue;
+            }
+            const double ls = (double) p.layer_steps[cls][layer];
+            fprintf(stderr, "moe-phase-probe-layer[%s]: blk.%02d steps=%llu attn_ms=%.3f moe_ms=%.3f ple_ms=%.3f "
+                "dense_ms=%.3f other_ms=%.3f\n",
+                class_name[cls], layer, (unsigned long long) p.layer_steps[cls][layer],
+                p.layer_ms[cls][layer][GGML_CUDA_MOE_PHASE_ATTN]  / ls,
+                p.layer_ms[cls][layer][GGML_CUDA_MOE_PHASE_MOE]   / ls,
+                p.layer_ms[cls][layer][GGML_CUDA_MOE_PHASE_PLE]   / ls,
+                p.layer_ms[cls][layer][GGML_CUDA_MOE_PHASE_DENSE] / ls,
+                p.layer_ms[cls][layer][GGML_CUDA_MOE_PHASE_OTHER] / ls);
+        }
+    }
+}
+
+// Instrument B: score the recorded look-ahead prediction against the ids the router
+// actually selected, for every MUL_MAT_ID node rather than only the legacy blk.47
+// lease. Enabled with GGML_CUDA_MOE_LOOKAHEAD_DEBUG=1. The ids of a MUL_MAT_ID node
+// live in src[2] ([n_expert_used, n_tokens], i32).
+#define GGML_CUDA_MOE_RECALL_PROBE_MAX 512
+#define GGML_CUDA_MOE_RECALL_PROBE_IDS 64
+
+struct ggml_cuda_moe_recall_probe {
+    struct entry {
+        int      layer;
+        int      n_ids;
+        int32_t * host;   // pinned staging for one ids tensor
+    };
+
+    entry    entries[GGML_CUDA_MOE_RECALL_PROBE_MAX];
+    int      n_entries  = 0;
+    uint64_t steps      = 0;
+    uint64_t scored     = 0;
+    uint64_t actual_ids = 0;
+    uint64_t hits       = 0;
+    bool     disabled   = false;
+};
+
+static bool ggml_cuda_moe_recall_probe_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MOE_LOOKAHEAD_DEBUG") != nullptr;
+    return enabled;
+}
+
+static ggml_cuda_moe_recall_probe & ggml_cuda_moe_recall_probe_state() {
+    static ggml_cuda_moe_recall_probe state;
+    return state;
+}
+
+// Queue one async D2H of the ids tensor of a MoE node; the tail syncs once.
+static void ggml_cuda_moe_recall_probe_note(const ggml_tensor * node, cudaStream_t stream) {
+    if (node->op != GGML_OP_MUL_MAT_ID) {
+        return;
+    }
+    const ggml_tensor * ids = node->src[2];
+    if (ids == nullptr || ids->type != GGML_TYPE_I32) {
+        return;
+    }
+    const int64_t n_ids = ggml_nelements(ids);
+    if (n_ids <= 0 || n_ids > GGML_CUDA_MOE_RECALL_PROBE_IDS) {
+        return;   // decode-sized only: keep the readback off the prefill path
+    }
+    const int layer = ggml_cuda_moe_phase_layer(node->name);
+    if (layer < 0) {
+        return;
+    }
+    auto & p = ggml_cuda_moe_recall_probe_state();
+    if (p.disabled || p.n_entries >= GGML_CUDA_MOE_RECALL_PROBE_MAX) {
+        return;
+    }
+    ggml_cuda_moe_recall_probe::entry & e = p.entries[p.n_entries];
+    if (e.host == nullptr) {
+        if (cudaHostAlloc((void **) &e.host, GGML_CUDA_MOE_RECALL_PROBE_IDS * sizeof(int32_t),
+                    cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            e.host = nullptr;
+            return;
+        }
+    }
+    if (cudaMemcpyAsync(e.host, ids->data, (size_t) n_ids * sizeof(int32_t),
+                cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        cudaGetLastError();
+        p.disabled = true;
+        fprintf(stderr, "moe-recall-probe: disabled, cudaMemcpyAsync failed\n");
+        return;
+    }
+    e.layer = layer;
+    e.n_ids = (int) n_ids;
+    p.n_entries++;
+}
+
+// Score every id set queued during the step, and account the population the demand
+// path can see: used experts that were not predicted. The other two populations -
+// predicted but not copied, copied but not used - are cache counters printed on the
+// `moe-cache-phase` line as prefetch_dropped / evicted_prefetched_unused.
+static void ggml_cuda_moe_recall_probe_end_step(cudaStream_t stream) {
+    auto & p = ggml_cuda_moe_recall_probe_state();
+    if (p.disabled || p.n_entries == 0) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        cudaGetLastError();
+        p.n_entries = 0;
+        return;
+    }
+    auto & dbg = ggml_cuda_moe_lookahead_debug_state();
+    uint64_t window_hits = 0, window_actual = 0, window_predicted = 0, scored_layers = 0;
+    for (int i = 0; i < p.n_entries; ++i) {
+        ggml_cuda_moe_recall_probe::entry & e = p.entries[i];
+        std::vector<int32_t> actual(e.host, e.host + e.n_ids);
+        std::sort(actual.begin(), actual.end());
+        actual.erase(std::unique(actual.begin(), actual.end()), actual.end());
+
+        std::vector<int32_t> predicted;
+        {
+            std::lock_guard<std::mutex> lk(dbg.mu);
+            predicted = dbg.predicted[e.layer];
+        }
+        if (predicted.empty()) {
+            continue;   // no prediction recorded for this layer: nothing to score
+        }
+        uint64_t hits = 0;
+        for (const int32_t eid : predicted) {
+            if (std::binary_search(actual.begin(), actual.end(), eid)) {
+                hits++;
+            }
+        }
+        ggml_cuda_moe_lookahead_debug_score(e.layer, actual);
+
+        window_hits      += hits;
+        window_actual    += (uint64_t) actual.size();
+        window_predicted += (uint64_t) predicted.size();
+        scored_layers++;
+        p.actual_ids     += (uint64_t) actual.size();
+        p.hits           += hits;
+    }
+    p.n_entries = 0;
+    p.steps++;
+    p.scored += scored_layers;
+    if (scored_layers > 0 && p.steps % 32 == 0) {
+        const uint64_t used_unpredicted = window_actual >= window_hits ?
+            window_actual - window_hits : 0;
+        fprintf(stderr, "moe-recall-probe: steps=%llu layers_scored=%llu actual_ids=%llu predicted_ids=%llu "
+            "used_and_predicted=%llu used_not_predicted=%llu recall=%.2f%% precision=%.2f%%\n",
+            (unsigned long long) p.steps, (unsigned long long) p.scored,
+            (unsigned long long) p.actual_ids,
+            (unsigned long long) window_predicted,
+            (unsigned long long) window_hits,
+            (unsigned long long) used_unpredicted,
+            window_actual > 0 ? 100.0 * (double) window_hits / (double) window_actual : 0.0,
+            window_predicted > 0 ? 100.0 * (double) window_hits / (double) window_predicted : 0.0);
+    }
+}
+
 // Cache misses cost one cudaMemcpyAsync per slab (slot_size bytes on PCIe).
 // Cache hits cost zero PCIe traffic; only the kernel reads the resident slot.
 static void ggml_cuda_mul_mat_id_cached(
@@ -6728,6 +7188,13 @@ static bool ggml_cuda_graph_evaluate_and_capture(
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                if (ggml_cuda_moe_phase_probe_enabled()) {
+                    ggml_cuda_moe_phase_probe_begin_node(ggml_cuda_moe_phase_classify(node),
+                            ggml_cuda_moe_phase_layer(node->name), cuda_ctx->stream());
+                }
+                if (ggml_cuda_moe_recall_probe_enabled() && node->op == GGML_OP_MUL_MAT_ID) {
+                    ggml_cuda_moe_recall_probe_note(node, cuda_ctx->stream());
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, moe_execution);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -7199,6 +7666,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         force_moe_direct();
         return required_here ? required_failure(
             !graph_evaluated ? "grouped evaluator failed" : "grouped finalization failed") : GGML_STATUS_FAILED;
+    }
+
+    if (ggml_cuda_moe_phase_probe_enabled()) {
+        ggml_cuda_moe_phase_probe_end_step(cuda_ctx->stream(), (int) moe_dispatch_mode, cgraph);
+    }
+    if (ggml_cuda_moe_recall_probe_enabled()) {
+        ggml_cuda_moe_recall_probe_end_step(cuda_ctx->stream());
     }
 
     return GGML_STATUS_SUCCESS;
