@@ -527,3 +527,84 @@ Refinement implied by the numbers: the model routes to **10** experts, so `--moe
 8` predicts fewer experts than are used - 69% coverage - while width 10 reaches 79%. Note
 also that the measurement runs add graph nodes and are therefore valid only for the recall
 numbers, not as output-equivalence runs (see blocker 1).
+
+### Phase attribution and off-lease recall (instruments A/B, temporary, measured 2026-09-14)
+
+Two temporary, env-gated instruments were run on the RTX 3060 (ctx 81920,
+`--moe-expert-cache-size 42`, one 13,946-token prompt, 256 decode tokens, no
+look-ahead) and then reverted; none of this is committed engine code.
+
+Method. The backend receives scheduler slices rather than the whole graph: those
+slices carry no leafs and their matmuls report `ne[1] == 1` in both regimes, so a
+step cannot be classified as prefill or decode from graph shape. They are separated
+by inter-step wall time instead - prefill ubatches take ~4.6 s and decode steps
+~97 ms, a ~47x gap, boundary 500 ms. CUDA events are opened per maximal run of
+same-(phase, layer) nodes and read once per step after one stream sync (that sync
+costs ~2.6% of throughput: 10.58/9.23 t/s instrumented against 10.98/9.47
+uninstrumented). The attribution arm must run with `GGML_CUDA_DISABLE_GRAPHS=1`,
+because replay steps never visit the host dispatch loop where events are recorded;
+the graphs-on control on this rig is 11.42 t/s against 10.98 t/s graphs-off (-3.9%),
+so the shares below are quoted for the graphs-off regime.
+
+Decode attribution (256 steps, 96.90 ms/step, 10.43 t/s; the phase rows sum to
+95.7 ms, so the split covers the step):
+
+| bucket | ops | ms/step | share |
+| --- | --- | --- | --- |
+| ATTN | flash-attn, indexer, SSM/GDN, rope, softmax | 1.41 | 1.5% |
+| MOE | `MUL_MAT_ID`, `MOE_PREFETCH`, `ARGSORT`, `TOP_K` | 67.18 | 69.3% |
+| DENSE | every other matmul and elementwise op | 23.80 | 24.6% |
+| OTHER | copy/cont/reshape/view/permute/transpose | 3.30 | 3.4% |
+| PLE | `GET_ROWS` on `per_layer_token_embd` | 0.00 | 0.0% |
+
+Dispatch state for this arm: `mode_legacy=3 mode_direct=253 mode_capture=0
+mode_replay=0` - these are DIRECT-dispatch numbers by construction. The buckets are
+op sets, not architectural phases: the MOE row is exactly the MoE op set (which is
+what the park turns on), while DENSE absorbs everything else, so attention work that
+is not one of the named ATTN ops (GDN elementwise in particular) sits in DENSE.
+
+Prefill attribution (28 ubatches, 4555 ms/ubatch): ATTN 42.07 ms (0.9%), MOE
+4005.38 ms (87.9%), DENSE 367.91 ms (8.1%), OTHER 11.49 ms, PLE 0.00.
+
+Per-layer decode MoE (ms/layer/step): blk.00 2.91, blk.01 2.48, blk.12 1.75,
+blk.24 1.12, blk.36 1.11, blk.47 1.55. MoE cost is spread across the layers - the
+grouped path executes for all of them - and the ATTN buckets stay below 0.02 ms per
+layer at this batch size.
+
+Device state in the same window (`dmon -s ump`, decode): SM 95-99%, DRAM controller
+19-26%, 90-94 W, 55-56 C, 10,851 MiB resident of 12,288 MiB; SM clock 2122-2145 MHz.
+The PCIe link is **gen4 x4** (the card is x16-capable, the slot is wired x4), about
+7.9 GB/s theoretical. Expert H2D traffic over the arm is 337.6 MiB/token
+(90.62 GB in 256 tokens) = 3.71 GB/s = ~47% of that ceiling, and the grouped
+telemetry reports `calls=ready=12240`, `ready_min=255`: every grouped op found its
+staging already complete, so the traffic is prefetched ahead and never gates the
+kernel. The measured limiter on this rig is therefore MoE kernel execution, not PCIe
+and not VRAM bandwidth.
+
+Recall measured off the legacy lease (instrument B). The committed instrumentation
+scores predictions only inside the legacy cached demand path, so it only ever sees
+`blk.47`; scoring in the dispatch loop for every `MUL_MAT_ID` node instead (the ids
+live in `src[2]`), with the ids read back asynchronously and scored once per step,
+gives over the last 32 decode steps: 141 node-predictions scored, 1,410 used expert
+ids, 909 used-and-predicted, 501 used-not-predicted - 64.5% of the used experts were
+predicted and 80.6% of the predictions were used. This confirms, independently of the
+in-graph measurement above and on the host-visible layer, the same order of magnitude
+(that measurement averages 86.2% of predicted / 69.0% coverage across all layers).
+The other two populations are structural zeros in this configuration:
+predicted-not-copied (install refusals) = 0 and copied-not-used (prefetched slabs
+evicted without a hit) = 0, because nothing is ever offered to the installer - the
+decode phase line reads `ops=0` with `legacy cache authority` printed once, i.e. the
+consumer is inert and every prediction is simply unused. The drop counters are now
+printed (`prefetch_dropped`, `evicted_prefetched_unused` on the phase line) instead
+of being counted silently, so a future reopen does not have to rediscover them.
+
+Conclusion relevant to the park. A decode step is 69% MoE execution on a saturated
+SM (95-99%) with prefetch traffic fully hidden; the producer covers one layer, and
+the host-visible prediction quality is 64.5% of the used experts. Prediction width,
+pinning or a device-side transport cannot move a limiter that is arithmetic
+throughput on the 3060, so the park stands.
+
+Independent finding recorded this round: the rig's `-ot per_layer_token_embd=CPU` is
+redundant and inert. Layer-input tensors already land in the CPU buflist, and the lazy
+path returns before user override matching runs, so the flag changes nothing; PLE time
+is 0.00 ms/step in the attribution above.
