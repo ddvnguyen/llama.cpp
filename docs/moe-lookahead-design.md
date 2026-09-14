@@ -395,6 +395,22 @@ setup). That makes the producer a side-channel that the legacy path consumes, wh
 document originally rejected - the measured cost of the in-graph readback flips that
 judgment, but the work stays gated on grouped-plan / layer-split work.
 
+The pool-install question is settled as a design invariant, not a bug. `acquire_legacy_cache`
+admits a new record only under `group_authority.authority == LEGACY && !admission_closed`, and
+that latch exists to bind pool creation to a certified execution: an unauthenticated install
+would let a caller claim VRAM pools that certification never proved, the overcommit class
+README.md:25 already warns about ("fit accounting does not include these pools"). Within a
+decode step, layer L+1 is by definition not the authoritative group - its authority publishes
+when its own demand path runs, which is the moment a prefetch would already be too late - so
+cross-layer install is unreachable BY DESIGN. `preinstall_legacy_pools` returning `-1` for all
+144 targets is the design working; do not patch it to open authority.
+
+If the track reopens, the seam to change is authority publication at graph reserve /
+certification time, where the full layer inventory and the slot budget are known up front
+(consistent with the recorded correction that the candidate snapshot only exists after
+`sched_reserve()`). That is a deliberate change to the certification contract and needs its
+own review, which is one more reason this producer stays parked rather than patched.
+
 ### Corrections this round made to the plan above
 
 - `ffn_gate_up_exps` is null for every layer of this model, so the producer targets
