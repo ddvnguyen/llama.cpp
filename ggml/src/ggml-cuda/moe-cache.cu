@@ -78,6 +78,19 @@ static int moe_cache_lookahead_width() {
     return g_moe_cache_lookahead.load(std::memory_order_relaxed);
 }
 
+// Opt-in plan-side admission for look-ahead staged experts, default off. When
+// set, the grouped plan classifies a would-be demand miss whose look-ahead slab
+// has already landed as served from staging, so the residency ledger stops
+// charging it as demand traffic (copied / copy_mib). Unset or "0" is today's
+// behaviour, byte for byte. Read once: one static bool, no per-call cost.
+static bool moe_lookahead_admit_in_plan() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_MOE_LOOKAHEAD_ADMIT_IN_PLAN");
+        return value != nullptr && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 // One-shot warn for prefetch path misuse. Never per-step spam.
 static void moe_cache_prefetch_warn_once(std::atomic<bool> & flag, const char * msg) {
     bool expected = false;
@@ -2989,6 +3002,23 @@ static __global__ void moe_grouped_set_clock(uint64_t * clock, uint64_t value) {
     }
 }
 
+// Read the copy worker's per-lane landing counter. The worker publishes `p + 1` on the
+// copy stream once staging slot p has landed, so `position < progress` is exactly
+// "the staged slab for this expert is here". System-scope acquire, matching the ready
+// filter this replaces, so the DMA'd staging bytes are visible before the plan
+// classifies them and before the gather reads them. Builds without the copy engine
+// never call this. Declared here because both readers below use it.
+static __device__ __forceinline__ uint32_t moe_staging_progress(const uint32_t * progress) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    // atomic_ref takes a mutable reference even for a load; the gather only ever reads
+    // this counter, and the copy worker is its only writer.
+    return cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(
+        *const_cast<uint32_t *>(progress)).load(cuda::memory_order_acquire);
+#else
+    return *reinterpret_cast<const volatile uint32_t *>(progress);
+#endif
+}
+
 static __global__ void moe_grouped_plan_decode(
         const int32_t * ids,
         uint32_t n_routes,
@@ -3010,7 +3040,9 @@ static __global__ void moe_grouped_plan_decode(
         moe_grouped_decode_plan * plan,
         uint64_t * resident_slot,
         uint64_t resident_tag,
-        uint64_t resident_bytes_per_miss) {
+        uint64_t resident_bytes_per_miss,
+        const int32_t * staging_positions,
+        const uint32_t * staging_progress) {
     if (blockIdx.x != 0) {
         return;
     }
@@ -3020,6 +3052,7 @@ static __global__ void moe_grouped_plan_decode(
     __shared__ unsigned long long warp_ages[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
     __shared__ uint32_t warp_slots[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
     __shared__ uint32_t selected_slot;
+    __shared__ uint32_t staged_admissions;
     __shared__ uint64_t clock_begin;
     __shared__ uint64_t clock_end;
     const uint32_t thread = threadIdx.x;
@@ -3078,6 +3111,9 @@ static __global__ void moe_grouped_plan_decode(
         plan->n_routes = n_routes;
         plan->n_unique = 0;
         plan->n_misses = 0;
+        // Zeroed before the commit/classification barriers that precede the count
+        // below, so no barrier is needed between this store and the atomicAdds.
+        staged_admissions = 0;
         const unsigned long long step = atomicAdd(reinterpret_cast<unsigned long long *>(device_step), 1ULL);
         if (step == UINT64_MAX) {
             moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
@@ -3321,6 +3357,26 @@ static __global__ void moe_grouped_plan_decode(
         __syncthreads();
     }
 
+    // Plan-side staged admission (opt-in; both pointers null when the gate is off).
+    // A would-be demand miss whose look-ahead slab has already landed is served from
+    // staging, so it must not be charged to the demand side of the residency ledger.
+    // Classification only: the miss entry, its slot and its committed mapping are
+    // exactly what the loop above produced, and the gather lands the staged payload
+    // in that same slot, so this never allocates or evicts a second slot and never
+    // writes any slot table. The predicate is the gather's `staged_ready` verbatim -
+    // same positions array, same landing counter, same `position < progress` test -
+    // sampled one launch earlier. The counter only ever grows, so every expert
+    // classified here is sourced from staging by the gather below.
+    if (staging_positions != nullptr && staging_progress != nullptr) {
+        const uint32_t landed = moe_staging_progress(staging_progress);
+        for (uint32_t miss = thread; miss < plan->n_misses; miss += blockDim.x) {
+            const int32_t position = staging_positions[miss_experts[miss]];
+            if (position >= 0 && (uint32_t) position < landed) {
+                atomicAdd(&staged_admissions, 1u);
+            }
+        }
+    }
+
     for (uint32_t unique = thread; unique < plan->n_unique; unique += blockDim.x) {
         if (unique_slots[unique] < 0) {
             moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
@@ -3341,17 +3397,29 @@ static __global__ void moe_grouped_plan_decode(
     }
     __syncthreads();
     if (thread == 0) {
+        if (staging_positions != nullptr && staged_admissions > plan->n_misses) {
+            moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+        }
         plan->status = MOE_GROUPED_PLAN_READY;
         if (resident_slot != nullptr) {
             // Device-side residency publish: n_unique/n_misses resolved above.
+            // A staged admission is a need the look-ahead already paid for: it stays a
+            // need (resident_slot[0]) and it is not resident at entry, so resident
+            // keeps its documented meaning, but it is not a demand miss either, so it
+            // is excluded from copied/copy_mib ([2]/[3]). Those two columns then read
+            // the demand traffic the admission removes instead of the churn it causes,
+            // and the staged-served count is the residual need - resident - copied.
+            // It was admitted exactly once, into the single victim slot chosen above,
+            // which is the slot the gather lands the staged payload in.
+            const uint32_t demand_misses = plan->n_misses - staged_admissions;
             atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[0]),
                 static_cast<unsigned long long>(plan->n_unique));
             atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[1]),
                 static_cast<unsigned long long>(plan->n_unique - plan->n_misses));
             atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[2]),
-                static_cast<unsigned long long>(plan->n_misses));
+                static_cast<unsigned long long>(demand_misses));
             atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[3]),
-                static_cast<unsigned long long>(plan->n_misses) * resident_bytes_per_miss);
+                static_cast<unsigned long long>(demand_misses) * resident_bytes_per_miss);
             resident_slot[4] = resident_tag;
         }
     }
@@ -4318,22 +4386,6 @@ static __global__ void moe_early_router_stage(
 // 8 * gridDim * blockDim words per re-sample, a fraction of one expert slab for the
 // grids this op uses, at negligible cost next to the PCIe reads it guards.
 #define GGML_CUDA_MOE_STAGING_RESAMPLE 8
-
-// Read the copy worker's per-lane landing counter. The worker publishes `p + 1` on the
-// copy stream once staging slot p has landed, so `position < progress` is exactly
-// "the staged slab for this expert is here". System-scope acquire, matching the ready
-// filter this replaces, so the DMA'd staging bytes are visible before the gather reads
-// them. Builds without the copy engine never call this.
-static __device__ __forceinline__ uint32_t moe_staging_progress(const uint32_t * progress) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
-    // atomic_ref takes a mutable reference even for a load; the gather only ever reads
-    // this counter, and the copy worker is its only writer.
-    return cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(
-        *const_cast<uint32_t *>(progress)).load(cuda::memory_order_acquire);
-#else
-    return *reinterpret_cast<const volatile uint32_t *>(progress);
-#endif
-}
 
 template<bool debug_transfers>
 static __global__ void moe_grouped_gather_decode(
@@ -10244,6 +10296,15 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             ggml_cuda_moe_resident_expect(resident_layer, key.candidate.generation, n_rows == 1 ? 0 : 1, resident_epoch);
         }
         const uint64_t resident_bpm = (uint64_t) device.words_per_miss * sizeof(uint4);
+        // Opt-in plan-side admission (default off): read-only view of this group's
+        // staging lane, the same descriptors the gather consumes below. Gate off or
+        // no lane means both stay null and the plan kernel is today's.
+        const int32_t * plan_staging_positions = nullptr;
+        const uint32_t * plan_staging_progress = nullptr;
+        if (lookahead != nullptr && moe_lookahead_admit_in_plan()) {
+            plan_staging_positions = lookahead->positions;
+            plan_staging_progress = lookahead->copy_progress;
+        }
         const uint32_t plan_threads = moe_grouped_plan_threads(resource->snapshot.n_slots);
         moe_grouped_plan_decode<<<1, plan_threads, 0, compute_stream>>>(
             static_cast<const int32_t *>(ids->data), n_routes, top_k, row_stride,
@@ -10251,7 +10312,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device.slot_for_expert, device.expert_for_slot, device.last_used,
             device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan,
-            resident_slot, resident_tag, resident_bpm);
+            resident_slot, resident_tag, resident_bpm, plan_staging_positions, plan_staging_progress);
         CUDA_CHECK(cudaGetLastError());
 #if CUDART_VERSION >= 12080
         if (ready_only && !ready_late) {
