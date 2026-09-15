@@ -2838,9 +2838,33 @@ uint64_t ggml_cuda_moe_execution_semantic_key(const ggml_cgraph * cgraph) {
 namespace {
 
 static constexpr uint32_t MOE_GROUPED_PLAN_THREADS = 128;
-static constexpr uint32_t MOE_GROUPED_FREQUENCY_EPOCH_SHIFT = 4;
+// Grouped planning steps per halving of the decayed demand frequency. The decay
+// law is one right shift of the stored frequency per elapsed epoch, so this
+// epoch length is the half-life. The historical default is 16 steps;
+// GGML_CUDA_MOE_FREQUENCY_HALFLIFE retunes the period without changing the law.
+static constexpr uint32_t MOE_GROUPED_FREQUENCY_HALFLIFE_DEFAULT = 16;
 static constexpr uint32_t MOE_GROUPED_TRANSFER_THREADS = 256;
 static constexpr uint32_t MOE_GROUPED_TRANSFER_BLOCKS_PER_SM = 4;
+
+// Single reader of GGML_CUDA_MOE_FREQUENCY_HALFLIFE, in grouped planning steps.
+// Unset, empty, non-numeric, non-positive, or out of range falls back to the
+// default. The process-wide static is initialised once, so neither context
+// creation nor the decode path pays for getenv/strtoll.
+static uint32_t moe_grouped_frequency_halflife() {
+    static const uint32_t halflife = []() -> uint32_t {
+        const char * value = getenv("GGML_CUDA_MOE_FREQUENCY_HALFLIFE");
+        if (value == nullptr || value[0] == '\0') {
+            return MOE_GROUPED_FREQUENCY_HALFLIFE_DEFAULT;
+        }
+        char * end = nullptr;
+        const long long parsed = strtoll(value, &end, 10);
+        if (end == value || *end != '\0' || parsed <= 0 || parsed > UINT32_MAX) {
+            return MOE_GROUPED_FREQUENCY_HALFLIFE_DEFAULT;
+        }
+        return static_cast<uint32_t>(parsed);
+    }();
+    return halflife;
+}
 
 static uint32_t moe_grouped_plan_threads(uint32_t n_slots) {
     return n_slots <= WARP_SIZE ? WARP_SIZE : n_slots <= 2 * WARP_SIZE ? 2 * WARP_SIZE : MOE_GROUPED_PLAN_THREADS;
@@ -3034,6 +3058,7 @@ static __global__ void moe_grouped_plan_decode(
         uint64_t * expert_frequency_epoch,
         uint64_t * device_step,
         bool frequency_aware,
+        uint32_t frequency_halflife,
         uint64_t host_clock_begin,
         uint64_t host_clock_end,
         uint64_t * device_clock,
@@ -3118,7 +3143,7 @@ static __global__ void moe_grouped_plan_decode(
         if (step == UINT64_MAX) {
             moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
         }
-        plan->frequency_epoch = step >> MOE_GROUPED_FREQUENCY_EPOCH_SHIFT;
+        plan->frequency_epoch = step / frequency_halflife;
         clock_begin = host_clock_begin;
         clock_end = host_clock_end;
         if (device_clock != nullptr) {
@@ -5074,9 +5099,11 @@ struct ggml_cuda_moe_grouped_context::impl {
     explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {
         const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
         frequency_aware = value == nullptr || strcmp(value, "0") != 0;
+        frequency_halflife = moe_grouped_frequency_halflife();
     }
 
     bool frequency_aware = true;
+    uint32_t frequency_halflife = MOE_GROUPED_FREQUENCY_HALFLIFE_DEFAULT;
 
     ~impl() {
         auto * stats = grouped_debug.load(std::memory_order_acquire);
@@ -10711,7 +10738,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             static_cast<const int32_t *>(ids->data), n_routes, top_k, row_stride,
             device.n_experts, resource->snapshot.n_slots, resource->snapshot.n_slots,
             device.slot_for_expert, device.expert_for_slot, device.last_used,
-            device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, clock_begin, clock_end,
+            device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, impl_->frequency_halflife, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan,
             resident_slot, resident_tag, resident_bpm, plan_staging_positions, plan_staging_progress);
         CUDA_CHECK(cudaGetLastError());
