@@ -1345,3 +1345,71 @@ r = 0.27, but that check mis-aligned the token stream (streaming emits sub-token
 perftok-*.tsv are not one-per-token), so the per-step slope is NOT reported. What is solid: per-step
 misses vary 59..480 (8.1x) while per-token time varies only p99/p50 = 1.34x, so transport is at least
 partly overlapped within a step. Do not use the step model to predict a single step.
+
+---
+
+## 7.28 Rev 19 - the retention axis is closed IN PRINCIPLE, not just in practice
+
+`PolicyEval` built a policy engine and calibrated it: it reproduces the shipped LFU-16 policy's
+PER-STEP miss counts **exactly on 8 of 8 recorded ledgers** (C=42/28/40/53 plus three policy
+variants), and reproduces the whole Belady table (C=8 305.09, 42 147.78, 512 67.07). So the engine is
+the shipped behaviour, not a model of it.
+
+### The result that was not expected
+
+    prediction-guided victim selection, PERFECT same-layer next-step predictor   214.22  +4.2%
+    same, at the measured width-8 quality (r86.21/cov68.97)                      217.71  +3.1%
+    same, with the tree's actual predictor                                       225.00  +0.0%
+    LFU-16 + RECENT1 (protect the last step's experts)                           223.57  +1.2%
+    LFU-16 (SHIPPED)                                                             225.00   -
+    Belady/MIN at C=42, offline                                                 147.78  +32.2%
+
+The predictor in the tree predicts **a different MoE LAYER, never the same layer** - its horizon is
+one layer inside a step, not one step (docs/moe-lookahead-design.md:484-487). Its ids therefore
+belong to another layer's cache, so as a RETENTION signal its effect is measured at exactly
+225.00 +/- 0.04, i.e. zero.
+
+The horizon curve shows where the 32% actually lives:
+
+    perfect horizon 1    214.22  +4.2%      perfect horizon 8    175.00  +19.1%
+    perfect horizon 2    206.34  +6.9%      perfect horizon 16   156.76  +27.6%
+    perfect horizon 4    194.27  +11.3%     horizon inf (step-granular MIN) 153.30  +29.3%
+                                            canonical MIN (knows sub-step order) 147.78  +32.2%
+
+### And then the argument that closes it
+
+A same-layer multi-step predictor **cannot exist for a non-speculative decoder**, and this is not a
+matter of engineering effort:
+
+- layer L's router at step T+1 consumes layer L-1's output at step T+1,
+- which is a function of token T+1,
+- which is sampled from layer 47's output at step T - i.e. **after** the moment you would need it.
+
+So at any instant you know token T but not token T+1, and expert demand one step ahead is gated on a
+value that does not exist yet. Even the +4.2% row above is therefore unreachable, not merely hard;
+`protect` as a retention policy is **exactly zero** for this decoder, which is what the engine
+measures. The only horizon the architecture gives you is *within* a step, one layer ahead - which is
+precisely the look-ahead that already exists.
+
+Consequence: the retention axis is closed **in principle**, not "we tried and it did not pay". The
++32% Belady gap is not a policy-quality gap, it is an information gap.
+
+### What that leaves, and it is the owner's request
+
+The single reachable lever is to make the existing one-layer look-ahead actually effective. It cannot
+change traffic (a prefetch is still a fetch, and its retention effect is zero), but it can move bytes
+off the critical path: link busy is 69%, so a fully utilised link would take transport from 63.9 to
+44.1 ms -> 13.8 t/s (+28%). Its blocker is measured and named: at width 8 the staged window is
+~2.05 MiB against 15.4 MiB needed, so usefulness is 1.91% while at width 1 it is 95.2-95.5%.
+
+Admitting the predictions into the CACHE instead of the lane removes exactly that blocker - the cache
+is 3.53 GiB - so usefulness should recover toward the width-1 figure and the timing win becomes
+available. That is `GGML_MOE_ADMIT_PREDICTED`, and it is the only live lever.
+
+Also confirmed by the engine: the half-life sweep's caveat was right. Half-life 256 and 2048 both
+collapse to no-decay = LRU behaviour (242.30), so the sweep tested two distinct policies, not four;
+and the shipped LFU-16 is the optimum of that family (4: 235.20, 8: 229.47, 16: 225.00, 32: 226.75,
+64: 233.13). An admission filter that refuses colder newcomers is WORSE (241.97).
+
+Harness now travels with the code: benches/moe-cache/ + docs/moe-lookahead-improvement-plan.md,
+commit bb2ca31a3.
