@@ -360,7 +360,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             }
             if (had_user_overrides) {
                 LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
-                               "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
+                               "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe (n_slots=%d).\n",
+                               params.moe_expert_cache_slots);
             }
             effective_overrides.push_back({nullptr, nullptr});
             effective_overrides_ptr = effective_overrides.data();
