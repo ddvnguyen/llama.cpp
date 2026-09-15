@@ -1,6 +1,6 @@
 # MoE look-ahead preload - evidence, mechanism, levers, plan
 
-Revision 25 (7.33: the MTP-lookahead premise is WITHDRAWN. Verification does batch every draft position into one ubatch (server-context.cpp:580/619/1273/4559) and the MoE cache is grouped (moe-cache.cu tracks unique_experts per dispatch), so layer L's router output for T+1..T+H is computed in the SAME dispatch that consumes it - there is no lead time, and the retention horizon the oracle curve assumes is across dispatches, whose demands still need layers 0..L-1 for the future tokens. That is 7.28's impossibility argument restated, not escaped: speculation changes when the token exists, not when its layer-L input exists. The horizon curve is an offline bound in the same sense Belady is; the +8%/+13% acceptance-discounted numbers are withdrawn. The --decode-overlap escape hatch is closed too: server-context.cpp:1273 refuses to start unless n_max + 1 tokens fit in a SINGLE ubatch, so the whole draft is replayed in one forward and no per-position ordering can exist). Revision 24 (7.32: an MTP block for this arch is a full layer plus a head - ~992 MiB of weights, but only ~78 MiB of that has to be VRAM under --n-cpu-moe, plus ~226 MiB of its own MoE cache at N=42, ~310-330 MiB total against 1.55/2.2 GiB of headroom, so either operating point covers it; the fork already ships the whole qwen4exp MTP path including nextn_state -> build_moe_lookahead, and its only existing consumer is the staging lane that 7.30 measured as a net loss, so the work item is retargeting the consumer to victim choice, not connecting the head. The trained block does not exist in this GGUF - 0 of 1224 tensors are nextn/mtp/draft - so the head has to arrive as a draft-only export. The one term that can bite is traffic: a full MoE block run once per draft step is +17.8% at H=4 unless those experts are cache-resident). Revision 16 (7.21: at N=42 the step is 28.3 ms fixed + 0.2842 ms per miss at 6.6 GB/s, the link idles 31%, and the distribution has NO tail so the mean is the whole story; the look-ahead's transport is 1.91% useful at width 8 vs 95.5% at width 1 - lateness, not wrongness - while the predictor's ~86% recall is a different quantity whose instrument is currently unwired; 7.22 ranks what is left: the x4 slot (+105%), a lossy cached tier (+44%, now measurable), and filling the idle window (+45%, not yet green)). Revision 15 (7.19: the correctness instrument exists and PR #127 Blocker 1 / issue #128 PASSES it - greedy token identity 648/648 chars and PPL 14.7350 identical over 15 chunks; 7.20: NEW DEFECT, at N=53 the look-ahead aborts the server on an unchecked 2.1484 MiB lane cudaMalloc, 48 lanes = 103.13 MiB never evicted, so the feature and the +21.5% capacity win are mutually exclusive). Revision 14 (7.18: instrument audit - the per-step ledger has no gaps and is internally consistent 199/199; the policy knob is proven to take effect, so the sweep tested 2 distinct policies not 4; the cache size is now echoed in the log (ed2b4b6b9); and the reversed-order control falsifies the drift confound - +21.5% and +21.1% by either ordering). Revision 13 (added the CURRENT OPERATING POINT block to section 8: best config is control + N=53, 11.738 t/s, look-ahead OFF, and earlier sections' ~10.2 t/s figures are N=28 or the retired synthetic harness and are not comparable). Revision 12 (7.17: the retention policy is NOT a lever - the default LFU-16 beats half-life 256 and 2048 and beats pure LRU; capacity is VRAM-capped at r~58%. All three code levers are now closed by measurement, leaving only the x4->x16 slot move). Revision 11 (7.16: the capacity lever is real - N=28 -> 53 is +21.5%, 9.661 -> 11.738 t/s, with the
+Revision 26 (7.34: CORRECTION - the MTP head DOES exist. /mnt/SSD/MTP/mtp-Qwen3.8-Flash-Next-shared-{Q8_0,Q4_K_M}.gguf, 2657.48 / 1818.80 MiB, and it is a complete block 48 (attn + indexer + hc_attn/hc_ffn + full MoE + the 6 nextn.* tensors), declaring nextn_predict_layers, nextn_shared_target_tensors and arch qwen4exp - so 7.32.2's "full layer plus a head" is confirmed against a real artifact and the head's cost is measurable directly. What remains true of the trunk file is only that it ships no head (0 of 1224 tensors). And the real blocker surfaced: issue #124 shows the expert cache and MTP are MUTUALLY EXCLUSIVE on this model today - with --moe-expert-cache-size > 0 plus --spec-type draft-mtp the grouped plan is unavailable (required_unsupported 63-95), the graph fails closed, draft-mtp never engages, and the server falls back to legacy, so any MTP number taken with the cache on is measuring the fallback. #124 is the next item, not sizing and not the withdrawn horizon). Revision 25 (7.33: the MTP-lookahead premise is WITHDRAWN. Verification does batch every draft position into one ubatch (server-context.cpp:580/619/1273/4559) and the MoE cache is grouped (moe-cache.cu tracks unique_experts per dispatch), so layer L's router output for T+1..T+H is computed in the SAME dispatch that consumes it - there is no lead time, and the retention horizon the oracle curve assumes is across dispatches, whose demands still need layers 0..L-1 for the future tokens. That is 7.28's impossibility argument restated, not escaped: speculation changes when the token exists, not when its layer-L input exists. The horizon curve is an offline bound in the same sense Belady is; the +8%/+13% acceptance-discounted numbers are withdrawn. The --decode-overlap escape hatch is closed too: server-context.cpp:1273 refuses to start unless n_max + 1 tokens fit in a SINGLE ubatch, so the whole draft is replayed in one forward and no per-position ordering can exist). Revision 24 (7.32: an MTP block for this arch is a full layer plus a head - ~992 MiB of weights, but only ~78 MiB of that has to be VRAM under --n-cpu-moe, plus ~226 MiB of its own MoE cache at N=42, ~310-330 MiB total against 1.55/2.2 GiB of headroom, so either operating point covers it; the fork already ships the whole qwen4exp MTP path including nextn_state -> build_moe_lookahead, and its only existing consumer is the staging lane that 7.30 measured as a net loss, so the work item is retargeting the consumer to victim choice, not connecting the head. The trained block does not exist in this GGUF - 0 of 1224 tensors are nextn/mtp/draft - so the head has to arrive as a draft-only export. The one term that can bite is traffic: a full MoE block run once per draft step is +17.8% at H=4 unless those experts are cache-resident). Revision 16 (7.21: at N=42 the step is 28.3 ms fixed + 0.2842 ms per miss at 6.6 GB/s, the link idles 31%, and the distribution has NO tail so the mean is the whole story; the look-ahead's transport is 1.91% useful at width 8 vs 95.5% at width 1 - lateness, not wrongness - while the predictor's ~86% recall is a different quantity whose instrument is currently unwired; 7.22 ranks what is left: the x4 slot (+105%), a lossy cached tier (+44%, now measurable), and filling the idle window (+45%, not yet green)). Revision 15 (7.19: the correctness instrument exists and PR #127 Blocker 1 / issue #128 PASSES it - greedy token identity 648/648 chars and PPL 14.7350 identical over 15 chunks; 7.20: NEW DEFECT, at N=53 the look-ahead aborts the server on an unchecked 2.1484 MiB lane cudaMalloc, 48 lanes = 103.13 MiB never evicted, so the feature and the +21.5% capacity win are mutually exclusive). Revision 14 (7.18: instrument audit - the per-step ledger has no gaps and is internally consistent 199/199; the policy knob is proven to take effect, so the sweep tested 2 distinct policies not 4; the cache size is now echoed in the log (ed2b4b6b9); and the reversed-order control falsifies the drift confound - +21.5% and +21.1% by either ordering). Revision 13 (added the CURRENT OPERATING POINT block to section 8: best config is control + N=53, 11.738 t/s, look-ahead OFF, and earlier sections' ~10.2 t/s figures are N=28 or the retired synthetic harness and are not comparable). Revision 12 (7.17: the retention policy is NOT a lever - the default LFU-16 beats half-life 256 and 2048 and beats pure LRU; capacity is VRAM-capped at r~58%. All three code levers are now closed by measurement, leaving only the x4->x16 slot move). Revision 11 (7.16: the capacity lever is real - N=28 -> 53 is +21.5%, 9.661 -> 11.738 t/s, with the
 T = 25.7 + 0.3003*misses model validating out-of-sample to 1.2%; it saturates near r=59% at the
 VRAM cap, which makes retention POLICY the binding lever). Revision 10 (7.14: per-token miss ledger - decode is bandwidth-bound on expert misses,
 T = 25.7 ms + 0.3003 ms/miss with r2 = 0.990, ceiling 38.9 t/s at a fully-resident cache vs 9.60
@@ -1871,3 +1871,69 @@ MTP as a speculative **decoder** (draft acceptance buys more than one token per 
 different claim and is already recorded as a negative in this document's index; it is not re-opened.
 What is withdrawn is only the hope that the *same* head supplies the cache a useful retention
 horizon.
+
+## 7.34 Rev 26 - CORRECTION: the MTP head exists, and the real blocker is #124
+
+7.32.5 item 1 said "the trained block does not exist in this file" and went on to describe the
+draft-only export as the cheap path to get one. **The first half was wrong in the way that matters,
+and the path is already walked.** Checked against the filesystem this cycle:
+
+```
+/mnt/SSD/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf     2657.48 MiB
+/mnt/SSD/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf   1818.80 MiB
+```
+
+What is true of the trunk file is what the tensor scan found: **0 of 1224 tensors** match
+`nextn|mtp|draft`, and `n_layer_nextn` is 0 - the head ships **separately**, not inside the trunk.
+Stating it as "no trained block exists" was wrong; the head is on the rig, and it is the `mtp_only`
+draft-only export 7.32 described, already built.
+
+### And it confirms 7.32.2 against a real artifact
+
+Enumerating the head's tensors shows it is **a complete block 48**, not a thin adapter:
+
+| family | present |
+|---|---|
+| `attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_q_norm`, `attn_k_norm` | yes |
+| `indexer_*` | 4 tensors |
+| `hc_attn_{up,down,inject,norm}`, `hc_ffn_{up,down,inject,norm}` | yes, all 8 |
+| `ffn_gate_inp`, `ffn_{gate,up,down}_exps`, `ffn_{gate,up,down}_shexp`, `ffn_gate_inp_shexp` | yes, the full MoE |
+| `nextn.{eh_proj,enorm,hnorm,hc_head_norm,hc_head_down,hc_head_up}` | 6 tensors |
+
+It also declares `nextn_predict_layers` and `nextn_shared_target_tensors`, and arch `qwen4exp`. So
+"a full layer plus a head", derived in 7.32.2 from the loader's control flow, is confirmed by the
+artifact - and the two file sizes give the head's cost directly rather than by arithmetic:
+**2657.48 MiB at Q8_0, 1818.80 MiB at Q4_K_M**.
+
+### The actual blocker: the cache and MTP are mutually exclusive today (issue #124)
+
+The more useful thing this turned up is that **the combination the MTP plan needs has already been
+tried and fails**, recorded in issue #124 (OPEN, `review-finding`, no comments):
+
+- Build `bdd54f475`, flags `--moe-expert-cache-size 2 --spec-draft-moe-expert-cache-size 2
+  --spec-type draft-mtp --spec-draft-model mtp-...-shared-Q8_0.gguf --spec-draft-n-max 2`.
+- `E moe-cache: required grouped execution failed: grouped plan unavailable`, repeated **95x** at
+  cache size 2 and **63x** at 32.
+- `moe-grouped-decode: registered=98 covered=0 ... required_unsupported=63..95`.
+- No `draft acceptance` line and no `draft_n` field: **draft-mtp never produced or verified drafts.**
+  One `llama_decode() failed: -3` during warmup, then a legacy fallback that still serves.
+- The reporter's own conclusion, which is the important line: *"`--moe-expert-cache-size` is unusable
+  together with MTP on this model; MTP throughput numbers measured with the cache enabled are
+  invalid."*
+
+This is consistent with 7.33 and not in tension with it: MTP stamps the main verification graph
+`REQUIRED_GROUPED`, while the grouped plan is unavailable, so the path fails closed rather than
+falling back. Note also `--spec-draft-moe-expert-cache-size` exists as a separate knob, which
+confirms the draft carries **its own MoE cache** - the 7.32.3 cache term is real, not speculative.
+
+### What this changes about priorities
+
+- The sizing question is **closed** (7.32) and the head is **in hand** (7.34). Neither is work.
+- The horizon question is **closed** (7.33), against the plan.
+- What is left, and it is a defect rather than a design question, is **#124**: the expert cache and
+  MTP cannot run together on this model. Any MTP experiment on this rig is measuring the legacy
+  fallback, not MTP. That is the thing to fix, and #121 (`draft-simple` intent rejection, which
+  blocks PR #120) is its sibling on the same execution-intent machinery.
+
+Nothing here reopens a settled decision. It corrects a factual claim of mine and identifies the real
+next item.
