@@ -458,12 +458,39 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         res_hc = build_hc_combine(res_hc, cur, inject, il);
 
+        // The look-ahead for layer il+1 is predicted from THIS layer's post-attention
+        // state, so the prediction can only be formed here. It is ISSUED after this
+        // layer's FFN (see below), which is why the state has to survive the FFN.
+        ggml_tensor * res_hc_post_attn = res_hc;
+
+        cur = build_hc_mix(res_hc,
+                model.layers[il].hc_ffn_norm,
+                model.layers[il].hc_ffn_down,
+                model.layers[il].hc_ffn_up,
+                model.layers[il].hc_ffn_inject,
+                &inject, il);
+
+        cur = build_layer_ffn(cur, il);
+        cb(cur, "ffn_out", il);
+
+        res_hc = build_hc_combine(res_hc, cur, inject, il);
+
         // MoE look-ahead: predict layer il+1's experts from this layer's post-attention
-        // state and page them while this layer's MoE still computes, so the H2D overlaps
-        // compute instead of stalling it. Placed immediately after attention and before
-        // the FFN so the layer's own router chain stays contiguous for the router fusions.
+        // state and page them into the window where the fabric is actually idle, which is
+        // the NEXT layer's attention.
+        //
+        // Issued AFTER this layer's FFN, and deliberately not before it. The MoE bucket
+        // is not compute-bound: of its 81.04 ms, ~77 ms is the demand gather reading the
+        // experts' host memory over the same PCIe link this transfer needs. A transfer
+        // issued alongside the gather therefore does not "overlap compute" - it competes
+        // with the gather and displaces it one byte for one byte (measured displacement
+        // coefficient 1.00, three runs). Issued after the FFN it rides the following
+        // attention instead, where nothing is reading host memory.
+        //
+        // Kept outside the FFN block so the layer's own router chain stays contiguous
+        // for the router fusions.
         if (il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr && moe_lookahead_enabled()) {
-            ggml_tensor * lookahead_state = build_hc_mix(res_hc,
+            ggml_tensor * lookahead_state = build_hc_mix(res_hc_post_attn,
                     model.layers[il + 1].hc_ffn_norm,
                     model.layers[il + 1].hc_ffn_down,
                     model.layers[il + 1].hc_ffn_up,
@@ -477,18 +504,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 ggml_build_forward_expand(gf, lookahead);
             }
         }
-
-        cur = build_hc_mix(res_hc,
-                model.layers[il].hc_ffn_norm,
-                model.layers[il].hc_ffn_down,
-                model.layers[il].hc_ffn_up,
-                model.layers[il].hc_ffn_inject,
-                &inject, il);
-
-        cur = build_layer_ffn(cur, il);
-        cb(cur, "ffn_out", il);
-
-        res_hc = build_hc_combine(res_hc, cur, inject, il);
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);

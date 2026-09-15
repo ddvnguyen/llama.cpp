@@ -203,23 +203,6 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         cur = ggml_add(ctx0, cur, inpSA);
         cb(cur, "attn_residual", il);
 
-        // MoE look-ahead: predict layer il+1's experts from this layer's post-attention
-        // state and page them while this layer's MoE still computes, so the H2D overlaps
-        // compute instead of stalling it. Placed immediately after attention and before
-        // this layer's post-attention norm so the router chain stays contiguous for the
-        // router fusions.
-        if (il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr && moe_lookahead_enabled()) {
-            ggml_tensor * lookahead_state = build_norm(cur,
-                    model.layers[il + 1].attn_post_norm, nullptr, LLM_NORM_RMS, il + 1);
-            ggml_tensor * lookahead = build_moe_lookahead(lookahead_state,
-                    model.layers[il + 1].ffn_gate_inp,
-                    model.layers[il + 1].ffn_up_exps,
-                    il + 1);
-            if (lookahead != nullptr) {
-                ggml_build_forward_expand(gf, lookahead);
-            }
-        }
-
         // Save the tensor before post-attention norm for residual connection
         ggml_tensor * ffn_residual = cur;
 
@@ -234,6 +217,32 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_moe", il);
+
+        // MoE look-ahead: predict layer il+1's experts from this layer's post-attention
+        // state and page them into the window where the fabric is actually idle, which is
+        // the NEXT layer's attention.
+        //
+        // Issued AFTER this layer's FFN, and deliberately not before it. The MoE bucket
+        // is not compute-bound: of its 81.04 ms, ~77 ms is the demand gather reading the
+        // experts' host memory over the same PCIe link this transfer needs. A transfer
+        // issued alongside the gather therefore does not "overlap compute" - it competes
+        // with the gather and displaces it one byte for one byte (measured displacement
+        // coefficient 1.00, three runs). Issued after the FFN it rides the following
+        // attention instead, where nothing is reading host memory.
+        //
+        // Kept outside the FFN block and after the post-attention norm so the router
+        // chain stays contiguous for the router fusions.
+        if (il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr && moe_lookahead_enabled()) {
+            ggml_tensor * lookahead_state = build_norm(ffn_residual,
+                    model.layers[il + 1].attn_post_norm, nullptr, LLM_NORM_RMS, il + 1);
+            ggml_tensor * lookahead = build_moe_lookahead(lookahead_state,
+                    model.layers[il + 1].ffn_gate_inp,
+                    model.layers[il + 1].ffn_up_exps,
+                    il + 1);
+            if (lookahead != nullptr) {
+                ggml_build_forward_expand(gf, lookahead);
+            }
+        }
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
