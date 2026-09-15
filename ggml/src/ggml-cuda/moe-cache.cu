@@ -2846,6 +2846,39 @@ static constexpr uint32_t MOE_GROUPED_FREQUENCY_HALFLIFE_DEFAULT = 16;
 static constexpr uint32_t MOE_GROUPED_TRANSFER_THREADS = 256;
 static constexpr uint32_t MOE_GROUPED_TRANSFER_BLOCKS_PER_SM = 4;
 
+// ---------------------------------------------------------------------------
+// Per-(step, layer) demanded-expert trace (diagnostic; off unless
+// GGML_CUDA_MOE_DEMAND_TRACE is set). Each grouped plan call is one layer of one
+// decode step, and the plan kernel already has that layer's demanded expert ids
+// in hand, so it records them into a device-side ring of steps. The ring is
+// drained to pinned memory one step at a time with the same non-blocking
+// pattern as the per-step miss ledger and written out as text.
+//
+// Observed geometry this is sized for: 48 MoE layers, top_k = 10 experts per
+// layer, so one decode step demands exactly 48 * 10 = 480 expert ids. The step
+// bound is the per-step ledger's, declared here (rather than beside the ledger,
+// below) because the plan kernel that fills this ring is defined first.
+#define GGML_CUDA_MOE_STEP_RING 256
+#define GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS  48
+#define GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS 10
+
+struct ggml_cuda_moe_demand_trace_step {
+    // Demanded expert ids in demand order, and the written length per layer:
+    // len == 0 means that layer did not record this step, so a step whose
+    // layers are not all written is a partially written step.
+    int16_t ids[GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS][GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS];
+    uint8_t len[GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS];
+};
+
+struct ggml_cuda_moe_demand_trace_buffer {
+    // One grouped plan call per layer per decode step, so this per-layer call
+    // count IS that layer's step index. Device-side on purpose: a captured
+    // graph replay re-runs the plan kernel, so the index advances exactly as it
+    // does for a direct launch, with no host bookkeeping on the decode path.
+    uint32_t layer_step[GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS];
+    ggml_cuda_moe_demand_trace_step step[GGML_CUDA_MOE_STEP_RING];
+};
+
 // Single reader of GGML_CUDA_MOE_FREQUENCY_HALFLIFE, in grouped planning steps.
 // Unset, empty, non-numeric, non-positive, or out of range falls back to the
 // default. The process-wide static is initialised once, so neither context
@@ -3043,6 +3076,15 @@ static __device__ __forceinline__ uint32_t moe_staging_progress(const uint32_t *
 #endif
 }
 
+// Demand-trace predicate for the plan kernel. Uniform across the block (both
+// operands are launch parameters), so every use below is a single predictable
+// branch that is never taken when the gate is off: the host then passes a null
+// buffer and layer -1, and no allocation or atomic happens anywhere.
+static __device__ __forceinline__ bool moe_grouped_demand_trace_on(
+        const ggml_cuda_moe_demand_trace_buffer * trace, int32_t layer) {
+    return trace != nullptr && layer >= 0 && layer < GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS;
+}
+
 static __global__ void moe_grouped_plan_decode(
         const int32_t * ids,
         uint32_t n_routes,
@@ -3067,7 +3109,9 @@ static __global__ void moe_grouped_plan_decode(
         uint64_t resident_tag,
         uint64_t resident_bytes_per_miss,
         const int32_t * staging_positions,
-        const uint32_t * staging_progress) {
+        const uint32_t * staging_progress,
+        ggml_cuda_moe_demand_trace_buffer * demand_trace,
+        int32_t demand_trace_layer) {
     if (blockIdx.x != 0) {
         return;
     }
@@ -3080,6 +3124,7 @@ static __global__ void moe_grouped_plan_decode(
     __shared__ uint32_t staged_admissions;
     __shared__ uint64_t clock_begin;
     __shared__ uint64_t clock_end;
+    __shared__ uint32_t demand_trace_slot;
     const uint32_t thread = threadIdx.x;
     int32_t * route_storage = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ROUTE_STORAGE);
     int32_t * route_unique = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ROUTE_UNIQUE);
@@ -3220,6 +3265,15 @@ static __global__ void moe_grouped_plan_decode(
             const uint32_t lane = thread;
             const bool active = lane < n_routes;
             const int32_t expert = active ? warp_route_experts[lane] : -1;
+            // One atomic per plan call, taken before any lane needs the slot.
+            const bool trace_on = moe_grouped_demand_trace_on(demand_trace, demand_trace_layer);
+            if (trace_on && lane == 0) {
+                demand_trace_slot = atomicAdd(&demand_trace->layer_step[demand_trace_layer], 1u) %
+                    GGML_CUDA_MOE_STEP_RING;
+            }
+            if (trace_on) {
+                __syncwarp(0xffffffff);
+            }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             const uint32_t first_lane = __ffs(__match_any_sync(0xffffffff, expert)) - 1;
 #else
@@ -3246,6 +3300,9 @@ static __global__ void moe_grouped_plan_decode(
                     (slot >= 0 && ((uint32_t) slot >= n_slots || expert_for_slot[slot] != expert));
                 unique_experts[unique] = expert;
                 unique_slots[unique] = slot;
+                if (trace_on && unique < GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS) {
+                    demand_trace->step[demand_trace_slot].ids[demand_trace_layer][unique] = (int16_t) expert;
+                }
             }
             const uint32_t invalid_mask = __ballot_sync(0xffffffff, invalid_slot);
             const bool miss = first && slot < 0;
@@ -3261,6 +3318,13 @@ static __global__ void moe_grouped_plan_decode(
                 }
                 plan->n_unique = __popc(first_mask);
                 plan->n_misses = __popc(miss_mask);
+                if (trace_on) {
+                    // Written length of this layer's demand for this step: the
+                    // per-(step, layer) validity marker the drain checks.
+                    const uint32_t recorded = __popc(first_mask);
+                    demand_trace->step[demand_trace_slot].len[demand_trace_layer] =
+                        (uint8_t) (recorded < 255 ? recorded : 255);
+                }
             }
             __syncwarp(0xffffffff);
         }
@@ -3269,16 +3333,28 @@ static __global__ void moe_grouped_plan_decode(
 #endif
     {
         if (thread == 0) {
+            const bool trace_on = moe_grouped_demand_trace_on(demand_trace, demand_trace_layer);
+            if (trace_on) {
+                demand_trace_slot = atomicAdd(&demand_trace->layer_step[demand_trace_layer], 1u) %
+                    GGML_CUDA_MOE_STEP_RING;
+            }
             uint32_t n_unique = 0;
             for (uint32_t route = 0; route < n_routes; ++route) {
                 const uint32_t expert = route_storage[route];
                 if (expert_routes[expert] == route) {
                     expert_routes[expert] = n_unique;
+                    if (trace_on && n_unique < GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS) {
+                        demand_trace->step[demand_trace_slot].ids[demand_trace_layer][n_unique] = (int16_t) expert;
+                    }
                     unique_experts[n_unique++] = expert;
                 }
                 route_unique[route] = expert_routes[expert];
             }
             plan->n_unique = n_unique;
+            if (trace_on) {
+                demand_trace->step[demand_trace_slot].len[demand_trace_layer] =
+                    (uint8_t) (n_unique < 255 ? n_unique : 255);
+            }
         }
         __syncthreads();
 
@@ -5095,6 +5171,7 @@ static bool ggml_cuda_moe_cache_abort_host_staged(ggml_cuda_moe_cache * cache, c
 
 static void ggml_cuda_moe_resident_free_for_device(int device);
 static void ggml_cuda_moe_step_ledger_free_for_device(int device);
+static void ggml_cuda_moe_demand_trace_free_for_device(int device);
 struct ggml_cuda_moe_grouped_context::impl {
     explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {
         const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
@@ -5114,6 +5191,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         ggml_cuda_moe_resident_free_for_device(device);
         ggml_cuda_moe_step_ledger_free_for_device(device);
+        ggml_cuda_moe_demand_trace_free_for_device(device);
     }
 
     struct grouped_resource;
@@ -10220,7 +10298,8 @@ static void ggml_cuda_moe_resident_drain_and_emit() {
 // be missing, and the warning says how many. Dropping is preferable to
 // syncing, which is what this ledger exists to avoid.
 // ---------------------------------------------------------------------------
-#define GGML_CUDA_MOE_STEP_RING 256
+// GGML_CUDA_MOE_STEP_RING is declared with the other MoE constants, above the
+// plan kernel that the demand trace ring shares it with.
 #define GGML_CUDA_MOE_STEP_STREAMS 8
 #define GGML_CUDA_MOE_STEP_CLASS_NONE 0xFFFFFFFFu
 struct ggml_cuda_moe_step_ledger {
@@ -10552,6 +10631,367 @@ static void ggml_cuda_moe_step_ledger_free_for_device(int device) {
     ledger.dropped = 0;
     memset(ledger.last, 0, sizeof(ledger.last));
 }
+// ---------------------------------------------------------------------------
+// Per-(step, layer) demanded-expert trace, host side. Gate:
+// GGML_CUDA_MOE_DEMAND_TRACE (presence only), output path:
+// GGML_CUDA_MOE_DEMAND_TRACE_FILE (default /tmp/moe-demand-trace.txt).
+//
+// The plan kernel records the ids into the preallocated device ring above, one
+// ring slot per decode step. This side drains one ring slot at a time into
+// pinned memory with the same pattern as the per-step miss ledger: an event
+// recorded on the stream that ran the step's kernels, a cudaMemcpyAsync on a
+// private non-blocking stream, and cudaEventQuery on the decode path, so the
+// decode loop never waits on the host. As in the ledger, the step boundary is
+// closed device-side instead: the next step's kernels may not touch the slot
+// until its snapshot has landed, which is what keeps a slot from being
+// overwritten before it is read. Any slot whose copy has landed is appended to
+// the output file, oldest first, so lines stay in step order.
+static std::mutex ggml_cuda_moe_demand_trace_alloc_mutex;
+struct ggml_cuda_moe_demand_trace {
+    std::atomic<ggml_cuda_moe_demand_trace_buffer *> buffer{nullptr};
+    ggml_cuda_moe_demand_trace_step * host = nullptr;   // pinned, [GGML_CUDA_MOE_STEP_RING]
+    uint64_t * slot_step = nullptr;                     // [ring] absolute step of that slot
+    cudaEvent_t * ev_done = nullptr;                    // [ring] slot landed on copy_stream
+    cudaEvent_t ev_ready[GGML_CUDA_MOE_STEP_STREAMS] = {};  // one step-end marker per compute stream
+    cudaStream_t copy_stream = nullptr;                 // private, non-blocking: never carries the step's kernels
+    uint64_t head = 0;                                  // next slot to snapshot
+    uint64_t tail = 0;                                  // next slot to write out
+    uint64_t step = 0;                                  // decode steps recorded so far
+    uint64_t emitted = 0;                               // (step, layer) lines written so far
+    uint64_t dropped = 0;                               // steps with no snapshot
+    uint64_t partial = 0;                               // steps whose layer set is incomplete
+    int device_idx = -1;
+    bool ready = false;
+    std::atomic<bool> wrote{false};                     // a grouped decode dispatch is open
+    bool unavailable = false;
+    bool failed = false;
+    bool warned = false;
+    FILE * file = nullptr;
+};
+static ggml_cuda_moe_demand_trace & ggml_cuda_moe_demand_trace_state() {
+    static ggml_cuda_moe_demand_trace state;
+    return state;
+}
+// Presence only, default off, exactly like the other gates.
+static bool ggml_cuda_moe_demand_trace_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MOE_DEMAND_TRACE") != nullptr;
+    return enabled;
+}
+// One decode step is open: the grouped plan kernels about to run advance the
+// device step counters, so the drain in finish_graph_dispatch must snapshot.
+static void ggml_cuda_moe_demand_trace_begin_step() {
+    if (ggml_cuda_moe_demand_trace_enabled()) {
+        ggml_cuda_moe_demand_trace_state().wrote.store(true, std::memory_order_release);
+    }
+}
+static const char * ggml_cuda_moe_demand_trace_path() {
+    static const char * path = []() -> const char * {
+        const char * value = getenv("GGML_CUDA_MOE_DEMAND_TRACE_FILE");
+        return value != nullptr && value[0] != '\0' ? value : "/tmp/moe-demand-trace.txt";
+    }();
+    return path;
+}
+// One device allocation for the whole run, the same shape as the residency
+// table's: the record path is a plain atomic load once it exists, and an
+// allocation failure is remembered rather than retried every step.
+static ggml_cuda_moe_demand_trace_buffer * ggml_cuda_moe_demand_trace_alloc(int device) {
+    if (!ggml_cuda_moe_demand_trace_enabled() || device < 0) {
+        return nullptr;
+    }
+    auto & trace = ggml_cuda_moe_demand_trace_state();
+    ggml_cuda_moe_demand_trace_buffer * result = trace.buffer.load(std::memory_order_acquire);
+    if (result != nullptr) {
+        // One device buffer for the process, like the residency table: a second
+        // device records nothing rather than recording into the wrong device's
+        // memory.
+        return trace.device_idx == device ? result : nullptr;
+    }
+    if (trace.unavailable) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_moe_demand_trace_alloc_mutex);
+    result = trace.buffer.load(std::memory_order_relaxed);
+    if (result == nullptr && !trace.unavailable) {
+        moe_grouped_device_scope device_scope(device);
+        if (!moe_grouped_cuda_success(cudaMalloc(&result, sizeof(ggml_cuda_moe_demand_trace_buffer))) ||
+                !moe_grouped_cuda_success(cudaMemset(result, 0, sizeof(ggml_cuda_moe_demand_trace_buffer)))) {
+            if (result != nullptr) {
+                (void) cudaFree(result);
+                result = nullptr;
+            }
+            trace.unavailable = true;
+            if (!trace.warned) {
+                trace.warned = true;
+                GGML_LOG_WARN("moe-demand-trace: disabled: could not allocate the device ring\n");
+            }
+            return nullptr;
+        }
+        trace.buffer.store(result, std::memory_order_release);
+    }
+    trace.device_idx = device;
+    return result;
+}
+// Pinned staging, private stream, one event per slot and one per compute
+// stream: allocated once, only when the gate is on.
+static bool ggml_cuda_moe_demand_trace_init(ggml_cuda_moe_demand_trace & trace, int device) {
+    if (trace.ready) {
+        return true;
+    }
+    if (trace.unavailable) {
+        return false;
+    }
+    const size_t host_bytes = (size_t) GGML_CUDA_MOE_STEP_RING * sizeof(ggml_cuda_moe_demand_trace_step);
+    moe_grouped_device_scope device_scope(device);
+    void * host = nullptr;
+    bool ok = moe_grouped_cuda_success(cudaMallocHost(&host, host_bytes));
+    uint64_t * slot_step = ok ? (uint64_t *) calloc(GGML_CUDA_MOE_STEP_RING, sizeof(uint64_t)) : nullptr;
+    cudaEvent_t * ev_done = ok ? (cudaEvent_t *) calloc(GGML_CUDA_MOE_STEP_RING, sizeof(cudaEvent_t)) : nullptr;
+    cudaStream_t copy_stream = nullptr;
+    ok = ok && slot_step != nullptr && ev_done != nullptr;
+    uint32_t ready_created = 0;
+    while (ok && ready_created < GGML_CUDA_MOE_STEP_STREAMS) {
+        if (!moe_grouped_cuda_success(cudaEventCreateWithFlags(&trace.ev_ready[ready_created], cudaEventDisableTiming))) {
+            ok = false;
+            break;
+        }
+        ++ready_created;
+    }
+    if (ok && !moe_grouped_cuda_success(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking))) {
+        ok = false;
+    }
+    uint32_t events_created = 0;
+    while (ok && events_created < GGML_CUDA_MOE_STEP_RING) {
+        if (!moe_grouped_cuda_success(cudaEventCreateWithFlags(&ev_done[events_created], cudaEventDisableTiming))) {
+            ok = false;
+            break;
+        }
+        ++events_created;
+    }
+    FILE * file = nullptr;
+    if (ok) {
+        file = fopen(ggml_cuda_moe_demand_trace_path(), "w");
+        ok = file != nullptr;
+    }
+    if (ok) {
+        trace.host = (ggml_cuda_moe_demand_trace_step *) host;
+        trace.slot_step = slot_step;
+        trace.ev_done = ev_done;
+        trace.copy_stream = copy_stream;
+        trace.file = file;
+        trace.device_idx = device;
+        trace.ready = true;
+        return true;
+    }
+    // Allocation failure: the trace stays off, one warning, no per-step cost.
+    for (uint32_t i = 0; i < events_created; ++i) {
+        (void) cudaEventDestroy(ev_done[i]);
+    }
+    for (uint32_t i = 0; i < ready_created; ++i) {
+        (void) cudaEventDestroy(trace.ev_ready[i]);
+        trace.ev_ready[i] = nullptr;
+    }
+    if (copy_stream != nullptr) {
+        (void) cudaStreamDestroy(copy_stream);
+    }
+    if (host != nullptr) {
+        (void) cudaFreeHost(host);
+    }
+    free(slot_step);
+    free(ev_done);
+    if (file != nullptr) {
+        fclose(file);
+    }
+    if (!trace.warned) {
+        trace.warned = true;
+        GGML_LOG_WARN("moe-demand-trace: disabled: could not allocate the drain ring\n");
+    }
+    trace.unavailable = true;
+    return false;
+}
+// Append every slot whose copy has landed, oldest first. Never waits unless
+// `flush` (teardown): a slot still in flight is left for a later call.
+static void ggml_cuda_moe_demand_trace_consume(ggml_cuda_moe_demand_trace & trace, bool flush) {
+    while (trace.tail != trace.head && !trace.failed && trace.file != nullptr) {
+        const size_t slot = (size_t) (trace.tail % GGML_CUDA_MOE_STEP_RING);
+        if (flush) {
+            moe_grouped_device_scope device_scope(trace.device_idx);
+            if (!moe_grouped_cuda_success(cudaEventSynchronize(trace.ev_done[slot]))) {
+                trace.failed = true;
+                return;
+            }
+        } else {
+            const cudaError_t status = cudaEventQuery(trace.ev_done[slot]);
+            if (status == cudaErrorNotReady) {
+                return;
+            }
+            if (status != cudaSuccess) {
+                (void) cudaGetLastError();
+                trace.failed = true;
+                return;
+            }
+        }
+        const ggml_cuda_moe_demand_trace_step * step_data = trace.host + slot;
+        const uint64_t step = trace.slot_step[slot];
+        uint32_t written = 0;
+        for (uint32_t layer = 0; layer < GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS; ++layer) {
+            // The per-(step, layer) length marker: 0 means this layer recorded
+            // nothing for this step, so it carries no line. A step with some
+            // but not all layers written is a partially written step.
+            const uint32_t len = step_data->len[layer];
+            if (len == 0) {
+                continue;
+            }
+            ++written;
+            if (len > GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS) {
+                // The layer demanded more experts than the trace row holds; the
+                // line below is truncated, and the step is flagged.
+                ++trace.partial;
+            }
+            const uint32_t count = len < GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS ?
+                len : (uint32_t) GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS;
+            fprintf(trace.file, "step=%llu layer=%u ids=", (unsigned long long) step, layer);
+            for (uint32_t k = 0; k < count; ++k) {
+                fprintf(trace.file, k == 0 ? "%d" : ",%d", (int) step_data->ids[layer][k]);
+            }
+            fputc('\n', trace.file);
+            ++trace.emitted;
+        }
+        if (written != 0 && written != GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS) {
+            ++trace.partial;
+        }
+        ++trace.tail;
+    }
+}
+// Snapshot the step that just closed: mark the end of its kernels on each
+// stream that ran them, copy its slot on the trace's own stream, clear the
+// slot's markers for the next wrap, and hold the next step's kernels until the
+// copy has landed. The host never waits here.
+static void ggml_cuda_moe_demand_trace_snapshot(
+        ggml_cuda_moe_demand_trace & trace, int device,
+        ggml_cuda_moe_demand_trace_buffer * buffer, const cudaStream_t * streams, uint32_t n_streams) {
+    if (trace.head - trace.tail >= GGML_CUDA_MOE_STEP_RING) {
+        ++trace.dropped;
+        return;
+    }
+    const size_t slot = (size_t) (trace.head % GGML_CUDA_MOE_STEP_RING);
+    const uint32_t bounded = n_streams < GGML_CUDA_MOE_STEP_STREAMS ? n_streams : GGML_CUDA_MOE_STEP_STREAMS;
+    bool ok = true;
+    {
+        moe_grouped_device_scope device_scope(device);
+        for (uint32_t i = 0; ok && i < bounded; ++i) {
+            ok = moe_grouped_cuda_success(cudaEventRecord(trace.ev_ready[i], streams[i])) &&
+                moe_grouped_cuda_success(cudaStreamWaitEvent(trace.copy_stream, trace.ev_ready[i], 0));
+        }
+        ok = ok && moe_grouped_cuda_success(cudaMemcpyAsync(trace.host + slot, buffer->step + slot,
+                sizeof(ggml_cuda_moe_demand_trace_step), cudaMemcpyDeviceToHost, trace.copy_stream)) &&
+            moe_grouped_cuda_success(cudaMemsetAsync(buffer->step[slot].len, 0,
+                sizeof(buffer->step[slot].len), trace.copy_stream)) &&
+            moe_grouped_cuda_success(cudaEventRecord(trace.ev_done[slot], trace.copy_stream));
+        // The next step's kernels write this ring again. Hold them until this
+        // slot's snapshot has landed, so a slot is never overwritten before it
+        // is read: the ledger's one added dependency, a device-side wait on a
+        // 1 KiB read, never a host sync.
+        for (uint32_t i = 0; ok && i < bounded; ++i) {
+            ok = moe_grouped_cuda_success(cudaStreamWaitEvent(streams[i], trace.ev_done[slot], 0));
+        }
+    }
+    if (!ok) {
+        ++trace.dropped;
+        return;
+    }
+    trace.slot_step[slot] = trace.step++;
+    ++trace.head;
+}
+static void ggml_cuda_moe_demand_trace_drain(const cudaStream_t * streams, uint32_t n_streams) {
+    if (!ggml_cuda_moe_demand_trace_enabled()) {
+        return;
+    }
+    auto & trace = ggml_cuda_moe_demand_trace_state();
+    ggml_cuda_moe_demand_trace_buffer * buffer = trace.buffer.load(std::memory_order_acquire);
+    const int device = trace.device_idx;
+    if (buffer == nullptr || device < 0) {
+        trace.wrote.store(false, std::memory_order_release);
+        return;
+    }
+    if (!ggml_cuda_moe_demand_trace_init(trace, device)) {
+        trace.wrote.store(false, std::memory_order_release);
+        return;
+    }
+    ggml_cuda_moe_demand_trace_consume(trace, false);
+    if (!trace.wrote.load(std::memory_order_acquire)) {
+        return;
+    }
+    trace.wrote.store(false, std::memory_order_release);
+    if (trace.failed || n_streams == 0) {
+        ++trace.dropped;
+        return;
+    }
+    ggml_cuda_moe_demand_trace_snapshot(trace, device, buffer, streams, n_streams);
+}
+static void ggml_cuda_moe_demand_trace_free_for_device(int device) {
+    auto & trace = ggml_cuda_moe_demand_trace_state();
+    if (trace.device_idx != device) {
+        return;
+    }
+    // Flush the tail once, at teardown: the last steps are still in flight, and
+    // this is the only place the trace waits for the device.
+    if (trace.ready) {
+        ggml_cuda_moe_demand_trace_consume(trace, true);
+    }
+    if (trace.file != nullptr) {
+        fclose(trace.file);
+        trace.file = nullptr;
+    }
+    if (trace.dropped != 0 || trace.partial != 0 || trace.failed) {
+        GGML_LOG_WARN("moe-demand-trace: dropped=%llu partial=%llu failed=%d emitted=%llu: a dropped or partial step has an incomplete line set\n",
+            (unsigned long long) trace.dropped, (unsigned long long) trace.partial,
+            trace.failed ? 1 : 0, (unsigned long long) trace.emitted);
+    }
+    ggml_cuda_moe_demand_trace_buffer * buffer = trace.buffer.exchange(nullptr, std::memory_order_acq_rel);
+    if (buffer != nullptr || trace.ready) {
+        moe_grouped_device_scope device_scope(device);
+        if (buffer != nullptr) {
+            (void) cudaFree(buffer);
+        }
+        if (trace.ev_done != nullptr) {
+            for (uint64_t i = 0; i < GGML_CUDA_MOE_STEP_RING; ++i) {
+                if (trace.ev_done[i] != nullptr) {
+                    (void) cudaEventDestroy(trace.ev_done[i]);
+                }
+            }
+        }
+        for (uint32_t i = 0; i < GGML_CUDA_MOE_STEP_STREAMS; ++i) {
+            if (trace.ev_ready[i] != nullptr) {
+                (void) cudaEventDestroy(trace.ev_ready[i]);
+                trace.ev_ready[i] = nullptr;
+            }
+        }
+        if (trace.copy_stream != nullptr) {
+            (void) cudaStreamDestroy(trace.copy_stream);
+        }
+        if (trace.host != nullptr) {
+            (void) cudaFreeHost(trace.host);
+        }
+    }
+    free(trace.slot_step);
+    free(trace.ev_done);
+    trace.host = nullptr;
+    trace.slot_step = nullptr;
+    trace.ev_done = nullptr;
+    trace.copy_stream = nullptr;
+    trace.device_idx = -1;
+    trace.ready = false;
+    trace.wrote.store(false, std::memory_order_release);
+    trace.unavailable = false;
+    trace.failed = false;
+    trace.head = 0;
+    trace.tail = 0;
+    trace.step = 0;
+    trace.emitted = 0;
+    trace.dropped = 0;
+    trace.partial = 0;
+}
+
 ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decode(
         const ggml_cuda_moe_complete_group_key & key,
         cudaStream_t compute_stream,
@@ -10743,13 +11183,24 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             plan_staging_progress = lookahead->copy_progress;
         }
         const uint32_t plan_threads = moe_grouped_plan_threads(resource->snapshot.n_slots);
+        // Demand trace: one predictable branch when the gate is off (the alloc
+        // returns null), and layer -1 keeps the kernel's own branch untaken.
+        // Recording is decode-only here: a decode plan call is one row of one
+        // step, and the layer index is the same one the residency table uses.
+        ggml_cuda_moe_demand_trace_buffer * demand_trace = ggml_cuda_moe_demand_trace_alloc(impl_->device);
+        const int32_t demand_trace_layer = demand_trace != nullptr && n_rows == 1 && resident_layer >= 0 ?
+            resident_layer : -1;
+        if (demand_trace_layer >= 0) {
+            ggml_cuda_moe_demand_trace_begin_step();
+        }
         moe_grouped_plan_decode<<<1, plan_threads, 0, compute_stream>>>(
             static_cast<const int32_t *>(ids->data), n_routes, top_k, row_stride,
             device.n_experts, resource->snapshot.n_slots, resource->snapshot.n_slots,
             device.slot_for_expert, device.expert_for_slot, device.last_used,
             device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, impl_->frequency_halflife, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan,
-            resident_slot, resident_tag, resident_bpm, plan_staging_positions, plan_staging_progress);
+            resident_slot, resident_tag, resident_bpm, plan_staging_positions, plan_staging_progress,
+            demand_trace, demand_trace_layer);
         CUDA_CHECK(cudaGetLastError());
 #if CUDART_VERSION >= 12080
         if (ready_only && !ready_late) {
@@ -12591,6 +13042,17 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
         }
     }
     note_ledger_groups();
+    // Graph replay runs the captured plan kernels without going through
+    // prepare_decode, so this is where a replayed decode step is armed for the
+    // demand trace. Same predicate as the direct path: a single-token group.
+    if (ggml_cuda_moe_demand_trace_enabled()) {
+        for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
+            if (execution->groups_[record_index].key.ids.ne[1] == 1) {
+                ggml_cuda_moe_demand_trace_begin_step();
+                break;
+            }
+        }
+    }
     return true;
 #endif
 }
@@ -13752,6 +14214,28 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
     }
     ggml_cuda_moe_resident_drain_and_emit();
     ggml_cuda_moe_step_ledger_drain();
+    // Demand trace: snapshot the step the grouped plan kernels just filled on
+    // the streams that ran them. The host never waits here; the slot is written
+    // out by a later drain or by the teardown flush.
+    if (ggml_cuda_moe_demand_trace_enabled()) {
+        cudaStream_t trace_streams[GGML_CUDA_MOE_STEP_STREAMS] = {};
+        uint32_t n_trace_streams = 0;
+        for (uint32_t record_index = 0; record_index < execution->n_groups_ &&
+                n_trace_streams < GGML_CUDA_MOE_STEP_STREAMS; ++record_index) {
+            const cudaStream_t stream = execution->groups_[record_index].stream;
+            if (stream == nullptr) {
+                continue;
+            }
+            bool seen = false;
+            for (uint32_t i = 0; i < n_trace_streams; ++i) {
+                seen = seen || trace_streams[i] == stream;
+            }
+            if (!seen) {
+                trace_streams[n_trace_streams++] = stream;
+            }
+        }
+        ggml_cuda_moe_demand_trace_drain(trace_streams, n_trace_streams);
+    }
     if (moe_cache_lookahead_width() > 0) {
         impl_->lookahead_drain_and_emit();
     }
