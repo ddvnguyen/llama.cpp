@@ -1,6 +1,6 @@
 # MoE look-ahead preload - evidence, mechanism, levers, plan
 
-Revision 16 (7.21: at N=42 the step is 28.3 ms fixed + 0.2842 ms per miss at 6.6 GB/s, the link idles 31%, and the distribution has NO tail so the mean is the whole story; the look-ahead's transport is 1.91% useful at width 8 vs 95.5% at width 1 - lateness, not wrongness - while the predictor's ~86% recall is a different quantity whose instrument is currently unwired; 7.22 ranks what is left: the x4 slot (+105%), a lossy cached tier (+44%, now measurable), and filling the idle window (+45%, not yet green)). Revision 15 (7.19: the correctness instrument exists and PR #127 Blocker 1 / issue #128 PASSES it - greedy token identity 648/648 chars and PPL 14.7350 identical over 15 chunks; 7.20: NEW DEFECT, at N=53 the look-ahead aborts the server on an unchecked 2.1484 MiB lane cudaMalloc, 48 lanes = 103.13 MiB never evicted, so the feature and the +21.5% capacity win are mutually exclusive). Revision 14 (7.18: instrument audit - the per-step ledger has no gaps and is internally consistent 199/199; the policy knob is proven to take effect, so the sweep tested 2 distinct policies not 4; the cache size is now echoed in the log (ed2b4b6b9); and the reversed-order control falsifies the drift confound - +21.5% and +21.1% by either ordering). Revision 13 (added the CURRENT OPERATING POINT block to section 8: best config is control + N=53, 11.738 t/s, look-ahead OFF, and earlier sections' ~10.2 t/s figures are N=28 or the retired synthetic harness and are not comparable). Revision 12 (7.17: the retention policy is NOT a lever - the default LFU-16 beats half-life 256 and 2048 and beats pure LRU; capacity is VRAM-capped at r~58%. All three code levers are now closed by measurement, leaving only the x4->x16 slot move). Revision 11 (7.16: the capacity lever is real - N=28 -> 53 is +21.5%, 9.661 -> 11.738 t/s, with the
+Revision 24 (7.32: an MTP block for this arch is a full layer plus a head - ~992 MiB of weights, but only ~78 MiB of that has to be VRAM under --n-cpu-moe, plus ~226 MiB of its own MoE cache at N=42, ~310-330 MiB total against 1.55/2.2 GiB of headroom, so either operating point covers it; the fork already ships the whole qwen4exp MTP path including nextn_state -> build_moe_lookahead, and its only existing consumer is the staging lane that 7.30 measured as a net loss, so the work item is retargeting the consumer to victim choice, not connecting the head. The trained block does not exist in this GGUF - 0 of 1224 tensors are nextn/mtp/draft - so the head has to arrive as a draft-only export. The one term that can bite is traffic: a full MoE block run once per draft step is +17.8% at H=4 unless those experts are cache-resident). Revision 16 (7.21: at N=42 the step is 28.3 ms fixed + 0.2842 ms per miss at 6.6 GB/s, the link idles 31%, and the distribution has NO tail so the mean is the whole story; the look-ahead's transport is 1.91% useful at width 8 vs 95.5% at width 1 - lateness, not wrongness - while the predictor's ~86% recall is a different quantity whose instrument is currently unwired; 7.22 ranks what is left: the x4 slot (+105%), a lossy cached tier (+44%, now measurable), and filling the idle window (+45%, not yet green)). Revision 15 (7.19: the correctness instrument exists and PR #127 Blocker 1 / issue #128 PASSES it - greedy token identity 648/648 chars and PPL 14.7350 identical over 15 chunks; 7.20: NEW DEFECT, at N=53 the look-ahead aborts the server on an unchecked 2.1484 MiB lane cudaMalloc, 48 lanes = 103.13 MiB never evicted, so the feature and the +21.5% capacity win are mutually exclusive). Revision 14 (7.18: instrument audit - the per-step ledger has no gaps and is internally consistent 199/199; the policy knob is proven to take effect, so the sweep tested 2 distinct policies not 4; the cache size is now echoed in the log (ed2b4b6b9); and the reversed-order control falsifies the drift confound - +21.5% and +21.1% by either ordering). Revision 13 (added the CURRENT OPERATING POINT block to section 8: best config is control + N=53, 11.738 t/s, look-ahead OFF, and earlier sections' ~10.2 t/s figures are N=28 or the retired synthetic harness and are not comparable). Revision 12 (7.17: the retention policy is NOT a lever - the default LFU-16 beats half-life 256 and 2048 and beats pure LRU; capacity is VRAM-capped at r~58%. All three code levers are now closed by measurement, leaving only the x4->x16 slot move). Revision 11 (7.16: the capacity lever is real - N=28 -> 53 is +21.5%, 9.661 -> 11.738 t/s, with the
 T = 25.7 + 0.3003*misses model validating out-of-sample to 1.2%; it saturates near r=59% at the
 VRAM cap, which makes retention POLICY the binding lever). Revision 10 (7.14: per-token miss ledger - decode is bandwidth-bound on expert misses,
 T = 25.7 ms + 0.3003 ms/miss with r2 = 0.990, ceiling 38.9 t/s at a fully-resident cache vs 9.60
@@ -1680,3 +1680,114 @@ therefore **victim choice, not staging** - retention directly removes fetches (m
 token), whereas the staging lane can only move them in time and was measured to cost throughput even
 when nearly every staged byte is used. Feed the MTP predictions into the cache's eviction decision;
 do not assume the lane becomes profitable because its input got better.
+
+## 7.32 Rev 24 - what an MTP head costs here, and how much of it the fork already has
+
+This is the sizing the N=42-vs-N=36 decision is a trade for, so it is worth having as numbers rather
+than as an intention. Everything in this section is **read from source or computed from measured
+totals**; no MTP head has been run, because none exists in the file (see 7.32.4).
+
+### 7.32.1 The fork already implements this model's MTP path
+
+`src/models/qwen4exp.cpp` is not a generic stub - it has a working DECODER_MTP graph for this exact
+architecture:
+
+| piece | where | what it does |
+|---|---|---|
+| `nextn_predict_layers` read into `hparams.n_layer_nextn` | qwen4exp.cpp:52-53 | asserts `n_layer_nextn < n_layer_all` |
+| `n_layer() = n_layer_all - n_layer_nextn` | llama-hparams.cpp:347 | NextN blocks are appended **past** the trunk |
+| draft-only export detection | qwen4exp.cpp:186 | `mtp_only` = block count declared, trunk tensors absent |
+| `LLM_GRAPH_TYPE_DECODER_MTP` -> `graph_mtp` | qwen4exp.cpp:313-314 | asserts `n_layer_nextn == 1` (:582) |
+| `llama_set_nextn_layer_offset` | llama-ext.h:127-130 | selects which appended head runs, to **"chain multiple trained NextN heads"** - H>1 is a driver concern, not a graph rewrite |
+| `t_h_nextn` + `llama_get_embeddings_nextn` | llama-context.h:980, llama-ext.h:125 | exposes the draft hidden state |
+| `build_moe_lookahead(nextn_state, ...)` | llama-graph.h:1210-1220 | **takes that state as its input** |
+| MTP KV filtered to the nextn layer | llama-model.cpp:2355-2360, 2455-2458, 2508-2511 | the draft context holds ~1/48 of the trunk's KV |
+
+Two consequences worth stating plainly.
+
+**The plumbing the plan needs already exists.** `build_moe_lookahead` is documented as taking
+`nextn_state` - the MTP head's hidden state - and predicting `il_next`'s top-K experts from it. The
+current look-ahead feeds that same argument from the *current layer's* post-attention state (the
+cross-layer heuristic of 7.28). So "drive the look-ahead from the MTP head" is a change of **input
+producer**, not a new mechanism.
+
+**But its only existing consumer is the lane that lost.** The same doc comment says it "emits a
+side-effect GGML_OP_MOE_PREFETCH node that pages them into that layer's MoE cache pool" - i.e. the
+existing consumer is the staging lane, which 7.30 measured as a net loss at every width, including
+width 1 where 94.85% of staged bytes were useful. **Retargeting the consumer to victim choice is the
+actual work item**, not connecting the head.
+
+### 7.32.2 An MTP block is a full layer plus a head, not a thin adapter
+
+In `qwen4exp.cpp:254-308` the NextN tensors are created **inside the same loop as trunk layers**, and
+the `if (il < n_layer) continue;` at :291 sits **after** attention/SSM, PLE, `ffn_gate_inp`,
+`ffn_*_exps` and `ffn_*_shexp`. So an appended block carries a whole layer's weights and adds:
+
+| tensor | shape | params |
+|---|---|---|
+| `nextn.eh_proj` | `{2*n_embd, n_embd}` | 13.107 M |
+| `nextn.hnorm` | `{hc_dim}` | small |
+| `nextn.enorm` | `{n_embd}` | 2560 |
+| `nextn.hc_head_norm` | `{hc_dim}` | small |
+| `nextn.hc_head_down` | `{hc_dim, hc_lr}` | small |
+| `nextn.hc_head_up` | `{hc_lr, hc_dim}` | small |
+| `nextn.embed_tokens`, `nextn.shared_head_head` | `{n_embd, n_vocab}` | **absent** |
+
+The last row is `TENSOR_NOT_REQUIRED` and the source comment states they are "absent when
+`mtp_use_dedicated_embeddings=false` (qwen4exp); the head falls back to the trunk's" - so the head
+costs **no extra vocab-sized tensor**.
+
+### 7.32.3 Sizing: ~992 MiB of weights, of which only ~80 MiB has to be VRAM
+
+Arithmetic on measured totals:
+
+- expert bytes 43837.5 MiB / 48 layers = **913.3 MiB per layer**
+- 47595 MiB total - 43837.5 MiB experts = 3757.5 MiB non-expert = **78.3 MiB per layer**
+- therefore one full appended block = **991.6 MiB** of weights
+
+The serve config is `--n-cpu-moe 99`, so a block's experts live on the host exactly as every other
+layer's do. The VRAM an MTP block actually needs is then:
+
+| term | at N=42 | at N=36 |
+|---|---|---|
+| one layer's non-expert weights | ~78 MiB | ~78 MiB |
+| head (`eh_proj` 13.1 M params + hc_head pair + norms) | ~7-27 MiB | ~7-27 MiB |
+| **its own MoE cache** (3 banks x N slots x 1.793 MiB x 1 layer) | **226 MiB** | **194 MiB** |
+| MTP KV (1 of 48 layers) | negligible | negligible |
+| **total** | **~310-330 MiB** | **~280-300 MiB** |
+
+Headroom at the operating point is ~1.55 GiB (N=42) and ~2.2 GiB (N=36). Recorded as arithmetic on
+the budget: **either operating point covers the head.** That is a statement about the numbers, not a
+proposal to move N - the operating point is the owner's decision and is not re-opened here.
+
+### 7.32.4 The term that can actually bite is traffic, not VRAM
+
+Because the block is a full MoE layer, running it once per draft step demands 10 experts x 1.793 MiB
+= **17.93 MiB per draft step**, i.e. **71.7 MiB/token at H=4, +17.8%** on the 403 MiB/token trunk
+demand - unless those experts are themselves cache-resident, which is what the 226 MiB of slots in
+7.32.3 buys. Priced with the same coefficient that prices everything else here (0.2842 ms per
+miss/token), an uncached 18% is not a rounding error at this margin. **This is the first number to
+check once a head exists.**
+
+### 7.32.5 What is still missing
+
+1. **The trained block does not exist in this file.** 0 of 1224 tensors match `nextn|mtp|draft`, and
+   `n_layer_nextn` is 0. But the loader supports a **draft-only export** (`mtp_only`: block count
+   declared, MTP block shipped alone), so the head can arrive as its own small GGUF loaded as a draft
+   of the target, rather than as a 49th layer inside the trunk file. That is the cheap path and it
+   keeps the trunk GGUF untouched.
+2. **The predictor's consumer must move** from `GGML_OP_MOE_PREFETCH` (staging, measured dead) to the
+   eviction decision (7.31).
+3. **The batched-router claim is not yet verified.** If the MTP/verification pass computes per-layer
+   router outputs for all H draft positions at layer L in one batched forward, then the horizon curve
+   of 7.31 maps onto H directly and H=4/H=8 are reachable by chaining heads via
+   `llama_set_nextn_layer_offset`. This has **not** been checked against the driver, and until it is,
+   the +8%/+13% figures remain a projection from the offline oracle, not a plan.
+
+### 7.32.6 Erratum
+
+An earlier check-in recorded a per-token latency-versus-misses relationship as negative (R2 ~ -0.015).
+That was a misreading of `perftok-*.tsv`: those rows are sub-token deltas, not one row per token, so a
+per-token regression on them is meaningless and the sign carries no information. It should not have
+been reported as a result. Retracted here rather than deleted, so the wrong version is not rediscovered
+later.
