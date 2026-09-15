@@ -312,6 +312,9 @@ enum ggml_cuda_moe_execution_strategy : uint32_t {
     GGML_CUDA_MOE_EXECUTION_STRATEGY_INVALID = 0,
     GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT,
     GGML_CUDA_MOE_EXECUTION_STRATEGY_HOST_STAGED,
+    // Step-1 probe only: never selected by the strategy picker. Counts per-dispatch
+    // resident-vs-missing from the decode plan when GGML_CUDA_MOE_DEVICE_SPLIT is set.
+    GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_SPLIT,
 };
 
 enum ggml_cuda_moe_graph_outcome : uint32_t {
@@ -463,6 +466,17 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t finish_error = 0;
     uint64_t h2d_banks = 0;
     uint64_t h2d_bytes = 0;
+    uint64_t split_probe_dispatches = 0;
+    uint64_t split_probe_routes = 0;
+    uint64_t split_probe_unique = 0;
+    uint64_t split_probe_misses = 0;
+    uint64_t split_probe_miss_routes = 0;
+    uint64_t shadow_dispatches = 0;
+    uint64_t shadow_rows = 0;
+    uint64_t shadow_skip = 0;
+    uint64_t cpu_replace_dispatches = 0;
+    uint64_t cpu_replace_rows = 0;
+    uint64_t cpu_replace_skip = 0;
 };
 
 struct ggml_cuda_moe_legacy_debug_telemetry {

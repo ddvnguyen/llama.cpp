@@ -2869,7 +2869,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-expert-cache-size"}, "N",
         "MoE expert cache: keep N expert slabs per expert tensor on GPU with LRU eviction; "
         "cold experts live in CPU pinned memory. 0 disables (default). "
-        "When enabled, all MoE expert tensors use the cache regardless of --cpu-moe or --n-cpu-moe.",
+        "When enabled, expert tensors not claimed by --cpu-moe, --n-cpu-moe or "
+        "--override-tensor use the cache.",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

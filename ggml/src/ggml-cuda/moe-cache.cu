@@ -29,6 +29,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cuda.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -730,6 +731,17 @@ struct moe_grouped_decode_debug_stats {
     std::atomic<uint64_t> host_staged_calls{0};
     std::atomic<uint64_t> host_staged_ops{0};
     std::atomic<uint64_t> host_staged_split_ops{0};
+    std::atomic<uint64_t> split_probe_dispatches{0};
+    std::atomic<uint64_t> split_probe_routes{0};
+    std::atomic<uint64_t> split_probe_unique{0};
+    std::atomic<uint64_t> split_probe_misses{0};
+    std::atomic<uint64_t> split_probe_miss_routes{0};
+    std::atomic<uint64_t> shadow_dispatches{0};
+    std::atomic<uint64_t> shadow_rows{0};
+    std::atomic<uint64_t> shadow_skip{0};
+    std::atomic<uint64_t> cpu_replace_dispatches{0};
+    std::atomic<uint64_t> cpu_replace_rows{0};
+    std::atomic<uint64_t> cpu_replace_skip{0};
     std::atomic<uint64_t> strategy_switches{0};
     std::atomic<uint64_t> required_unsupported{0};
     std::atomic<uint64_t> prepare_error{0};
@@ -775,7 +787,7 @@ static bool moe_grouped_has_activity(const ggml_cuda_moe_grouped_debug_telemetry
     return telemetry.covered != 0 || telemetry.plan_calls != 0 || telemetry.plan_compiles != 0 || telemetry.plan_reuses != 0 ||
         telemetry.calls != 0 || telemetry.ready != 0 || telemetry.completed != 0 || telemetry.admitted_banks != 0 ||
         telemetry.fallback != 0 || telemetry.rollback != 0 || telemetry.host_staged_calls != 0 ||
-        telemetry.host_staged_ops != 0 || telemetry.host_staged_split_ops != 0 || telemetry.strategy_switches != 0 ||
+        telemetry.host_staged_ops != 0 || telemetry.host_staged_split_ops != 0 || telemetry.split_probe_dispatches != 0 || telemetry.strategy_switches != 0 ||
         telemetry.required_unsupported != 0 || telemetry.prepare_error != 0 || telemetry.finish_error != 0 ||
         telemetry.h2d_banks != 0 || telemetry.h2d_bytes != 0;
 }
@@ -4787,9 +4799,31 @@ struct ggml_cuda_moe_grouped_context::impl {
     explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {
         const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
         frequency_aware = value == nullptr || strcmp(value, "0") != 0;
+        const char * split = getenv("GGML_CUDA_MOE_DEVICE_SPLIT");
+        device_split_probe = split != nullptr && strcmp(split, "0") != 0;
+        device_split_shadow = split != nullptr &&
+            (strcmp(split, "shadow") == 0 || strcmp(split, "cpu") == 0);
+        device_split_cpu = split != nullptr && strcmp(split, "cpu") == 0;
     }
 
     bool frequency_aware = true;
+    // Step-1 probe gate, off by default. When off, prepare_decode skips the
+    // plan readback entirely: zero behavior change.
+    bool device_split_probe = false;
+    // Phase C record gate, off by default. Read-only dump of live dispatch
+    // inputs (x + plan ids + miss weight slices) to /tmp for offline
+    // CPU-vs-GPU validation. Never alters outcome.
+    bool device_split_shadow = false;
+    // Phase D move gate, off by default. Recomputes cache-miss expert rows on
+    // the CPU and overwrites the matching DOWN output rows before finish.
+    // Staging stays on, so failures fall back to the GPU values in place.
+    bool device_split_cpu = false;
+    // Phase D worker: overwrite DOWN output rows of cache-miss routes.
+    // Best-effort, returns replaced row count, sets skip on any fallback.
+    uint64_t cpu_replace_miss_rows(ggml_cuda_moe_graph_group_dispatch * group,
+        const ggml_tensor * down_node,
+        cudaStream_t stream,
+        bool * skip);
 
     ~impl() {
         auto * stats = grouped_debug.load(std::memory_order_acquire);
@@ -5554,6 +5588,17 @@ struct ggml_cuda_moe_grouped_context::impl {
         result.host_staged_calls = take(stats->host_staged_calls);
         result.host_staged_ops = take(stats->host_staged_ops);
         result.host_staged_split_ops = take(stats->host_staged_split_ops);
+        result.split_probe_dispatches = take(stats->split_probe_dispatches);
+        result.split_probe_routes = take(stats->split_probe_routes);
+        result.split_probe_unique = take(stats->split_probe_unique);
+        result.split_probe_misses = take(stats->split_probe_misses);
+        result.split_probe_miss_routes = take(stats->split_probe_miss_routes);
+        result.shadow_dispatches = take(stats->shadow_dispatches);
+        result.shadow_rows = take(stats->shadow_rows);
+        result.shadow_skip = take(stats->shadow_skip);
+        result.cpu_replace_dispatches = take(stats->cpu_replace_dispatches);
+        result.cpu_replace_rows = take(stats->cpu_replace_rows);
+        result.cpu_replace_skip = take(stats->cpu_replace_skip);
         result.strategy_switches = take(stats->strategy_switches);
         result.required_unsupported = take(stats->required_unsupported);
         result.prepare_error = take(stats->prepare_error);
@@ -9506,6 +9551,9 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             decode->auxiliary_data[auxiliary] = device.auxiliary_data[auxiliary];
             decode->auxiliary_roles[auxiliary] = resource->snapshot.slot_auxiliaries[auxiliary].role;
         }
+        // NOTE: no stream ops here. prepare_decode runs inside CUDA-graph
+        // capture, where memcpy/sync are illegal. Step-1 sampling happens in
+        // finish_graph_dispatch, after capture ends and the plan executed.
         return GGML_CUDA_MOE_GROUPED_DECODE_READY;
     }
     return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
@@ -12178,6 +12226,296 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_graph
     return GGML_CUDA_MOE_GROUPED_DECODE_READY;
 }
 
+// Phase D move (Approach A). Persistent CPU backend for miss-expert
+// recompute. Same expert graph as the Phase C validator (gate/up/down(x),
+// silu+mul activation, F32 out), guarded by one mutex: finish runs on the
+// graph-eval thread and must not race concurrent dispatches.
+static std::mutex moe_cpu_replace_mutex;
+static ggml_backend_t moe_cpu_replace_backend = nullptr;
+
+static bool moe_cpu_replace_expert(ggml_backend_t cpu_be,
+        ggml_type gt, ggml_type ut, ggml_type dt, ggml_type xt,
+        int64_t din, int64_t dhid, int64_t dout,
+        const void * gslice, size_t gnbytes,
+        const void * uslice, size_t unbytes,
+        const void * dslice, size_t dnbytes,
+        const void * xbytes, size_t xnbytes,
+        float * out) {
+    struct ggml_init_params params = {8 * 1024 * 1024, nullptr, true};
+    struct ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+    struct ggml_tensor * t_gate = ggml_new_tensor_2d(ctx, gt, din, dhid);
+    struct ggml_tensor * t_up   = ggml_new_tensor_2d(ctx, ut, din, dhid);
+    struct ggml_tensor * t_down = ggml_new_tensor_2d(ctx, dt, dhid, dout);
+    struct ggml_tensor * t_x    = ggml_new_tensor_2d(ctx, xt, din, 1);
+    struct ggml_tensor * h_gate = ggml_mul_mat(ctx, t_gate, t_x);
+    struct ggml_tensor * h_up   = ggml_mul_mat(ctx, t_up, t_x);
+    struct ggml_tensor * h_act  = ggml_mul(ctx, ggml_silu(ctx, h_gate), h_up);
+    struct ggml_tensor * h_out  = ggml_mul_mat(ctx, t_down, h_act);
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16, false);
+    bool ok = false;
+    ggml_backend_buffer_t buf = nullptr;
+    if (t_gate != nullptr && t_up != nullptr && t_down != nullptr && t_x != nullptr &&
+            h_gate != nullptr && h_up != nullptr && h_act != nullptr && h_out != nullptr && gf != nullptr) {
+        ggml_build_forward_expand(gf, h_out);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, cpu_be);
+        if (buf != nullptr && t_gate->data != nullptr && t_up->data != nullptr &&
+                t_down->data != nullptr && t_x->data != nullptr &&
+                h_act->data != nullptr && h_out->data != nullptr &&
+                h_act->type == GGML_TYPE_F32 && h_out->type == GGML_TYPE_F32 &&
+                h_act->ne[0] == dhid && h_out->ne[0] == dout &&
+                (size_t) ggml_nbytes(t_gate) <= gnbytes &&
+                (size_t) ggml_nbytes(t_up) <= unbytes &&
+                (size_t) ggml_nbytes(t_down) <= dnbytes &&
+                (size_t) ggml_nbytes(t_x) <= xnbytes) {
+            ggml_backend_tensor_set(t_gate, gslice, 0, ggml_nbytes(t_gate));
+            ggml_backend_tensor_set(t_up, uslice, 0, ggml_nbytes(t_up));
+            ggml_backend_tensor_set(t_down, dslice, 0, ggml_nbytes(t_down));
+            ggml_backend_tensor_set(t_x, xbytes, 0, ggml_nbytes(t_x));
+            if (ggml_backend_graph_compute(cpu_be, gf) == GGML_STATUS_SUCCESS) {
+                ggml_backend_tensor_get(h_out, out, 0, (size_t) dout * sizeof(float));
+                ok = true;
+            }
+        }
+    }
+    if (buf != nullptr) {
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+    return ok;
+}
+
+// Phase D move: overwrite DOWN output rows of cache-miss routes with CPU
+// recompute. Runs after the DOWN GEMM is enqueued (same stream) and before
+// finish_decode, so the MIX consumer sees replaced rows via stream order.
+// Best-effort: any validation or compute failure skips the overwrite and the
+// GPU values stand (pure-GPU fallback). Returns replaced row count.
+uint64_t ggml_cuda_moe_grouped_context::impl::cpu_replace_miss_rows(
+        ggml_cuda_moe_graph_group_dispatch * group,
+        const ggml_tensor * down_node,
+        cudaStream_t stream,
+        bool * skip) {
+    *skip = false;
+    const ggml_tensor * gate_node = group->first_reader;
+    const ggml_tensor * cp_x = gate_node->op == GGML_OP_MUL_MAT_ID ? gate_node->src[1] : nullptr;
+    bool ok = gate_node->op == GGML_OP_MUL_MAT_ID &&
+        down_node->op == GGML_OP_MUL_MAT_ID && cp_x != nullptr &&
+        gate_node->src[0] != nullptr &&
+        strstr(gate_node->src[0]->name, "ffn_gate_exps") != nullptr &&
+        down_node->src[0] != nullptr &&
+        strstr(down_node->src[0]->name, "ffn_down_exps") != nullptr &&
+        (cp_x->type == GGML_TYPE_F32 || cp_x->type == GGML_TYPE_F16) &&
+        ggml_is_contiguous(cp_x) && cp_x->ne[0] > 0 && cp_x->ne[1] > 0 &&
+        cp_x->nb[0] == ggml_type_size(cp_x->type) &&
+        cp_x->nb[1] == (size_t) cp_x->ne[0] * ggml_type_size(cp_x->type) &&
+        down_node->type == GGML_TYPE_F32 && ggml_is_contiguous(down_node) &&
+        down_node->data != nullptr && down_node->ne[0] > 0 && down_node->ne[1] > 0 &&
+        down_node->nb[1] > 0;
+    struct bank_info {
+        ggml_type type = GGML_TYPE_COUNT;
+        const void * base = nullptr;
+        uint64_t stride = 0;
+        int64_t ne0 = 0;
+        int64_t ne1 = 0;
+        int64_t ne2 = 0;
+    };
+    bank_info cp_gate, cp_up, cp_down;
+    moe_grouped_decode_plan * cp_plan = nullptr;
+    uint32_t cp_cap = 0;
+    uint32_t cp_gi = UINT32_MAX;
+    if (ok) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto * resource = find_resource(group->transaction);
+        if (resource != nullptr && resource->device != nullptr) {
+            cp_plan = resource->device->plan;
+            cp_cap = resource->snapshot.n_slots;
+        }
+        cp_gi = group->key.candidate.group_index;
+        if (cp_gi < table.groups.size()) {
+            for (const auto & bank : table.groups[cp_gi].banks) {
+                bank_info info;
+                info.type = (ggml_type) bank.info.type;
+                info.base = bank.info.source_data;
+                info.stride = bank.info.expert_stride;
+                info.ne0 = bank.ne[0];
+                info.ne1 = bank.ne[1];
+                info.ne2 = ggml_n_dims(bank.info.tensor) > 2 ? bank.info.tensor->ne[2] : 0;
+                if (bank.info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT) {
+                    cp_gate = info;
+                } else if (bank.info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) {
+                    cp_up = info;
+                } else if (bank.info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) {
+                    cp_down = info;
+                }
+            }
+        }
+        ok = cp_plan != nullptr && cp_gate.base != nullptr && cp_up.base != nullptr &&
+            cp_down.base != nullptr && cp_gate.stride > 0 && cp_up.stride > 0 && cp_down.stride > 0 &&
+            cp_gate.ne0 == cp_x->ne[0] && cp_up.ne0 == cp_x->ne[0] &&
+            cp_up.ne1 == cp_gate.ne1 && cp_down.ne0 == cp_gate.ne1;
+    }
+    const int64_t cp_tokens = ok ? cp_x->ne[1] : 0;
+    const int64_t cp_din = ok ? cp_x->ne[0] : 0;
+    const int64_t cp_dh = ok ? cp_gate.ne1 : 0;
+    const int64_t cp_d = ok ? cp_down.ne1 : 0;
+    ok = ok && cp_tokens > 0 && cp_din > 0 && cp_dh > 0 && cp_d > 0 &&
+        cp_gate.ne2 > 0 && cp_gate.ne2 == cp_up.ne2 && cp_gate.ne2 == cp_down.ne2;
+    moe_grouped_decode_plan cp_host_plan{};
+    std::vector<int32_t> cp_route_unique, cp_miss_unique, cp_miss_experts, cp_unique_experts;
+    std::vector<char> cp_x_host;
+    if (ok) {
+        ok =
+            moe_grouped_cuda_success(cudaStreamSynchronize(stream)) &&
+            moe_grouped_cuda_success(cudaMemcpy(&cp_host_plan, cp_plan,
+                sizeof(cp_host_plan), cudaMemcpyDeviceToHost)) &&
+            cp_host_plan.status == MOE_GROUPED_PLAN_READY &&
+            cp_host_plan.n_routes > 0 && cp_host_plan.n_routes <= cp_cap &&
+            cp_host_plan.n_unique > 0 && cp_host_plan.n_unique <= cp_host_plan.n_routes &&
+            cp_host_plan.n_misses <= cp_host_plan.n_unique &&
+            cp_host_plan.n_routes % (uint32_t) cp_tokens == 0 &&
+            (uint64_t) down_node->ne[1] == cp_host_plan.n_routes &&
+            down_node->ne[0] == cp_d;
+    }
+    const uint32_t cp_n = ok ? cp_host_plan.n_routes : 0;
+    const uint32_t cp_k = ok && cp_tokens > 0 ? cp_n / (uint32_t) cp_tokens : 0;
+    if (ok) {
+        cp_route_unique.assign(cp_n, -1);
+        cp_miss_unique.assign(cp_host_plan.n_misses, -1);
+        cp_miss_experts.assign(cp_host_plan.n_misses, -1);
+        cp_unique_experts.assign(cp_host_plan.n_unique, -1);
+        cp_x_host.assign(ggml_nbytes(cp_x), 0);
+        const int32_t * d_ru = moe_grouped_plan_array_ptr(cp_plan, cp_cap, MOE_GROUPED_PLAN_ROUTE_UNIQUE);
+        const int32_t * d_mu = moe_grouped_plan_array_ptr(cp_plan, cp_cap, MOE_GROUPED_PLAN_MISS_UNIQUE);
+        const int32_t * d_me = moe_grouped_plan_array_ptr(cp_plan, cp_cap, MOE_GROUPED_PLAN_MISS_EXPERTS);
+        const int32_t * d_ue = moe_grouped_plan_array_ptr(cp_plan, cp_cap, MOE_GROUPED_PLAN_UNIQUE_EXPERTS);
+        ok =
+            moe_grouped_cuda_success(cudaMemcpy(cp_route_unique.data(), d_ru,
+                (size_t) cp_n * sizeof(int32_t), cudaMemcpyDeviceToHost)) &&
+            moe_grouped_cuda_success(cudaMemcpy(cp_unique_experts.data(), d_ue,
+                (size_t) cp_host_plan.n_unique * sizeof(int32_t), cudaMemcpyDeviceToHost)) &&
+            moe_grouped_cuda_success(cudaMemcpy(cp_x_host.data(), cp_x->data,
+                cp_x_host.size(), cudaMemcpyDeviceToHost));
+        if (ok && !cp_miss_unique.empty()) {
+            ok =
+                moe_grouped_cuda_success(cudaMemcpy(cp_miss_unique.data(), d_mu,
+                    (size_t) cp_host_plan.n_misses * sizeof(int32_t), cudaMemcpyDeviceToHost)) &&
+                moe_grouped_cuda_success(cudaMemcpy(cp_miss_experts.data(), d_me,
+                    (size_t) cp_host_plan.n_misses * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        }
+    }
+    std::vector<char> cp_seen;
+    if (ok) {
+        // Same miss-chain validation as the Phase C record hook: distinct
+        // uniques, valid expert ids, miss path consistent with UNIQUE_EXPERTS.
+        cp_seen.assign(cp_host_plan.n_unique, 0);
+        for (uint32_t miss = 0; ok && miss < cp_host_plan.n_misses; ++miss) {
+            const int32_t unique = cp_miss_unique[miss];
+            const int32_t expert = cp_miss_experts[miss];
+            ok = unique >= 0 && (uint32_t) unique < cp_host_plan.n_unique &&
+                expert >= 0 && (int64_t) expert < cp_gate.ne2 &&
+                cp_unique_experts[(uint32_t) unique] == expert && cp_seen[(uint32_t) unique] == 0;
+            if (ok) {
+                cp_seen[(uint32_t) unique] = 1;
+            }
+        }
+        ok = ok && cp_din < UINT32_MAX && cp_dh < UINT32_MAX && cp_d < UINT32_MAX &&
+            cp_tokens < UINT32_MAX && cp_k > 0;
+    }
+    if (!ok) {
+        *skip = true;
+        return 0;
+    }
+    const size_t cp_xelsize = ggml_type_size(cp_x->type);
+    // Quantized strides are in bytes and cover the full expert slab; the
+    // tensor payload is the leading nbytes. Guard against short strides.
+    ok = cp_gate.stride >= (uint64_t) ggml_row_size(cp_gate.type, cp_din * cp_dh) &&
+        cp_up.stride >= (uint64_t) ggml_row_size(cp_up.type, cp_din * cp_dh) &&
+        cp_down.stride >= (uint64_t) ggml_row_size(cp_down.type, cp_dh * cp_d);
+    if (!ok) {
+        *skip = true;
+        return 0;
+    }
+    std::lock_guard<std::mutex> cpu_lock(moe_cpu_replace_mutex);
+    if (moe_cpu_replace_backend == nullptr) {
+        moe_cpu_replace_backend = ggml_backend_cpu_init();
+        if (moe_cpu_replace_backend != nullptr) {
+            ggml_backend_cpu_set_n_threads(moe_cpu_replace_backend, 8);
+        }
+    }
+    if (moe_cpu_replace_backend == nullptr) {
+        *skip = true;
+        return 0;
+    }
+    // Per miss expert: D2H the three slices, CPU recompute, H2D into every
+    // route row with that miss unique. Routes are token-major: tok = r / k.
+    std::vector<char> cp_gslice(cp_gate.stride, 0);
+    std::vector<char> cp_uslice(cp_up.stride, 0);
+    std::vector<char> cp_dslice(cp_down.stride, 0);
+    std::vector<float> cp_out((size_t) cp_d, 0.0f);
+    const size_t cp_xnbytes = (size_t) cp_din * cp_xelsize;
+    uint64_t replaced = 0;
+    static std::atomic<int> cp_logged{0};
+    for (uint32_t miss = 0; ok && miss < cp_host_plan.n_misses; ++miss) {
+        const int32_t expert = cp_miss_experts[miss];
+        const int32_t unique = cp_miss_unique[miss];
+        const char * gptr = (const char *) cp_gate.base + (uint64_t) expert * cp_gate.stride;
+        const char * uptr = (const char *) cp_up.base + (uint64_t) expert * cp_up.stride;
+        const char * dptr = (const char *) cp_down.base + (uint64_t) expert * cp_down.stride;
+        ok =
+            moe_grouped_cuda_success(cudaMemcpy(cp_gslice.data(), gptr,
+                cp_gslice.size(), cudaMemcpyDeviceToHost)) &&
+            moe_grouped_cuda_success(cudaMemcpy(cp_uslice.data(), uptr,
+                cp_uslice.size(), cudaMemcpyDeviceToHost)) &&
+            moe_grouped_cuda_success(cudaMemcpy(cp_dslice.data(), dptr,
+                cp_dslice.size(), cudaMemcpyDeviceToHost));
+        if (!ok) {
+            break;
+        }
+        for (uint32_t r = 0; ok && r < cp_n; ++r) {
+            if (cp_route_unique[r] != unique) {
+                continue;
+            }
+            const uint32_t tok = r / cp_k;
+            if (tok >= (uint32_t) cp_tokens) {
+                ok = false;
+                break;
+            }
+            const void * xcol = cp_x_host.data() + (size_t) tok * (size_t) cp_din * cp_xelsize;
+            if (!moe_cpu_replace_expert(moe_cpu_replace_backend,
+                    cp_gate.type, cp_up.type, cp_down.type, cp_x->type,
+                    cp_din, cp_dh, cp_d,
+                    cp_gslice.data(), cp_gslice.size(),
+                    cp_uslice.data(), cp_uslice.size(),
+                    cp_dslice.data(), cp_dslice.size(),
+                    xcol, cp_xnbytes, cp_out.data())) {
+                ok = false;
+                break;
+            }
+            char * dst_row = (char *) down_node->data + (size_t) r * down_node->nb[1];
+            if (!moe_grouped_cuda_success(cudaMemcpy(dst_row, cp_out.data(),
+                    (size_t) cp_d * sizeof(float), cudaMemcpyHostToDevice))) {
+                ok = false;
+                break;
+            }
+            ++replaced;
+        }
+    }
+    if (!ok) {
+        *skip = true;
+        return replaced;
+    }
+    if (cp_logged.exchange(1) == 0) {
+        GGML_LOG("moe-split-cpu: replace gi=%u routes=%u nunique=%u nmiss=%u topk=%u "
+            "din=%lld dhid=%lld dout=%lld ntok=%lld xt=%d gt=%d ut=%d dt=%d\n",
+            (unsigned) cp_gi, cp_n, cp_host_plan.n_unique, cp_host_plan.n_misses, cp_k,
+            (long long) cp_din, (long long) cp_dh, (long long) cp_d, (long long) cp_tokens,
+            (int) cp_x->type, (int) cp_gate.type, (int) cp_up.type, (int) cp_down.type);
+    }
+    return replaced;
+}
+
 bool ggml_cuda_moe_grouped_context::finish_graph_group(
         ggml_cuda_moe_graph_group_dispatch * group,
         const ggml_cuda_moe_graph_binding & binding,
@@ -12201,6 +12539,24 @@ bool ggml_cuda_moe_grouped_context::finish_graph_group(
     }
     if (group->defer_completion) {
         return true;
+    }
+    // Phase D move (Approach A). DIRECT eager path only: capture returns
+    // above via defer_completion, replay never reaches per-node finish, and
+    // the env gate is a single bool when off. Overwrites DOWN rows of
+    // cache-miss routes with CPU recompute; failures fall back to GPU values.
+    if (impl_->device_split_cpu) {
+        bool cp_skip = false;
+        const uint64_t cp_replaced = impl_->cpu_replace_miss_rows(group, node, stream, &cp_skip);
+        auto * cp_stats = impl_->debug_stats();
+        if (cp_stats != nullptr) {
+            if (cp_replaced > 0) {
+                cp_stats->cpu_replace_dispatches.fetch_add(1, std::memory_order_relaxed);
+                cp_stats->cpu_replace_rows.fetch_add(cp_replaced, std::memory_order_relaxed);
+            }
+            if (cp_skip) {
+                cp_stats->cpu_replace_skip.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
     ggml_cuda_moe_grouped_decode_acquisition decode;
     decode.transaction = group->transaction;
@@ -12291,6 +12647,310 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
         auto & group = execution->groups_[record_index];
         const bool grouped = group.authority.authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED;
         const bool host_staged = group.authority.authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED_HOST_STAGED;
+        // Step-1 split probe. This runs after graph capture ends and the plan
+        // kernel executed (inline, or via graph launch), so stream sync and
+        // D2H readback are legal here. Read-only sampling, never alters outcome.
+        if (grouped && impl_->device_split_probe && group.transaction.transaction_token != 0 &&
+                group.stream != nullptr && group.key.ids.ne[0] > 0 && group.key.ids.ne[1] > 0) {
+            auto * split_stats = impl_->debug_stats();
+            moe_grouped_decode_plan * split_plan = nullptr;
+            uint32_t split_cap = 0;
+            if (split_stats != nullptr) {
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                auto * resource = impl_->find_resource(group.transaction);
+                if (resource != nullptr && resource->device != nullptr) {
+                    split_plan = resource->device->plan;
+                    split_cap = resource->snapshot.n_slots;
+                }
+            }
+            const uint64_t ids_routes =
+                (uint64_t) group.key.ids.ne[0] * (uint64_t) group.key.ids.ne[1];
+            bool probe_ok = split_stats != nullptr && split_plan != nullptr &&
+                ids_routes > 0 && ids_routes <= UINT32_MAX && split_cap >= ids_routes;
+            moe_grouped_decode_plan host_plan{};
+            const uint32_t n_routes = probe_ok ? (uint32_t) ids_routes : 0;
+            if (probe_ok) {
+                probe_ok =
+                    moe_grouped_cuda_success(cudaStreamSynchronize(group.stream)) &&
+                    moe_grouped_cuda_success(cudaMemcpy(&host_plan, split_plan,
+                        sizeof(host_plan), cudaMemcpyDeviceToHost)) &&
+                    host_plan.status == MOE_GROUPED_PLAN_READY && host_plan.n_routes == n_routes &&
+                    host_plan.n_unique > 0 && host_plan.n_unique <= host_plan.n_routes &&
+                    host_plan.n_misses <= host_plan.n_unique;
+            }
+            std::vector<int32_t> route_unique;
+            std::vector<int32_t> miss_unique;
+            if (probe_ok) {
+                route_unique.assign(n_routes, -1);
+                miss_unique.assign(host_plan.n_misses, -1);
+                const int32_t * d_route_unique =
+                    moe_grouped_plan_array_ptr(split_plan, split_cap, MOE_GROUPED_PLAN_ROUTE_UNIQUE);
+                const int32_t * d_miss_unique =
+                    moe_grouped_plan_array_ptr(split_plan, split_cap, MOE_GROUPED_PLAN_MISS_UNIQUE);
+                if (!moe_grouped_cuda_success(cudaMemcpy(route_unique.data(), d_route_unique,
+                        (size_t) n_routes * sizeof(int32_t), cudaMemcpyDeviceToHost))) {
+                    probe_ok = false;
+                } else if (!miss_unique.empty() && !moe_grouped_cuda_success(cudaMemcpy(
+                        miss_unique.data(), d_miss_unique,
+                        (size_t) host_plan.n_misses * sizeof(int32_t), cudaMemcpyDeviceToHost))) {
+                    probe_ok = false;
+                }
+            }
+            uint64_t miss_routes = 0;
+            if (probe_ok) {
+                // Never index host memory by unchecked device data.
+                std::vector<char> unique_is_miss(host_plan.n_unique, 0);
+                for (uint32_t miss = 0; probe_ok && miss < host_plan.n_misses; ++miss) {
+                    const int32_t unique = miss_unique[miss];
+                    probe_ok = unique >= 0 && (uint32_t) unique < host_plan.n_unique;
+                    if (probe_ok) {
+                        unique_is_miss[unique] = 1;
+                    }
+                }
+                for (uint32_t route = 0; probe_ok && route < n_routes; ++route) {
+                    const int32_t unique = route_unique[route];
+                    probe_ok = unique >= 0 && (uint32_t) unique < host_plan.n_unique;
+                    if (probe_ok) {
+                        miss_routes += unique_is_miss[unique] != 0 ? 1 : 0;
+                    }
+                }
+            }
+            if (probe_ok) {
+                split_stats->split_probe_dispatches.fetch_add(1, std::memory_order_relaxed);
+                split_stats->split_probe_routes.fetch_add(n_routes, std::memory_order_relaxed);
+                split_stats->split_probe_unique.fetch_add(host_plan.n_unique, std::memory_order_relaxed);
+                split_stats->split_probe_misses.fetch_add(host_plan.n_misses, std::memory_order_relaxed);
+                split_stats->split_probe_miss_routes.fetch_add(miss_routes, std::memory_order_relaxed);
+            }
+        }
+        // Phase C record (Option E). Read-only: sync + D2H of live dispatch
+        // inputs (x + plan ids) + host-side weight slices, dumped to /tmp for
+        // offline CPU-vs-GPU validation. Intermediates (gdst/h/dst) are NOT
+        // read: ggml-alloc reuses dead buffers before finish runs, so their
+        // content is not the live dispatch values (proven by slotbytes +
+        // hdowncheck triage). Never alters outcome; failures bump shadow_skip.
+        if (grouped && !host_staged && impl_->device_split_shadow &&
+                group.strategy == GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT &&
+                execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED &&
+                group.transaction.transaction_token != 0 && group.stream != nullptr &&
+                group.first_reader != nullptr && group.last_reader != nullptr) {
+            auto * sh_stats = impl_->debug_stats();
+            const ggml_tensor * gate_node = group.first_reader;
+            const ggml_tensor * down_node = group.last_reader;
+            struct moe_shadow_rec_bank {
+                ggml_type type = GGML_TYPE_COUNT;
+                const void * base = nullptr;
+                uint64_t stride = 0;
+                int64_t ne0 = 0;
+                int64_t ne1 = 0;
+                int64_t ne2 = 0;
+            };
+            const ggml_tensor * sh_x = gate_node->op == GGML_OP_MUL_MAT_ID ? gate_node->src[1] : nullptr;
+            bool sh_ok = sh_stats != nullptr && gate_node->op == GGML_OP_MUL_MAT_ID &&
+                down_node->op == GGML_OP_MUL_MAT_ID && sh_x != nullptr &&
+                gate_node->src[0] != nullptr &&
+                strstr(gate_node->src[0]->name, "ffn_gate_exps") != nullptr &&
+                down_node->src[0] != nullptr &&
+                strstr(down_node->src[0]->name, "ffn_down_exps") != nullptr &&
+                (sh_x->type == GGML_TYPE_F32 || sh_x->type == GGML_TYPE_F16) &&
+                ggml_is_contiguous(sh_x) && sh_x->ne[0] > 0 && sh_x->ne[1] > 0 &&
+                sh_x->nb[0] == ggml_type_size(sh_x->type) &&
+                sh_x->nb[1] == (size_t) sh_x->ne[0] * ggml_type_size(sh_x->type);
+            moe_grouped_decode_plan * sh_plan = nullptr;
+            uint32_t sh_cap = 0;
+            uint32_t sh_gi = UINT32_MAX;
+            moe_shadow_rec_bank sh_gate, sh_up, sh_down;
+            if (sh_ok) {
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                auto * resource = impl_->find_resource(group.transaction);
+                if (resource != nullptr && resource->device != nullptr) {
+                    sh_plan = resource->device->plan;
+                    sh_cap = resource->snapshot.n_slots;
+                }
+                sh_gi = group.key.candidate.group_index;
+                if (sh_gi < impl_->table.groups.size()) {
+                    for (const auto & bank : impl_->table.groups[sh_gi].banks) {
+                        moe_shadow_rec_bank info;
+                        info.type = (ggml_type) bank.info.type;
+                        info.base = bank.info.source_data;
+                        info.stride = bank.info.expert_stride;
+                        info.ne0 = bank.ne[0];
+                        info.ne1 = bank.ne[1];
+                        info.ne2 = ggml_n_dims(bank.info.tensor) > 2 ? bank.info.tensor->ne[2] : 0;
+                        if (bank.info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT) {
+                            sh_gate = info;
+                        } else if (bank.info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) {
+                            sh_up = info;
+                        } else if (bank.info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) {
+                            sh_down = info;
+                        }
+                    }
+                }
+                sh_ok = sh_plan != nullptr && sh_gate.base != nullptr && sh_up.base != nullptr &&
+                    sh_down.base != nullptr && sh_gate.stride > 0 && sh_up.stride > 0 && sh_down.stride > 0 &&
+                    sh_gate.ne0 == sh_x->ne[0] && sh_up.ne0 == sh_x->ne[0] &&
+                    sh_up.ne1 == sh_gate.ne1 && sh_down.ne0 == sh_gate.ne1;
+            }
+            const int64_t sh_tokens = sh_ok ? sh_x->ne[1] : 0;
+            const int64_t sh_din = sh_ok ? sh_x->ne[0] : 0;
+            const int64_t sh_dh = sh_ok ? sh_gate.ne1 : 0;
+            const int64_t sh_d = sh_ok ? sh_down.ne1 : 0;
+            sh_ok = sh_ok && sh_tokens > 0 && sh_din > 0 && sh_dh > 0 && sh_d > 0 &&
+                sh_gate.ne2 > 0 && sh_gate.ne2 == sh_up.ne2 && sh_gate.ne2 == sh_down.ne2;
+            moe_grouped_decode_plan sh_host_plan{};
+            std::vector<int32_t> sh_route_unique, sh_miss_unique, sh_miss_experts, sh_unique_experts;
+            std::vector<char> sh_x_host;
+            if (sh_ok) {
+                sh_ok =
+                    moe_grouped_cuda_success(cudaStreamSynchronize(group.stream)) &&
+                    moe_grouped_cuda_success(cudaMemcpy(&sh_host_plan, sh_plan,
+                        sizeof(sh_host_plan), cudaMemcpyDeviceToHost)) &&
+                    sh_host_plan.status == MOE_GROUPED_PLAN_READY &&
+                    sh_host_plan.n_routes > 0 && sh_host_plan.n_routes <= sh_cap &&
+                    sh_host_plan.n_unique > 0 && sh_host_plan.n_unique <= sh_host_plan.n_routes &&
+                    sh_host_plan.n_misses <= sh_host_plan.n_unique &&
+                    sh_host_plan.n_routes % (uint32_t) sh_tokens == 0;
+            }
+            const uint32_t sh_n = sh_ok ? sh_host_plan.n_routes : 0;
+            const uint32_t sh_k = sh_ok && sh_tokens > 0 ? sh_n / (uint32_t) sh_tokens : 0;
+            if (sh_ok) {
+                sh_route_unique.assign(sh_n, -1);
+                sh_miss_unique.assign(sh_host_plan.n_misses, -1);
+                sh_miss_experts.assign(sh_host_plan.n_misses, -1);
+                sh_unique_experts.assign(sh_host_plan.n_unique, -1);
+                sh_x_host.assign(ggml_nbytes(sh_x), 0);
+                const int32_t * d_ru = moe_grouped_plan_array_ptr(sh_plan, sh_cap, MOE_GROUPED_PLAN_ROUTE_UNIQUE);
+                const int32_t * d_mu = moe_grouped_plan_array_ptr(sh_plan, sh_cap, MOE_GROUPED_PLAN_MISS_UNIQUE);
+                const int32_t * d_me = moe_grouped_plan_array_ptr(sh_plan, sh_cap, MOE_GROUPED_PLAN_MISS_EXPERTS);
+                const int32_t * d_ue = moe_grouped_plan_array_ptr(sh_plan, sh_cap, MOE_GROUPED_PLAN_UNIQUE_EXPERTS);
+                sh_ok =
+                    moe_grouped_cuda_success(cudaMemcpy(sh_route_unique.data(), d_ru,
+                        (size_t) sh_n * sizeof(int32_t), cudaMemcpyDeviceToHost)) &&
+                    moe_grouped_cuda_success(cudaMemcpy(sh_unique_experts.data(), d_ue,
+                        (size_t) sh_host_plan.n_unique * sizeof(int32_t), cudaMemcpyDeviceToHost)) &&
+                    moe_grouped_cuda_success(cudaMemcpy(sh_x_host.data(), sh_x->data,
+                        sh_x_host.size(), cudaMemcpyDeviceToHost));
+                if (sh_ok && !sh_miss_unique.empty()) {
+                    sh_ok =
+                        moe_grouped_cuda_success(cudaMemcpy(sh_miss_unique.data(), d_mu,
+                            (size_t) sh_host_plan.n_misses * sizeof(int32_t), cudaMemcpyDeviceToHost)) &&
+                        moe_grouped_cuda_success(cudaMemcpy(sh_miss_experts.data(), d_me,
+                            (size_t) sh_host_plan.n_misses * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                }
+            }
+            if (sh_ok) {
+                // Validate miss arrays: distinct uniques, valid expert ids, and
+                // miss path consistent with UNIQUE_EXPERTS (proven in triage).
+                std::vector<char> sh_seen(sh_host_plan.n_unique, 0);
+                for (uint32_t miss = 0; sh_ok && miss < sh_host_plan.n_misses; ++miss) {
+                    const int32_t unique = sh_miss_unique[miss];
+                    const int32_t expert = sh_miss_experts[miss];
+                    sh_ok = unique >= 0 && (uint32_t) unique < sh_host_plan.n_unique &&
+                        expert >= 0 && (int64_t) expert < sh_gate.ne2 &&
+                        sh_unique_experts[(uint32_t) unique] == expert && sh_seen[(uint32_t) unique] == 0;
+                    if (sh_ok) {
+                        sh_seen[(uint32_t) unique] = 1;
+                    }
+                }
+                sh_ok = sh_ok && sh_din < UINT32_MAX && sh_dh < UINT32_MAX && sh_d < UINT32_MAX &&
+                    sh_tokens < UINT32_MAX;
+            }
+                // No per-route CPU work here: dump the record, validate offline.
+                static std::atomic<uint64_t> sh_rec_count{0};
+                static std::atomic<int> sh_rec_logged{0};
+                static const uint64_t sh_rec_cap = 4;
+                const uint64_t sh_seq = sh_rec_count.fetch_add(1, std::memory_order_relaxed);
+                if (sh_ok && sh_seq < sh_rec_cap) {
+                    char sh_path[160];
+                    snprintf(sh_path, sizeof(sh_path), "/tmp/shadow-rec/rec-g%u-s%llu.bin",
+                        (unsigned) sh_gi, (unsigned long long) sh_seq);
+                    FILE * sh_f = fopen(sh_path, "wb");
+                    sh_ok = sh_f != nullptr;
+                    const uint32_t sh_n32 = sh_n;
+                    const uint32_t sh_nu32 = sh_host_plan.n_unique;
+                    const uint32_t sh_nm32 = sh_host_plan.n_misses;
+                    const uint32_t sh_din32 = (uint32_t) sh_din;
+                    const uint32_t sh_dh32 = (uint32_t) sh_dh;
+                    const uint32_t sh_d32 = (uint32_t) sh_d;
+                    const uint32_t sh_ntok32 = (uint32_t) sh_tokens;
+                    const uint32_t sh_xt32 = (uint32_t) sh_x->type;
+                    const uint32_t sh_gt32 = (uint32_t) sh_gate.type;
+                    const uint32_t sh_ut32 = (uint32_t) sh_up.type;
+                    const uint32_t sh_dt32 = (uint32_t) sh_down.type;
+                    const uint64_t sh_xbytes = sh_x_host.size();
+                    if (sh_ok) {
+                        sh_ok =
+                            fwrite("SHDWREC1", 1, 8, sh_f) == 8 &&
+                            fwrite(&sh_gi, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_seq, 8, 1, sh_f) == 1 &&
+                            fwrite(&sh_n32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_nu32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_nm32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_k, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_din32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_dh32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_d32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_ntok32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_xt32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_gt32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_ut32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_dt32, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_gate.stride, 8, 1, sh_f) == 1 &&
+                            fwrite(&sh_up.stride, 8, 1, sh_f) == 1 &&
+                            fwrite(&sh_down.stride, 8, 1, sh_f) == 1 &&
+                            fwrite(&sh_xbytes, 8, 1, sh_f) == 1;
+                    }
+                    if (sh_ok) {
+                        sh_ok =
+                            (sh_n32 == 0 ||
+                                fwrite(sh_route_unique.data(), 4, sh_n32, sh_f) == sh_n32) &&
+                            (sh_nu32 == 0 ||
+                                fwrite(sh_unique_experts.data(), 4, sh_nu32, sh_f) == sh_nu32) &&
+                            (sh_nm32 == 0 ||
+                                fwrite(sh_miss_unique.data(), 4, sh_nm32, sh_f) == sh_nm32) &&
+                            (sh_nm32 == 0 ||
+                                fwrite(sh_miss_experts.data(), 4, sh_nm32, sh_f) == sh_nm32) &&
+                            (sh_xbytes == 0 ||
+                                fwrite(sh_x_host.data(), 1, (size_t) sh_xbytes, sh_f) == (size_t) sh_xbytes);
+                    }
+                    for (uint32_t miss = 0; sh_ok && miss < sh_nm32; ++miss) {
+                        const int32_t expert = sh_miss_experts[miss];
+                        const char * gptr = (const char *) sh_gate.base + (uint64_t) expert * sh_gate.stride;
+                        const char * uptr = (const char *) sh_up.base + (uint64_t) expert * sh_up.stride;
+                        const char * dptr = (const char *) sh_down.base + (uint64_t) expert * sh_down.stride;
+                        sh_ok =
+                            fwrite(&expert, 4, 1, sh_f) == 1 &&
+                            fwrite(&sh_gate.stride, 8, 1, sh_f) == 1 &&
+                            fwrite(gptr, 1, (size_t) sh_gate.stride, sh_f) == (size_t) sh_gate.stride &&
+                            fwrite(&sh_up.stride, 8, 1, sh_f) == 1 &&
+                            fwrite(uptr, 1, (size_t) sh_up.stride, sh_f) == (size_t) sh_up.stride &&
+                            fwrite(&sh_down.stride, 8, 1, sh_f) == 1 &&
+                            fwrite(dptr, 1, (size_t) sh_down.stride, sh_f) == (size_t) sh_down.stride;
+                    }
+                    if (sh_f != nullptr) {
+                        sh_ok = fclose(sh_f) == 0 && sh_ok;
+                    }
+                    if (sh_ok) {
+                        sh_stats->shadow_dispatches.fetch_add(1, std::memory_order_relaxed);
+                        sh_stats->shadow_rows.fetch_add(sh_nm32, std::memory_order_relaxed);
+                        if (sh_rec_logged.exchange(1) == 0) {
+                            GGML_LOG("moe-split-shadow: record gi=%u seq=%llu path=%s routes=%u nunique=%u "
+                                "nmiss=%u topk=%u din=%u dhid=%u dout=%u ntok=%u xt=%d gt=%d/%llu ut=%d/%llu "
+                                "dt=%d/%llu xbytes=%llu xptr=%p\n",
+                                (unsigned) sh_gi, (unsigned long long) sh_seq, sh_path,
+                                sh_n32, sh_nu32, sh_nm32, sh_k,
+                                sh_din32, sh_dh32, sh_d32, sh_ntok32, (int) sh_xt32,
+                                (int) sh_gt32, (unsigned long long) sh_gate.stride,
+                                (int) sh_ut32, (unsigned long long) sh_up.stride,
+                                (int) sh_dt32, (unsigned long long) sh_down.stride,
+                                (unsigned long long) sh_xbytes, sh_x->data);
+                        }
+                    }
+                }
+            if (!sh_ok) {
+                sh_stats->shadow_skip.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (grouped && ((group.state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE && group.defer_completion) ||
                 group.state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_REPLAY)) {
             ggml_cuda_moe_grouped_decode_acquisition decode;
@@ -14308,6 +14968,17 @@ static void moe_grouped_add_telemetry(
     dst.host_staged_calls += src.host_staged_calls;
     dst.host_staged_ops += src.host_staged_ops;
     dst.host_staged_split_ops += src.host_staged_split_ops;
+    dst.split_probe_dispatches += src.split_probe_dispatches;
+    dst.split_probe_routes += src.split_probe_routes;
+    dst.split_probe_unique += src.split_probe_unique;
+    dst.split_probe_misses += src.split_probe_misses;
+    dst.split_probe_miss_routes += src.split_probe_miss_routes;
+    dst.shadow_dispatches += src.shadow_dispatches;
+    dst.shadow_rows += src.shadow_rows;
+    dst.shadow_skip += src.shadow_skip;
+    dst.cpu_replace_dispatches += src.cpu_replace_dispatches;
+    dst.cpu_replace_rows += src.cpu_replace_rows;
+    dst.cpu_replace_skip += src.cpu_replace_skip;
     dst.strategy_switches += src.strategy_switches;
     dst.required_unsupported += src.required_unsupported;
     dst.prepare_error += src.prepare_error;
@@ -14672,7 +15343,7 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
 
     if (moe_cache_mm_debug_enabled()) {
         GGML_LOG(
-            "moe-grouped-decode: registered=%llu covered=%llu plan_calls=%llu plan_compiles=%llu plan_reuses=%llu calls=%llu ready=%llu ready_min=%llu ready_max=%llu completed=%llu completed_min=%llu completed_max=%llu admitted_banks=%llu fallback=%llu rollback=%llu host_calls=%llu host_ops=%llu host_split_ops=%llu strategy_switches=%llu required_unsupported=%llu prepare_error=%llu finish_error=%llu h2d_banks=%llu h2d_bytes=%llu\n",
+            "moe-grouped-decode: registered=%llu covered=%llu plan_calls=%llu plan_compiles=%llu plan_reuses=%llu calls=%llu ready=%llu ready_min=%llu ready_max=%llu completed=%llu completed_min=%llu completed_max=%llu admitted_banks=%llu fallback=%llu rollback=%llu host_calls=%llu host_ops=%llu host_split_ops=%llu split_dispatches=%llu split_routes=%llu split_unique=%llu split_misses=%llu split_miss_routes=%llu shadow_dispatches=%llu shadow_rows=%llu shadow_skip=%llu cpu_replace_dispatches=%llu cpu_replace_rows=%llu cpu_replace_skip=%llu strategy_switches=%llu required_unsupported=%llu prepare_error=%llu finish_error=%llu h2d_banks=%llu h2d_bytes=%llu\n",
             (unsigned long long) grouped.registered,
             (unsigned long long) grouped.covered,
             (unsigned long long) grouped.plan_calls,
@@ -14691,6 +15362,17 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
             (unsigned long long) grouped.host_staged_calls,
             (unsigned long long) grouped.host_staged_ops,
             (unsigned long long) grouped.host_staged_split_ops,
+            (unsigned long long) grouped.split_probe_dispatches,
+            (unsigned long long) grouped.split_probe_routes,
+            (unsigned long long) grouped.split_probe_unique,
+            (unsigned long long) grouped.split_probe_misses,
+            (unsigned long long) grouped.split_probe_miss_routes,
+            (unsigned long long) grouped.shadow_dispatches,
+            (unsigned long long) grouped.shadow_rows,
+            (unsigned long long) grouped.shadow_skip,
+            (unsigned long long) grouped.cpu_replace_dispatches,
+            (unsigned long long) grouped.cpu_replace_rows,
+            (unsigned long long) grouped.cpu_replace_skip,
             (unsigned long long) grouped.strategy_switches,
             (unsigned long long) grouped.required_unsupported,
             (unsigned long long) grouped.prepare_error,

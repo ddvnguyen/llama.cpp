@@ -317,13 +317,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
         // If the user enabled the MoE expert cache (--moe-expert-cache-size > 0)
-        // and CUDA is available, *prepend* a tensor_buft_override that routes
-        // every expert tensor to the CUDA_MoE_Cached buffer type. Prepending
-        // matters because the loader's match loop is first-match-wins -- we
-        // need the cache override to catch expert tensors before any earlier
-        // --cpu-moe / --n-cpu-moe overrides do. The vector owns the storage
-        // for the duration of this function, which outlives the loader's use
-        // of the pointer.
+        // and CUDA is available, *append* a tensor_buft_override that routes
+        // expert tensors to the CUDA_MoE_Cached buffer type. Appending matters
+        // because the loader's match loop is first-match-wins: expert tensors
+        // already claimed by user --cpu-moe / --n-cpu-moe / -ot overrides keep
+        // the user's placement, the cache only claims the rest. With no user
+        // overrides the list is just the cache pattern, same as before.
+        // The vector owns the storage for the duration of this function,
+        // which outlives the loader's use of the pointer.
         std::vector<llama_model_tensor_buft_override> effective_overrides;
         const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
         if (params.moe_expert_cache_slots > 0) {
@@ -349,8 +350,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
             static const char * MOE_EXPS_PATTERN =
                 "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
-            effective_overrides.push_back({MOE_EXPS_PATTERN, buffer_type_fn()});
-
             bool had_user_overrides = false;
             if (params.tensor_buft_overrides) {
                 for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
@@ -358,9 +357,12 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     had_user_overrides = true;
                 }
             }
+            effective_overrides.push_back({MOE_EXPS_PATTERN, buffer_type_fn()});
+
             if (had_user_overrides) {
-                LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
-                               "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
+                LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors claimed by "
+                               "--cpu-moe / --n-cpu-moe / -ot keep user placement, the rest use "
+                               "the GPU LRU cache.\n");
             }
             effective_overrides.push_back({nullptr, nullptr});
             effective_overrides_ptr = effective_overrides.data();
