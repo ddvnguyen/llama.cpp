@@ -1,6 +1,6 @@
 # MoE look-ahead preload - evidence, mechanism, levers, plan
 
-Revision 24 (7.32: an MTP block for this arch is a full layer plus a head - ~992 MiB of weights, but only ~78 MiB of that has to be VRAM under --n-cpu-moe, plus ~226 MiB of its own MoE cache at N=42, ~310-330 MiB total against 1.55/2.2 GiB of headroom, so either operating point covers it; the fork already ships the whole qwen4exp MTP path including nextn_state -> build_moe_lookahead, and its only existing consumer is the staging lane that 7.30 measured as a net loss, so the work item is retargeting the consumer to victim choice, not connecting the head. The trained block does not exist in this GGUF - 0 of 1224 tensors are nextn/mtp/draft - so the head has to arrive as a draft-only export. The one term that can bite is traffic: a full MoE block run once per draft step is +17.8% at H=4 unless those experts are cache-resident). Revision 16 (7.21: at N=42 the step is 28.3 ms fixed + 0.2842 ms per miss at 6.6 GB/s, the link idles 31%, and the distribution has NO tail so the mean is the whole story; the look-ahead's transport is 1.91% useful at width 8 vs 95.5% at width 1 - lateness, not wrongness - while the predictor's ~86% recall is a different quantity whose instrument is currently unwired; 7.22 ranks what is left: the x4 slot (+105%), a lossy cached tier (+44%, now measurable), and filling the idle window (+45%, not yet green)). Revision 15 (7.19: the correctness instrument exists and PR #127 Blocker 1 / issue #128 PASSES it - greedy token identity 648/648 chars and PPL 14.7350 identical over 15 chunks; 7.20: NEW DEFECT, at N=53 the look-ahead aborts the server on an unchecked 2.1484 MiB lane cudaMalloc, 48 lanes = 103.13 MiB never evicted, so the feature and the +21.5% capacity win are mutually exclusive). Revision 14 (7.18: instrument audit - the per-step ledger has no gaps and is internally consistent 199/199; the policy knob is proven to take effect, so the sweep tested 2 distinct policies not 4; the cache size is now echoed in the log (ed2b4b6b9); and the reversed-order control falsifies the drift confound - +21.5% and +21.1% by either ordering). Revision 13 (added the CURRENT OPERATING POINT block to section 8: best config is control + N=53, 11.738 t/s, look-ahead OFF, and earlier sections' ~10.2 t/s figures are N=28 or the retired synthetic harness and are not comparable). Revision 12 (7.17: the retention policy is NOT a lever - the default LFU-16 beats half-life 256 and 2048 and beats pure LRU; capacity is VRAM-capped at r~58%. All three code levers are now closed by measurement, leaving only the x4->x16 slot move). Revision 11 (7.16: the capacity lever is real - N=28 -> 53 is +21.5%, 9.661 -> 11.738 t/s, with the
+Revision 25 (7.33: the MTP-lookahead premise is WITHDRAWN. Verification does batch every draft position into one ubatch (server-context.cpp:580/619/1273/4559) and the MoE cache is grouped (moe-cache.cu tracks unique_experts per dispatch), so layer L's router output for T+1..T+H is computed in the SAME dispatch that consumes it - there is no lead time, and the retention horizon the oracle curve assumes is across dispatches, whose demands still need layers 0..L-1 for the future tokens. That is 7.28's impossibility argument restated, not escaped: speculation changes when the token exists, not when its layer-L input exists. The horizon curve is an offline bound in the same sense Belady is; the +8%/+13% acceptance-discounted numbers are withdrawn. One loophole, measurable not arguable: --decode-overlap could split draft positions into separate dispatches, in which case re-check with the moe-step ledger and the demand trace). Revision 24 (7.32: an MTP block for this arch is a full layer plus a head - ~992 MiB of weights, but only ~78 MiB of that has to be VRAM under --n-cpu-moe, plus ~226 MiB of its own MoE cache at N=42, ~310-330 MiB total against 1.55/2.2 GiB of headroom, so either operating point covers it; the fork already ships the whole qwen4exp MTP path including nextn_state -> build_moe_lookahead, and its only existing consumer is the staging lane that 7.30 measured as a net loss, so the work item is retargeting the consumer to victim choice, not connecting the head. The trained block does not exist in this GGUF - 0 of 1224 tensors are nextn/mtp/draft - so the head has to arrive as a draft-only export. The one term that can bite is traffic: a full MoE block run once per draft step is +17.8% at H=4 unless those experts are cache-resident). Revision 16 (7.21: at N=42 the step is 28.3 ms fixed + 0.2842 ms per miss at 6.6 GB/s, the link idles 31%, and the distribution has NO tail so the mean is the whole story; the look-ahead's transport is 1.91% useful at width 8 vs 95.5% at width 1 - lateness, not wrongness - while the predictor's ~86% recall is a different quantity whose instrument is currently unwired; 7.22 ranks what is left: the x4 slot (+105%), a lossy cached tier (+44%, now measurable), and filling the idle window (+45%, not yet green)). Revision 15 (7.19: the correctness instrument exists and PR #127 Blocker 1 / issue #128 PASSES it - greedy token identity 648/648 chars and PPL 14.7350 identical over 15 chunks; 7.20: NEW DEFECT, at N=53 the look-ahead aborts the server on an unchecked 2.1484 MiB lane cudaMalloc, 48 lanes = 103.13 MiB never evicted, so the feature and the +21.5% capacity win are mutually exclusive). Revision 14 (7.18: instrument audit - the per-step ledger has no gaps and is internally consistent 199/199; the policy knob is proven to take effect, so the sweep tested 2 distinct policies not 4; the cache size is now echoed in the log (ed2b4b6b9); and the reversed-order control falsifies the drift confound - +21.5% and +21.1% by either ordering). Revision 13 (added the CURRENT OPERATING POINT block to section 8: best config is control + N=53, 11.738 t/s, look-ahead OFF, and earlier sections' ~10.2 t/s figures are N=28 or the retired synthetic harness and are not comparable). Revision 12 (7.17: the retention policy is NOT a lever - the default LFU-16 beats half-life 256 and 2048 and beats pure LRU; capacity is VRAM-capped at r~58%. All three code levers are now closed by measurement, leaving only the x4->x16 slot move). Revision 11 (7.16: the capacity lever is real - N=28 -> 53 is +21.5%, 9.661 -> 11.738 t/s, with the
 T = 25.7 + 0.3003*misses model validating out-of-sample to 1.2%; it saturates near r=59% at the
 VRAM cap, which makes retention POLICY the binding lever). Revision 10 (7.14: per-token miss ledger - decode is bandwidth-bound on expert misses,
 T = 25.7 ms + 0.3003 ms/miss with r2 = 0.990, ceiling 38.9 t/s at a fully-resident cache vs 9.60
@@ -1791,3 +1791,73 @@ That was a misreading of `perftok-*.tsv`: those rows are sub-token deltas, not o
 per-token regression on them is meaningless and the sign carries no information. It should not have
 been reported as a result. Retracted here rather than deleted, so the wrong version is not rediscovered
 later.
+
+## 7.33 Rev 25 - the MTP-lookahead premise does NOT hold: the horizon is same-dispatch, not ahead of it
+
+7.31 argued that MTP reopens the retention axis, because "draft hidden states give, for each layer, its
+demand at T+1..T+H before the real tokens exist", and mapped the offline horizon curve onto draft
+length H (H=4 ~+8%, H=8 ~+13%). Checked against the driver this cycle. **The premise fails, and the
+mapping should be withdrawn.** The mechanism is specific, so it is worth writing down rather than just
+retracting the number.
+
+### What is true
+
+Verification **is** one batched forward over every draft position, and the MoE dispatch inside it is
+**grouped**. So at layer L the router output for positions T+1..T+H does exist:
+
+- `tools/server/server-context.cpp:580` - "add sampled token of this slot to the batch, **optionally
+  add the speculative draft tokens if any**"; `:619` asserts the batch holds the sampled and the draft
+  tokens together.
+- `:1273-1275` - `n_max + 1 > llama_n_ubatch(ctx_tgt)` is rejected, i.e. **the whole draft is forced
+  into a single ubatch**.
+- `:4559` - `spec_i_batch.size() == n_draft + 1`, so acceptance samples over all draft positions at
+  once.
+- `ggml/src/ggml-cuda/moe-cache.cu` - the cache is the **grouped** one and tracks `unique_experts` per
+  dispatch, i.e. it fetches the **union over tokens** in one operation.
+
+### Why that is not a look-ahead
+
+The router output for T+1..T+H at layer L is computed **in the same grouped dispatch that consumes
+it**. There is no per-position ordering inside a layer to exploit, and no lead time: the union is
+fetched once, in the same operation that revealed it. The fetch count for a dispatch is `|union|`
+minus whatever is resident; a *retention* policy changes which residents survive **into later
+dispatches**, and those dispatches' demands are exactly what is still unknown.
+
+And they are unknown for the original reason, not a new one. Layer L's demand for a future token
+T+k needs layers 0..L-1's output for T+k. MTP supplies draft **tokens**; it does not supply their
+trunk hidden states at layer L. The only way to get those is to run the trunk on them - which is
+precisely the verification pass, and by construction that is the dispatch whose own needs it
+discovers. 7.28's impossibility argument is therefore **restated, not escaped**:
+
+> a same-layer multi-step predictor cannot exist for a non-speculative decoder because layer L's
+> router at T+1 consumes layer L-1's output at T+1.
+
+Speculation changes *when the token exists*, not *when its layer-L input exists*.
+
+### What this means for the numbers in 7.31
+
+- The horizon curve (H=1 +4.2% ... H=16 +27.6%) is an **offline bound**, in exactly the sense Belady
+  is: it assumes knowledge that no online policy can have, in the pre-MTP and the MTP case alike. It
+  should be quoted as a ceiling only, and the +8%/+13% acceptance-discounted figures withdrawn.
+- The one ahead-of-time signal MTP genuinely creates is for **its own layer**: the MTP head runs
+  before verification, so its own demands are known early. That is one layer, and its only consumer
+  today is the staging lane, measured as a net loss at every width. It is not the lever 7.31 hoped
+  for.
+
+### The one loophole, stated honestly
+
+`--decode-overlap` is in every serve flag set (`server-context.cpp:2014`, "decode overlap: MTP draft
+enabled after target acceptance"). If overlap splits the draft positions into **separate dispatches**
+rather than one ubatch, a per-position ordering would exist again and the argument above would need
+re-checking. That is a measurable question, not a matter of reading: the `moe-step:` ledger counts
+dispatches and the demand trace is per (layer, token), so a spec-decode run would show directly
+whether positions inside one draft group share a step or get their own. **Until that is run, treat
+7.31's H-curve mapping as withdrawn** - the safe reading is that the horizon is not reachable, and
+that is the reading a plan should be built on.
+
+### Not refuted here
+
+MTP as a speculative **decoder** (draft acceptance buys more than one token per trunk dispatch) is a
+different claim and is already recorded as a negative in this document's index; it is not re-opened.
+What is withdrawn is only the hope that the *same* head supplies the cache a useful retention
+horizon.
