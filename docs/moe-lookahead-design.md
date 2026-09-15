@@ -576,10 +576,30 @@ Device state in the same window (`dmon -s ump`, decode): SM 95-99%, DRAM control
 The PCIe link is **gen4 x4** (the card is x16-capable, the slot is wired x4), about
 7.9 GB/s theoretical. Expert H2D traffic over the arm is 337.6 MiB/token
 (90.62 GB in 256 tokens) = 3.71 GB/s = ~47% of that ceiling, and the grouped
-telemetry reports `calls=ready=12240`, `ready_min=255`: every grouped op found its
-staging already complete, so the traffic is prefetched ahead and never gates the
-kernel. The measured limiter on this rig is therefore MoE kernel execution, not PCIe
-and not VRAM bandwidth.
+telemetry reports `calls=12240 ready=12240 ready_min=255 completed=12240`.
+
+Do NOT read those grouped counters as staging residency. `ready` and `completed`
+count **plan admission** (`state = GROUPED_ACTIVE`, moe-cache.cu:12177, 11215, 11939),
+not data in the banks: they say every step's plan was admitted, and nothing about
+whether the slabs were resident. Reading `ready_min=255` as "staging already complete,
+so the traffic never gates the kernel" is the error that produced the earlier "the
+limiter is MoE kernel execution, not PCIe" verdict, and that verdict is withdrawn.
+
+The existing counters cannot settle it, because the grouped path has no copy-wait
+accounting at all. `copy_wait_event_*` is recorded only by the legacy `moe-cache-phase`
+line, whose decode row covers **9 of the 12,240** grouped calls
+(`phase=decode ops=9 ... copy_wait_events=9 copy_wait_event_ms=0.007`), and the
+`copy_wait_event_ms=0.000` row in the same log is the shutdown flush (`ops=0`).
+Neither is evidence about the grouped path.
+
+What the log does fix arithmetically: 91,316,684,800 H2D bytes over 255 steps =
+358 MiB/step, ~45 ms/step at the 7.88 GB/s link, against a 92 ms step and a 67 ms MoE
+bucket whose `MUL_MAT_ID` kernels account for only 460 us x 48 = 22 ms/step. The MoE
+bucket residual and the serialised transfer time are the same order, so both "transfer
+is already hidden" and "transfer is the residual" fit the numbers in hand. The grouped
+phase timer plus the consumption-side residency counter (plan/prepare/remap/wait/impl/
+finish split, `resident_at_entry` against `copied`) are what separate them; the
+decision rule is the regression of per-op microseconds on `copied`.
 
 Recall measured off the legacy lease (instrument B). The committed instrumentation
 scores predictions only inside the legacy cached demand path, so it only ever sees
@@ -593,8 +613,8 @@ in-graph measurement above and on the host-visible layer, the same order of magn
 The other two populations are structural zeros in this configuration:
 predicted-not-copied (install refusals) = 0 and copied-not-used (prefetched slabs
 evicted without a hit) = 0, because nothing is ever offered to the installer - the
-decode phase line reads `ops=0` with `legacy cache authority` printed once, i.e. the
-consumer is inert and every prediction is simply unused. The drop counters are now
+decode phase line reads `ops=9` (of 12,240 grouped calls) with `legacy cache authority`
+printed once, i.e. the consumer is inert and every prediction is simply unused. The drop counters are now
 printed (`prefetch_dropped`, `evicted_prefetched_unused` on the phase line) instead
 of being counted silently, so a future reopen does not have to rediscover them.
 
@@ -608,3 +628,39 @@ Independent finding recorded this round: the rig's `-ot per_layer_token_embd=CPU
 redundant and inert. Layer-input tensors already land in the CPU buflist, and the lazy
 path returns before user override matching runs, so the flag changes nothing; PLE time
 is 0.00 ms/step in the attribution above.
+
+### Review corrections (advisory review of issue #129, 2026-09-14)
+
+Four claims from this section were put to review; three were upheld, with one caveat that
+changes how the numbers must be quoted, and two pieces of arithmetic were falsified.
+
+1. The MOE bucket is **not kernel-pure**. The phase instrument opens events per maximal run
+   of same-(phase,layer) nodes, so host-side gaps fall inside the window. In decode the
+   legacy-dispatch ops alone contribute `op_cpu_ms=16.761` over 9 ops (1.86 ms/op) and
+   `ids_d2h_ms=10.920` over 2 syncs, i.e. roughly 5-9 ms/step of the 67.18 ms bucket. The
+   conclusion holds because the 45 direct-dispatch layers (no id readback, no lease acquire)
+   independently show ~1.2-1.4 ms per ~21.5 MiB, the same 15-18 GB/s as the aggregate, but a
+   kernel-only rate does not yet exist and must be produced before any kernel campaign is
+   priced.
+2. Decode at M=1 already selects MMVQ, not MMQ: `ggml_cuda_moe_use_mmq` requires
+   `n_tokens > 1`, so there is no mis-selection to harvest there.
+3. The measured -8..-13% of `--moe-lookahead` is **not prefetch overhead**. Under direct
+   authority the producer installs 0 of 144 pools ("look-ahead could not install 144 of 144
+   MoE expert cache pools ... prefetch is inert"), so the whole penalty is the cost of forcing
+   `use_cuda_graph=false` plus the ids readback sync. Fixing the transport removes that
+   penalty; it does not by itself add throughput here.
+4. The 94% wasted speculative installs are a **prefill lease-path** phenomenon (M=512 rows,
+   flat router, `l1_evictions=123,151` against 129,073 fills); decode prediction quality is
+   separately measured as decent (64.5% used-and-predicted, 80.6% predicted-and-used). The
+   prefill waste is not evidence about decode prediction.
+5. Falsified in earlier drafts of this work: the link-bound acceptance table. With the miss
+   set at 1.0817e9 B/token (`1031 MiB`) against a 7.88 GB/s gen4 x4 link, the binding
+   fraction is `miss_fraction * 1.0817e9 * tps <= 7.88e9`: today's 32.7% miss binds at about
+   22 t/s, so 30 t/s requires <=24% and 48 t/s requires <=15%. An earlier statement of 74%
+   and 46% for those rates was wrong by roughly 3x.
+6. Reviewer's ordering: raised M via the existing MTP/draft path ranks ahead of split-K,
+   because the same work at M=512 costs 8.9 ms/token-equivalent against 96.9 ms at M=1 and
+   that machinery already exists and is certified in this fork, while split-K targets an
+   efficiency ceiling not yet separated from booking overhead. Split-K itself is feasible
+   without disturbing the pool-install authority invariant: it changes capability plumbing
+   and plan admission, not `acquire_locked`/install.

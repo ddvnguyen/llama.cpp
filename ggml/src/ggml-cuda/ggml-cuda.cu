@@ -1982,6 +1982,424 @@ struct ggml_cuda_mul_mat_id_host_route {
     int n_wait_classes = 1;
     const uint32_t * stage_ready = nullptr;
 };
+// Forward declaration: defined with the phase probe below; reused here so this
+// probe honors the same GGML_CUDA_MOE_PHASE_PROBE switch with zero added state.
+static bool ggml_cuda_moe_phase_probe_enabled();
+
+// ---------------------------------------------------------------------------
+// MUL_MAT_ID branch probe (diagnostic, off unless GGML_CUDA_MOE_PHASE_PROBE is set).
+//
+// Answers which of the four mutually exclusive exits of ggml_cuda_mul_mat_id_impl
+// fires in situ, split by decode (dst ne2 == 1) vs prefill (dst ne2 > 1), and
+// times the MMVQ and generic exits so the two can be compared per call. All
+// counters are atomics; the branch bodies gain no allocation and no locks. When
+// the variable is unset each hook returns after one static bool load, so the hot
+// path cost is a single predictable branch and there is no output. Timing uses
+// one event pair per device, recorded and consumed inside the same call, never
+// left pending across calls; if the stream is capturing or recording fails the
+// sample is skipped with a one-time note instead of a guess.
+// ---------------------------------------------------------------------------
+enum ggml_cuda_moe_mmid_branch {
+    GGML_CUDA_MOE_MMID_MMVQ = 0,
+    GGML_CUDA_MOE_MMID_MMQ_MAPPED,
+    GGML_CUDA_MOE_MMID_MMQ_DIRECT,
+    GGML_CUDA_MOE_MMID_MMF,
+    GGML_CUDA_MOE_MMID_GENERIC,
+    GGML_CUDA_MOE_MMID_BRANCH_COUNT,
+};
+
+struct ggml_cuda_moe_mmid_branch_probe {
+    std::atomic<uint64_t> calls[2][GGML_CUDA_MOE_MMID_BRANCH_COUNT];
+    std::atomic<uint64_t> mapped[2];
+    std::atomic<uint64_t> total[2];
+    std::atomic<uint64_t> mmvq_hundredths[2];    // elapsed ms x 100
+    std::atomic<uint64_t> generic_hundredths[2]; // elapsed ms x 100
+    std::atomic<bool>     timing_note_done{false};
+    cudaEvent_t ev_start[GGML_CUDA_MAX_DEVICES] = {};
+    cudaEvent_t ev_end[GGML_CUDA_MAX_DEVICES]   = {};
+};
+
+static ggml_cuda_moe_mmid_branch_probe & ggml_cuda_moe_mmid_branch_state() {
+    static ggml_cuda_moe_mmid_branch_probe state;
+    return state;
+}
+
+static void ggml_cuda_moe_mmid_branch_timing_note(const char * why) {
+    auto & p = ggml_cuda_moe_mmid_branch_state();
+    bool done = false;
+    if (p.timing_note_done.compare_exchange_strong(done, true, std::memory_order_relaxed)) {
+        fprintf(stderr, "moe-mmid-branch: timing skipped, %s\n", why);
+    }
+}
+
+static bool ggml_cuda_moe_mmid_branch_timed_begin(int dev, cudaStream_t stream) {
+    auto & p = ggml_cuda_moe_mmid_branch_state();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) == cudaSuccess && capture != cudaStreamCaptureStatusNone) {
+        ggml_cuda_moe_mmid_branch_timing_note("stream is capturing");
+        return false;
+    }
+    cudaGetLastError();
+    if (p.ev_start[dev] == nullptr || p.ev_end[dev] == nullptr) {
+        if (cudaEventCreateWithFlags(&p.ev_start[dev], cudaEventDefault) != cudaSuccess ||
+                cudaEventCreateWithFlags(&p.ev_end[dev], cudaEventDefault) != cudaSuccess) {
+            cudaGetLastError();
+            ggml_cuda_moe_mmid_branch_timing_note("cudaEventCreate failed");
+            return false;
+        }
+    }
+    if (cudaEventRecord(p.ev_start[dev], stream) != cudaSuccess) {
+        cudaGetLastError();
+        ggml_cuda_moe_mmid_branch_timing_note("cudaEventRecord failed");
+        return false;
+    }
+    return true;
+}
+
+static void ggml_cuda_moe_mmid_branch_timed_end(int cls, bool is_mmvq, int dev, cudaStream_t stream) {
+    auto & p = ggml_cuda_moe_mmid_branch_state();
+    if (cudaEventRecord(p.ev_end[dev], stream) != cudaSuccess) {
+        cudaGetLastError();
+        ggml_cuda_moe_mmid_branch_timing_note("cudaEventRecord failed");
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        cudaGetLastError();
+        ggml_cuda_moe_mmid_branch_timing_note("cudaStreamSynchronize failed");
+        return;
+    }
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, p.ev_start[dev], p.ev_end[dev]) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+    }
+    const uint64_t hundredths = (uint64_t) ((double) ms * 100.0 + 0.5);
+    if (is_mmvq) {
+        p.mmvq_hundredths[cls].fetch_add(hundredths, std::memory_order_relaxed);
+    } else {
+        p.generic_hundredths[cls].fetch_add(hundredths, std::memory_order_relaxed);
+    }
+}
+
+static void ggml_cuda_moe_mmid_branch_emit(int cls) {
+    auto & p = ggml_cuda_moe_mmid_branch_state();
+    static const char * mmid_class_name[2] = { "decode", "prefill" };
+    fprintf(stderr,
+        "moe-mmid-branch[%s]: mmvq=%llu mmq_mapped=%llu mmq_direct=%llu mmf=%llu generic=%llu mapped=%llu mmvq_ms=%.2f generic_ms=%.2f\n",
+        mmid_class_name[cls],
+        (unsigned long long) p.calls[cls][GGML_CUDA_MOE_MMID_MMVQ].load(std::memory_order_relaxed),
+        (unsigned long long) p.calls[cls][GGML_CUDA_MOE_MMID_MMQ_MAPPED].load(std::memory_order_relaxed),
+        (unsigned long long) p.calls[cls][GGML_CUDA_MOE_MMID_MMQ_DIRECT].load(std::memory_order_relaxed),
+        (unsigned long long) p.calls[cls][GGML_CUDA_MOE_MMID_MMF].load(std::memory_order_relaxed),
+        (unsigned long long) p.calls[cls][GGML_CUDA_MOE_MMID_GENERIC].load(std::memory_order_relaxed),
+        (unsigned long long) p.mapped[cls].load(std::memory_order_relaxed),
+        (double) p.mmvq_hundredths[cls].load(std::memory_order_relaxed) / 100.0,
+        (double) p.generic_hundredths[cls].load(std::memory_order_relaxed) / 100.0);
+}
+
+static void ggml_cuda_moe_mmid_branch_note(int cls, int branch, bool is_mapped) {
+    auto & p = ggml_cuda_moe_mmid_branch_state();
+    p.calls[cls][branch].fetch_add(1, std::memory_order_relaxed);
+    if (is_mapped) {
+        p.mapped[cls].fetch_add(1, std::memory_order_relaxed);
+    }
+    const uint64_t n = p.total[cls].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n % (cls == 0 ? 16 : 4) == 0) {
+        ggml_cuda_moe_mmid_branch_emit(cls);
+    }
+}
+// ---------------------------------------------------------------------------
+// Grouped MoE dispatch phase probe (diagnostic, off unless GGML_CUDA_MOE_PHASE_PROBE is set).
+//
+// Times the grouped dispatch path per boundary call (one ggml_cuda_mul_mat_id
+// invocation that reaches a grouped group) with CPU wall clock, split by
+// decode (dst ne2 == 1) vs prefill (dst ne2 > 1):
+//   plan    - find_group / rejects_cached_mmid lookup
+//   prepare - prepare_graph_group / prepare_host_staged_group (admission, acquire/install)
+//   remap   - group_views capability checks plus the per-op view setup
+//   impl    - the ggml_cuda_mul_mat_id_impl call (control; lands near the MMVQ time)
+//   finish  - finish_graph_group / finish_host_staged_group
+//   tail    - residue of the whole boundary call so phases + tail = 100% of the op
+// Counters are atomics; when the variable is unset each boundary call costs one
+// gate load plus a few predictable branches and there is no output. Host phases
+// use ggml_time_us, so they add no stream work. The wait phase uses one event
+// pair per device (pre recorded before impl, post at impl entry, collected
+// after the op window so its sync never lands in a phase). The print happens
+// after the last timestamp so formatting never perturbs the measurement. The
+// cumulative line prints on every recorded call: host_us_per_op covers the
+// host-measured phases (plan+prepare+remap+finish+tail, impl and wait excluded)
+// and wait_us_per_op covers the stream wait; both divide checkable totals by
+// the printed op count. Over a decode step the totals are directly comparable
+// with per-op/per-step rig numbers.
+// ---------------------------------------------------------------------------
+struct ggml_cuda_moe_grouped_phase_probe {
+    std::atomic<uint64_t> calls[2];
+    std::atomic<uint64_t> banks[2];
+    std::atomic<uint64_t> plan_us[2];
+    std::atomic<uint64_t> prepare_us[2];
+    std::atomic<uint64_t> wait_us[2];
+    std::atomic<uint64_t> remap_us[2];
+    std::atomic<uint64_t> impl_us[2];
+    std::atomic<uint64_t> finish_us[2];
+    std::atomic<uint64_t> tail_us[2];
+};
+
+static ggml_cuda_moe_grouped_phase_probe & ggml_cuda_moe_grouped_phase_state() {
+    static ggml_cuda_moe_grouped_phase_probe state;
+    return state;
+}
+
+static void ggml_cuda_moe_grouped_phase_note(int cls, uint64_t banks, uint64_t plan_us, uint64_t prepare_us,
+        uint64_t remap_us, uint64_t wait_us, uint64_t impl_us, uint64_t finish_us, uint64_t tail_us) {
+    auto & p = ggml_cuda_moe_grouped_phase_state();
+    p.calls[cls].fetch_add(1, std::memory_order_relaxed);
+    p.banks[cls].fetch_add(banks, std::memory_order_relaxed);
+    p.plan_us[cls].fetch_add(plan_us, std::memory_order_relaxed);
+    p.prepare_us[cls].fetch_add(prepare_us, std::memory_order_relaxed);
+    p.remap_us[cls].fetch_add(remap_us, std::memory_order_relaxed);
+    p.wait_us[cls].fetch_add(wait_us, std::memory_order_relaxed);
+    p.impl_us[cls].fetch_add(impl_us, std::memory_order_relaxed);
+    p.finish_us[cls].fetch_add(finish_us, std::memory_order_relaxed);
+    p.tail_us[cls].fetch_add(tail_us, std::memory_order_relaxed);
+    static const char * grouped_class_name[2] = { "decode", "prefill" };
+    const uint64_t calls = p.calls[cls].load(std::memory_order_relaxed);
+    const uint64_t plan = p.plan_us[cls].load(std::memory_order_relaxed);
+    const uint64_t prepare = p.prepare_us[cls].load(std::memory_order_relaxed);
+    const uint64_t remap = p.remap_us[cls].load(std::memory_order_relaxed);
+    const uint64_t wait = p.wait_us[cls].load(std::memory_order_relaxed);
+    const uint64_t impl = p.impl_us[cls].load(std::memory_order_relaxed);
+    const uint64_t finish = p.finish_us[cls].load(std::memory_order_relaxed);
+    const uint64_t tail = p.tail_us[cls].load(std::memory_order_relaxed);
+    const uint64_t banks_done = p.banks[cls].load(std::memory_order_relaxed);
+    const double host_avg = calls != 0 ? (double) (plan + prepare + remap + finish + tail) / (double) calls : 0.0;
+    const double wait_avg = calls != 0 ? (double) wait / (double) calls : 0.0;
+    fprintf(stderr,
+        "moe-mid-grouped-phase[%s]: calls=%llu banks=%llu plan_ms=%.2f prepare_ms=%.2f remap_ms=%.2f wait_ms=%.2f impl_ms=%.2f finish_ms=%.2f tail_ms=%.2f host_us_per_op=%.2f wait_us_per_op=%.2f\n",
+        grouped_class_name[cls],
+        (unsigned long long) calls,
+        (unsigned long long) banks_done,
+        (double) plan / 1000.0,
+        (double) prepare / 1000.0,
+        (double) remap / 1000.0,
+        (double) wait / 1000.0,
+        (double) impl / 1000.0,
+        (double) finish / 1000.0,
+        (double) tail / 1000.0,
+        host_avg,
+        wait_avg);
+}
+
+// ---------------------------------------------------------------------------
+// Stream-wait probe (diagnostic, same gate as the phase probes above).
+//
+// Splits HOST time from STREAM-WAIT time per op. The caller records wait_pre
+// on the compute stream immediately before the impl call, after all host work
+// for the op is done; ggml_cuda_mul_mat_id_impl records wait_post as its
+// first stream action, before any kernel is enqueued (all code before that
+// point in impl is host-only). The stream-ordered elapsed time pre->post is
+// the delay the stream imposed between end of host work and first kernel:
+// prior queued work draining plus any explicit stream waits (e.g. waits on
+// copy-stream H2D installs). Kernel execution itself is excluded. Collection
+// runs after the op window, synchronizing only wait_post (already complete on
+// paths the branch probe times, so it adds no stall there); on untimed paths
+// the sync can stall the host, which is the known observer cost of this gate.
+// One event pair per device, created lazily, never allocated per op. During
+// graph capture the pair stays disarmed and the sample is 0. A pre/post pair
+// is always overwritten together before any collect reads it, so a dropped
+// op can never poison a later sample.
+// ---------------------------------------------------------------------------
+struct ggml_cuda_moe_wait_probe {
+    cudaEvent_t pre[GGML_CUDA_MAX_DEVICES] = {};
+    cudaEvent_t post[GGML_CUDA_MAX_DEVICES] = {};
+    bool armed[GGML_CUDA_MAX_DEVICES] = {};
+    bool pending[GGML_CUDA_MAX_DEVICES] = {};
+    std::atomic<bool> note_done{false};
+};
+
+static ggml_cuda_moe_wait_probe & ggml_cuda_moe_wait_state() {
+    static ggml_cuda_moe_wait_probe state;
+    return state;
+}
+
+static void ggml_cuda_moe_wait_note(const char * why) {
+    auto & p = ggml_cuda_moe_wait_state();
+    bool done = false;
+    if (p.note_done.compare_exchange_strong(done, true, std::memory_order_relaxed)) {
+        fprintf(stderr, "moe-mid-grouped-phase: wait timing skipped, %s\n", why);
+    }
+}
+
+static bool ggml_cuda_moe_wait_events(int dev) {
+    auto & p = ggml_cuda_moe_wait_state();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    if (p.pre[dev] == nullptr || p.post[dev] == nullptr) {
+        if (cudaEventCreateWithFlags(&p.pre[dev], cudaEventDefault) != cudaSuccess ||
+                cudaEventCreateWithFlags(&p.post[dev], cudaEventDefault) != cudaSuccess) {
+            cudaGetLastError();
+            ggml_cuda_moe_wait_note("cudaEventCreate failed");
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ggml_cuda_moe_wait_mark_pre(int dev, cudaStream_t stream) {
+    auto & p = ggml_cuda_moe_wait_state();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES || stream == nullptr) {
+        return;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) == cudaSuccess && capture != cudaStreamCaptureStatusNone) {
+        p.armed[dev] = false;
+        ggml_cuda_moe_wait_note("stream is capturing");
+        return;
+    }
+    cudaGetLastError();
+    if (!ggml_cuda_moe_wait_events(dev)) {
+        p.armed[dev] = false;
+        return;
+    }
+    if (cudaEventRecord(p.pre[dev], stream) != cudaSuccess) {
+        cudaGetLastError();
+        p.armed[dev] = false;
+        ggml_cuda_moe_wait_note("cudaEventRecord failed");
+        return;
+    }
+    p.armed[dev] = true;
+}
+
+static void ggml_cuda_moe_wait_mark_post(ggml_backend_cuda_context & ctx) {
+    if (!ggml_cuda_moe_phase_probe_enabled()) {
+        return;
+    }
+    const int dev = ggml_cuda_get_device();
+    auto & p = ggml_cuda_moe_wait_state();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES || !p.armed[dev]) {
+        return;
+    }
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) == cudaSuccess && capture != cudaStreamCaptureStatusNone) {
+        p.armed[dev] = false;
+        ggml_cuda_moe_wait_note("stream is capturing");
+        return;
+    }
+    cudaGetLastError();
+    if (cudaEventRecord(p.post[dev], stream) != cudaSuccess) {
+        cudaGetLastError();
+        p.armed[dev] = false;
+        ggml_cuda_moe_wait_note("cudaEventRecord failed");
+        return;
+    }
+    p.armed[dev] = false;
+    p.pending[dev] = true;
+}
+
+static bool ggml_cuda_moe_wait_collect(int dev, uint64_t * out_us) {
+    if (out_us != nullptr) {
+        *out_us = 0;
+    }
+    auto & p = ggml_cuda_moe_wait_state();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES || !p.pending[dev]) {
+        return false;
+    }
+    p.pending[dev] = false;
+    if (cudaEventSynchronize(p.post[dev]) != cudaSuccess) {
+        cudaGetLastError();
+        ggml_cuda_moe_wait_note("cudaEventSynchronize failed");
+        return false;
+    }
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, p.pre[dev], p.post[dev]) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (out_us != nullptr) {
+        *out_us = (uint64_t) ((double) ms * 1000.0 + 0.5);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy cached MoE dispatch phase probe (diagnostic, same gate as above).
+//
+// Times ggml_cuda_mul_mat_id_cached per op that reaches the GEMM, with the
+// same wall-clock discipline and decode/prefill split (here the cached path's
+// own single_row/telemetry flag):
+//   read_ids - ggml_cuda_moe_read_ids including D2H copy, sync and lookup
+//   dedup    - the loop building unique_eids / expert_to_slot
+//   sibling  - prefetch_legacy_siblings (and any look-ahead offer on this path)
+//   acquire  - per-unique-expert acquire loop plus the copy-stream event wait
+//   remap    - H2D of the synthesized ids buffer and pool allocations
+//   wait     - stream-ordered pre->post delay (prior work drain plus copy waits)
+//   impl     - the ggml_cuda_mul_mat_id_impl call (same control as above)
+//   tail     - residue of the whole function so phases + tail = 100% of the op
+// Staged-fallback exits return before the note, so they never pollute these
+// counters. This path is structurally idle on grouped decode (ops stays 0
+// there); its zeros must not be read as the decode answer - the grouped line
+// above is the answer on that configuration.
+// ---------------------------------------------------------------------------
+struct ggml_cuda_moe_mmid_phase_probe {
+    std::atomic<uint64_t> ops[2];
+    std::atomic<uint64_t> read_us[2];
+    std::atomic<uint64_t> dedup_us[2];
+    std::atomic<uint64_t> sibling_us[2];
+    std::atomic<uint64_t> acquire_us[2];
+    std::atomic<uint64_t> remap_us[2];
+    std::atomic<uint64_t> wait_us[2];
+    std::atomic<uint64_t> impl_us[2];
+    std::atomic<uint64_t> tail_us[2];
+};
+
+static ggml_cuda_moe_mmid_phase_probe & ggml_cuda_moe_mmid_phase_state() {
+    static ggml_cuda_moe_mmid_phase_probe state;
+    return state;
+}
+
+static void ggml_cuda_moe_mmid_phase_note(int cls, uint64_t read_us, uint64_t dedup_us, uint64_t sibling_us,
+        uint64_t acquire_us, uint64_t remap_us, uint64_t wait_us, uint64_t impl_us, uint64_t tail_us) {
+    auto & p = ggml_cuda_moe_mmid_phase_state();
+    p.ops[cls].fetch_add(1, std::memory_order_relaxed);
+    p.read_us[cls].fetch_add(read_us, std::memory_order_relaxed);
+    p.dedup_us[cls].fetch_add(dedup_us, std::memory_order_relaxed);
+    p.sibling_us[cls].fetch_add(sibling_us, std::memory_order_relaxed);
+    p.acquire_us[cls].fetch_add(acquire_us, std::memory_order_relaxed);
+    p.remap_us[cls].fetch_add(remap_us, std::memory_order_relaxed);
+    p.wait_us[cls].fetch_add(wait_us, std::memory_order_relaxed);
+    p.impl_us[cls].fetch_add(impl_us, std::memory_order_relaxed);
+    p.tail_us[cls].fetch_add(tail_us, std::memory_order_relaxed);
+    static const char * mmid_phase_class_name[2] = { "decode", "prefill" };
+    const uint64_t ops = p.ops[cls].load(std::memory_order_relaxed);
+    const uint64_t read = p.read_us[cls].load(std::memory_order_relaxed);
+    const uint64_t dedup = p.dedup_us[cls].load(std::memory_order_relaxed);
+    const uint64_t sibling = p.sibling_us[cls].load(std::memory_order_relaxed);
+    const uint64_t acquire = p.acquire_us[cls].load(std::memory_order_relaxed);
+    const uint64_t remap = p.remap_us[cls].load(std::memory_order_relaxed);
+    const uint64_t wait = p.wait_us[cls].load(std::memory_order_relaxed);
+    const uint64_t impl = p.impl_us[cls].load(std::memory_order_relaxed);
+    const uint64_t tail = p.tail_us[cls].load(std::memory_order_relaxed);
+    const double host_avg = ops != 0 ? (double) (read + dedup + sibling + acquire + remap + tail) / (double) ops : 0.0;
+    const double wait_avg = ops != 0 ? (double) wait / (double) ops : 0.0;
+    fprintf(stderr,
+        "moe-mmid-phase[%s]: ops=%llu read_ids_ms=%.2f dedup_ms=%.2f sibling_ms=%.2f acquire_ms=%.2f remap_ms=%.2f wait_ms=%.2f impl_ms=%.2f tail_ms=%.2f host_us_per_op=%.2f wait_us_per_op=%.2f\n",
+        mmid_phase_class_name[cls],
+        (unsigned long long) ops,
+        (double) read / 1000.0,
+        (double) dedup / 1000.0,
+        (double) sibling / 1000.0,
+        (double) acquire / 1000.0,
+        (double) remap / 1000.0,
+        (double) wait / 1000.0,
+        (double) impl / 1000.0,
+        (double) tail / 1000.0,
+        host_avg,
+        wait_avg);
+}
 
 // Shared by the regular and cached-buffer dispatch paths.
 static bool ggml_cuda_mul_mat_id_impl(
@@ -2004,6 +2422,7 @@ static bool ggml_cuda_mul_mat_id_impl(
             !ggml_cuda_mmid_direct_source_view_valid(src0, *direct_source_view, required_consumer))) {
         return false;
     }
+    ggml_cuda_moe_wait_mark_post(ctx);
     const int64_t chooser_ne02 = direct_source_view != nullptr ? direct_source_view->logical_n_experts : ne02;
     const auto source_capability = ggml_cuda_mmid_source_capability_for(src0->type);
     const bool mapped_mmq = !mapped_experts || (source_capability.flags & GGML_CUDA_MMID_SOURCE_MAPPED_MMQ) != 0;
@@ -2017,13 +2436,29 @@ static bool ggml_cuda_mul_mat_id_impl(
                         required_consumer == GGML_CUDA_MMID_CONSUMER_MMVQ)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    const bool mmid_probe = ggml_cuda_moe_phase_probe_enabled();
+                    const int mmid_cls = (mmid_probe && ne2 > 1) ? 1 : 0;
+                    const int mmid_dev = mmid_probe ? ggml_cuda_get_device() : 0;
+                    cudaStream_t mmid_stream = mmid_probe ? ctx.stream() : nullptr;
+                    const bool mmid_timed = mmid_probe &&
+                        ggml_cuda_moe_mmid_branch_timed_begin(mmid_dev, mmid_stream);
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    if (mmid_probe) {
+                        if (mmid_timed) {
+                            ggml_cuda_moe_mmid_branch_timed_end(mmid_cls, true, mmid_dev, mmid_stream);
+                        }
+                        ggml_cuda_moe_mmid_branch_note(mmid_cls, GGML_CUDA_MOE_MMID_MMVQ, false);
+                    }
                     return true;
                 }
             } else if (required_consumer == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED ||
                     required_consumer == GGML_CUDA_MMID_CONSUMER_MMVF) {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                    // Same outer fast branch; no separate bucket, unreachable on NVIDIA.
+                    if (ggml_cuda_moe_phase_probe_enabled()) {
+                        ggml_cuda_moe_mmid_branch_note(ne2 > 1 ? 1 : 0, GGML_CUDA_MOE_MMID_MMVQ, false);
+                    }
                     return true;
                 }
             }
@@ -2058,6 +2493,11 @@ static bool ggml_cuda_mul_mat_id_impl(
             } else {
                 ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             }
+            if (ggml_cuda_moe_phase_probe_enabled()) {
+                ggml_cuda_moe_mmid_branch_note(ne2 > 1 ? 1 : 0,
+                    mapped_experts ? GGML_CUDA_MOE_MMID_MMQ_MAPPED : GGML_CUDA_MOE_MMID_MMQ_DIRECT,
+                    mapped_experts);
+            }
             return true;
         }
 
@@ -2068,6 +2508,9 @@ static bool ggml_cuda_mul_mat_id_impl(
                 required_consumer == GGML_CUDA_MMID_CONSUMER_MMF) && !mapped_experts &&
                 ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, chooser_ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+            if (ggml_cuda_moe_phase_probe_enabled()) {
+                ggml_cuda_moe_mmid_branch_note(ne2 > 1 ? 1 : 0, GGML_CUDA_MOE_MMID_MMF, false);
+            }
             return true;
         }
     }
@@ -2080,6 +2523,11 @@ static bool ggml_cuda_mul_mat_id_impl(
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     GGML_ASSERT(mapped_experts || !use_mmq || ggml_cuda_mul_mat_id_needs_sync(dst, cc));
     cudaStream_t stream = ctx.stream();
+    const bool mmid_probe = ggml_cuda_moe_phase_probe_enabled();
+    const int mmid_cls = (mmid_probe && ne2 > 1) ? 1 : 0;
+    const int mmid_dev = mmid_probe ? ggml_cuda_get_device() : 0;
+    const bool mmid_timed = mmid_probe &&
+        ggml_cuda_moe_mmid_branch_timed_begin(mmid_dev, stream);
 
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
@@ -2253,6 +2701,12 @@ static bool ggml_cuda_mul_mat_id_impl(
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+    if (mmid_probe) {
+        if (mmid_timed) {
+            ggml_cuda_moe_mmid_branch_timed_end(mmid_cls, false, mmid_dev, stream);
+        }
+        ggml_cuda_moe_mmid_branch_note(mmid_cls, GGML_CUDA_MOE_MMID_GENERIC, mapped_experts);
+    }
     return true;
 }
 
@@ -3372,6 +3826,9 @@ static void ggml_cuda_moe_lookahead_debug_score(int layer, const std::vector<int
 // ---------------------------------------------------------------------------
 #define GGML_CUDA_MOE_PHASE_MAX_LAYERS 64
 #define GGML_CUDA_MOE_PHASE_MAX_RUNS   4096
+#define GGML_CUDA_MOE_NODE_ATTRIB_MAX_NODES 4096
+#define GGML_CUDA_MOE_NODE_ATTRIB_MAX_OPS   128
+#define GGML_CUDA_MOE_NODE_ATTRIB_NAME_LEN  32
 
 enum ggml_cuda_moe_phase {
     GGML_CUDA_MOE_PHASE_ATTN = 0,
@@ -3458,6 +3915,23 @@ struct ggml_cuda_moe_phase_probe {
     int         open     = -1;
     bool        disabled = false;
 
+    // Per-node attribution: one event pair per node in the direct dispatch loop.
+    cudaEvent_t node_starts[GGML_CUDA_MOE_NODE_ATTRIB_MAX_NODES] = {};
+    cudaEvent_t node_ends  [GGML_CUDA_MOE_NODE_ATTRIB_MAX_NODES] = {};
+    const char * node_ops   [GGML_CUDA_MOE_NODE_ATTRIB_MAX_NODES] = {};
+    int          node_phases[GGML_CUDA_MOE_NODE_ATTRIB_MAX_NODES] = {};
+    int          n_nodes   = 0;
+    int          node_open = -1;
+    struct ggml_cuda_moe_node_attrib_entry {
+        char     name[GGML_CUDA_MOE_NODE_ATTRIB_NAME_LEN] = {};
+        int      phase = 0;
+        uint64_t calls = 0;
+        double   ms    = 0.0;
+    };
+    ggml_cuda_moe_node_attrib_entry node_accum[2][GGML_CUDA_MOE_NODE_ATTRIB_MAX_OPS] = {};
+    int    n_node_accum[2] = {};
+    double node_total_ms[2] = {};
+
     double   phase_ms[2][GGML_CUDA_MOE_PHASE_COUNT] = {};
     double   layer_ms[2][GGML_CUDA_MOE_PHASE_MAX_LAYERS][GGML_CUDA_MOE_PHASE_COUNT] = {};
     uint64_t layer_steps[2][GGML_CUDA_MOE_PHASE_MAX_LAYERS] = {};
@@ -3529,6 +4003,60 @@ static void ggml_cuda_moe_phase_probe_begin_node(int phase, int layer, cudaStrea
     p.open = run;
 }
 
+static const char * ggml_cuda_moe_phase_short_name(int phase) {
+    switch (phase) {
+        case GGML_CUDA_MOE_PHASE_ATTN:  return "ATTN";
+        case GGML_CUDA_MOE_PHASE_MOE:   return "MOE";
+        case GGML_CUDA_MOE_PHASE_PLE:   return "PLE";
+        case GGML_CUDA_MOE_PHASE_DENSE: return "DENSE";
+        default:                        return "OTHER";
+    }
+}
+
+// Per-node event pair around one node's compute. Uses the same disable-on-error
+// path as the bucket probe, so capture stays safe and the single stderr note
+// still fires at most once. The slot is reserved at begin and committed at end
+// so a dropped begin can never desync the pairing.
+static void ggml_cuda_moe_node_attrib_begin(cudaStream_t stream) {
+    auto & p = ggml_cuda_moe_phase_probe_state();
+    if (p.disabled || p.node_open >= 0) {
+        return;
+    }
+    if (p.n_nodes >= GGML_CUDA_MOE_NODE_ATTRIB_MAX_NODES) {
+        return;
+    }
+    const int slot = p.n_nodes;
+    if (p.node_starts[slot] == nullptr || p.node_ends[slot] == nullptr) {
+        if (cudaEventCreateWithFlags(&p.node_starts[slot], cudaEventDefault) != cudaSuccess ||
+                cudaEventCreateWithFlags(&p.node_ends[slot], cudaEventDefault) != cudaSuccess) {
+            cudaGetLastError();
+            p.disabled = true;
+            fprintf(stderr, "moe-phase-probe: disabled, cudaEventCreate failed\n");
+            return;
+        }
+    }
+    if (!ggml_cuda_moe_phase_probe_record(p, p.node_starts[slot], stream)) {
+        return;
+    }
+    p.node_open = slot;
+}
+
+static void ggml_cuda_moe_node_attrib_end(const char * op, int phase, cudaStream_t stream) {
+    auto & p = ggml_cuda_moe_phase_probe_state();
+    if (p.disabled || p.node_open < 0) {
+        return;
+    }
+    const int slot = p.node_open;
+    p.node_open = -1;
+    if (!ggml_cuda_moe_phase_probe_record(p, p.node_ends[slot], stream)) {
+        p.n_nodes = 0;
+        return;
+    }
+    p.node_ops[slot]    = op;
+    p.node_phases[slot] = phase;
+    p.n_nodes++;
+}
+
 static void ggml_cuda_moe_phase_probe_end_step(cudaStream_t stream, int dispatch_mode, const ggml_cgraph * cgraph) {
     if (!ggml_cuda_moe_phase_probe_enabled()) {
         return;
@@ -3586,9 +4114,11 @@ static void ggml_cuda_moe_phase_probe_end_step(cudaStream_t stream, int dispatch
         }
         p.open = -1;
     }
-    if (p.n_runs > 0 && cudaStreamSynchronize(stream) != cudaSuccess) {
+    if ((p.n_runs > 0 || p.n_nodes > 0) && cudaStreamSynchronize(stream) != cudaSuccess) {
         cudaGetLastError();
         p.n_runs = 0;
+        p.n_nodes = 0;
+        p.node_open = -1;
         return;
     }
 
@@ -3610,6 +4140,40 @@ static void ggml_cuda_moe_phase_probe_end_step(cudaStream_t stream, int dispatch
             }
         }
     }
+    double step_node_ms = 0.0;
+    for (int i = 0; i < p.n_nodes; ++i) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, p.node_starts[i], p.node_ends[i]) != cudaSuccess) {
+            cudaGetLastError();
+            continue;
+        }
+        const char * op = p.node_ops[i] != nullptr ? p.node_ops[i] : "?";
+        const int phase = p.node_phases[i];
+        step_node_ms += (double) ms;
+        int found = -1;
+        for (int j = 0; j < p.n_node_accum[cls]; ++j) {
+            if (p.node_accum[cls][j].phase == phase && strcmp(p.node_accum[cls][j].name, op) == 0) {
+                found = j;
+                break;
+            }
+        }
+        if (found < 0) {
+            if (p.n_node_accum[cls] >= GGML_CUDA_MOE_NODE_ATTRIB_MAX_OPS) {
+                continue;
+            }
+            found = p.n_node_accum[cls]++;
+            strncpy(p.node_accum[cls][found].name, op, GGML_CUDA_MOE_NODE_ATTRIB_NAME_LEN - 1);
+            p.node_accum[cls][found].name[GGML_CUDA_MOE_NODE_ATTRIB_NAME_LEN - 1] = '\0';
+            p.node_accum[cls][found].phase = phase;
+            p.node_accum[cls][found].calls = 0;
+            p.node_accum[cls][found].ms = 0.0;
+        }
+        p.node_accum[cls][found].calls++;
+        p.node_accum[cls][found].ms += (double) ms;
+    }
+    p.node_total_ms[cls] += step_node_ms;
+    p.n_nodes = 0;
+    p.node_open = -1;
     p.n_runs = 0;
 
     // Only same-class neighbours contribute: bridging the other regime would add the
@@ -3641,11 +4205,12 @@ static void ggml_cuda_moe_phase_probe_end_step(cudaStream_t stream, int dispatch
     const double s = (double) p.steps[cls];
     const double den = s - 1.0 > 0.0 ? s - 1.0 : 1.0;
     if (p.steps[cls] % (cls == 0 ? 16 : 4) == 0) {
-        fprintf(stderr, "moe-phase-probe[%s]: steps=%llu rows=%llu..%llu interval_ms=%.2f attn_ms=%.2f moe_ms=%.2f "
+        fprintf(stderr, "moe-phase-probe[%s]: steps=%llu rows=%llu..%llu interval_ms=%.2f node_ms=%.2f attn_ms=%.2f moe_ms=%.2f "
             "ple_ms=%.2f dense_ms=%.2f other_ms=%.2f mode_legacy=%llu mode_direct=%llu mode_capture=%llu mode_replay=%llu\n",
             class_name[cls], (unsigned long long) p.steps[cls],
             (unsigned long long) p.rows_min[cls], (unsigned long long) p.rows_max[cls],
             p.interval_ms[cls] / den,
+            p.node_total_ms[cls] / s,
             p.phase_ms[cls][GGML_CUDA_MOE_PHASE_ATTN]  / s,
             p.phase_ms[cls][GGML_CUDA_MOE_PHASE_MOE]   / s,
             p.phase_ms[cls][GGML_CUDA_MOE_PHASE_PLE]   / s,
@@ -3653,6 +4218,35 @@ static void ggml_cuda_moe_phase_probe_end_step(cudaStream_t stream, int dispatch
             p.phase_ms[cls][GGML_CUDA_MOE_PHASE_OTHER] / s,
             (unsigned long long) p.mode_legacy[cls], (unsigned long long) p.mode_direct[cls],
             (unsigned long long) p.mode_capture[cls], (unsigned long long) p.mode_replay[cls]);
+        {
+            int order[GGML_CUDA_MOE_NODE_ATTRIB_MAX_OPS];
+            const int n = p.n_node_accum[cls];
+            for (int i = 0; i < n; ++i) {
+                order[i] = i;
+            }
+            for (int i = 0; i < n; ++i) {
+                int best = i;
+                for (int j = i + 1; j < n; ++j) {
+                    if (p.node_accum[cls][order[j]].ms > p.node_accum[cls][order[best]].ms) {
+                        best = j;
+                    }
+                }
+                if (best != i) {
+                    const int tmp = order[i];
+                    order[i] = order[best];
+                    order[best] = tmp;
+                }
+            }
+            const double total = p.node_total_ms[cls];
+            const int show = n < 20 ? n : 20;
+            for (int k = 0; k < show; ++k) {
+                const auto & e = p.node_accum[cls][order[k]];
+                const double share = total > 0.0 ? 100.0 * e.ms / total : 0.0;
+                fprintf(stderr, "moe-node-attrib[%s]: op=%s phase=%s calls=%llu total_ms=%.2f per_step_ms=%.3f share=%.1f%%\n",
+                    class_name[cls], e.name, ggml_cuda_moe_phase_short_name(e.phase),
+                    (unsigned long long) e.calls, e.ms, e.ms / s, share);
+            }
+        }
     }
     if (p.steps[cls] % (cls == 0 ? 128 : 16) == 0) {
         for (int layer = 0; layer < GGML_CUDA_MOE_PHASE_MAX_LAYERS; ++layer) {
@@ -3831,8 +4425,14 @@ static void ggml_cuda_mul_mat_id_cached(
     auto cache_lease = leased_owner != nullptr ? leased_owner->acquire_legacy_cache(src0, nullptr, authority, stream) : ggml_cuda_moe_legacy_cache_lease{};
     ggml_cuda_moe_cache * cache = cache_lease.get();
 
+    const bool cached_probe = ggml_cuda_moe_phase_probe_enabled();
+    uint64_t cached_sibling_us = 0;
+    uint64_t cached_impl_us = 0;
+    uint64_t cached_wait_us = 0;
     std::vector<char> ids_host_storage;
+    const int64_t cached_t_read0 = cached_probe ? ggml_time_us() : 0;
     const ggml_cuda_moe_ids_host ids_host = ggml_cuda_moe_read_ids(ctx, ids, src0->name, ids_host_storage);
+    const int64_t cached_t_read1 = cached_probe ? ggml_time_us() : 0;
     const std::vector<char> * ids_host_bytes = ids_host.bytes;
     const size_t ids_host_nb0 = ids_host.nb0;
     const size_t ids_host_nb1 = ids_host.nb1;
@@ -3869,6 +4469,7 @@ static void ggml_cuda_mul_mat_id_cached(
     std::vector<int32_t> unique_eids;
     unique_eids.reserve(std::min<int64_t>(n_experts_total, 64));
     bool overflow = false;
+    const int64_t cached_t_dedup0 = cached_probe ? ggml_time_us() : 0;
     for (int64_t i2 = 0; i2 < ids_ne2 && !overflow; ++i2) {
         for (int64_t i1 = 0; i1 < ids_ne1 && !overflow; ++i1) {
             for (int64_t i0 = 0; i0 < ids_ne0 && !overflow; ++i0) {
@@ -3885,6 +4486,7 @@ static void ggml_cuda_mul_mat_id_cached(
             }
         }
     }
+    const int64_t cached_t_dedup1 = cached_probe ? ggml_time_us() : 0;
 
     if (ggml_cuda_moe_lookahead_debug_enabled()) {
         ggml_cuda_moe_lookahead_debug_score(ggml_cuda_moe_layer_from_name(src0->name), unique_eids);
@@ -3909,8 +4511,13 @@ static void ggml_cuda_mul_mat_id_cached(
     const int64_t acquire_start_us = ggml_time_us();
 
     if (leased_owner != nullptr) {
+        const int64_t cached_t_sib0 = cached_probe ? ggml_time_us() : 0;
         leased_owner->prefetch_legacy_siblings(
             cache_lease, unique_eids.data(), (int) unique_eids.size(), use_l2, telemetry_is_decode);
+        const int64_t cached_t_sib1 = cached_probe ? ggml_time_us() : 0;
+        if (cached_probe) {
+            cached_sibling_us += (uint64_t) (cached_t_sib1 - cached_t_sib0);
+        }
     }
 
     // 5. Reset sentinels and acquire each unique expert on this tensor's cache.
@@ -3968,6 +4575,7 @@ static void ggml_cuda_mul_mat_id_cached(
         CUDA_CHECK(cudaEventDestroy(copy_done));
         copy_wait_event_time_us = (uint64_t) (ggml_time_us() - event_start_us);
     }
+    const int64_t cached_t_acq1 = cached_probe ? ggml_time_us() : 0;
 
     void * pool_d = ggml_cuda_moe_cache_slot_ptr(cache, 0);
     uint64_t remap_time_us = 0;
@@ -4008,11 +4616,22 @@ static void ggml_cuda_mul_mat_id_cached(
         ggml_tensor * orig_ids = dst->src[2];
         dst->src[0] = &src0_synth;
         dst->src[2] = &ids_synth;
+        const int64_t cached_t_impl0 = cached_probe ? ggml_time_us() : 0;
+        if (cached_probe) {
+            ggml_cuda_moe_wait_mark_pre(ggml_cuda_get_device(), ctx.stream());
+        }
         const bool dispatched = ggml_cuda_mul_mat_id_impl(
             ctx, dst, use_mmq, nullptr,
             compact_mmvq ? GGML_CUDA_MMID_CONSUMER_MMVQ : GGML_CUDA_MMID_CONSUMER_UNSUPPORTED);
         dst->src[0] = orig_src0;
         dst->src[2] = orig_ids;
+        const int64_t cached_t_impl1 = cached_probe ? ggml_time_us() : 0;
+        if (cached_probe) {
+            cached_impl_us += (uint64_t) (cached_t_impl1 - cached_t_impl0);
+            uint64_t impl_wait_us = 0;
+            ggml_cuda_moe_wait_collect(ggml_cuda_get_device(), &impl_wait_us);
+            cached_wait_us += impl_wait_us;
+        }
         GGML_ASSERT(dispatched);
     } else {
         ggml_tensor src0_synth = *src0;
@@ -4025,7 +4644,18 @@ static void ggml_cuda_mul_mat_id_cached(
         const ggml_cuda_mul_mat_id_host_route host_route = {
             ids_host_bytes->data(), ids_host_nb0, ids_host_nb1, expert_to_slot.data(),
         };
+        const int64_t cached_t_impl0b = cached_probe ? ggml_time_us() : 0;
+        if (cached_probe) {
+            ggml_cuda_moe_wait_mark_pre(ggml_cuda_get_device(), ctx.stream());
+        }
         ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq, &host_route);
+        const int64_t cached_t_impl1b = cached_probe ? ggml_time_us() : 0;
+        if (cached_probe) {
+            cached_impl_us += (uint64_t) (cached_t_impl1b - cached_t_impl0b);
+            uint64_t impl_wait_us = 0;
+            ggml_cuda_moe_wait_collect(ggml_cuda_get_device(), &impl_wait_us);
+            cached_wait_us += impl_wait_us;
+        }
         dst->src[0] = orig_src0;
     }
     if (!ggml_cuda_moe_cache_mark_used(cache, stream)) {
@@ -4037,6 +4667,20 @@ static void ggml_cuda_mul_mat_id_cached(
         telemetry_is_decode, false, false, false, (uint64_t) unique_eids.size(), (uint64_t) ggml_nbytes(ids),
         ids_d2h_time_us, ids_d2h_sync_count, acquire_time_us, remap_time_us,
         1, copy_wait_event_time_us, (uint64_t) (ggml_time_us() - op_start_us), ids_cache_hit);
+    if (cached_probe) {
+        const int64_t cached_t_end = ggml_time_us();
+        const uint64_t read_us = (uint64_t) (cached_t_read1 - cached_t_read0);
+        const uint64_t dedup_us = (uint64_t) (cached_t_dedup1 - cached_t_dedup0);
+        const uint64_t sibling_us = cached_sibling_us;
+        const uint64_t acquire_us = (uint64_t) (cached_t_acq1 - acquire_start_us);
+        const uint64_t remap_us = remap_time_us;
+        const uint64_t wait_us = cached_wait_us;
+        const uint64_t impl_us = cached_impl_us;
+        const uint64_t total_us = (uint64_t) (cached_t_end - op_start_us);
+        const uint64_t tail_us = total_us - (read_us + dedup_us + sibling_us + acquire_us + remap_us + impl_us);
+        ggml_cuda_moe_mmid_phase_note(telemetry_is_decode ? 0 : 1,
+            read_us, dedup_us, sibling_us, acquire_us, remap_us, wait_us, impl_us, tail_us);
+    }
 }
 
 static void ggml_cuda_moe_shadow_probe_registered(
@@ -4228,14 +4872,19 @@ static bool ggml_cuda_mul_mat_id(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
         ggml_cuda_moe_graph_execution * execution) {
+    const bool grouped_probe = ggml_cuda_moe_phase_probe_enabled();
+    const int grouped_cls = (grouped_probe && dst->ne[2] > 1) ? 1 : 0;
+    const int64_t grouped_t0 = grouped_probe ? ggml_time_us() : 0;
     const ggml_tensor * src0 = dst->src[0];
     ggml_cuda_moe_graph_binding binding;
     auto * group = execution != nullptr ? execution->find_group(dst, &binding) : nullptr;
     if (execution != nullptr && execution->rejects_cached_mmid(dst)) {
         return false;
     }
+    const int64_t grouped_t_plan = grouped_probe ? ggml_time_us() : 0;
 
     ggml_cuda_moe_shadow_probe(ctx, execution, dst, src0, dst->src[2]);
+    const int64_t grouped_t_prep0 = grouped_probe ? ggml_time_us() : 0;
 
     if (group != nullptr && group->state == GGML_CUDA_MOE_GRAPH_GROUP_HOST_STAGED_ARMED) {
         const auto result = ctx.moe_grouped_context->prepare_host_staged_group(group, binding, dst, ctx.stream());
@@ -4247,12 +4896,31 @@ static bool ggml_cuda_mul_mat_id(
         }
     }
     if (group != nullptr && group->state == GGML_CUDA_MOE_GRAPH_GROUP_HOST_STAGED_ACTIVE) {
+        const int64_t grouped_t_hs_prep = grouped_probe ? ggml_time_us() : 0;
+        if (grouped_probe) {
+            // Wait window starts here and ends at impl entry inside the staged call.
+            ggml_cuda_moe_wait_mark_pre(ggml_cuda_get_device(), ctx.stream());
+        }
         if (!ggml_cuda_mul_mat_id_grouped_host_staged(ctx, dst, group, binding)) {
             return false;
         }
+        const int64_t grouped_t_hs_impl = grouped_probe ? ggml_time_us() : 0;
         if (binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT &&
                 !ctx.moe_grouped_context->finish_host_staged_group(group, binding, dst, ctx.stream())) {
             return false;
+        }
+        const int64_t grouped_t_hs_fin = grouped_probe ? ggml_time_us() : 0;
+        if (grouped_probe) {
+            uint64_t hs_wait_us = 0;
+            ggml_cuda_moe_wait_collect(ggml_cuda_get_device(), &hs_wait_us);
+            const uint64_t plan_us = (uint64_t) (grouped_t_plan - grouped_t0);
+            const uint64_t prepare_us = (uint64_t) (grouped_t_hs_prep - grouped_t_prep0);
+            const uint64_t remap_us = 0;
+            const uint64_t impl_us = (uint64_t) (grouped_t_hs_impl - grouped_t_hs_prep);
+            const uint64_t finish_us = (uint64_t) (grouped_t_hs_fin - grouped_t_hs_impl);
+            const uint64_t total_us = (uint64_t) (grouped_t_hs_fin - grouped_t0);
+            const uint64_t tail_us = total_us - (plan_us + prepare_us + remap_us + impl_us + finish_us);
+            ggml_cuda_moe_grouped_phase_note(grouped_cls, 1, plan_us, prepare_us, remap_us, hs_wait_us, impl_us, finish_us, tail_us);
         }
         return true;
     }
@@ -4262,6 +4930,7 @@ static bool ggml_cuda_mul_mat_id(
             return false;
         }
     }
+    const int64_t grouped_t_prepared = grouped_probe ? ggml_time_us() : 0;
     if (group != nullptr && group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
         ggml_tensor bank_view;
         ggml_tensor ids_view;
@@ -4283,6 +4952,7 @@ static bool ggml_cuda_mul_mat_id(
         ggml_tensor * original_ids = dst->src[2];
         dst->src[0] = &bank_view;
         dst->src[2] = &ids_view;
+        const int64_t grouped_t_remap = grouped_probe ? ggml_time_us() : 0;
         const ggml_cuda_mmid_direct_source_view direct_source_view = {
             bank_view.type,
             capability.n_slots,
@@ -4290,17 +4960,35 @@ static bool ggml_cuda_mul_mat_id(
             group->n_slots,
             bank_view.nb[2],
         };
+        if (grouped_probe) {
+            // Wait window: pre is the last stream action before impl; post is impl entry.
+            ggml_cuda_moe_wait_mark_pre(ggml_cuda_get_device(), ctx.stream());
+        }
         const bool dispatched = ggml_cuda_mul_mat_id_impl(
             ctx, dst, use_mmq, nullptr, static_cast<ggml_cuda_mmid_consumer>(capability.consumer),
             &direct_source_view);
         dst->src[0] = original_weight;
         dst->src[2] = original_ids;
+        const int64_t grouped_t_impl = grouped_probe ? ggml_time_us() : 0;
         if (!dispatched) {
             return false;
         }
         if (binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT &&
                 !ctx.moe_grouped_context->finish_graph_group(group, binding, dst, ctx.stream())) {
             return false;
+        }
+        const int64_t grouped_t_fin = grouped_probe ? ggml_time_us() : 0;
+        if (grouped_probe) {
+            uint64_t grouped_wait_us = 0;
+            ggml_cuda_moe_wait_collect(ggml_cuda_get_device(), &grouped_wait_us);
+            const uint64_t plan_us = (uint64_t) (grouped_t_plan - grouped_t0);
+            const uint64_t prepare_us = (uint64_t) (grouped_t_prepared - grouped_t_prep0);
+            const uint64_t remap_us = (uint64_t) (grouped_t_remap - grouped_t_prepared);
+            const uint64_t impl_us = (uint64_t) (grouped_t_impl - grouped_t_remap);
+            const uint64_t finish_us = (uint64_t) (grouped_t_fin - grouped_t_impl);
+            const uint64_t total_us = (uint64_t) (grouped_t_fin - grouped_t0);
+            const uint64_t tail_us = total_us - (plan_us + prepare_us + remap_us + impl_us + finish_us);
+            ggml_cuda_moe_grouped_phase_note(grouped_cls, 1, plan_us, prepare_us, remap_us, grouped_wait_us, impl_us, finish_us, tail_us);
         }
         return true;
     }
@@ -4362,18 +5050,26 @@ static void ggml_cuda_moe_prefetch(ggml_backend_cuda_context & ctx, struct ggml_
     if (n_ids <= 0 || n_ids > INT32_MAX) {
         return;
     }
-    // The cache consumer selects source rows from host pointers, so the predicted
-    // ids have to be visible to the host. Decode predicts a handful of ids per
-    // layer; the staging buffer is reused across steps.
+    // Same decode test the cached demand path uses: a single row of ids per token.
+    const bool is_decode = ids->ne[1] * ids->ne[2] * ids->ne[3] == 1;
+    // Staged fill first: device-side filter plus mailbox publish, no D2H and
+    // no host sync. When it serves the prediction the legacy D2H path below
+    // (and its stream sync) is skipped. The MOE_PREFETCH graph ban above is
+    // left untouched, so with lookahead on this still runs in direct dispatch.
+    if (is_decode && ggml_backend_cuda_moe_stage_lookahead(ggml_cuda_get_device(), experts,
+            static_cast<const int32_t *>(ids->data), (int) n_ids, ctx.stream())) {
+        return;
+    }
+    // Legacy fallback (unchanged): the cache consumer selects source rows
+    // from host pointers, so the predicted ids have to be visible to the
+    // host. Decode predicts a handful of ids per layer; the staging buffer
+    // is reused across steps.
     if ((int64_t) ctx.moe_lookahead_ids.size() != n_ids) {
         ctx.moe_lookahead_ids.resize((size_t) n_ids);
     }
     CUDA_CHECK(cudaMemcpyAsync(ctx.moe_lookahead_ids.data(), ids->data,
                 (size_t) n_ids * sizeof(int32_t), cudaMemcpyDeviceToHost, ctx.stream()));
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
-
-    // Same decode test the cached demand path uses: a single row of ids per token.
-    const bool is_decode = ids->ne[1] * ids->ne[2] * ids->ne[3] == 1;
 
     if (ggml_cuda_moe_lookahead_debug_enabled()) {
         ggml_cuda_moe_lookahead_debug_record(
@@ -7188,9 +7884,14 @@ static bool ggml_cuda_graph_evaluate_and_capture(
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                int probe_phase = -1;
+                const char * probe_op = nullptr;
                 if (ggml_cuda_moe_phase_probe_enabled()) {
-                    ggml_cuda_moe_phase_probe_begin_node(ggml_cuda_moe_phase_classify(node),
+                    probe_phase = ggml_cuda_moe_phase_classify(node);
+                    probe_op = ggml_op_desc(node);
+                    ggml_cuda_moe_phase_probe_begin_node(probe_phase,
                             ggml_cuda_moe_phase_layer(node->name), cuda_ctx->stream());
+                    ggml_cuda_moe_node_attrib_begin(cuda_ctx->stream());
                 }
                 if (ggml_cuda_moe_recall_probe_enabled() && node->op == GGML_OP_MUL_MAT_ID) {
                     ggml_cuda_moe_recall_probe_note(node, cuda_ctx->stream());
@@ -7203,6 +7904,9 @@ static bool ggml_cuda_graph_evaluate_and_capture(
                         GGML_ASSERT(!use_cuda_graph && !cuda_graph_update_required);
                         return false;
                     }
+                }
+                if (probe_op != nullptr) {
+                    ggml_cuda_moe_node_attrib_end(probe_op, probe_phase, cuda_ctx->stream());
                 }
                 GGML_ASSERT(ok);
 

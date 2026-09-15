@@ -834,6 +834,16 @@ public:
             int n_expert_ids,
             bool use_l2,
             bool is_decode);
+    // MoE look-ahead staging issue (PR-B): filter device-resident predicted
+    // ids into the target group's staging lane for DMA ahead of its gather.
+    // True when staged (caller skips legacy prefetch); false falls back.
+    // Gate-off cost is one atomic load. No D2H, no host sync.
+    bool prefetch_stage_layer(
+            const ggml_tensor * experts,
+            const int32_t * ids_device,
+            int n_ids,
+            bool is_decode,
+            ggml_cuda_moe_stream_t stream);
     // Installs the legacy pools for every expert tensor the published candidate
     // snapshot knows about, so a look-ahead prefetch cannot find an empty lease.
     // Returns the number of pools that could not be installed.
@@ -1127,6 +1137,15 @@ void ggml_backend_cuda_moe_prefetch_experts_tensor(
     int n_expert_ids,
     bool use_l2,
     bool is_decode);
+// MoE look-ahead staging issue (PR-B): filter device-resident predicted ids
+// into the target group's staging lane for DMA ahead of its gather. True when
+// staged (caller skips legacy prefetch); false falls back. No D2H, no sync.
+bool ggml_backend_cuda_moe_stage_lookahead(
+    int device,
+    const ggml_tensor * experts,
+    const int32_t * ids_device,
+    int n_ids,
+    ggml_cuda_moe_stream_t stream);
 // Prefetch phase counters for tests: hits, misses, used, h2d bytes, and the
 // number of predictions dropped because the LFRU eviction guard protected a
 // warm resident (or no victim slot was available).
