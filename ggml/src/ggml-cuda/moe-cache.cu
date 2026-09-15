@@ -91,6 +91,117 @@ static bool moe_lookahead_admit_in_plan() {
     return enabled;
 }
 
+// Victim-choice policy for the grouped expert cache, selected once from
+// GGML_MOE_EVICT_POLICY. The policy never touches the geometry (slot counts stay
+// uniform, N per bank per layer); it only decides which resident a demand miss
+// replaces. Retaining better is the only lever that reduces the number of
+// fetches: a prefetch is still a PCIe fetch, so moving bytes earlier changes
+// when traffic happens, never how much of it there is.
+//
+//   lfu     (default, unset): today's behaviour, byte for byte - frequency
+//           first, age second (GGML_CUDA_MOE_FREQUENCY=0 still selects plain
+//           LRU, unchanged). This is the path taken when the variable is absent.
+//   lru     : plain LRU - the frequency term is dropped from the victim order,
+//           so the victim is the least recently used resident.
+//   protect : the lfu order plus a warm-resident override. A resident is pinned
+//           while any unpinned candidate exists, and "warm" means either the
+//           look-ahead already predicts it for this layer (when a lane exists -
+//           at width 0 there is none) or the layer's own preceding plan touched
+//           its slot. When every candidate is pinned the override declines and
+//           the lfu choice stands.
+//   recent1 : the lfu order plus the same override keyed on hard evidence only:
+//           a resident whose slot was touched by the layer's immediately
+//           preceding plan (last_used above that plan's clock_begin) is never
+//           the victim while any older candidate exists. No predictor is
+//           involved, so this isolates the warm-set half of protect - and it is
+//           the arm the offline replay found positive over the whole C=28..64
+//           range; see the counters appended to moe-lookahead-stage for how
+//           often it actually binds.
+//
+// Unknown values warn once and stay on the default; "0" and "1" are rejected the
+// same way rather than guessed at.
+enum moe_cache_evict_policy {
+    MOE_CACHE_EVICT_LFU = 0,
+    MOE_CACHE_EVICT_LRU,
+    MOE_CACHE_EVICT_PROTECT,
+    MOE_CACHE_EVICT_RECENT1,
+};
+
+// How the plan kernel keys its eviction-pin override. None means the hook is
+// uniformly dead for the whole block and the victim is the plain policy choice.
+enum moe_cache_pin_mode : uint32_t {
+    MOE_CACHE_PIN_NONE = 0,
+    MOE_CACHE_PIN_PREDICTED,
+    MOE_CACHE_PIN_RECENT1,
+};
+
+static moe_cache_evict_policy moe_cache_evict_policy_env() {
+    static const moe_cache_evict_policy policy = [] {
+        const char * value = getenv("GGML_MOE_EVICT_POLICY");
+        if (value == nullptr || value[0] == '\0' || strcmp(value, "lfu") == 0) {
+            return MOE_CACHE_EVICT_LFU;
+        }
+        if (strcmp(value, "lru") == 0) {
+            return MOE_CACHE_EVICT_LRU;
+        }
+        if (strcmp(value, "protect") == 0) {
+            return MOE_CACHE_EVICT_PROTECT;
+        }
+        if (strcmp(value, "recent1") == 0) {
+            return MOE_CACHE_EVICT_RECENT1;
+        }
+        GGML_LOG_WARN("moe-cache: unknown GGML_MOE_EVICT_POLICY=\"%s\", using lfu\n", value);
+        return MOE_CACHE_EVICT_LFU;
+    }();
+    return policy;
+}
+
+// Opt-in admission of the look-ahead's prediction INTO the cache slots
+// (GGML_MOE_ADMIT_PREDICTED, default off). The side lane holds one publish's
+// worth of slabs while a width-8 prediction needs ~7.5x that, so the staged
+// bytes of the last experts are overwritten before a later step could use them
+// and the measured transport usefulness stays near 1.91%. The cache holds three
+// orders of magnitude more, so admitting the same experts into slots removes
+// that window constraint: the plan takes the prediction's own compacted list
+// (predicted, not resident - the same publish the staging copy already fetches),
+// picks slots for it with the eviction policy selected above - still preferring
+// non-predicted victims in protect mode - and the gather moves the payload into
+// the slot: from the staging buffer when that slab has landed, otherwise
+// straight from the source, exactly like a demand miss. Every admission is real
+// PCIe traffic and is billed as a fetch in the residency ledger.
+// GGML_MOE_ADMIT_MAX caps admissions per layer per step (default 10, 0 = off).
+static constexpr uint32_t MOE_CACHE_ADMIT_MAX_DEFAULT = 10;
+// Sanity bound on the parsed cap. The plan clamps to the slots actually free in
+// that layer, so this only keeps a typo from asking for absurd counts.
+static constexpr uint32_t MOE_CACHE_ADMIT_MAX_LIMIT = 4096;
+
+static bool moe_cache_admit_predicted() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_MOE_ADMIT_PREDICTED");
+        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static uint32_t moe_cache_admit_max() {
+    static const uint32_t cap = [] {
+        const char * value = getenv("GGML_MOE_ADMIT_MAX");
+        if (value == nullptr || value[0] == '\0') {
+            return MOE_CACHE_ADMIT_MAX_DEFAULT;
+        }
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long parsed = strtoul(value, &end, 10);
+        if (end == value || *end != '\0' || errno != 0 || parsed > MOE_CACHE_ADMIT_MAX_LIMIT) {
+            GGML_LOG_WARN("moe-cache: invalid GGML_MOE_ADMIT_MAX=\"%s\", using %u\n",
+                value, MOE_CACHE_ADMIT_MAX_DEFAULT);
+            return MOE_CACHE_ADMIT_MAX_DEFAULT;
+        }
+        return (uint32_t) parsed;
+    }();
+    return cap;
+}
+
 // One-shot warn for prefetch path misuse. Never per-step spam.
 static void moe_cache_prefetch_warn_once(std::atomic<bool> & flag, const char * msg) {
     bool expected = false;
@@ -2928,11 +3039,23 @@ enum moe_grouped_plan_status : uint32_t {
     MOE_GROUPED_PLAN_INVALID_STATE,
 };
 
+// Width of the look-ahead's per-layer prediction: the length of the compacted
+// candidate list the staging lane publishes, and the hard cap on how many
+// candidates the plan's admission pass can be handed. Declared here because the
+// plan kernel reads that list; the staging section below documents the rest of
+// the lane's layout and owns the counter array.
+#define GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH 8
+
 struct moe_grouped_decode_plan {
     uint32_t status;
     uint32_t n_routes;
     uint32_t n_unique;
     uint32_t n_misses;
+    // Admission pass (GGML_MOE_ADMIT_PREDICTED): predicted experts inserted into
+    // slots nobody demanded. Kept out of n_unique/n_misses so the demand ledger
+    // (need, hits, resident) keeps its meaning; the gather transfers them like
+    // misses and the next commit installs them like misses.
+    uint32_t n_admissions;
     uint64_t next_clock;
     uint64_t frequency_epoch;
 };
@@ -2946,6 +3069,8 @@ enum moe_grouped_plan_array_index : uint32_t {
     MOE_GROUPED_PLAN_MISS_EXPERTS,
     MOE_GROUPED_PLAN_MISS_SLOTS,
     MOE_GROUPED_PLAN_REMAPPED_IDS,
+    MOE_GROUPED_PLAN_ADMIT_EXPERTS,
+    MOE_GROUPED_PLAN_ADMIT_SLOTS,
     MOE_GROUPED_PLAN_ROUTE_ARRAY_COUNT,
 };
 
@@ -3111,7 +3236,13 @@ static __global__ void moe_grouped_plan_decode(
         const int32_t * staging_positions,
         const uint32_t * staging_progress,
         ggml_cuda_moe_demand_trace_buffer * demand_trace,
-        int32_t demand_trace_layer) {
+        int32_t demand_trace_layer,
+        const int32_t * predict_mask,
+        uint64_t * predict_counters,
+        const int32_t * admit_candidates,
+        uint32_t admit_width,
+        uint32_t admit_max,
+        uint32_t pin_mode) {
     if (blockIdx.x != 0) {
         return;
     }
@@ -3121,7 +3252,22 @@ static __global__ void moe_grouped_plan_decode(
     __shared__ unsigned long long warp_ages[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
     __shared__ uint32_t warp_slots[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
     __shared__ uint32_t selected_slot;
+    // Protect-policy parallel victim order (unused, and never read, unless the
+    // host passed a prediction mask down).
+    __shared__ uint32_t warp_unprotected_frequencies[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
+    __shared__ unsigned long long warp_unprotected_ages[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
+    __shared__ uint32_t warp_unprotected_slots[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
+    __shared__ uint32_t selected_slot_unprotected;
     __shared__ uint32_t staged_admissions;
+    // Admission pass: candidates that survived the residency/duplicate filter,
+    // and how many of them found a slot. Unused without a candidate list.
+    __shared__ int32_t admit_pending[GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH];
+    __shared__ uint32_t admit_placements;
+    __shared__ uint32_t admit_skipped;
+    // RECENT1's boundary: the clock_begin of this layer's previous plan, i.e. the
+    // edge between residents its immediately preceding step touched and older
+    // churn. Zero (first plan) pins nothing, since no slot has an age yet.
+    __shared__ uint64_t recent_threshold;
     __shared__ uint64_t clock_begin;
     __shared__ uint64_t clock_end;
     __shared__ uint32_t demand_trace_slot;
@@ -3134,11 +3280,14 @@ static __global__ void moe_grouped_plan_decode(
     int32_t * miss_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
     int32_t * miss_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
     int32_t * remapped_ids = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_REMAPPED_IDS);
+    int32_t * admit_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ADMIT_EXPERTS);
+    int32_t * admit_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ADMIT_SLOTS);
     uint32_t * expert_routes = moe_grouped_plan_expert_routes(plan, plan_capacity);
 
     // Commit the prior admission before this call overwrites the shared plan.
     if (plan->status == MOE_GROUPED_PLAN_READY) {
-        if (plan->n_unique > plan_capacity || plan->n_misses > plan->n_unique) {
+        if (plan->n_unique > plan_capacity || plan->n_misses > plan->n_unique ||
+                plan->n_admissions > plan_capacity) {
             moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
         }
         for (uint32_t miss = thread; miss < plan->n_misses; miss += blockDim.x) {
@@ -3153,6 +3302,31 @@ static __global__ void moe_grouped_plan_decode(
             }
             expert_for_slot[slot] = expert;
             slot_for_expert[expert] = slot;
+        }
+        __syncthreads();
+
+        // Admission install, same commit point as a miss: the payload was moved
+        // into the slot by the gather of the plan that chose it. last_used is set
+        // here rather than in the admission pass because residency is entered
+        // here, and the residency invariant below rejects a resident slot whose
+        // age is still zero. next_clock is the newest tick of that generation and
+        // is never zero for a plan that reached READY (n_unique >= 1).
+        for (uint32_t admit = thread; admit < plan->n_admissions; admit += blockDim.x) {
+            const int32_t expert = admit_experts[admit];
+            const int32_t slot = admit_slots[admit];
+            if (expert < 0 || (uint32_t) expert >= n_experts || slot < 0 || (uint32_t) slot >= n_slots) {
+                moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+            }
+            const int32_t old_expert = expert_for_slot[slot];
+            if (old_expert >= 0) {
+                slot_for_expert[old_expert] = -1;
+            }
+            expert_for_slot[slot] = expert;
+            slot_for_expert[expert] = slot;
+            // No frequency bump: the expert was not used, only paged in. Its
+            // decayed counter keeps it a candidate; a demand for it next step is
+            // a hit and bumps it then.
+            last_used[slot] = plan->next_clock;
         }
         __syncthreads();
 
@@ -3178,6 +3352,13 @@ static __global__ void moe_grouped_plan_decode(
 
     if (thread == 0) {
         plan->status = MOE_GROUPED_PLAN_BUILDING;
+        // RECENT1 threshold, read before the previous plan's span is overwritten
+        // below: next_clock - n_unique of the plan that just committed is exactly
+        // its clock_begin, and every resident it touched carries a last_used at or
+        // above that. The guard only keeps a hand-corrupted plan from underflowing
+        // into an absurd threshold.
+        recent_threshold = (plan->n_unique != 0 && plan->next_clock >= plan->n_unique) ?
+            plan->next_clock - plan->n_unique : 0;
         plan->n_routes = n_routes;
         plan->n_unique = 0;
         plan->n_misses = 0;
@@ -3399,10 +3580,103 @@ static __global__ void moe_grouped_plan_decode(
 
     const uint32_t lane = thread % WARP_SIZE;
     const uint32_t warp = thread / WARP_SIZE;
-    for (uint32_t miss = 0; miss < plan->n_misses; ++miss) {
+    // Warm-resident pin override: recent1 pins only what the layer's previous
+    // plan touched; protect pins that plus whatever the look-ahead mask names,
+    // when the host passed one (it is null at width 0 and for lfu/lru, where
+    // pin_mode is NONE and every branch below is uniformly false for the whole
+    // block, so `slot`/`selected_slot` are chosen exactly as before).
+    const bool pin_on = pin_mode != MOE_CACHE_PIN_NONE;
+    const bool pin_recent1 = pin_mode == MOE_CACHE_PIN_RECENT1;
+    if (thread == 0) {
+        selected_slot_unprotected = UINT32_MAX;
+    }
+    // Admission pass (opt-in; the host passes no candidate list otherwise, and
+    // then every branch below is uniformly dead for the whole block). The
+    // candidates are the lane's compacted prediction from the publish this
+    // layer's filter already issued: predicted experts that were NOT resident at
+    // publish time, in predictor confidence order, -1 padded. Two filters run
+    // here, both in thread 0 and both deterministic:
+    //   - drop any candidate this layer demands right now: the demand path just
+    //     gave that expert a slot, and installing it twice would leave two slots
+    //     claiming one expert and the residency invariant would fire next plan;
+    //   - drop any candidate the slot tables already hold: the list was built
+    //     from the publish's view of residency, which predates the commit of the
+    //     preceding plan, so an expert that plan admitted (or installed for a
+    //     miss) is resident here while still listed. Same double install, same
+    //     trap, so the live tables are the authority;
+    //   - stop at admit_max and at the slots nobody demanded (n_slots -
+    //     n_unique), which is exactly the room the placement is guaranteed for.
+    const bool admit_on = admit_candidates != nullptr && predict_counters != nullptr && admit_max != 0;
+    if (thread == 0) {
+        uint32_t placements = 0;
+        uint32_t skipped = 0;
+        if (admit_on) {
+            const uint32_t width = admit_width < (uint32_t) GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH ?
+                admit_width : (uint32_t) GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH;
+            uint32_t pending = 0;
+            for (uint32_t candidate = 0; candidate < width; ++candidate) {
+                const int32_t expert = admit_candidates[candidate];
+                if (expert < 0) {
+                    break;   // -1 padding: the filter's list ended here
+                }
+                if ((uint32_t) expert >= n_experts) {
+                    continue;   // cannot be resident, and the tables cannot be indexed
+                }
+                bool demanded = false;
+                for (uint32_t unique = 0; unique < plan->n_unique; ++unique) {
+                    if (unique_experts[unique] == expert) {
+                        demanded = true;
+                        break;
+                    }
+                }
+                // Live residency, not the publish-time view the list was built
+                // from. The filter sampled the slot tables before the preceding
+                // plan's commit, so an expert that plan admitted - or that its
+                // misses installed - is resident here while still appearing in
+                // the list. Admitting it again would leave two slots claiming one
+                // expert, and the next plan's residency invariant
+                // (slot_for_expert[expert_for_slot[slot]] == slot) would trap on
+                // the stale one. The test is the demand path's own live test, and
+                // running it after the commit above is what makes it exact: an
+                // admission committed a step ago is resident by now and drops out
+                // here, so no expert is ever installed twice.
+                if (!demanded && slot_for_expert[expert] < 0) {
+                    admit_pending[pending++] = expert;
+                }
+            }
+            const uint32_t room = n_slots > plan->n_unique ? n_slots - plan->n_unique : 0;
+            placements = pending < admit_max ? pending : admit_max;
+            if (placements > room) {
+                placements = room;
+            }
+            skipped = pending - placements;
+        }
+        admit_placements = placements;
+        admit_skipped = skipped;
+        // Published before the gather can see it (the status is still BUILDING
+        // for the whole kernel), and read by the next plan's commit before this
+        // store can race it: the commit loops run under the barriers above.
+        plan->n_admissions = placements;
+    }
+    __syncthreads();
+    // One placement per demand miss, then one per admitted candidate: identical
+    // candidate scan, identical victim order, identical policy and identical
+    // protect preference. Only the expert installed into the slot differs (the
+    // miss's unique, or the admitted candidate), and only the demand half feeds
+    // the two protect counters - the admission half has its own three.
+    const uint32_t place_total = plan->n_misses + admit_placements;
+    for (uint32_t place = 0; place < place_total; ++place) {
+        const bool admission = place >= plan->n_misses;
         uint32_t frequency = UINT32_MAX;
         unsigned long long age = UINT64_MAX;
         uint32_t slot = UINT32_MAX;
+        // The same order over the same candidates minus the predicted residents.
+        // The identity triple (UINT32_MAX / UINT64_MAX / UINT32_MAX) means "this
+        // thread found no such candidate"; UINT32_MAX is not a slot index, so a
+        // thread that only saw predicted residents can never win the reduction.
+        uint32_t unprotected_frequency = UINT32_MAX;
+        unsigned long long unprotected_age = UINT64_MAX;
+        uint32_t unprotected_slot = UINT32_MAX;
         for (uint32_t candidate = thread; candidate < n_slots; candidate += blockDim.x) {
             if (route_storage[candidate] == 0) {
                 const int32_t resident = expert_for_slot[candidate];
@@ -3420,6 +3694,29 @@ static __global__ void moe_grouped_plan_decode(
                     age = candidate_age;
                     slot = candidate;
                 }
+                // A pin is "do not evict this resident yet". Two sources:
+                // recent1 (and every pin mode) reads the slot table - the layer's
+                // previous plan touched this slot, so its resident is warm - and
+                // protect additionally reads the look-ahead mask for this layer.
+                // The recipe arm gets the union: with a look-ahead lane the
+                // prediction joins in, without one the warm set alone is what
+                // protects (an arm that runs protect at width 0 must still be the
+                // retention policy, not a no-op). An empty slot is nobody's
+                // resident, so it stays eligible and is picked as the pinned-free
+                // victim whenever one exists: the override therefore only ever
+                // refuses to evict a pinned resident while some other demand-free
+                // slot is available.
+                const bool pinned_warm = resident >= 0 && candidate_age > recent_threshold;
+                const bool pinned_predicted = !pin_recent1 && resident >= 0 &&
+                    predict_mask != nullptr && predict_mask[resident] != 0;
+                if (pin_on && !pinned_warm && !pinned_predicted &&
+                        (candidate_frequency < unprotected_frequency ||
+                            (candidate_frequency == unprotected_frequency && (candidate_age < unprotected_age ||
+                                (candidate_age == unprotected_age && candidate < unprotected_slot))))) {
+                    unprotected_frequency = candidate_frequency;
+                    unprotected_age = candidate_age;
+                    unprotected_slot = candidate;
+                }
             }
         }
         if (blockDim.x == WARP_SIZE) {
@@ -3427,12 +3724,29 @@ static __global__ void moe_grouped_plan_decode(
             if (lane == 0) {
                 selected_slot = candidate_slot;
             }
+            if (pin_on) {
+                // Slot joins the tiebreak here (unlike the default order above);
+                // for a single-warp block the candidate index is the slot, so the
+                // chosen victim is the lowest unpinned candidate slot.
+                moe_grouped_warp_min(unprotected_frequency, unprotected_age, unprotected_slot);
+                if (lane == 0) {
+                    selected_slot_unprotected = unprotected_slot;
+                }
+            }
         } else {
             moe_grouped_warp_min(frequency, age, slot);
             if (lane == 0) {
                 warp_frequencies[warp] = frequency;
                 warp_ages[warp] = age;
                 warp_slots[warp] = slot;
+            }
+            if (pin_on) {
+                moe_grouped_warp_min(unprotected_frequency, unprotected_age, unprotected_slot);
+                if (lane == 0) {
+                    warp_unprotected_frequencies[warp] = unprotected_frequency;
+                    warp_unprotected_ages[warp] = unprotected_age;
+                    warp_unprotected_slots[warp] = unprotected_slot;
+                }
             }
             __syncthreads();
             if (warp == 0) {
@@ -3443,19 +3757,76 @@ static __global__ void moe_grouped_plan_decode(
                 if (lane == 0) {
                     selected_slot = slot;
                 }
+                if (pin_on) {
+                    unprotected_frequency = lane < blockDim.x / WARP_SIZE ? warp_unprotected_frequencies[lane] : UINT32_MAX;
+                    unprotected_age = lane < blockDim.x / WARP_SIZE ? warp_unprotected_ages[lane] : UINT64_MAX;
+                    unprotected_slot = lane < blockDim.x / WARP_SIZE ? warp_unprotected_slots[lane] : UINT32_MAX;
+                    moe_grouped_warp_min(unprotected_frequency, unprotected_age, unprotected_slot);
+                    if (lane == 0) {
+                        selected_slot_unprotected = unprotected_slot;
+                    }
+                }
             }
         }
         __syncthreads();
         if (thread == 0) {
-            const int32_t unique = miss_unique[miss];
-            if (selected_slot >= n_slots || unique < 0 || (uint32_t) unique >= plan->n_unique) {
+            if (selected_slot >= n_slots) {
                 moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
             }
-            unique_slots[unique] = selected_slot;
-            miss_slots[miss] = selected_slot;
-            route_storage[selected_slot] = 1;
+            uint32_t victim = selected_slot;
+            if (pin_on) {
+                // predict_counters is the lane's counter array itself, so the
+                // absolute slots are the ones the stage line reads: [7]/[8] for
+                // the pin hook, [9]/[10]/[11] for the admission pass.
+                // A real slot index means this eviction had an unpinned candidate;
+                // it differs from the default victim exactly when the default
+                // victim was itself pinned, so [7] counts the choices the hook
+                // actually moved. UINT32_MAX means every demand-free slot held a
+                // pinned resident: the hook declines and the default victim
+                // stands, counted in [8]. Admission placements reuse the same
+                // preference but stay out of both counters: they are not demand
+                // evictions, and mixing them would make the two numbers mean
+                // different things in different arms. The counters live in the
+                // look-ahead lane, so recent1 without a lane still pins but has
+                // nowhere to count.
+                if (selected_slot_unprotected < n_slots) {
+                    if (selected_slot_unprotected != selected_slot) {
+                        victim = selected_slot_unprotected;
+                        if (!admission && predict_counters != nullptr) {
+                            atomicAdd(reinterpret_cast<unsigned long long *>(&predict_counters[7]), 1ULL);
+                        }
+                    }
+                } else if (!admission && predict_counters != nullptr) {
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&predict_counters[8]), 1ULL);
+                }
+            }
+            if (admission) {
+                const uint32_t index = place - plan->n_misses;
+                admit_experts[index] = admit_pending[index];
+                admit_slots[index] = victim;
+                // [10]: the victim slot held a resident, so this admission was
+                // an eviction; the rest fill slots nobody held.
+                if (expert_for_slot[victim] >= 0) {
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&predict_counters[10]), 1ULL);
+                }
+                atomicAdd(reinterpret_cast<unsigned long long *>(&predict_counters[9]), 1ULL);
+            } else {
+                const int32_t unique = miss_unique[place];
+                if (unique < 0 || (uint32_t) unique >= plan->n_unique) {
+                    moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+                }
+                unique_slots[unique] = victim;
+                miss_slots[place] = victim;
+            }
+            route_storage[victim] = 1;
         }
         __syncthreads();
+    }
+    if (admit_on && admit_skipped != 0 && thread == 0) {
+        // [11]: predicted, non-resident, not-demanded candidates the room or the
+        // cap could not take. Counted once per plan, never per placement.
+        atomicAdd(reinterpret_cast<unsigned long long *>(&predict_counters[11]),
+            (unsigned long long) admit_skipped);
     }
 
     // Plan-side staged admission (opt-in; both pointers null when the gate is off).
@@ -3512,15 +3883,22 @@ static __global__ void moe_grouped_plan_decode(
             // and the staged-served count is the residual need - resident - copied.
             // It was admitted exactly once, into the single victim slot chosen above,
             // which is the slot the gather lands the staged payload in.
-            const uint32_t demand_misses = plan->n_misses - staged_admissions;
+            //
+            // Admission fetches (GGML_MOE_ADMIT_PREDICTED) are the opposite case and
+            // are charged here: a prefetch is still a PCIe fetch, and admitting an
+            // expert nobody demanded buys that expert's slab - from the source, or
+            // recycled out of a staged slab that had already landed - so [2]/[3] read
+            // misses = demand misses + admissions. They add no need, so with the gate
+            // on, need - resident is no longer copied, by design.
+            const uint32_t billed_fetches = plan->n_misses - staged_admissions + plan->n_admissions;
             atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[0]),
                 static_cast<unsigned long long>(plan->n_unique));
             atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[1]),
                 static_cast<unsigned long long>(plan->n_unique - plan->n_misses));
             atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[2]),
-                static_cast<unsigned long long>(demand_misses));
+                static_cast<unsigned long long>(billed_fetches));
             atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[3]),
-                static_cast<unsigned long long>(demand_misses) * resident_bytes_per_miss);
+                static_cast<unsigned long long>(billed_fetches) * resident_bytes_per_miss);
             resident_slot[4] = resident_tag;
         }
     }
@@ -4082,11 +4460,20 @@ static void moe_early_router_wait_copy(cudaStream_t stream, uint32_t * done) {
 // stream-ordered. Single-flight per lane is enforced with a stream WaitValue
 // on the previous copy_done, so the compute stream never blocks on the host.
 // ---------------------------------------------------------------------------
-#define GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH 8
-#define GGML_CUDA_MOE_LOOKAHEAD_COUNTERS 8
+// GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH is declared above (the plan kernel reads
+// the width-8 candidate list).
+#define GGML_CUDA_MOE_LOOKAHEAD_COUNTERS 12
 // Lane counters: [0]=staged bytes [1]=consumed bytes [2]=staged count
 // [3]=consumed count [4]=publishes [5]=dropped [6]=resident-skipped.
-// Index 7 is reserved. The gather adds [1]/[3]; the filter adds the rest.
+// The gather adds [1]/[3]; the filter adds the rest. [7]/[8] are lifetime
+// eviction-pin counters, written by the plan kernel only under a pin policy:
+// [7]=evictions whose victim was overridden away from the default choice,
+// [8]=evictions that found every candidate resident already pinned.
+// [9]/[10]/[11] are lifetime admission counters, written by the plan kernel
+// only with a candidate list: [9]=predicted experts admitted into slots,
+// [10]=those admissions whose victim slot held a resident hence were evictions
+// rather than fills of an empty slot, [11]=candidates that found no slot (cap
+// or no room) and were therefore dropped.
 
 struct moe_copy_config {
     bool mailbox = false;
@@ -4134,13 +4521,25 @@ static moe_copy_config moe_copy_config_lookahead() {
 // are treated as present because the plan kernel commits them before this
 // step's plan overwrites the shared plan, exactly like the incoming check in
 // moe_early_router_select. Single block; only thread 0 filters (width <= 8).
+//
+// predict_mask (nullable) is the same prediction kept whole instead of
+// compacted: every valid id in the first width entries is marked, resident or
+// not. That is the one form the eviction policy can use - positions is
+// predicted-AND-not-resident by construction, so it never intersects the
+// residents a victim is chosen from. Cleared and refilled in the same launch as
+// positions, so a mask is never a mixture of two predictions. Null for every
+// policy but protect: nothing is written and nothing is allocated.
 static __global__ void moe_lookahead_stage_filter(
         const int32_t * ids, uint32_t n_ids, uint32_t width,
         const int32_t * slot_for_expert, uint32_t n_experts,
         const moe_grouped_decode_plan * prior, uint32_t plan_capacity,
-        int32_t * predicted, int32_t * positions, uint64_t * counters, size_t entry_bytes) {
+        int32_t * predicted, int32_t * positions, uint64_t * counters, size_t entry_bytes,
+        int32_t * predict_mask) {
     for (uint32_t e = threadIdx.x; e < n_experts; e += blockDim.x) {
         positions[e] = -1;
+        if (predict_mask != nullptr) {
+            predict_mask[e] = 0;
+        }
     }
     __syncthreads();
     if (threadIdx.x != 0) {
@@ -4160,6 +4559,12 @@ static __global__ void moe_lookahead_stage_filter(
     const uint32_t n = n_ids < width ? n_ids : width;
     for (uint32_t r = 0; r < n; ++r) {
         const int32_t expert = ids[r];
+        if (predict_mask != nullptr && expert >= 0 && (uint32_t) expert < n_experts) {
+            // Whole prediction, resident or not. Marking is idempotent and
+            // independent of the residency classification below, so the
+            // compaction stays byte-for-byte the same as without a mask.
+            predict_mask[expert] = 1;
+        }
         if (expert < 0 || (uint32_t) expert >= n_experts || staged >= width || positions[expert] >= 0) {
             ++dropped;
             continue;
@@ -4520,10 +4925,16 @@ static __global__ void moe_grouped_gather_decode(
     uint32_t early_completed = early_rolling ? moe_staging_progress(early_progress) : 0;
     if constexpr (debug_transfers) {
         if (early_phase != 2 && early_phase != 3 && blockIdx.x == 0 && threadIdx.x == 0) {
+            // Admissions are fetches too (from the source, or recycled from an
+            // already-landed staged slab), so they belong in the debug transfer
+            // meters. [1] counts bytes; the staged-recycled ones counted here are
+            // not re-read from the source, which is precisely the traffic the
+            // meter would otherwise over-report.
+            const uint32_t fetches = plan->n_misses + plan->n_admissions;
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[0]),
-                static_cast<unsigned long long>(plan->n_misses) * n_banks);
+                static_cast<unsigned long long>(fetches) * n_banks);
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[1]),
-                static_cast<unsigned long long>(plan->n_misses) * words_per_miss * sizeof(uint4));
+                static_cast<unsigned long long>(fetches) * words_per_miss * sizeof(uint4));
         }
     }
     const int32_t * miss_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
@@ -4600,6 +5011,72 @@ static __global__ void moe_grouped_gather_decode(
             const int32_t slot = miss_slots[miss];
             descriptor.data[(size_t) slot * descriptor.n_values + auxiliary_value] =
                 descriptor.source[(size_t) expert * descriptor.n_values + auxiliary_value];
+        }
+    }
+    // Admission transfers (opt-in): predicted experts the plan placed into slots
+    // nobody demanded. Same word walk and same rolling readiness as the misses
+    // above, so an admission whose slab has already landed in the lane's staging
+    // buffer is landed from there instead of being re-read from the source - that
+    // is bytes the look-ahead already paid to cross PCIe, and they would otherwise
+    // be overwritten unused. The plan only ever commits admissions when the host
+    // gave it a candidate list, and the host only does that for a look-ahead lane,
+    // but this block is deliberately not gated on the lane: an admission the plan
+    // committed must be transferred by whichever gather runs, staged or not.
+    if (plan->n_admissions != 0) {
+        const int32_t * admit_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ADMIT_EXPERTS);
+        const int32_t * admit_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ADMIT_SLOTS);
+        const size_t admit_words = words_per_miss * plan->n_admissions;
+        for (size_t word = first; word < admit_words; word += stride) {
+            if (early_rolling) {
+                if (resample == 0) {
+                    early_completed = moe_staging_progress(early_progress);
+                    resample = GGML_CUDA_MOE_STAGING_RESAMPLE;
+                }
+                --resample;
+            }
+            const uint32_t admit = word / words_per_miss;
+            const int32_t expert = admit_experts[admit];
+            const int32_t slot = admit_slots[admit];
+            const int32_t position = early_positions != nullptr ? early_positions[expert] : -1;
+            const bool staged_ready = position >= 0 && (!early_rolling || (uint32_t) position < early_completed);
+            size_t bank_word = word % words_per_miss;
+            for (uint32_t bank = 0; bank < n_banks; ++bank) {
+                const auto descriptor = banks[bank];
+                const size_t bank_words = descriptor.expert_stride / sizeof(uint4);
+                if (bank_word >= bank_words) {
+                    bank_word -= bank_words;
+                    continue;
+                }
+                if ((bank_mask & (uint32_t{1} << bank)) == 0) {
+                    break;
+                }
+                const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.source + (size_t) expert * descriptor.expert_stride);
+                if (staged_ready) {
+                    source = early_staging + (size_t) position * words_per_miss + word % words_per_miss - bank_word;
+                }
+                uint4 * destination = reinterpret_cast<uint4 *>(descriptor.data + (size_t) slot * descriptor.expert_stride);
+                destination[bank_word] = source[bank_word];
+                break;
+            }
+        }
+        if (n_auxiliaries != 0) {
+            const size_t admit_values = auxiliary_values_per_miss * plan->n_admissions;
+            for (size_t index = first; index < admit_values; index += stride) {
+                const uint32_t admit = index / auxiliary_values_per_miss;
+                size_t auxiliary_value = index % auxiliary_values_per_miss;
+                uint32_t auxiliary = 0;
+                while (auxiliary < n_auxiliaries && auxiliary_value >= auxiliaries[auxiliary].n_values) {
+                    auxiliary_value -= auxiliaries[auxiliary++].n_values;
+                }
+                if (auxiliary == n_auxiliaries) {
+                    continue;
+                }
+                const auto descriptor = auxiliaries[auxiliary];
+                const int32_t expert = admit_experts[admit];
+                const int32_t slot = admit_slots[admit];
+                descriptor.data[(size_t) slot * descriptor.n_values + auxiliary_value] =
+                    descriptor.source[(size_t) expert * descriptor.n_values + auxiliary_value];
+            }
         }
     }
     if (resident_slot != nullptr && blockIdx.x == 0) {
@@ -5176,11 +5653,20 @@ struct ggml_cuda_moe_grouped_context::impl {
     explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {
         const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
         frequency_aware = value == nullptr || strcmp(value, "0") != 0;
+        evict_policy = moe_cache_evict_policy_env();
+        if (evict_policy == MOE_CACHE_EVICT_LRU) {
+            // lru means exactly that: the frequency term is out of the victim
+            // order even if GGML_CUDA_MOE_FREQUENCY asked for it. lfu and
+            // protect leave the existing knob in charge, so an unset policy is
+            // today's code path bit for bit.
+            frequency_aware = false;
+        }
         frequency_halflife = moe_grouped_frequency_halflife();
     }
 
     bool frequency_aware = true;
     uint32_t frequency_halflife = MOE_GROUPED_FREQUENCY_HALFLIFE_DEFAULT;
+    moe_cache_evict_policy evict_policy = MOE_CACHE_EVICT_LFU;
 
     ~impl() {
         auto * stats = grouped_debug.load(std::memory_order_acquire);
@@ -5586,6 +6072,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             (void) cudaFree(scores);
             (void) cudaFree(predicted);
             (void) cudaFree(positions);
+            (void) cudaFree(la_predict_mask);
             (void) cudaFree(staging);
             (void) cudaFree(counters);
             (void) cudaEventDestroy(ready);
@@ -5658,6 +6145,10 @@ struct ggml_cuda_moe_grouped_context::impl {
         std::unique_ptr<copy_job> la_job;
         uint32_t la_group = UINT32_MAX;
         uint32_t la_generation = 0;
+        // Whole look-ahead prediction for this group's layer, one entry per
+        // expert, 1 when predicted for the pending plan. Allocated only in the
+        // protect policy; null everywhere else (nothing allocated, nothing read).
+        int32_t * la_predict_mask = nullptr;
         uint64_t la_publish_seq = 0;
         uint64_t la_consumed_seq = 0;
         uint64_t la_evicted = 0;
@@ -5819,6 +6310,14 @@ struct ggml_cuda_moe_grouped_context::impl {
             CUDA_CHECK(cudaEventCreateWithFlags(&fresh->done, cudaEventDisableTiming));
             CUDA_CHECK(cudaMalloc(&fresh->predicted, (size_t) width * sizeof(int32_t)));
             CUDA_CHECK(cudaMalloc(&fresh->positions, (size_t) n_experts * sizeof(int32_t)));
+            if (evict_policy == MOE_CACHE_EVICT_PROTECT) {
+                // Sized by this group's expert count and never resized: the plan
+                // only ever indexes it under a matching experts count, so a lane
+                // whose geometry moved on can only turn the hook off, not read
+                // out of bounds.
+                CUDA_CHECK(cudaMalloc(&fresh->la_predict_mask, (size_t) n_experts * sizeof(int32_t)));
+                CUDA_CHECK(cudaMemset(fresh->la_predict_mask, 0, (size_t) n_experts * sizeof(int32_t)));
+            }
             CUDA_CHECK(cudaMalloc(&fresh->staging, fresh->staging_bytes));
             CUDA_CHECK(cudaMalloc(&fresh->counters, GGML_CUDA_MOE_LOOKAHEAD_COUNTERS * sizeof(uint64_t)));
             CUDA_CHECK(cudaMemset(fresh->counters, 0, GGML_CUDA_MOE_LOOKAHEAD_COUNTERS * sizeof(uint64_t)));
@@ -5885,7 +6384,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         moe_lookahead_stage_filter<<<1, 256, 0, stream>>>(
             ids_device, n_ids, width, dev.slot_for_expert, (uint32_t) dev.n_experts,
             dev.plan, resource->snapshot.n_slots, lane->predicted, lane->positions,
-            lane->counters, entry_bytes);
+            lane->counters, entry_bytes, lane->la_predict_mask);
         CUDA_CHECK(cudaGetLastError());
         moe_early_router_publish_copy<<<1, 32, 0, stream>>>(
             lane->predicted, lane->mapped_predicted, job->top_k,
@@ -5944,6 +6443,16 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint64_t staged_experts_total = 0;
         uint64_t consumed_bytes_total = 0;
         uint64_t consumed_total = 0;
+        // Lifetime protect-policy counters, summed over lanes and never reset:
+        // both are zero unless the protect policy ran, because nothing writes
+        // the two slots otherwise.
+        uint64_t protect_overrides_total = 0;
+        uint64_t protect_all_predicted_total = 0;
+        // Lifetime admission counters, same rule: all three are zero unless the
+        // plan was given a candidate list.
+        uint64_t admitted_experts_total = 0;
+        uint64_t admit_evictions_total = 0;
+        uint64_t admit_skipped_total = 0;
         for (auto & lane : lookahead) {
             uint64_t snap[GGML_CUDA_MOE_LOOKAHEAD_COUNTERS] = {};
             {
@@ -5962,6 +6471,11 @@ struct ggml_cuda_moe_grouped_context::impl {
             staged_experts_total += snap[2];
             consumed_bytes_total += snap[1];
             consumed_total += snap[3];
+            protect_overrides_total += snap[7];
+            protect_all_predicted_total += snap[8];
+            admitted_experts_total += snap[9];
+            admit_evictions_total += snap[10];
+            admit_skipped_total += snap[11];
             for (int i = 0; i < GGML_CUDA_MOE_LOOKAHEAD_COUNTERS; ++i) {
                 lane->la_emit_counters[i] = snap[i];
             }
@@ -5970,7 +6484,12 @@ struct ggml_cuda_moe_grouped_context::impl {
             busy += lane->la_busy_skips - lane->la_emit_busy;
             lane->la_emit_busy = lane->la_busy_skips;
         }
-        GGML_LOG("moe-lookahead-stage: dispatches=%llu lanes=%llu published=%llu staged_mib=%.2f prefetch_used=%llu prefetch_dropped=%llu prefetch_reserve_refused=%llu evicted_prefetched=%llu busy_skips=%llu consumed_mib_total=%.2f consumed_total=%llu consume_pct_total=%.2f staged_experts_total=%llu used_pct_total=%.2f\n",
+        GGML_LOG("moe-lookahead-stage: dispatches=%llu lanes=%llu published=%llu staged_mib=%.2f prefetch_used=%llu prefetch_dropped=%llu prefetch_reserve_refused=%llu evicted_prefetched=%llu busy_skips=%llu consumed_mib_total=%.2f consumed_total=%llu consume_pct_total=%.2f staged_experts_total=%llu used_pct_total=%.2f protect_overrides=%llu protect_all_predicted=%llu admitted_experts=%llu admit_evictions=%llu admit_skipped=%llu staged_mib_total=%.2f\n",
+            // Field convention, because mixing the two has already cost one
+            // analysis: names ending in _total are lifetime sums over lanes and
+            // never reset, while every other field is this dispatch's delta
+            // (staged_mib is the bytes staged since the previous line, NOT a
+            // running total - compare it against staged_mib_total, which is).
             (unsigned long long) lookahead_dispatches, (unsigned long long) lookahead.size(),
             (unsigned long long) published, (double) staged_bytes / 1048576.0,
             (unsigned long long) used, (unsigned long long) dropped,
@@ -5978,7 +6497,13 @@ struct ggml_cuda_moe_grouped_context::impl {
             (double) consumed_bytes_total / 1048576.0, (unsigned long long) consumed_total,
             100.0 * (double) consumed_bytes_total / (double) std::max<uint64_t>(1, staged_bytes_total),
             (unsigned long long) staged_experts_total,
-            100.0 * (double) consumed_total / (double) std::max<uint64_t>(1, staged_experts_total));
+            100.0 * (double) consumed_total / (double) std::max<uint64_t>(1, staged_experts_total),
+            (unsigned long long) protect_overrides_total,
+            (unsigned long long) protect_all_predicted_total,
+            (unsigned long long) admitted_experts_total,
+            (unsigned long long) admit_evictions_total,
+            (unsigned long long) admit_skipped_total,
+            (double) staged_bytes_total / 1048576.0);
     }
 
     struct grouped_device_resource {
@@ -11182,6 +11707,53 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             plan_staging_positions = lookahead->positions;
             plan_staging_progress = lookahead->copy_progress;
         }
+        // Protect policy: hand the plan this layer's look-ahead prediction and its
+        // lane counters, so the victim choice can keep predicted residents. The
+        // mask stays null - and the plan kernel keeps its lfu/lru path exactly -
+        // unless the policy is protect, the lane exists for this group and
+        // generation, and its mask was sized for this group's expert count. The
+        // mask is written by the same filter launch that writes the staging
+        // positions (same stream, enqueued by the MOE_PREFETCH node ahead of this
+        // layer's plan in graph order), so in the steady state it is the
+        // prediction the look-ahead issued for this call's own plan. If a publish
+        // was skipped for backpressure it is the previous one, exactly as
+        // positions is - the hook can then only protect a staler set, never a
+        // wrong slot.
+        //
+        // recent1 needs no host input at all (its pin predicate is the slot
+        // table's own last_used), so it only borrows the lane counters when a lane
+        // exists, to report how often the hook binds.
+        const uint32_t pin_mode = impl_->evict_policy == MOE_CACHE_EVICT_PROTECT ? MOE_CACHE_PIN_PREDICTED :
+            (impl_->evict_policy == MOE_CACHE_EVICT_RECENT1 ? MOE_CACHE_PIN_RECENT1 : MOE_CACHE_PIN_NONE);
+        const int32_t * plan_predict_mask = nullptr;
+        bool pin_wants_counters = pin_mode == MOE_CACHE_PIN_RECENT1;
+        if (lookahead != nullptr && pin_mode == MOE_CACHE_PIN_PREDICTED &&
+                lookahead->la_predict_mask != nullptr && lookahead->counters != nullptr &&
+                lookahead->experts == (uint32_t) device.n_experts) {
+            plan_predict_mask = lookahead->la_predict_mask;
+            pin_wants_counters = true;
+        }
+        // Admission (GGML_MOE_ADMIT_PREDICTED): hand the plan the same lane's
+        // compacted prediction - predicted experts that were not resident at
+        // publish time, in predictor confidence order, -1 padded - plus the cap.
+        // Orthogonal to the pin policy above, so it composes with lfu/lru/protect,
+        // and additive to the workstream goal: this is what makes the prediction a
+        // residency decision instead of only a staging one. The lane counters come
+        // along whenever either mechanism is on, because both count there.
+        const int32_t * plan_admit_candidates = nullptr;
+        uint32_t plan_admit_width = 0;
+        uint32_t plan_admit_max = 0;
+        const uint32_t admit_cap = moe_cache_admit_predicted() ? moe_cache_admit_max() : 0;
+        if (lookahead != nullptr && admit_cap != 0 && lookahead->predicted != nullptr &&
+                lookahead->experts == (uint32_t) device.n_experts) {
+            plan_admit_candidates = lookahead->predicted;
+            plan_admit_width = lookahead->width;
+            plan_admit_max = admit_cap;
+        }
+        uint64_t * plan_predict_counters = nullptr;
+        if (lookahead != nullptr && lookahead->counters != nullptr && (pin_wants_counters || admit_cap != 0)) {
+            plan_predict_counters = lookahead->counters;
+        }
         const uint32_t plan_threads = moe_grouped_plan_threads(resource->snapshot.n_slots);
         // Demand trace: one predictable branch when the gate is off (the alloc
         // returns null), and layer -1 keeps the kernel's own branch untaken.
@@ -11200,7 +11772,8 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, impl_->frequency_halflife, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan,
             resident_slot, resident_tag, resident_bpm, plan_staging_positions, plan_staging_progress,
-            demand_trace, demand_trace_layer);
+            demand_trace, demand_trace_layer, plan_predict_mask, plan_predict_counters,
+            plan_admit_candidates, plan_admit_width, plan_admit_max, pin_mode);
         CUDA_CHECK(cudaGetLastError());
 #if CUDART_VERSION >= 12080
         if (ready_only && !ready_late) {
