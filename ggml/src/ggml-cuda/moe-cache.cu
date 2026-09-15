@@ -5069,6 +5069,7 @@ static bool ggml_cuda_moe_cache_handoff_grouped(ggml_cuda_moe_cache * cache, cud
 static bool ggml_cuda_moe_cache_abort_host_staged(ggml_cuda_moe_cache * cache, cudaStream_t compute_stream);
 
 static void ggml_cuda_moe_resident_free_for_device(int device);
+static void ggml_cuda_moe_step_ledger_free_for_device(int device);
 struct ggml_cuda_moe_grouped_context::impl {
     explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {
         const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
@@ -5085,6 +5086,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             (void) cudaFree(transfers);
         }
         ggml_cuda_moe_resident_free_for_device(device);
+        ggml_cuda_moe_step_ledger_free_for_device(device);
     }
 
     struct grouped_resource;
@@ -9919,8 +9921,24 @@ static ggml_cuda_moe_resident_probe & ggml_cuda_moe_resident_state() {
     static ggml_cuda_moe_resident_probe state;
     return state;
 }
-static bool ggml_cuda_moe_resident_enabled() {
+// Cumulative reporter gate: the original switch, presence only, unchanged.
+static bool ggml_cuda_moe_resident_summary_enabled() {
     static const bool enabled = getenv("GGML_CUDA_MOE_PHASE_PROBE") != nullptr;
+    return enabled;
+}
+// Per-step ledger gate: unset or "0" is off, any other value is on. Separate
+// from the cumulative switch on purpose, so the ledger can be measured against
+// a control arm with neither instrument loaded.
+static bool ggml_cuda_moe_step_ledger_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_MOE_PHASE_PROBE_PER_STEP");
+        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+// Counter publication gate: either instrument needs the device table.
+static bool ggml_cuda_moe_resident_enabled() {
+    static const bool enabled = ggml_cuda_moe_resident_summary_enabled() || ggml_cuda_moe_step_ledger_enabled();
     return enabled;
 }
 static int ggml_cuda_moe_resident_layer_of(const char * name, uint32_t fallback) {
@@ -9995,7 +10013,7 @@ static void ggml_cuda_moe_resident_free_for_device(int device) {
     }
 }
 static void ggml_cuda_moe_resident_drain_and_emit() {
-    if (!ggml_cuda_moe_resident_enabled()) {
+    if (!ggml_cuda_moe_resident_summary_enabled()) {
         return;
     }
     uint64_t * dev = ggml_cuda_moe_resident_device.load(std::memory_order_acquire);
@@ -10121,6 +10139,382 @@ static void ggml_cuda_moe_resident_drain_and_emit() {
     // Advance the prepare epoch once per drain; slots stamped earlier that
     // land here are device-behind-host slop and compare unequal above.
     ggml_cuda_moe_resident_state().drain_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// ---------------------------------------------------------------------------
+// Per-step MoE miss ledger (diagnostic, off unless
+// GGML_CUDA_MOE_PHASE_PROBE_PER_STEP is set to a value other than "0").
+//
+// Question: how many expert demands, cache hits and miss bytes does ONE decode
+// step cost, so a host-side joiner can pair the numbers with that token's
+// arrival time. Same counters as the cumulative reporter above, and the same
+// meaning: need = expert demands, resident = demands served from the cache at
+// entry, misses = demand misses (= copied, the column the summary prints),
+// miss_mib = the bytes those misses moved. One line per decode step:
+//
+//   moe-step: step=<n> need=<u> resident=<u> misses=<u> miss_mib=<f>
+//
+// Mechanism, chosen so the ledger does not sit on the clock it measures: the
+// counter table is read with cudaMemcpyAsync into pinned host memory, ordered
+// after the step's kernels by an event recorded on the stream those kernels
+// ran on, and copied on a private non-blocking stream. The decode loop never
+// waits for the device: cudaEventQuery polls, and a snapshot that has not
+// landed is emitted by a later drain (or by the teardown flush). No host
+// synchronize is issued per step. The step boundary is held closed device-side
+// instead: the next step's kernels cannot touch the counters until the 8 KiB
+// snapshot has been read, which costs a few microseconds per step and is the
+// ledger's only effect on the measured path.
+//
+// Every dispatch that ran grouped work is snapshotted, not only decode
+// dispatches, so the diff between consecutive snapshots is exactly one step
+// wide; the per-layer class recorded with the slot keeps prefill activity out
+// of the decode line. A step whose decode layers moved no counter is not a
+// counted step, the cumulative reporter's own rule, so the per-step lines
+// partition exactly the totals the summary prints.
+//
+// Ring wrap: the ring holds GGML_CUDA_MOE_STEP_RING undrained snapshots. If it
+// is ever full (the host more than that many steps ahead of the device, a copy
+// that never completes, or an unorderable set of streams) that step's snapshot
+// is dropped instead of synced, and it is counted, reported once at teardown.
+// A dropped step gets no line of its own; its counters land in the following
+// snapshot, which is then one step wide plus the dropped step. Worst case, if
+// the device never completes another copy, every step after the first
+// GGML_CUDA_MOE_STEP_RING is dropped, and the ring's remaining snapshots are
+// still flushed at teardown: at most steps - GGML_CUDA_MOE_STEP_RING lines can
+// be missing, and the warning says how many. Dropping is preferable to
+// syncing, which is what this ledger exists to avoid.
+// ---------------------------------------------------------------------------
+#define GGML_CUDA_MOE_STEP_RING 256
+#define GGML_CUDA_MOE_STEP_STREAMS 8
+#define GGML_CUDA_MOE_STEP_CLASS_NONE 0xFFFFFFFFu
+struct ggml_cuda_moe_step_ledger {
+    // Pinned host copy of the counter table, one slot per snapshot.
+    uint64_t * snap = nullptr;          // [RING][MAX_LAYERS][FIELDS]
+    uint8_t * slot_cls = nullptr;       // [RING][MAX_LAYERS] layer class in that step, 0xFF = untouched
+    uint32_t * slot_decode = nullptr;   // [RING] 1 = the step had at least one decode layer
+    cudaEvent_t * ev_done = nullptr;    // [RING] snapshot landed on copy_stream
+    cudaEvent_t ev_ready[GGML_CUDA_MOE_STEP_STREAMS] = {};  // one step-end marker per compute stream
+    cudaStream_t copy_stream = nullptr; // private, non-blocking: never carries the step's kernels
+    void * step_stream[GGML_CUDA_MOE_STEP_STREAMS] = {};
+    std::atomic<uint32_t> step_stream_count{0};
+    std::atomic<uint32_t> step_stream_overflow{0};
+    std::atomic<uint32_t> step_cls[GGML_CUDA_MOE_RESIDENT_MAX_LAYERS];
+    uint64_t last[GGML_CUDA_MOE_RESIDENT_MAX_LAYERS][4] = {};   // cumulative baseline for the diff
+    int device = -1;
+    bool cls_ready = false;
+    bool unavailable = false;
+    bool failed = false;
+    bool warned = false;
+    uint64_t head = 0;                                                  // next slot to fill
+    uint64_t tail = 0;                                                  // next slot to emit
+    uint64_t emitted = 0;                                               // decode steps emitted so far
+    uint64_t dropped = 0;                                               // snapshots not taken
+};
+static ggml_cuda_moe_step_ledger & ggml_cuda_moe_step_ledger_state() {
+    static ggml_cuda_moe_step_ledger state;
+    return state;
+}
+static void ggml_cuda_moe_step_ledger_reset_step(ggml_cuda_moe_step_ledger & ledger) {
+    ledger.step_stream_count.store(0, std::memory_order_release);
+    ledger.step_stream_overflow.store(0, std::memory_order_relaxed);
+}
+static bool ggml_cuda_moe_step_ledger_init(ggml_cuda_moe_step_ledger & ledger, int device) {
+    if (ledger.device >= 0) {
+        // Allocation failure is remembered: retrying it every step would be the
+        // perturbation this ledger exists to avoid.
+        return !ledger.unavailable && ledger.device == device;
+    }
+    const size_t snap_bytes = (size_t) GGML_CUDA_MOE_STEP_RING * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS *
+        GGML_CUDA_MOE_RESIDENT_FIELDS * sizeof(uint64_t);
+    const size_t cls_bytes = (size_t) GGML_CUDA_MOE_STEP_RING * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS;
+    moe_grouped_device_scope device_scope(device);
+    void * snap = nullptr;
+    bool ok = moe_grouped_cuda_success(cudaMallocHost(&snap, snap_bytes));
+    uint8_t * slot_cls = ok ? (uint8_t *) malloc(cls_bytes) : nullptr;
+    uint32_t * slot_decode = ok ? (uint32_t *) calloc(GGML_CUDA_MOE_STEP_RING, sizeof(uint32_t)) : nullptr;
+    cudaEvent_t * ev_done = ok ? (cudaEvent_t *) calloc(GGML_CUDA_MOE_STEP_RING, sizeof(cudaEvent_t)) : nullptr;
+    cudaStream_t copy_stream = nullptr;
+    ok = ok && slot_cls != nullptr && slot_decode != nullptr && ev_done != nullptr;
+    uint32_t ready_created = 0;
+    while (ok && ready_created < GGML_CUDA_MOE_STEP_STREAMS) {
+        if (!moe_grouped_cuda_success(cudaEventCreateWithFlags(&ledger.ev_ready[ready_created], cudaEventDisableTiming))) {
+            ok = false;
+            break;
+        }
+        ++ready_created;
+    }
+    if (ok && !moe_grouped_cuda_success(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking))) {
+        ok = false;
+    }
+    uint32_t events_created = 0;
+    while (ok && events_created < GGML_CUDA_MOE_STEP_RING) {
+        if (!moe_grouped_cuda_success(cudaEventCreateWithFlags(&ev_done[events_created], cudaEventDisableTiming))) {
+            ok = false;
+            break;
+        }
+        ++events_created;
+    }
+    if (ok) {
+        memset(slot_cls, 0xFF, cls_bytes);
+        ledger.snap = (uint64_t *) snap;
+        ledger.slot_cls = slot_cls;
+        ledger.slot_decode = slot_decode;
+        ledger.ev_done = ev_done;
+        ledger.copy_stream = copy_stream;
+        ledger.device = device;
+        ledger.unavailable = false;
+        return true;
+    }
+    // Allocation failure: the ledger stays off, one warning, no per-step cost.
+    for (uint32_t i = 0; i < events_created; ++i) {
+        (void) cudaEventDestroy(ev_done[i]);
+    }
+    for (uint32_t i = 0; i < ready_created; ++i) {
+        (void) cudaEventDestroy(ledger.ev_ready[i]);
+        ledger.ev_ready[i] = nullptr;
+    }
+    if (copy_stream != nullptr) {
+        (void) cudaStreamDestroy(copy_stream);
+    }
+    if (snap != nullptr) {
+        (void) cudaFreeHost(snap);
+    }
+    free(slot_cls);
+    free(slot_decode);
+    free(ev_done);
+    if (!ledger.warned) {
+        ledger.warned = true;
+        GGML_LOG_WARN("moe-ledger: per-step ledger disabled: could not allocate the snapshot ring\n");
+    }
+    ledger.device = device;
+    ledger.unavailable = true;
+    return false;
+}
+// Prepare-time notes. Both are pure host state, capture-safe, and do nothing
+// unless the ledger is enabled.
+static void ggml_cuda_moe_step_ledger_note_layer(int layer, uint32_t cls) {
+    if (!ggml_cuda_moe_step_ledger_enabled() || layer < 0 || layer >= GGML_CUDA_MOE_RESIDENT_MAX_LAYERS) {
+        return;
+    }
+    auto & ledger = ggml_cuda_moe_step_ledger_state();
+    // First note of the run: prepares happen before the first drain, so the
+    // table is seeded here, not at ring allocation, to keep the first step's
+    // classes.
+    if (!ledger.cls_ready) {
+        ledger.cls_ready = true;
+        for (int l = 0; l < GGML_CUDA_MOE_RESIDENT_MAX_LAYERS; ++l) {
+            ledger.step_cls[l].store(GGML_CUDA_MOE_STEP_CLASS_NONE, std::memory_order_relaxed);
+        }
+    }
+    ledger.step_cls[layer].store(cls, std::memory_order_relaxed);
+}
+static void ggml_cuda_moe_step_ledger_note_stream(cudaStream_t stream) {
+    if (!ggml_cuda_moe_step_ledger_enabled() || stream == nullptr) {
+        return;
+    }
+    auto & ledger = ggml_cuda_moe_step_ledger_state();
+    const uint32_t count = ledger.step_stream_count.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < count && i < GGML_CUDA_MOE_STEP_STREAMS; ++i) {
+        if (ledger.step_stream[i] == reinterpret_cast<void *>(stream)) {
+            return;
+        }
+    }
+    if (count >= GGML_CUDA_MOE_STEP_STREAMS) {
+        ledger.step_stream_overflow.store(1, std::memory_order_relaxed);
+        return;
+    }
+    ledger.step_stream[count] = reinterpret_cast<void *>(stream);
+    ledger.step_stream_count.store(count + 1, std::memory_order_release);
+}
+// Emit every snapshot that has landed, oldest first, so lines stay in step
+// order. Never waits unless `flush` (teardown): a slot still in flight is left
+// for a later call.
+static void ggml_cuda_moe_step_ledger_consume(ggml_cuda_moe_step_ledger & ledger, bool flush) {
+    while (ledger.tail != ledger.head && !ledger.failed) {
+        const size_t slot = (size_t) (ledger.tail % GGML_CUDA_MOE_STEP_RING);
+        if (flush) {
+            moe_grouped_device_scope device_scope(ledger.device);
+            if (!moe_grouped_cuda_success(cudaEventSynchronize(ledger.ev_done[slot]))) {
+                ledger.failed = true;
+                return;
+            }
+        } else {
+            const cudaError_t status = cudaEventQuery(ledger.ev_done[slot]);
+            if (status == cudaErrorNotReady) {
+                return;
+            }
+            if (status != cudaSuccess) {
+                (void) cudaGetLastError();
+                ledger.failed = true;
+                return;
+            }
+        }
+        const uint64_t * snap = ledger.snap +
+            slot * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS * GGML_CUDA_MOE_RESIDENT_FIELDS;
+        const uint8_t * slot_cls = ledger.slot_cls + slot * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS;
+        uint64_t need = 0, resident = 0, misses = 0, bytes = 0;
+        for (int l = 0; l < GGML_CUDA_MOE_RESIDENT_MAX_LAYERS; ++l) {
+            const uint64_t * row = snap + (size_t) l * GGML_CUDA_MOE_RESIDENT_FIELDS;
+            uint64_t delta[4] = {};
+            for (int f = 0; f < 4; ++f) {
+                // Counters are cumulative with no memset; a decrease means the
+                // device buffer was freed and zero-reallocated, so rebase.
+                delta[f] = row[f] >= ledger.last[l][f] ? row[f] - ledger.last[l][f] : row[f];
+                ledger.last[l][f] = row[f];
+            }
+            if (slot_cls[l] != 0) {
+                continue;
+            }
+            need += delta[0];
+            resident += delta[1];
+            misses += delta[2];
+            bytes += delta[3];
+        }
+        // A step with no decode layer at all (a prefill dispatch), or one whose
+        // decode layers moved no counter, is not a counted step: the cumulative
+        // reporter skips it too, so the per-step lines partition exactly the
+        // same totals and no zero line is invented.
+        if (ledger.slot_decode[slot] != 0 && (need != 0 || resident != 0 || misses != 0 || bytes != 0)) {
+            GGML_LOG("moe-step: step=%llu need=%llu resident=%llu misses=%llu miss_mib=%.2f\n",
+                (unsigned long long) ledger.emitted, (unsigned long long) need,
+                (unsigned long long) resident, (unsigned long long) misses, (double) bytes / 1048576.0);
+            ++ledger.emitted;
+        }
+        ++ledger.tail;
+    }
+}
+// One snapshot per dispatch: mark the end of the step's kernels on each stream
+// that ran them, copy the counters on the ledger's own stream, then hold the
+// next step's kernels until that copy has landed.
+static void ggml_cuda_moe_step_ledger_snapshot(ggml_cuda_moe_step_ledger & ledger, int device, uint64_t * dev) {
+    const uint32_t n_streams = ledger.step_stream_count.load(std::memory_order_acquire);
+    const bool overflow = ledger.step_stream_overflow.exchange(0, std::memory_order_acq_rel) != 0;
+    if (n_streams == 0 || overflow) {
+        // No grouped work this dispatch, or more distinct streams than the ring
+        // can order: no snapshot, so the step's counters move into the next
+        // window (counted, never guessed at).
+        if (overflow) {
+            ++ledger.dropped;
+        }
+        ggml_cuda_moe_step_ledger_reset_step(ledger);
+        return;
+    }
+    if (ledger.head - ledger.tail >= GGML_CUDA_MOE_STEP_RING) {
+        ++ledger.dropped;
+        ggml_cuda_moe_step_ledger_reset_step(ledger);
+        return;
+    }
+    const size_t slot = (size_t) (ledger.head % GGML_CUDA_MOE_STEP_RING);
+    uint8_t * slot_cls = ledger.slot_cls + slot * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS;
+    bool decode = false;
+    for (int l = 0; l < GGML_CUDA_MOE_RESIDENT_MAX_LAYERS; ++l) {
+        const uint32_t cls = ledger.step_cls[l].exchange(GGML_CUDA_MOE_STEP_CLASS_NONE, std::memory_order_acq_rel);
+        slot_cls[l] = cls == 0 ? 0 : (cls == 1 ? 1 : 0xFF);
+        if (cls == 0) {
+            decode = true;
+        }
+    }
+    ledger.slot_decode[slot] = decode ? 1 : 0;
+    bool ok = true;
+    {
+        moe_grouped_device_scope device_scope(device);
+        for (uint32_t i = 0; ok && i < n_streams; ++i) {
+            const cudaStream_t stream = reinterpret_cast<cudaStream_t>(ledger.step_stream[i]);
+            ok = moe_grouped_cuda_success(cudaEventRecord(ledger.ev_ready[i], stream)) &&
+                moe_grouped_cuda_success(cudaStreamWaitEvent(ledger.copy_stream, ledger.ev_ready[i], 0));
+        }
+        ok = ok && moe_grouped_cuda_success(cudaMemcpyAsync(ledger.snap +
+                slot * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS * GGML_CUDA_MOE_RESIDENT_FIELDS, dev,
+                (size_t) GGML_CUDA_MOE_RESIDENT_MAX_LAYERS * GGML_CUDA_MOE_RESIDENT_FIELDS * sizeof(uint64_t),
+                cudaMemcpyDeviceToHost, ledger.copy_stream)) &&
+            moe_grouped_cuda_success(cudaEventRecord(ledger.ev_done[slot], ledger.copy_stream));
+        // The next step's kernels run on the streams that ran this one, and
+        // they write these same counters. Hold them until the snapshot has been
+        // read, so a snapshot is exactly the step boundary and never a mix of
+        // two steps. This is the ledger's only added dependency: a device-side
+        // wait on an 8 KiB read, a few microseconds, never a host sync.
+        for (uint32_t i = 0; ok && i < n_streams; ++i) {
+            const cudaStream_t stream = reinterpret_cast<cudaStream_t>(ledger.step_stream[i]);
+            ok = moe_grouped_cuda_success(cudaStreamWaitEvent(stream, ledger.ev_done[slot], 0));
+        }
+    }
+    if (!ok) {
+        // The ordering could not be expressed; skip the slot instead of
+        // emitting a snapshot that is not step-aligned.
+        ++ledger.dropped;
+        ggml_cuda_moe_step_ledger_reset_step(ledger);
+        return;
+    }
+    ++ledger.head;
+    ggml_cuda_moe_step_ledger_reset_step(ledger);
+}
+static void ggml_cuda_moe_step_ledger_drain() {
+    if (!ggml_cuda_moe_step_ledger_enabled()) {
+        return;
+    }
+    uint64_t * dev = ggml_cuda_moe_resident_device.load(std::memory_order_acquire);
+    const int dev_idx = ggml_cuda_moe_resident_device_idx.load(std::memory_order_acquire);
+    if (dev == nullptr || dev_idx < 0) {
+        return;
+    }
+    auto & ledger = ggml_cuda_moe_step_ledger_state();
+    if (ledger.failed || !ggml_cuda_moe_step_ledger_init(ledger, dev_idx)) {
+        return;
+    }
+    ggml_cuda_moe_step_ledger_consume(ledger, false);
+    ggml_cuda_moe_step_ledger_snapshot(ledger, dev_idx, dev);
+}
+static void ggml_cuda_moe_step_ledger_free_for_device(int device) {
+    auto & ledger = ggml_cuda_moe_step_ledger_state();
+    if (ledger.device != device) {
+        return;
+    }
+    // Flush the tail once, at teardown: the last steps are still in flight, and
+    // this is the only place the ledger waits for the device.
+    ggml_cuda_moe_step_ledger_consume(ledger, true);
+    if (ledger.dropped != 0 || ledger.failed) {
+        GGML_LOG_WARN("moe-ledger: dropped=%llu failed=%d: dropped steps carry no moe-step line\n",
+            (unsigned long long) ledger.dropped, ledger.failed ? 1 : 0);
+    }
+    moe_grouped_device_scope device_scope(device);
+    if (ledger.ev_done != nullptr) {
+        for (uint64_t i = 0; i < GGML_CUDA_MOE_STEP_RING; ++i) {
+            if (ledger.ev_done[i] != nullptr) {
+                (void) cudaEventDestroy(ledger.ev_done[i]);
+            }
+        }
+    }
+    for (uint32_t i = 0; i < GGML_CUDA_MOE_STEP_STREAMS; ++i) {
+        if (ledger.ev_ready[i] != nullptr) {
+            (void) cudaEventDestroy(ledger.ev_ready[i]);
+        }
+    }
+    if (ledger.copy_stream != nullptr) {
+        (void) cudaStreamDestroy(ledger.copy_stream);
+    }
+    if (ledger.snap != nullptr) {
+        (void) cudaFreeHost(ledger.snap);
+    }
+    free(ledger.slot_cls);
+    free(ledger.slot_decode);
+    free(ledger.ev_done);
+    ledger.snap = nullptr;
+    ledger.slot_cls = nullptr;
+    ledger.slot_decode = nullptr;
+    ledger.ev_done = nullptr;
+    for (uint32_t i = 0; i < GGML_CUDA_MOE_STEP_STREAMS; ++i) {
+        ledger.ev_ready[i] = nullptr;
+    }
+    ledger.copy_stream = nullptr;
+    ledger.device = -1;
+    ledger.cls_ready = false;
+    ledger.unavailable = false;
+    ledger.failed = false;
+    ledger.head = 0;
+    ledger.tail = 0;
+    ledger.emitted = 0;
+    ledger.dropped = 0;
+    memset(ledger.last, 0, sizeof(ledger.last));
 }
 ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decode(
         const ggml_cuda_moe_complete_group_key & key,
@@ -10293,7 +10687,14 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
         uint64_t resident_tag = 0;
         if (resident_slot != nullptr) {
             resident_tag = (static_cast<uint64_t>(key.candidate.generation) << 32) | resident_epoch;
-            ggml_cuda_moe_resident_expect(resident_layer, key.candidate.generation, n_rows == 1 ? 0 : 1, resident_epoch);
+            const uint32_t resident_cls = n_rows == 1 ? 0 : 1;
+            ggml_cuda_moe_resident_expect(resident_layer, key.candidate.generation, resident_cls, resident_epoch);
+            // Per-step ledger bookkeeping: which layer this step touches and
+            // which stream runs its kernels, both read at the step's drain.
+            if (ggml_cuda_moe_step_ledger_enabled()) {
+                ggml_cuda_moe_step_ledger_note_layer(resident_layer, resident_cls);
+                ggml_cuda_moe_step_ledger_note_stream(compute_stream);
+            }
         }
         const uint64_t resident_bpm = (uint64_t) device.words_per_miss * sizeof(uint4);
         // Opt-in plan-side admission (default off): read-only view of this group's
@@ -12024,6 +12425,26 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
     }
     auto * debug = impl_->debug_stats();
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    // Per-step ledger bookkeeping for this token: which layers it touches and
+    // which stream its kernels run on. prepare_decode is the hook for the
+    // direct path, but a replayed graph never calls it, so it must be taken
+    // here as well, once per token and before the kernels are launched,
+    // otherwise replay steps publish counters that no snapshot ever covers.
+    const auto note_ledger_groups = [&]() {
+        if (!ggml_cuda_moe_step_ledger_enabled()) {
+            return;
+        }
+        for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
+            const auto & group = execution->groups_[record_index];
+            const auto & resource = *impl_->resources[group.key.candidate.group_index];
+            const char * bank_name = !resource.snapshot.banks.empty() && resource.snapshot.banks[0].tensor != nullptr ?
+                resource.snapshot.banks[0].tensor->name : nullptr;
+            ggml_cuda_moe_step_ledger_note_layer(
+                ggml_cuda_moe_resident_layer_of(bank_name, group.key.candidate.group_index),
+                group.key.ids.ne[1] == 1 ? 0 : 1);
+            ggml_cuda_moe_step_ledger_note_stream(group.stream);
+        }
+    };
     const auto decline = [&]() {
         for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
             if (execution->groups_[record_index].state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED) {
@@ -12092,6 +12513,7 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
         for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
             execution->groups_[record_index].defer_completion = true;
         }
+        note_ledger_groups();
         return true;
     }
 
@@ -12132,6 +12554,7 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
             }
         }
     }
+    note_ledger_groups();
     return true;
 #endif
 }
@@ -13292,6 +13715,7 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
         execution->groups_[record_index].authority = {};
     }
     ggml_cuda_moe_resident_drain_and_emit();
+    ggml_cuda_moe_step_ledger_drain();
     if (moe_cache_lookahead_width() > 0) {
         impl_->lookahead_drain_and_emit();
     }
