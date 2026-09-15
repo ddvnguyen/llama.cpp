@@ -1,0 +1,27 @@
+# Harness outputs: produced by running the arms, rig-local evidence, not source.
+# Patterns below are chosen so that no script in this directory matches them.
+*.log
+*.tsv
+server-*
+stream-*.txt
+moe-steps-*
+demand-trace-*
+perftok-*
+rows-*.json
+ppl-*
+vram-*
+link-*
+dmon-*
+steptrace-*
+phase-*.txt
+la-*.txt
+limit-*.txt
+conc-*.txt
+result-*.txt
+depth-*.txt
+__pycache__/
+*.pyc
+slotalloc/*.json
+slotalloc/*.txt
+# compiled microbench
+mixed_contention
