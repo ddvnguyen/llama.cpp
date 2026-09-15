@@ -4312,6 +4312,29 @@ static __global__ void moe_early_router_stage(
 
 // Resident probe staging flag (full probe block further below, after impl).
 #define GGML_CUDA_MOE_RESIDENT_STAGED_BIT (1ULL << 63)
+// How many word iterations the gather runs between re-samples of the staging landing
+// counter. Re-sampling per word would cost an acquire load per 16 bytes moved; sampling
+// once per layer is what made readiness all-or-nothing. 8 iterations covers
+// 8 * gridDim * blockDim words per re-sample, a fraction of one expert slab for the
+// grids this op uses, at negligible cost next to the PCIe reads it guards.
+#define GGML_CUDA_MOE_STAGING_RESAMPLE 8
+
+// Read the copy worker's per-lane landing counter. The worker publishes `p + 1` on the
+// copy stream once staging slot p has landed, so `position < progress` is exactly
+// "the staged slab for this expert is here". System-scope acquire, matching the ready
+// filter this replaces, so the DMA'd staging bytes are visible before the gather reads
+// them. Builds without the copy engine never call this.
+static __device__ __forceinline__ uint32_t moe_staging_progress(const uint32_t * progress) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    // atomic_ref takes a mutable reference even for a load; the gather only ever reads
+    // this counter, and the copy worker is its only writer.
+    return cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(
+        *const_cast<uint32_t *>(progress)).load(cuda::memory_order_acquire);
+#else
+    return *reinterpret_cast<const volatile uint32_t *>(progress);
+#endif
+}
+
 template<bool debug_transfers>
 static __global__ void moe_grouped_gather_decode(
         const moe_grouped_device_bank * banks,
@@ -4328,13 +4351,20 @@ static __global__ void moe_grouped_gather_decode(
         uint64_t * early_counters = nullptr,
         int early_phase = 0,
         uint32_t bank_mask = UINT32_MAX,
-        uint64_t * resident_slot = nullptr) {
+        uint64_t * resident_slot = nullptr,
+        const uint32_t * early_progress = nullptr) {
     if (plan->status != MOE_GROUPED_PLAN_READY) {
         return;
     }
     if (resident_slot != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
         resident_slot[5] = clock64();
     }
+    // Rolling staging readiness. When the caller supplies the copy worker's landing
+    // counter, a staged position is consumable iff it has landed BY THE TIME the gather
+    // reaches it - not merely by the time the gather started. A caller that supplies no
+    // counter keeps the legacy meaning of `position >= 0` (early router path).
+    const bool early_rolling = early_positions != nullptr && early_progress != nullptr;
+    uint32_t early_completed = early_rolling ? moe_staging_progress(early_progress) : 0;
     if constexpr (debug_transfers) {
         if (early_phase != 2 && early_phase != 3 && blockIdx.x == 0 && threadIdx.x == 0) {
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[0]),
@@ -4346,8 +4376,10 @@ static __global__ void moe_grouped_gather_decode(
     const int32_t * miss_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
     const int32_t * miss_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
     if (early_positions != nullptr && early_counters != nullptr && early_phase != 1 && blockIdx.x == 0 && threadIdx.x == 0) {
+        const uint32_t counted_at = early_rolling ? moe_staging_progress(early_progress) : 0;
         for (uint32_t m = 0; m < plan->n_misses; ++m) {
-            if (early_positions[miss_experts[m]] >= 0) {
+            const int32_t staged_position = early_positions[miss_experts[m]];
+            if (staged_position >= 0 && (!early_rolling || (uint32_t) staged_position < counted_at)) {
                 early_counters[1] += words_per_miss * sizeof(uint4);
                 early_counters[3] += 1;
             }
@@ -4356,10 +4388,23 @@ static __global__ void moe_grouped_gather_decode(
     const size_t total_words = words_per_miss * plan->n_misses;
     const size_t first = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const size_t stride = (size_t) gridDim.x * blockDim.x;
+    uint32_t resample = 0;
     for (size_t word = first; word < total_words; word += stride) {
+        if (early_rolling) {
+            // Re-sample as the sweep advances. Misses are covered in increasing order, so a
+            // later miss sees a later landing count: a copy still in flight is consumed as it
+            // lands rather than being discarded wholesale by one sample taken before the
+            // gather even started.
+            if (resample == 0) {
+                early_completed = moe_staging_progress(early_progress);
+                resample = GGML_CUDA_MOE_STAGING_RESAMPLE;
+            }
+            --resample;
+        }
         const uint32_t miss = word / words_per_miss;
         const int32_t position = early_positions != nullptr ? early_positions[miss_experts[miss]] : -1;
-        const bool prefetched = position >= 0;
+        const bool staged_ready = position >= 0 && (!early_rolling || (uint32_t) position < early_completed);
+        const bool prefetched = staged_ready;
         if ((early_phase == 1 && prefetched) || (early_phase == 2 && !prefetched) || (early_phase == 3 && position == -1)) {
             continue;
         }
@@ -4377,8 +4422,8 @@ static __global__ void moe_grouped_gather_decode(
             const int32_t expert = miss_experts[miss];
             const int32_t slot = miss_slots[miss];
             const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.source + (size_t) expert * descriptor.expert_stride);
-            if (early_positions != nullptr && early_positions[expert] >= 0) {
-                source = early_staging + (size_t) early_positions[expert] * words_per_miss + word % words_per_miss - bank_word;
+            if (staged_ready) {
+                source = early_staging + (size_t) position * words_per_miss + word % words_per_miss - bank_word;
             }
             uint4 * destination = reinterpret_cast<uint4 *>(descriptor.data + (size_t) slot * descriptor.expert_stride);
             destination[bank_word] = source[bank_word];
@@ -5707,20 +5752,23 @@ struct ggml_cuda_moe_grouped_context::impl {
         return false;
 #endif
     }
-    // Cumulative device-counter drain, every 16 dispatches. Counter names
-    // reuse the prefetch family the moe-cache-phase line prints: prefetch_used
+    // Cumulative device-counter drain, every dispatch, so each emitted line is
+    // a per-step sample. Counter names reuse the prefetch family the
+    // moe-cache-phase line prints and stay interval deltas: prefetch_used
     // is gather-consumed staged experts, prefetch_dropped is filter-invalid /
     // duplicate / over-width, prefetch_reserve_refused is predicted-but-
     // resident (speculation refused: no copy needed), evicted_prefetched is
     // staged bytes overwritten by a later publish without being consumed.
+    // The consumed_*_total fields are lane-lifetime totals read straight from
+    // the device counters ([0] staged bytes, [1] consumed bytes, [3] consumed
+    // count, cumulative since the lane was created), so consume_pct_total is
+    // the lifetime staging ratio: staged bytes minus consumed bytes is the
+    // look-ahead's own accounting, distinct from the one-layer instrument.
     void lookahead_drain_and_emit() {
         if (lookahead.empty()) {
             return;
         }
         lookahead_dispatches++;
-        if ((lookahead_dispatches % 16) != 0) {
-            return;
-        }
         uint64_t staged_bytes = 0;
         uint64_t used = 0;
         uint64_t dropped = 0;
@@ -5728,6 +5776,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint64_t evicted = 0;
         uint64_t busy = 0;
         uint64_t published = 0;
+        uint64_t staged_bytes_total = 0;
+        uint64_t consumed_bytes_total = 0;
+        uint64_t consumed_total = 0;
         for (auto & lane : lookahead) {
             uint64_t snap[GGML_CUDA_MOE_LOOKAHEAD_COUNTERS] = {};
             {
@@ -5742,6 +5793,9 @@ struct ggml_cuda_moe_grouped_context::impl {
             dropped += snap[5] - lane->la_emit_counters[5];
             refused += snap[6] - lane->la_emit_counters[6];
             published += snap[4] - lane->la_emit_counters[4];
+            staged_bytes_total += snap[0];
+            consumed_bytes_total += snap[1];
+            consumed_total += snap[3];
             for (int i = 0; i < GGML_CUDA_MOE_LOOKAHEAD_COUNTERS; ++i) {
                 lane->la_emit_counters[i] = snap[i];
             }
@@ -5750,11 +5804,13 @@ struct ggml_cuda_moe_grouped_context::impl {
             busy += lane->la_busy_skips - lane->la_emit_busy;
             lane->la_emit_busy = lane->la_busy_skips;
         }
-        GGML_LOG("moe-lookahead-stage: dispatches=%llu lanes=%llu published=%llu staged_mib=%.2f prefetch_used=%llu prefetch_dropped=%llu prefetch_reserve_refused=%llu evicted_prefetched=%llu busy_skips=%llu\n",
+        GGML_LOG("moe-lookahead-stage: dispatches=%llu lanes=%llu published=%llu staged_mib=%.2f prefetch_used=%llu prefetch_dropped=%llu prefetch_reserve_refused=%llu evicted_prefetched=%llu busy_skips=%llu consumed_mib_total=%.2f consumed_total=%llu consume_pct_total=%.2f\n",
             (unsigned long long) lookahead_dispatches, (unsigned long long) lookahead.size(),
             (unsigned long long) published, (double) staged_bytes / 1048576.0,
             (unsigned long long) used, (unsigned long long) dropped,
-            (unsigned long long) refused, (unsigned long long) evicted, (unsigned long long) busy);
+            (unsigned long long) refused, (unsigned long long) evicted, (unsigned long long) busy,
+            (double) consumed_bytes_total / 1048576.0, (unsigned long long) consumed_total,
+            100.0 * (double) consumed_bytes_total / (double) std::max<uint64_t>(1, staged_bytes_total));
     }
 
     struct grouped_device_resource {
@@ -10203,9 +10259,12 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             CUDA_CHECK(cudaGetLastError());
         }
         if (lookahead != nullptr) {
-            moe_early_router_ready_positions<<<1, 128, 0, compute_stream>>>(
-                lookahead->positions, device.n_experts, lookahead->copy_progress);
-            CUDA_CHECK(cudaGetLastError());
+            // No ready filter is enqueued for the look-ahead path. Clearing the positions
+            // array against one sample of the landing counter is what made readiness
+            // all-or-nothing: a transfer still in flight when the gather began was demoted
+            // wholesale and its bytes were paid for and thrown away. The gather now evaluates
+            // readiness per expert against the live counter instead. The sequence handoff
+            // stays here, where it releases backpressure without touching positions.
             lookahead->la_consumed_seq = lookahead->la_publish_seq;
         }
 #endif
@@ -10246,7 +10305,8 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                 early != nullptr ? early->staging : (lookahead != nullptr ? lookahead->staging : nullptr),
                 early != nullptr ? early->positions : (lookahead != nullptr ? lookahead->positions : nullptr),
                 early != nullptr ? early->counters : (lookahead != nullptr ? lookahead->counters : nullptr),
-                ready_late ? 3 : split_early ? 2 : 0, head_mask, resident_slot);
+                ready_late ? 3 : split_early ? 2 : 0, head_mask, resident_slot,
+                early != nullptr ? nullptr : (lookahead != nullptr ? lookahead->copy_progress : nullptr));
         } else {
             moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
@@ -10255,7 +10315,8 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                 early != nullptr ? early->staging : (lookahead != nullptr ? lookahead->staging : nullptr),
                 early != nullptr ? early->positions : (lookahead != nullptr ? lookahead->positions : nullptr),
                 early != nullptr ? early->counters : (lookahead != nullptr ? lookahead->counters : nullptr),
-                ready_late ? 3 : split_early ? 2 : 0, head_mask, resident_slot);
+                ready_late ? 3 : split_early ? 2 : 0, head_mask, resident_slot,
+                early != nullptr ? nullptr : (lookahead != nullptr ? lookahead->copy_progress : nullptr));
         }
         if (bank_split) {
             GGML_ASSERT(early->down_reader != nullptr && early->pending_bank_mask == 0);

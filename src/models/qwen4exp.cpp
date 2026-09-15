@@ -6,6 +6,29 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
+
+// WHERE the look-ahead for layer il+1 is ISSUED, chosen at run time.
+//
+// Both positions form the same prediction from the same post-attention state (layer
+// il+1's plan), but each couples it to a different part of layer il:
+//
+//   after this layer's FFN (default) - the staging transfer rides the NEXT layer's
+//     attention, where nothing is reading host memory. The filter that decides WHICH
+//     experts to stage then runs at a different point relative to the plan, so it stages
+//     a different set of experts.
+//   before this layer's FFN (legacy) - the filter matches the plan as computed, but the
+//     transfer is issued while this layer's MoE demand gather is running: both read over
+//     the same PCIe link, so the staging displaces the gather one byte for one byte
+//     (displacement coefficient 1.00, measured over three runs).
+//
+// Neither position is free, so this knob exists to A/B the two couplings in one binary.
+static bool moe_lookahead_issue_after_ffn() {
+    static const bool after_ffn = getenv("GGML_MOE_LOOKAHEAD_ISSUE_AFTER_FFN") == nullptr ||
+            strcmp(getenv("GGML_MOE_LOOKAHEAD_ISSUE_AFTER_FFN"), "0") != 0;
+    return after_ffn;
+}
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -459,9 +482,49 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         res_hc = build_hc_combine(res_hc, cur, inject, il);
 
         // The look-ahead for layer il+1 is predicted from THIS layer's post-attention
-        // state, so the prediction can only be formed here. It is ISSUED after this
-        // layer's FFN (see below), which is why the state has to survive the FFN.
+        // state, so the prediction can only be formed here. Both issue positions read that
+        // same state, which is why it has to survive the FFN.
         ggml_tensor * res_hc_post_attn = res_hc;
+
+        // MoE look-ahead: predict layer il+1's experts from this layer's post-attention
+        // state and page them into the window where the fabric is actually idle, which is
+        // the NEXT layer's attention.
+        //
+        // The MoE bucket is not compute-bound: of its 81.04 ms, ~77 ms is the demand
+        // gather reading the experts' host memory over the same PCIe link this transfer
+        // needs. Issued BEFORE this layer's FFN - the legacy position - the transfer runs
+        // alongside that gather and displaces it one byte for one byte (measured
+        // displacement coefficient 1.00, three runs). Issued AFTER the FFN - the default -
+        // it rides the following attention instead, where nothing is reading host memory,
+        // but the filter that decides WHICH experts to stage then runs at a different
+        // point relative to the plan and stages a different set of experts.
+        //
+        // Neither position is free, so GGML_MOE_LOOKAHEAD_ISSUE_AFTER_FFN A/Bs the two
+        // couplings in one binary.
+        //
+        // Kept outside the FFN block so the layer's own router chain stays contiguous
+        // for the router fusions.
+        auto issue_lookahead = [&](ggml_tensor * post_attn) {
+            if (il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr && moe_lookahead_enabled()) {
+                ggml_tensor * lookahead_state = build_hc_mix(post_attn,
+                        model.layers[il + 1].hc_ffn_norm,
+                        model.layers[il + 1].hc_ffn_down,
+                        model.layers[il + 1].hc_ffn_up,
+                        model.layers[il + 1].hc_ffn_inject,
+                        nullptr, il + 1);
+                ggml_tensor * lookahead = build_moe_lookahead(lookahead_state,
+                        model.layers[il + 1].ffn_gate_inp,
+                        model.layers[il + 1].ffn_up_exps,
+                        il + 1);
+                if (lookahead != nullptr) {
+                    ggml_build_forward_expand(gf, lookahead);
+                }
+            }
+        };
+
+        if (!moe_lookahead_issue_after_ffn()) {
+            issue_lookahead(res_hc_post_attn);
+        }
 
         cur = build_hc_mix(res_hc,
                 model.layers[il].hc_ffn_norm,
@@ -475,34 +538,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         res_hc = build_hc_combine(res_hc, cur, inject, il);
 
-        // MoE look-ahead: predict layer il+1's experts from this layer's post-attention
-        // state and page them into the window where the fabric is actually idle, which is
-        // the NEXT layer's attention.
-        //
-        // Issued AFTER this layer's FFN, and deliberately not before it. The MoE bucket
-        // is not compute-bound: of its 81.04 ms, ~77 ms is the demand gather reading the
-        // experts' host memory over the same PCIe link this transfer needs. A transfer
-        // issued alongside the gather therefore does not "overlap compute" - it competes
-        // with the gather and displaces it one byte for one byte (measured displacement
-        // coefficient 1.00, three runs). Issued after the FFN it rides the following
-        // attention instead, where nothing is reading host memory.
-        //
-        // Kept outside the FFN block so the layer's own router chain stays contiguous
-        // for the router fusions.
-        if (il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr && moe_lookahead_enabled()) {
-            ggml_tensor * lookahead_state = build_hc_mix(res_hc_post_attn,
-                    model.layers[il + 1].hc_ffn_norm,
-                    model.layers[il + 1].hc_ffn_down,
-                    model.layers[il + 1].hc_ffn_up,
-                    model.layers[il + 1].hc_ffn_inject,
-                    nullptr, il + 1);
-            ggml_tensor * lookahead = build_moe_lookahead(lookahead_state,
-                    model.layers[il + 1].ffn_gate_inp,
-                    model.layers[il + 1].ffn_up_exps,
-                    il + 1);
-            if (lookahead != nullptr) {
-                ggml_build_forward_expand(gf, lookahead);
-            }
+        if (moe_lookahead_issue_after_ffn()) {
+            issue_lookahead(res_hc_post_attn);
         }
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
