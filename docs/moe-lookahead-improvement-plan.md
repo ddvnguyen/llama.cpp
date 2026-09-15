@@ -1615,3 +1615,68 @@ scripts to `bin/llama-server` / `bin/llama-perplexity` / `bin/test-moe-cache`, w
 real argv[0] (`$BIN/llama-server`) and cannot match a build command. Also added TAG_PREFIX to
 arm_cache_sweep.sh and an arm selector to arm_evict_policy.sh, so a single arm can be run without
 overwriting another arm's logs.
+
+---
+
+## 7.31 Rev 23 - operating point set to N=42 or N=36, keeping VRAM for MTP
+
+Owner decision (2026-09-15): the operating point stays at **N=42 or N=36**, deliberately not N=53, so
+that VRAM is available **later for MTP**, and the look-ahead is to be driven by the **MTP head** rather
+than by the current cross-layer heuristic.
+
+### N=36 measured, same session and binary, look-ahead off
+
+| N | misses/step | t/s | vs N=42 | cache VRAM | headroom on 12 GiB |
+|---|---|---|---|---|---|
+| 36 | 239.11 | 10.3626 | **-4.37%** | ~9.60 GiB | ~2.2 GiB |
+| 42 | 225.00 | 10.8362 | - | ~10.22 GiB | ~1.55 GiB |
+
+Marginal is -2.35 misses/slot, consistent with the -2.25 measured from 42 to 48 and with Belady's
+-2.0. The step model predicts 10.39 t/s at 239.11 misses against 10.3626 measured, so it holds here
+too. **Choosing N=36 over N=42 costs 4.37% of throughput and frees ~618 MiB.**
+
+### What that does to this document's central impossibility argument
+
+Section 7.28 closes the retention axis with an information argument, and the argument is **scoped to a
+non-speculative decoder** on purpose. That scoping is now load-bearing rather than pedantic:
+
+> layer L's router at step T+1 consumes layer L-1's output at step T+1, a function of token T+1, which
+> is sampled after the moment the prediction would be needed.
+
+MTP **is** speculation. A draft head produces candidate tokens T+1..T+H, and running the router on
+those draft hidden states yields, for each layer, its demand at T+1..T+H **before** the real tokens
+exist. That is exactly the same-layer, multi-step horizon that 7.28 says cannot otherwise be had, so
+the retention axis is not permanently closed - it is closed for the pre-MTP fork.
+
+PolicyEval's horizon curve is the target, and it is steep (perfect knowledge, C=42, offline):
+
+| horizon | misses/step | t/s | vs shipped |
+|---|---|---|---|
+| 1 | 214.22 | 11.21 | +4.2% |
+| 2 | 206.34 | 11.50 | +6.9% |
+| 4 | 194.27 | 11.97 | +11.3% |
+| 8 | 175.00 | 12.81 | +19.1% |
+| 16 | 156.76 | 13.73 | +27.6% |
+
+With MTP these are not perfect: the prediction is exact **conditional on the draft token being
+accepted**, so the realised gain scales roughly with the acceptance rate (commonly ~0.7), putting
+H=4 near +8% and H=8 near +13%. Even the pessimistic end is an order of magnitude more than anything
+the pre-MTP fork can reach (best implementable retention today: -0.10% at the operating point).
+
+### The look-ahead should change FUNCTION, not just its input
+
+An important distinction, so the MTP plan is not oversold. The current look-ahead fails for two
+separable reasons:
+
+1. **Wrong predictions** - it is a cross-layer heuristic, so as a retention signal its effect is
+   exactly zero (measured 223.49 vs 223.57).
+2. **A structurally expensive transport path** - the staging lane costs ~1.3 ms fixed plus ~0.10 ms
+   per MiB/step of wasted staging, and it loses at width 1 where 94.85% of staged data is useful and
+   the waste term is only 0.15 ms of a 3.6 ms loss.
+
+MTP fixes (1) completely and (2) only partly: better predictions remove the waste, but the fixed
+per-feature cost and the displacement of demand fetches remain. The high-value use of an MTP head is
+therefore **victim choice, not staging** - retention directly removes fetches (misses x 0.2842 ms per
+token), whereas the staging lane can only move them in time and was measured to cost throughput even
+when nearly every staged byte is used. Feed the MTP predictions into the cache's eviction decision;
+do not assume the lane becomes profitable because its input got better.
