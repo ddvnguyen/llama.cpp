@@ -211,6 +211,8 @@ extern "C" {
 #define GGML_BACKEND_MOE_CACHE_SET_L2_PINNED_SIZE_PROC_NAME "ggml_backend_moe_cache_set_l2_pinned_size"
 #define GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME "ggml_backend_moe_cache_set_debug"
 #define GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME "ggml_backend_moe_cache_log_and_reset_stats"
+#define GGML_BACKEND_MOE_CACHE_SET_LOOKAHEAD_PROC_NAME "ggml_backend_moe_cache_set_lookahead"
+#define GGML_BACKEND_MOE_CACHE_PREINSTALL_LOOKAHEAD_PROC_NAME "ggml_backend_moe_cache_preinstall_lookahead"
 
     typedef ggml_backend_buffer_type_t (*ggml_backend_moe_cache_buffer_type_t)(void);
     typedef bool (*ggml_backend_moe_cache_is_buffer_type_t)(ggml_backend_buffer_type_t buft);
@@ -219,6 +221,11 @@ extern "C" {
     typedef void (*ggml_backend_moe_cache_set_l2_pinned_size_t)(size_t bytes);
     typedef void (*ggml_backend_moe_cache_set_debug_t)(bool enabled);
     typedef void (*ggml_backend_moe_cache_log_and_reset_stats_t)(void);
+    typedef void (*ggml_backend_moe_cache_set_lookahead_t)(int n);
+    // Installs the MoE expert cache pools for every look-ahead target up front so a
+    // prediction can never find an uninstalled pool. Returns the number of pools that
+    // could not be installed (0 on success, and 0 when look-ahead is disabled).
+    typedef int (*ggml_backend_moe_cache_preinstall_lookahead_t)(void);
 
 #define GGML_BACKEND_MOE_CANDIDATE_REPLACE_V1_PROC_NAME "ggml_backend_moe_candidate_replace_v1"
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC 0x4d4f4531u

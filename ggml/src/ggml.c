@@ -1099,9 +1099,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "MOE_PREFETCH",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1215,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "moe_prefetch(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5470,6 +5472,25 @@ struct ggml_tensor * ggml_top_k(
     return result;
 }
 
+// ggml_moe_prefetch
+
+struct ggml_tensor * ggml_moe_prefetch(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    // the output aliases the ids tensor so that this node keeps a dependency on the ids producer
+    // and is not removed by dead-node elimination
+    struct ggml_tensor * result = ggml_view_tensor(ctx, ids);
+
+    result->op     = GGML_OP_MOE_PREFETCH;
+    result->src[0] = experts;
+    result->src[1] = ids;
+
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(
@@ -7417,8 +7438,12 @@ static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_
         if (src) {
             const size_t src_hash_pos = ggml_visit_parents_graph(cgraph, src, compute);
 
-            // Update the use count for this operand.
-            cgraph->use_counts[src_hash_pos]++;
+            // Update the use count for this operand. A side-effect op consumes no
+            // values, so it must stay out of the counts that the MoE grouped-execution
+            // graph proof is derived from.
+            if (node->op != GGML_OP_MOE_PREFETCH) {
+                cgraph->use_counts[src_hash_pos]++;
+            }
         }
     }
 

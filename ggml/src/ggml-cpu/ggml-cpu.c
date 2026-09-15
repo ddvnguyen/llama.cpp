@@ -2161,11 +2161,20 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
+        case GGML_OP_MOE_PREFETCH:
+            {
+                ggml_compute_forward_moe_prefetch(tensor);
+            } break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
             }
     }
+}
+
+void ggml_compute_forward_moe_prefetch(struct ggml_tensor * dst) {
+    // this op is a device-side side effect (expert pool prefetch) and is a no-op on the CPU
+    UNUSED(dst);
 }
 
 // Android's libc implementation "bionic" does not support setting affinity
@@ -2490,6 +2499,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:
+        case GGML_OP_MOE_PREFETCH:
             {
                 n_tasks = 1;
             } break;

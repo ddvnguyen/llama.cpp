@@ -17,6 +17,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cmath>
@@ -2062,6 +2063,63 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in
     );
+}
+
+bool llm_graph_context::moe_lookahead_enabled() const {
+    if (cparams.moe_lookahead <= 0) {
+        return false;
+    }
+    // MAIN target only: a DRAFT or MTP context builds its own graph and must never emit
+    // target prediction nodes. The execution certificate that encodes the same
+    // distinction for the backend is assembled at compute time, after this graph
+    // exists, so the context type is the equivalent discriminator available here.
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        return false;
+    }
+    // Decode rows only: every sequence contributes exactly one token. Prompt
+    // processing has no per-token reuse for a transfer to hide behind.
+    if (ubatch.n_seqs_unq == 0 || ubatch.n_tokens != (int64_t) ubatch.n_seqs_unq) {
+        return false;
+    }
+    return true;
+}
+
+ggml_tensor * llm_graph_context::build_moe_lookahead(
+        ggml_tensor * nextn_state,
+        ggml_tensor * gate_inp,
+        ggml_tensor * layer_experts,
+                int   il_next) const {
+    if (nextn_state == nullptr || gate_inp == nullptr || layer_experts == nullptr) {
+        return nullptr;
+    }
+    if (!moe_lookahead_enabled()) {
+        return nullptr;
+    }
+    // Mirrors build_moe_ffn's selection for the architectures that reach here: no router
+    // bias and no expert-group routing, so selection is the top-K of the router logits.
+    // The gating function is monotonic, so it cannot change which experts are chosen and
+    // is skipped to keep the prediction cheap.
+    const int64_t width = cparams.moe_lookahead < n_expert_used ? cparams.moe_lookahead : n_expert_used;
+    if (width <= 0) {
+        return nullptr;
+    }
+
+    ggml_tensor * logits = build_lora_mm(gate_inp, nextn_state); // [n_expert, n_tokens]
+    cb(logits, "lookahead_logits", il_next);
+
+    ggml_tensor * ids = ggml_argsort_top_k(ctx0, logits, width); // [width, n_tokens]
+    cb(ids, "lookahead_topk", il_next);
+
+    // Side-effect node: it pages the predicted experts into layer il_next's cache pool
+    // and produces nothing. Its output aliases the ids, so the node has no consumer
+    // of its own and has to be kept alive explicitly.
+    ggml_tensor * prefetch = ggml_moe_prefetch(ctx0, layer_experts, ids);
+    cb(prefetch, "lookahead_prefetch", il_next);
+    // The node produces nothing, so nothing downstream keeps it alive. Mark it as an
+    // output so the allocator treats it as a live graph result instead of dead code.
+    ggml_set_output(prefetch);
+
+    return prefetch;
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(

@@ -5782,11 +5782,47 @@ static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
 
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-        if (t->type != GGML_TYPE_I32) {
-            init_tensor_uniform(t);
+        if (t->type == GGML_TYPE_I32) {
+            continue;
         }
+        if (ggml_is_view_op(t->op)) {
+            continue; // strided weight view aliases storage, already initialized via the parent
+        }
+        init_tensor_uniform(t);
     }
     init_mul_mat_id_ids(ctx, n_mats);
+}
+
+// Deterministic expert-id patterns for the MoE stride/ids sweep (n_mats=512, n_used=10, n=1).
+// ids_mode: 0 = contiguous 0..9, 1 = scattered i*51 % 512, 2 = repeated {5,123,400} cycle.
+// Negative = legacy random shuffle (init_mul_mat_id_ids), left untouched.
+static void write_mul_mat_id_pattern(ggml_context * ctx, int n_mats, int n_used, int ids_mode) {
+    if (ids_mode < 0) {
+        return;
+    }
+    std::vector<int32_t> pattern(n_used);
+    if (ids_mode == 0) {
+        for (int i = 0; i < n_used; i++) {
+            pattern[i] = i % n_mats;
+        }
+    } else if (ids_mode == 1) {
+        for (int i = 0; i < n_used; i++) {
+            pattern[i] = (int32_t) (((int64_t) i * 51) % n_mats);
+        }
+    } else {
+        const int32_t pool[3] = {5, 123, 400};
+        for (int i = 0; i < n_used; i++) {
+            pattern[i] = pool[i % 3] % n_mats;
+        }
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+            continue;
+        }
+        for (int64_t r = 0; r < ggml_nrows(t); r++) {
+            ggml_backend_tensor_set(t, pattern.data(), r * t->nb[1], n_used * sizeof(int32_t));
+        }
+    }
 }
 
 // GGML_OP_MUL_MAT_ID
@@ -5799,9 +5835,11 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const int ids_mode;    // -1 = legacy random, 0 = contiguous 0..9, 1 = scattered, 2 = repeated 3 experts
+    const int stride_mode; // 0 = tight contiguous nb[2], 1 = pool-like padded nb[2]
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, ids_mode, stride_mode);
     }
 
     double max_nmse_err() override {
@@ -5823,15 +5861,48 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32,
+            int ids_mode = -1, int stride_mode = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), ids_mode(ids_mode), stride_mode(stride_mode) {
             GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(ids_mode >= -1 && ids_mode <= 2);
+            GGML_ASSERT(stride_mode == 0 || stride_mode == 1);
         }
+
+    // Pool-like expert-slab stride: tight slab plus the runtime's quantized
+    // tail padding, copied from moe_cache_quantized_source_padding() in
+    // ggml/src/ggml-cuda/moe-cache.cu (MATRIX_ROW_PADDING = 512, see
+    // ggml/src/ggml-cuda/common.cuh): pad = row_size(type, 512 - k % 512).
+    // The runtime applies this ONCE at the end of the slot pool
+    // (slot_size = nb[2] tight, alloc = n_slots * slot_size + pad), so this
+    // per-slot padded stride is a conservative upper bound, not the exact
+    // pool layout. Rounded up to 16 B (sizeof(uint4)) for kernel legality.
+    size_t pool_stride() const {
+        const size_t row_bytes = ggml_row_size(type_a, k);
+        const size_t tight = row_bytes * (size_t) m;
+        const int64_t rem = k % 512;
+        const size_t pad = rem == 0 ? 0 : ggml_row_size(type_a, 512 - rem);
+        return ((tight + pad + 15) / 16) * 16;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
-        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * as = nullptr;
+        if (stride_mode == 0) {
+            as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        } else {
+            // Strided view over a wider contiguous parent (the file's usual
+            // padded/strided construction): rows stay contiguous (nb[1] =
+            // row_size), expert slabs separated by pool_stride() bytes.
+            const size_t row_bytes = ggml_row_size(type_a, k);
+            const size_t padded = pool_stride();
+            const size_t span = (size_t) (n_mats - 1) * padded + row_bytes * (size_t) m;
+            const int64_t total_rows = (int64_t) ((span + row_bytes - 1) / row_bytes);
+            ggml_tensor * storage = ggml_new_tensor_2d(ctx, type_a, k, total_rows);
+            ggml_set_name(storage, "as_storage");
+            as = ggml_view_3d(ctx, storage, k, m, n_mats, row_bytes, padded, 0);
+        }
         ggml_set_name(as, "as");
 
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
@@ -5852,10 +5923,12 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
+        write_mul_mat_id_pattern(ctx, n_mats, n_used, ids_mode);
     }
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+        write_mul_mat_id_pattern(ctx, n_mats, n_used, ids_mode);
     }
 };
 
@@ -11988,6 +12061,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // MoE expert shapes: gate IQ3_XXS and up IQ3_S are (k=2560, m=640),
+    // down IQ4_NL is (k=640, m=2560); 512 experts, 10 used; n=1 decode, n=512 prefill
+    for (int bs : {1, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+    }
+
+    // ids-pattern x slab-stride isolation sweep (decode n=1 only):
+    // 3 quants x {contiguous 0..9, scattered i*51, repeated 3 experts} x {tight, pool-like}.
+    // Note: for gate/up k=2560 % 512 == 0 so the pool padding is 0 and the
+    // padded stride equals the tight stride; only down (k=640) has a nonzero
+    // pad (row_size(IQ4_NL, 384) = 216 B, rounded to 224 for 16 B alignment).
+    for (int ids_mode = 0; ids_mode <= 2; ids_mode++) {
+        for (int stride_mode = 0; stride_mode <= 1; stride_mode++) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 512, 10, false, 640, 1, 2560, ids_mode, stride_mode));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 512, 10, false, 640, 1, 2560, ids_mode, stride_mode));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 1, 640, ids_mode, stride_mode));
+        }
+    }
+
     for (int K : {3, 5}) {
         for (int IC : {256, 2560}) {
             for (int IW_IH : {32, 64, 256}) {
@@ -12586,6 +12680,7 @@ static void show_test_coverage() {
             op == GGML_OP_TRANSPOSE ||
             op == GGML_OP_CONT      ||
             op == GGML_OP_GLU       ||
+            op == GGML_OP_MOE_PREFETCH ||
             op == GGML_OP_UNARY) {
             continue;
         }

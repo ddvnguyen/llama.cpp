@@ -641,6 +641,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_MOE_PREFETCH,
 
         GGML_OP_COUNT,
     };
@@ -2508,6 +2509,13 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // prefetch the expert pool identified by `experts` for the expert ids in `ids`
+    // note: this is a side-effect op - the output aliases `ids` and is not modified
+    GGML_API struct ggml_tensor * ggml_moe_prefetch(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * ids);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

@@ -824,6 +824,38 @@ public:
             int n_expert_ids,
             bool use_l2,
             bool is_decode);
+    // MoE look-ahead consumer (PR-A): page the next layer's experts for the
+    // predicted eids into this context's legacy pools. No-op when the
+    // lookahead gate is off, the tensor is not MoE-cached, or no pool exists.
+    // Never touches the layer being computed, never synchronizes.
+    void prefetch_legacy_layer(
+            const ggml_tensor * experts,
+            const int32_t * expert_ids,
+            int n_expert_ids,
+            bool use_l2,
+            bool is_decode);
+    // MoE look-ahead staging issue (PR-B): filter device-resident predicted
+    // ids into the target group's staging lane for DMA ahead of its gather.
+    // True when staged (caller skips legacy prefetch); false falls back.
+    // Gate-off cost is one atomic load. No D2H, no host sync.
+    bool prefetch_stage_layer(
+            const ggml_tensor * experts,
+            const int32_t * ids_device,
+            int n_ids,
+            bool is_decode,
+            ggml_cuda_moe_stream_t stream);
+    // Installs the legacy pools for every expert tensor the published candidate
+    // snapshot knows about, so a look-ahead prefetch cannot find an empty lease.
+    // Returns the number of pools that could not be installed.
+    int preinstall_legacy_pools();
+    // Name-based adapter for the exported prefetch entry point. Resolves the
+    // tensor within this context's known expert tensors, then prefetches.
+    void prefetch_legacy_layer_by_name(
+            const char * tensor_name,
+            const int32_t * expert_ids,
+            int n_expert_ids,
+            bool use_l2,
+            bool is_decode);
     void record_legacy_op(
             bool is_decode,
             bool staged,
@@ -1094,6 +1126,37 @@ int ggml_cuda_moe_cache_acquire(
     bool         is_decode,
     bool         is_prefetch,
     bool         pin);
+
+// MoE look-ahead consumer (PR-A): pointer-based prefetch for the device's
+// grouped context. Future graph-level producer calls this with the next
+// layer's expert tensor directly. No-op when the lookahead gate is off.
+void ggml_backend_cuda_moe_prefetch_experts_tensor(
+    int device,
+    const ggml_tensor * experts,
+    const int32_t * expert_ids,
+    int n_expert_ids,
+    bool use_l2,
+    bool is_decode);
+// MoE look-ahead staging issue (PR-B): filter device-resident predicted ids
+// into the target group's staging lane for DMA ahead of its gather. True when
+// staged (caller skips legacy prefetch); false falls back. No D2H, no sync.
+bool ggml_backend_cuda_moe_stage_lookahead(
+    int device,
+    const ggml_tensor * experts,
+    const int32_t * ids_device,
+    int n_ids,
+    ggml_cuda_moe_stream_t stream);
+// Prefetch phase counters for tests: hits, misses, used, h2d bytes, and the
+// number of predictions dropped because the LFRU eviction guard protected a
+// warm resident (or no victim slot was available).
+void ggml_cuda_moe_cache_prefetch_stats_for_test(
+    const struct ggml_cuda_moe_cache * cache,
+    bool is_decode,
+    uint64_t * out_hits,
+    uint64_t * out_misses,
+    uint64_t * out_used,
+    uint64_t * out_h2d_bytes,
+    uint64_t * out_dropped = nullptr);
 
 void ggml_cuda_moe_cache_release_slots(
     struct ggml_cuda_moe_cache * cache,

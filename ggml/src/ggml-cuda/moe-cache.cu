@@ -49,6 +49,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -71,6 +72,178 @@ static constexpr uint64_t MOE_ORIGINAL_DIRECT_AUX_MAX_BYTES = 4 * 1024;
 static constexpr size_t MOE_PREFILL_RESIDENT_AUX_BUDGET = 32 * 1024 * 1024;
 static std::atomic<bool> g_moe_cache_mm_debug{false};
 static std::atomic<size_t> g_moe_cache_l2_pinned_size{0};
+static std::atomic<int> g_moe_cache_lookahead{0};
+
+static int moe_cache_lookahead_width() {
+    return g_moe_cache_lookahead.load(std::memory_order_relaxed);
+}
+
+// Opt-in plan-side admission for look-ahead staged experts, default off. When
+// set, the grouped plan classifies a would-be demand miss whose look-ahead slab
+// has already landed as served from staging, so the residency ledger stops
+// charging it as demand traffic (copied / copy_mib). Unset or "0" is today's
+// behaviour, byte for byte. Read once: one static bool, no per-call cost.
+static bool moe_lookahead_admit_in_plan() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_MOE_LOOKAHEAD_ADMIT_IN_PLAN");
+        return value != nullptr && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+// Victim-choice policy for the grouped expert cache, selected once from
+// GGML_MOE_EVICT_POLICY. The policy never touches the geometry (slot counts stay
+// uniform, N per bank per layer); it only decides which resident a demand miss
+// replaces. Retaining better is the only lever that reduces the number of
+// fetches: a prefetch is still a PCIe fetch, so moving bytes earlier changes
+// when traffic happens, never how much of it there is.
+//
+//   lfu     (default, unset): today's behaviour, byte for byte - frequency
+//           first, age second (GGML_CUDA_MOE_FREQUENCY=0 still selects plain
+//           LRU, unchanged). This is the path taken when the variable is absent.
+//   lru     : plain LRU - the frequency term is dropped from the victim order,
+//           so the victim is the least recently used resident.
+//   protect : the lfu order plus a warm-resident override. A resident is pinned
+//           while any unpinned candidate exists, and "warm" means either the
+//           look-ahead already predicts it for this layer (when a lane exists -
+//           at width 0 there is none) or the layer's own preceding plan touched
+//           its slot. When every candidate is pinned the override declines and
+//           the lfu choice stands.
+//   recent1 : the lfu order plus the same override keyed on hard evidence only:
+//           a resident whose slot was touched by the layer's immediately
+//           preceding plan (last_used above that plan's clock_begin) is never
+//           the victim while any older candidate exists. No predictor is
+//           involved, so this isolates the warm-set half of protect - and it is
+//           the arm the offline replay found positive over the whole C=28..64
+//           range; see the counters appended to moe-lookahead-stage for how
+//           often it actually binds.
+//
+// Unknown values warn once and stay on the default; "0" and "1" are rejected the
+// same way rather than guessed at.
+enum moe_cache_evict_policy {
+    MOE_CACHE_EVICT_LFU = 0,
+    MOE_CACHE_EVICT_LRU,
+    MOE_CACHE_EVICT_PROTECT,
+    MOE_CACHE_EVICT_RECENT1,
+};
+
+// How the plan kernel keys its eviction-pin override. None means the hook is
+// uniformly dead for the whole block and the victim is the plain policy choice.
+enum moe_cache_pin_mode : uint32_t {
+    MOE_CACHE_PIN_NONE = 0,
+    MOE_CACHE_PIN_PREDICTED,
+    MOE_CACHE_PIN_RECENT1,
+};
+
+static moe_cache_evict_policy moe_cache_evict_policy_env() {
+    static const moe_cache_evict_policy policy = [] {
+        const char * value = getenv("GGML_MOE_EVICT_POLICY");
+        if (value == nullptr || value[0] == '\0' || strcmp(value, "lfu") == 0) {
+            return MOE_CACHE_EVICT_LFU;
+        }
+        if (strcmp(value, "lru") == 0) {
+            return MOE_CACHE_EVICT_LRU;
+        }
+        if (strcmp(value, "protect") == 0) {
+            return MOE_CACHE_EVICT_PROTECT;
+        }
+        if (strcmp(value, "recent1") == 0) {
+            return MOE_CACHE_EVICT_RECENT1;
+        }
+        GGML_LOG_WARN("moe-cache: unknown GGML_MOE_EVICT_POLICY=\"%s\", using lfu\n", value);
+        return MOE_CACHE_EVICT_LFU;
+    }();
+    return policy;
+}
+
+// Opt-in admission of the look-ahead's prediction INTO the cache slots
+// (GGML_MOE_ADMIT_PREDICTED, default off). The side lane holds one publish's
+// worth of slabs while a width-8 prediction needs ~7.5x that, so the staged
+// bytes of the last experts are overwritten before a later step could use them
+// and the measured transport usefulness stays near 1.91%. The cache holds three
+// orders of magnitude more, so admitting the same experts into slots removes
+// that window constraint: the plan takes the prediction's own compacted list
+// (predicted, not resident - the same publish the staging copy already fetches),
+// picks slots for it with the eviction policy selected above - still preferring
+// non-predicted victims in protect mode - and the gather moves the payload into
+// the slot: from the staging buffer when that slab has landed, otherwise
+// straight from the source, exactly like a demand miss. Every admission is real
+// PCIe traffic and is billed as a fetch in the residency ledger.
+// GGML_MOE_ADMIT_MAX caps admissions per layer per step (default 10, 0 = off).
+static constexpr uint32_t MOE_CACHE_ADMIT_MAX_DEFAULT = 10;
+// Sanity bound on the parsed cap. The plan clamps to the slots actually free in
+// that layer, so this only keeps a typo from asking for absurd counts.
+static constexpr uint32_t MOE_CACHE_ADMIT_MAX_LIMIT = 4096;
+
+static bool moe_cache_admit_predicted() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_MOE_ADMIT_PREDICTED");
+        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static uint32_t moe_cache_admit_max() {
+    static const uint32_t cap = [] {
+        const char * value = getenv("GGML_MOE_ADMIT_MAX");
+        if (value == nullptr || value[0] == '\0') {
+            return MOE_CACHE_ADMIT_MAX_DEFAULT;
+        }
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long parsed = strtoul(value, &end, 10);
+        if (end == value || *end != '\0' || errno != 0 || parsed > MOE_CACHE_ADMIT_MAX_LIMIT) {
+            GGML_LOG_WARN("moe-cache: invalid GGML_MOE_ADMIT_MAX=\"%s\", using %u\n",
+                value, MOE_CACHE_ADMIT_MAX_DEFAULT);
+            return MOE_CACHE_ADMIT_MAX_DEFAULT;
+        }
+        return (uint32_t) parsed;
+    }();
+    return cap;
+}
+
+// One-shot warn for prefetch path misuse. Never per-step spam.
+static void moe_cache_prefetch_warn_once(std::atomic<bool> & flag, const char * msg) {
+    bool expected = false;
+    if (flag.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        GGML_LOG_WARN("%s\n", msg);
+    }
+}
+
+// Device -> latest grouped context, so the exported string-keyed prefetch
+// entry point can find the cache owner. Backend contexts own the objects;
+// this map never owns. Multiple contexts per device may exist in tests; the
+// latest registered wins, which matches single-context production use.
+static std::mutex g_moe_prefetch_registry_mu;
+static std::unordered_map<int, ggml_cuda_moe_grouped_context *> g_moe_prefetch_registry;
+
+static void moe_cache_prefetch_register(int device, ggml_cuda_moe_grouped_context * context) {
+    if (device < 0 || context == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_moe_prefetch_registry_mu);
+    g_moe_prefetch_registry[device] = context;
+}
+
+static void moe_cache_prefetch_unregister(ggml_cuda_moe_grouped_context * context) {
+    if (context == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_moe_prefetch_registry_mu);
+    for (auto it = g_moe_prefetch_registry.begin(); it != g_moe_prefetch_registry.end();) {
+        if (it->second == context) {
+            it = g_moe_prefetch_registry.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static ggml_cuda_moe_grouped_context * moe_cache_prefetch_context(int device) {
+    std::lock_guard<std::mutex> lock(g_moe_prefetch_registry_mu);
+    auto it = g_moe_prefetch_registry.find(device);
+    return it != g_moe_prefetch_registry.end() ? it->second : nullptr;
+}
 
 static size_t moe_cache_quantized_source_padding(uint32_t type, int64_t ne0) {
     if (type >= GGML_TYPE_COUNT || ne0 <= 0 || !ggml_is_quantized((ggml_type) type)) {
@@ -595,6 +768,11 @@ struct moe_cache_phase_stats {
     uint64_t prefetch_misses;
     uint64_t prefetch_used;
     uint64_t prefetch_evictions;
+    uint64_t prefetch_dropped;
+    uint64_t prefetch_reserve_refused;
+    uint64_t l1_reserved;
+    uint64_t l1_reserved_high;
+    uint64_t l1_reserve_budget;
     uint64_t demand_evictions;
     uint64_t evicted_prefetched;
     uint64_t evicted_hit_count_le1;
@@ -2771,9 +2949,66 @@ uint64_t ggml_cuda_moe_execution_semantic_key(const ggml_cgraph * cgraph) {
 namespace {
 
 static constexpr uint32_t MOE_GROUPED_PLAN_THREADS = 128;
-static constexpr uint32_t MOE_GROUPED_FREQUENCY_EPOCH_SHIFT = 4;
+// Grouped planning steps per halving of the decayed demand frequency. The decay
+// law is one right shift of the stored frequency per elapsed epoch, so this
+// epoch length is the half-life. The historical default is 16 steps;
+// GGML_CUDA_MOE_FREQUENCY_HALFLIFE retunes the period without changing the law.
+static constexpr uint32_t MOE_GROUPED_FREQUENCY_HALFLIFE_DEFAULT = 16;
 static constexpr uint32_t MOE_GROUPED_TRANSFER_THREADS = 256;
 static constexpr uint32_t MOE_GROUPED_TRANSFER_BLOCKS_PER_SM = 4;
+
+// ---------------------------------------------------------------------------
+// Per-(step, layer) demanded-expert trace (diagnostic; off unless
+// GGML_CUDA_MOE_DEMAND_TRACE is set). Each grouped plan call is one layer of one
+// decode step, and the plan kernel already has that layer's demanded expert ids
+// in hand, so it records them into a device-side ring of steps. The ring is
+// drained to pinned memory one step at a time with the same non-blocking
+// pattern as the per-step miss ledger and written out as text.
+//
+// Observed geometry this is sized for: 48 MoE layers, top_k = 10 experts per
+// layer, so one decode step demands exactly 48 * 10 = 480 expert ids. The step
+// bound is the per-step ledger's, declared here (rather than beside the ledger,
+// below) because the plan kernel that fills this ring is defined first.
+#define GGML_CUDA_MOE_STEP_RING 256
+#define GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS  48
+#define GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS 10
+
+struct ggml_cuda_moe_demand_trace_step {
+    // Demanded expert ids in demand order, and the written length per layer:
+    // len == 0 means that layer did not record this step, so a step whose
+    // layers are not all written is a partially written step.
+    int16_t ids[GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS][GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS];
+    uint8_t len[GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS];
+};
+
+struct ggml_cuda_moe_demand_trace_buffer {
+    // One grouped plan call per layer per decode step, so this per-layer call
+    // count IS that layer's step index. Device-side on purpose: a captured
+    // graph replay re-runs the plan kernel, so the index advances exactly as it
+    // does for a direct launch, with no host bookkeeping on the decode path.
+    uint32_t layer_step[GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS];
+    ggml_cuda_moe_demand_trace_step step[GGML_CUDA_MOE_STEP_RING];
+};
+
+// Single reader of GGML_CUDA_MOE_FREQUENCY_HALFLIFE, in grouped planning steps.
+// Unset, empty, non-numeric, non-positive, or out of range falls back to the
+// default. The process-wide static is initialised once, so neither context
+// creation nor the decode path pays for getenv/strtoll.
+static uint32_t moe_grouped_frequency_halflife() {
+    static const uint32_t halflife = []() -> uint32_t {
+        const char * value = getenv("GGML_CUDA_MOE_FREQUENCY_HALFLIFE");
+        if (value == nullptr || value[0] == '\0') {
+            return MOE_GROUPED_FREQUENCY_HALFLIFE_DEFAULT;
+        }
+        char * end = nullptr;
+        const long long parsed = strtoll(value, &end, 10);
+        if (end == value || *end != '\0' || parsed <= 0 || parsed > UINT32_MAX) {
+            return MOE_GROUPED_FREQUENCY_HALFLIFE_DEFAULT;
+        }
+        return static_cast<uint32_t>(parsed);
+    }();
+    return halflife;
+}
 
 static uint32_t moe_grouped_plan_threads(uint32_t n_slots) {
     return n_slots <= WARP_SIZE ? WARP_SIZE : n_slots <= 2 * WARP_SIZE ? 2 * WARP_SIZE : MOE_GROUPED_PLAN_THREADS;
@@ -2804,11 +3039,23 @@ enum moe_grouped_plan_status : uint32_t {
     MOE_GROUPED_PLAN_INVALID_STATE,
 };
 
+// Width of the look-ahead's per-layer prediction: the length of the compacted
+// candidate list the staging lane publishes, and the hard cap on how many
+// candidates the plan's admission pass can be handed. Declared here because the
+// plan kernel reads that list; the staging section below documents the rest of
+// the lane's layout and owns the counter array.
+#define GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH 8
+
 struct moe_grouped_decode_plan {
     uint32_t status;
     uint32_t n_routes;
     uint32_t n_unique;
     uint32_t n_misses;
+    // Admission pass (GGML_MOE_ADMIT_PREDICTED): predicted experts inserted into
+    // slots nobody demanded. Kept out of n_unique/n_misses so the demand ledger
+    // (need, hits, resident) keeps its meaning; the gather transfers them like
+    // misses and the next commit installs them like misses.
+    uint32_t n_admissions;
     uint64_t next_clock;
     uint64_t frequency_epoch;
 };
@@ -2822,6 +3069,8 @@ enum moe_grouped_plan_array_index : uint32_t {
     MOE_GROUPED_PLAN_MISS_EXPERTS,
     MOE_GROUPED_PLAN_MISS_SLOTS,
     MOE_GROUPED_PLAN_REMAPPED_IDS,
+    MOE_GROUPED_PLAN_ADMIT_EXPERTS,
+    MOE_GROUPED_PLAN_ADMIT_SLOTS,
     MOE_GROUPED_PLAN_ROUTE_ARRAY_COUNT,
 };
 
@@ -2935,6 +3184,32 @@ static __global__ void moe_grouped_set_clock(uint64_t * clock, uint64_t value) {
     }
 }
 
+// Read the copy worker's per-lane landing counter. The worker publishes `p + 1` on the
+// copy stream once staging slot p has landed, so `position < progress` is exactly
+// "the staged slab for this expert is here". System-scope acquire, matching the ready
+// filter this replaces, so the DMA'd staging bytes are visible before the plan
+// classifies them and before the gather reads them. Builds without the copy engine
+// never call this. Declared here because both readers below use it.
+static __device__ __forceinline__ uint32_t moe_staging_progress(const uint32_t * progress) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    // atomic_ref takes a mutable reference even for a load; the gather only ever reads
+    // this counter, and the copy worker is its only writer.
+    return cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(
+        *const_cast<uint32_t *>(progress)).load(cuda::memory_order_acquire);
+#else
+    return *reinterpret_cast<const volatile uint32_t *>(progress);
+#endif
+}
+
+// Demand-trace predicate for the plan kernel. Uniform across the block (both
+// operands are launch parameters), so every use below is a single predictable
+// branch that is never taken when the gate is off: the host then passes a null
+// buffer and layer -1, and no allocation or atomic happens anywhere.
+static __device__ __forceinline__ bool moe_grouped_demand_trace_on(
+        const ggml_cuda_moe_demand_trace_buffer * trace, int32_t layer) {
+    return trace != nullptr && layer >= 0 && layer < GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS;
+}
+
 static __global__ void moe_grouped_plan_decode(
         const int32_t * ids,
         uint32_t n_routes,
@@ -2950,10 +3225,24 @@ static __global__ void moe_grouped_plan_decode(
         uint64_t * expert_frequency_epoch,
         uint64_t * device_step,
         bool frequency_aware,
+        uint32_t frequency_halflife,
         uint64_t host_clock_begin,
         uint64_t host_clock_end,
         uint64_t * device_clock,
-        moe_grouped_decode_plan * plan) {
+        moe_grouped_decode_plan * plan,
+        uint64_t * resident_slot,
+        uint64_t resident_tag,
+        uint64_t resident_bytes_per_miss,
+        const int32_t * staging_positions,
+        const uint32_t * staging_progress,
+        ggml_cuda_moe_demand_trace_buffer * demand_trace,
+        int32_t demand_trace_layer,
+        const int32_t * predict_mask,
+        uint64_t * predict_counters,
+        const int32_t * admit_candidates,
+        uint32_t admit_width,
+        uint32_t admit_max,
+        uint32_t pin_mode) {
     if (blockIdx.x != 0) {
         return;
     }
@@ -2963,8 +3252,25 @@ static __global__ void moe_grouped_plan_decode(
     __shared__ unsigned long long warp_ages[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
     __shared__ uint32_t warp_slots[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
     __shared__ uint32_t selected_slot;
+    // Protect-policy parallel victim order (unused, and never read, unless the
+    // host passed a prediction mask down).
+    __shared__ uint32_t warp_unprotected_frequencies[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
+    __shared__ unsigned long long warp_unprotected_ages[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
+    __shared__ uint32_t warp_unprotected_slots[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
+    __shared__ uint32_t selected_slot_unprotected;
+    __shared__ uint32_t staged_admissions;
+    // Admission pass: candidates that survived the residency/duplicate filter,
+    // and how many of them found a slot. Unused without a candidate list.
+    __shared__ int32_t admit_pending[GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH];
+    __shared__ uint32_t admit_placements;
+    __shared__ uint32_t admit_skipped;
+    // RECENT1's boundary: the clock_begin of this layer's previous plan, i.e. the
+    // edge between residents its immediately preceding step touched and older
+    // churn. Zero (first plan) pins nothing, since no slot has an age yet.
+    __shared__ uint64_t recent_threshold;
     __shared__ uint64_t clock_begin;
     __shared__ uint64_t clock_end;
+    __shared__ uint32_t demand_trace_slot;
     const uint32_t thread = threadIdx.x;
     int32_t * route_storage = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ROUTE_STORAGE);
     int32_t * route_unique = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ROUTE_UNIQUE);
@@ -2974,11 +3280,14 @@ static __global__ void moe_grouped_plan_decode(
     int32_t * miss_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
     int32_t * miss_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
     int32_t * remapped_ids = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_REMAPPED_IDS);
+    int32_t * admit_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ADMIT_EXPERTS);
+    int32_t * admit_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ADMIT_SLOTS);
     uint32_t * expert_routes = moe_grouped_plan_expert_routes(plan, plan_capacity);
 
     // Commit the prior admission before this call overwrites the shared plan.
     if (plan->status == MOE_GROUPED_PLAN_READY) {
-        if (plan->n_unique > plan_capacity || plan->n_misses > plan->n_unique) {
+        if (plan->n_unique > plan_capacity || plan->n_misses > plan->n_unique ||
+                plan->n_admissions > plan_capacity) {
             moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
         }
         for (uint32_t miss = thread; miss < plan->n_misses; miss += blockDim.x) {
@@ -2993,6 +3302,31 @@ static __global__ void moe_grouped_plan_decode(
             }
             expert_for_slot[slot] = expert;
             slot_for_expert[expert] = slot;
+        }
+        __syncthreads();
+
+        // Admission install, same commit point as a miss: the payload was moved
+        // into the slot by the gather of the plan that chose it. last_used is set
+        // here rather than in the admission pass because residency is entered
+        // here, and the residency invariant below rejects a resident slot whose
+        // age is still zero. next_clock is the newest tick of that generation and
+        // is never zero for a plan that reached READY (n_unique >= 1).
+        for (uint32_t admit = thread; admit < plan->n_admissions; admit += blockDim.x) {
+            const int32_t expert = admit_experts[admit];
+            const int32_t slot = admit_slots[admit];
+            if (expert < 0 || (uint32_t) expert >= n_experts || slot < 0 || (uint32_t) slot >= n_slots) {
+                moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+            }
+            const int32_t old_expert = expert_for_slot[slot];
+            if (old_expert >= 0) {
+                slot_for_expert[old_expert] = -1;
+            }
+            expert_for_slot[slot] = expert;
+            slot_for_expert[expert] = slot;
+            // No frequency bump: the expert was not used, only paged in. Its
+            // decayed counter keeps it a candidate; a demand for it next step is
+            // a hit and bumps it then.
+            last_used[slot] = plan->next_clock;
         }
         __syncthreads();
 
@@ -3018,14 +3352,24 @@ static __global__ void moe_grouped_plan_decode(
 
     if (thread == 0) {
         plan->status = MOE_GROUPED_PLAN_BUILDING;
+        // RECENT1 threshold, read before the previous plan's span is overwritten
+        // below: next_clock - n_unique of the plan that just committed is exactly
+        // its clock_begin, and every resident it touched carries a last_used at or
+        // above that. The guard only keeps a hand-corrupted plan from underflowing
+        // into an absurd threshold.
+        recent_threshold = (plan->n_unique != 0 && plan->next_clock >= plan->n_unique) ?
+            plan->next_clock - plan->n_unique : 0;
         plan->n_routes = n_routes;
         plan->n_unique = 0;
         plan->n_misses = 0;
+        // Zeroed before the commit/classification barriers that precede the count
+        // below, so no barrier is needed between this store and the atomicAdds.
+        staged_admissions = 0;
         const unsigned long long step = atomicAdd(reinterpret_cast<unsigned long long *>(device_step), 1ULL);
         if (step == UINT64_MAX) {
             moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
         }
-        plan->frequency_epoch = step >> MOE_GROUPED_FREQUENCY_EPOCH_SHIFT;
+        plan->frequency_epoch = step / frequency_halflife;
         clock_begin = host_clock_begin;
         clock_end = host_clock_end;
         if (device_clock != nullptr) {
@@ -3102,6 +3446,15 @@ static __global__ void moe_grouped_plan_decode(
             const uint32_t lane = thread;
             const bool active = lane < n_routes;
             const int32_t expert = active ? warp_route_experts[lane] : -1;
+            // One atomic per plan call, taken before any lane needs the slot.
+            const bool trace_on = moe_grouped_demand_trace_on(demand_trace, demand_trace_layer);
+            if (trace_on && lane == 0) {
+                demand_trace_slot = atomicAdd(&demand_trace->layer_step[demand_trace_layer], 1u) %
+                    GGML_CUDA_MOE_STEP_RING;
+            }
+            if (trace_on) {
+                __syncwarp(0xffffffff);
+            }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             const uint32_t first_lane = __ffs(__match_any_sync(0xffffffff, expert)) - 1;
 #else
@@ -3128,6 +3481,9 @@ static __global__ void moe_grouped_plan_decode(
                     (slot >= 0 && ((uint32_t) slot >= n_slots || expert_for_slot[slot] != expert));
                 unique_experts[unique] = expert;
                 unique_slots[unique] = slot;
+                if (trace_on && unique < GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS) {
+                    demand_trace->step[demand_trace_slot].ids[demand_trace_layer][unique] = (int16_t) expert;
+                }
             }
             const uint32_t invalid_mask = __ballot_sync(0xffffffff, invalid_slot);
             const bool miss = first && slot < 0;
@@ -3143,6 +3499,13 @@ static __global__ void moe_grouped_plan_decode(
                 }
                 plan->n_unique = __popc(first_mask);
                 plan->n_misses = __popc(miss_mask);
+                if (trace_on) {
+                    // Written length of this layer's demand for this step: the
+                    // per-(step, layer) validity marker the drain checks.
+                    const uint32_t recorded = __popc(first_mask);
+                    demand_trace->step[demand_trace_slot].len[demand_trace_layer] =
+                        (uint8_t) (recorded < 255 ? recorded : 255);
+                }
             }
             __syncwarp(0xffffffff);
         }
@@ -3151,16 +3514,28 @@ static __global__ void moe_grouped_plan_decode(
 #endif
     {
         if (thread == 0) {
+            const bool trace_on = moe_grouped_demand_trace_on(demand_trace, demand_trace_layer);
+            if (trace_on) {
+                demand_trace_slot = atomicAdd(&demand_trace->layer_step[demand_trace_layer], 1u) %
+                    GGML_CUDA_MOE_STEP_RING;
+            }
             uint32_t n_unique = 0;
             for (uint32_t route = 0; route < n_routes; ++route) {
                 const uint32_t expert = route_storage[route];
                 if (expert_routes[expert] == route) {
                     expert_routes[expert] = n_unique;
+                    if (trace_on && n_unique < GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS) {
+                        demand_trace->step[demand_trace_slot].ids[demand_trace_layer][n_unique] = (int16_t) expert;
+                    }
                     unique_experts[n_unique++] = expert;
                 }
                 route_unique[route] = expert_routes[expert];
             }
             plan->n_unique = n_unique;
+            if (trace_on) {
+                demand_trace->step[demand_trace_slot].len[demand_trace_layer] =
+                    (uint8_t) (n_unique < 255 ? n_unique : 255);
+            }
         }
         __syncthreads();
 
@@ -3205,10 +3580,103 @@ static __global__ void moe_grouped_plan_decode(
 
     const uint32_t lane = thread % WARP_SIZE;
     const uint32_t warp = thread / WARP_SIZE;
-    for (uint32_t miss = 0; miss < plan->n_misses; ++miss) {
+    // Warm-resident pin override: recent1 pins only what the layer's previous
+    // plan touched; protect pins that plus whatever the look-ahead mask names,
+    // when the host passed one (it is null at width 0 and for lfu/lru, where
+    // pin_mode is NONE and every branch below is uniformly false for the whole
+    // block, so `slot`/`selected_slot` are chosen exactly as before).
+    const bool pin_on = pin_mode != MOE_CACHE_PIN_NONE;
+    const bool pin_recent1 = pin_mode == MOE_CACHE_PIN_RECENT1;
+    if (thread == 0) {
+        selected_slot_unprotected = UINT32_MAX;
+    }
+    // Admission pass (opt-in; the host passes no candidate list otherwise, and
+    // then every branch below is uniformly dead for the whole block). The
+    // candidates are the lane's compacted prediction from the publish this
+    // layer's filter already issued: predicted experts that were NOT resident at
+    // publish time, in predictor confidence order, -1 padded. Two filters run
+    // here, both in thread 0 and both deterministic:
+    //   - drop any candidate this layer demands right now: the demand path just
+    //     gave that expert a slot, and installing it twice would leave two slots
+    //     claiming one expert and the residency invariant would fire next plan;
+    //   - drop any candidate the slot tables already hold: the list was built
+    //     from the publish's view of residency, which predates the commit of the
+    //     preceding plan, so an expert that plan admitted (or installed for a
+    //     miss) is resident here while still listed. Same double install, same
+    //     trap, so the live tables are the authority;
+    //   - stop at admit_max and at the slots nobody demanded (n_slots -
+    //     n_unique), which is exactly the room the placement is guaranteed for.
+    const bool admit_on = admit_candidates != nullptr && predict_counters != nullptr && admit_max != 0;
+    if (thread == 0) {
+        uint32_t placements = 0;
+        uint32_t skipped = 0;
+        if (admit_on) {
+            const uint32_t width = admit_width < (uint32_t) GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH ?
+                admit_width : (uint32_t) GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH;
+            uint32_t pending = 0;
+            for (uint32_t candidate = 0; candidate < width; ++candidate) {
+                const int32_t expert = admit_candidates[candidate];
+                if (expert < 0) {
+                    break;   // -1 padding: the filter's list ended here
+                }
+                if ((uint32_t) expert >= n_experts) {
+                    continue;   // cannot be resident, and the tables cannot be indexed
+                }
+                bool demanded = false;
+                for (uint32_t unique = 0; unique < plan->n_unique; ++unique) {
+                    if (unique_experts[unique] == expert) {
+                        demanded = true;
+                        break;
+                    }
+                }
+                // Live residency, not the publish-time view the list was built
+                // from. The filter sampled the slot tables before the preceding
+                // plan's commit, so an expert that plan admitted - or that its
+                // misses installed - is resident here while still appearing in
+                // the list. Admitting it again would leave two slots claiming one
+                // expert, and the next plan's residency invariant
+                // (slot_for_expert[expert_for_slot[slot]] == slot) would trap on
+                // the stale one. The test is the demand path's own live test, and
+                // running it after the commit above is what makes it exact: an
+                // admission committed a step ago is resident by now and drops out
+                // here, so no expert is ever installed twice.
+                if (!demanded && slot_for_expert[expert] < 0) {
+                    admit_pending[pending++] = expert;
+                }
+            }
+            const uint32_t room = n_slots > plan->n_unique ? n_slots - plan->n_unique : 0;
+            placements = pending < admit_max ? pending : admit_max;
+            if (placements > room) {
+                placements = room;
+            }
+            skipped = pending - placements;
+        }
+        admit_placements = placements;
+        admit_skipped = skipped;
+        // Published before the gather can see it (the status is still BUILDING
+        // for the whole kernel), and read by the next plan's commit before this
+        // store can race it: the commit loops run under the barriers above.
+        plan->n_admissions = placements;
+    }
+    __syncthreads();
+    // One placement per demand miss, then one per admitted candidate: identical
+    // candidate scan, identical victim order, identical policy and identical
+    // protect preference. Only the expert installed into the slot differs (the
+    // miss's unique, or the admitted candidate), and only the demand half feeds
+    // the two protect counters - the admission half has its own three.
+    const uint32_t place_total = plan->n_misses + admit_placements;
+    for (uint32_t place = 0; place < place_total; ++place) {
+        const bool admission = place >= plan->n_misses;
         uint32_t frequency = UINT32_MAX;
         unsigned long long age = UINT64_MAX;
         uint32_t slot = UINT32_MAX;
+        // The same order over the same candidates minus the predicted residents.
+        // The identity triple (UINT32_MAX / UINT64_MAX / UINT32_MAX) means "this
+        // thread found no such candidate"; UINT32_MAX is not a slot index, so a
+        // thread that only saw predicted residents can never win the reduction.
+        uint32_t unprotected_frequency = UINT32_MAX;
+        unsigned long long unprotected_age = UINT64_MAX;
+        uint32_t unprotected_slot = UINT32_MAX;
         for (uint32_t candidate = thread; candidate < n_slots; candidate += blockDim.x) {
             if (route_storage[candidate] == 0) {
                 const int32_t resident = expert_for_slot[candidate];
@@ -3226,6 +3694,29 @@ static __global__ void moe_grouped_plan_decode(
                     age = candidate_age;
                     slot = candidate;
                 }
+                // A pin is "do not evict this resident yet". Two sources:
+                // recent1 (and every pin mode) reads the slot table - the layer's
+                // previous plan touched this slot, so its resident is warm - and
+                // protect additionally reads the look-ahead mask for this layer.
+                // The recipe arm gets the union: with a look-ahead lane the
+                // prediction joins in, without one the warm set alone is what
+                // protects (an arm that runs protect at width 0 must still be the
+                // retention policy, not a no-op). An empty slot is nobody's
+                // resident, so it stays eligible and is picked as the pinned-free
+                // victim whenever one exists: the override therefore only ever
+                // refuses to evict a pinned resident while some other demand-free
+                // slot is available.
+                const bool pinned_warm = resident >= 0 && candidate_age > recent_threshold;
+                const bool pinned_predicted = !pin_recent1 && resident >= 0 &&
+                    predict_mask != nullptr && predict_mask[resident] != 0;
+                if (pin_on && !pinned_warm && !pinned_predicted &&
+                        (candidate_frequency < unprotected_frequency ||
+                            (candidate_frequency == unprotected_frequency && (candidate_age < unprotected_age ||
+                                (candidate_age == unprotected_age && candidate < unprotected_slot))))) {
+                    unprotected_frequency = candidate_frequency;
+                    unprotected_age = candidate_age;
+                    unprotected_slot = candidate;
+                }
             }
         }
         if (blockDim.x == WARP_SIZE) {
@@ -3233,12 +3724,29 @@ static __global__ void moe_grouped_plan_decode(
             if (lane == 0) {
                 selected_slot = candidate_slot;
             }
+            if (pin_on) {
+                // Slot joins the tiebreak here (unlike the default order above);
+                // for a single-warp block the candidate index is the slot, so the
+                // chosen victim is the lowest unpinned candidate slot.
+                moe_grouped_warp_min(unprotected_frequency, unprotected_age, unprotected_slot);
+                if (lane == 0) {
+                    selected_slot_unprotected = unprotected_slot;
+                }
+            }
         } else {
             moe_grouped_warp_min(frequency, age, slot);
             if (lane == 0) {
                 warp_frequencies[warp] = frequency;
                 warp_ages[warp] = age;
                 warp_slots[warp] = slot;
+            }
+            if (pin_on) {
+                moe_grouped_warp_min(unprotected_frequency, unprotected_age, unprotected_slot);
+                if (lane == 0) {
+                    warp_unprotected_frequencies[warp] = unprotected_frequency;
+                    warp_unprotected_ages[warp] = unprotected_age;
+                    warp_unprotected_slots[warp] = unprotected_slot;
+                }
             }
             __syncthreads();
             if (warp == 0) {
@@ -3249,19 +3757,96 @@ static __global__ void moe_grouped_plan_decode(
                 if (lane == 0) {
                     selected_slot = slot;
                 }
+                if (pin_on) {
+                    unprotected_frequency = lane < blockDim.x / WARP_SIZE ? warp_unprotected_frequencies[lane] : UINT32_MAX;
+                    unprotected_age = lane < blockDim.x / WARP_SIZE ? warp_unprotected_ages[lane] : UINT64_MAX;
+                    unprotected_slot = lane < blockDim.x / WARP_SIZE ? warp_unprotected_slots[lane] : UINT32_MAX;
+                    moe_grouped_warp_min(unprotected_frequency, unprotected_age, unprotected_slot);
+                    if (lane == 0) {
+                        selected_slot_unprotected = unprotected_slot;
+                    }
+                }
             }
         }
         __syncthreads();
         if (thread == 0) {
-            const int32_t unique = miss_unique[miss];
-            if (selected_slot >= n_slots || unique < 0 || (uint32_t) unique >= plan->n_unique) {
+            if (selected_slot >= n_slots) {
                 moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
             }
-            unique_slots[unique] = selected_slot;
-            miss_slots[miss] = selected_slot;
-            route_storage[selected_slot] = 1;
+            uint32_t victim = selected_slot;
+            if (pin_on) {
+                // predict_counters is the lane's counter array itself, so the
+                // absolute slots are the ones the stage line reads: [7]/[8] for
+                // the pin hook, [9]/[10]/[11] for the admission pass.
+                // A real slot index means this eviction had an unpinned candidate;
+                // it differs from the default victim exactly when the default
+                // victim was itself pinned, so [7] counts the choices the hook
+                // actually moved. UINT32_MAX means every demand-free slot held a
+                // pinned resident: the hook declines and the default victim
+                // stands, counted in [8]. Admission placements reuse the same
+                // preference but stay out of both counters: they are not demand
+                // evictions, and mixing them would make the two numbers mean
+                // different things in different arms. The counters live in the
+                // look-ahead lane, so recent1 without a lane still pins but has
+                // nowhere to count.
+                if (selected_slot_unprotected < n_slots) {
+                    if (selected_slot_unprotected != selected_slot) {
+                        victim = selected_slot_unprotected;
+                        if (!admission && predict_counters != nullptr) {
+                            atomicAdd(reinterpret_cast<unsigned long long *>(&predict_counters[7]), 1ULL);
+                        }
+                    }
+                } else if (!admission && predict_counters != nullptr) {
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&predict_counters[8]), 1ULL);
+                }
+            }
+            if (admission) {
+                const uint32_t index = place - plan->n_misses;
+                admit_experts[index] = admit_pending[index];
+                admit_slots[index] = victim;
+                // [10]: the victim slot held a resident, so this admission was
+                // an eviction; the rest fill slots nobody held.
+                if (expert_for_slot[victim] >= 0) {
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&predict_counters[10]), 1ULL);
+                }
+                atomicAdd(reinterpret_cast<unsigned long long *>(&predict_counters[9]), 1ULL);
+            } else {
+                const int32_t unique = miss_unique[place];
+                if (unique < 0 || (uint32_t) unique >= plan->n_unique) {
+                    moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+                }
+                unique_slots[unique] = victim;
+                miss_slots[place] = victim;
+            }
+            route_storage[victim] = 1;
         }
         __syncthreads();
+    }
+    if (admit_on && admit_skipped != 0 && thread == 0) {
+        // [11]: predicted, non-resident, not-demanded candidates the room or the
+        // cap could not take. Counted once per plan, never per placement.
+        atomicAdd(reinterpret_cast<unsigned long long *>(&predict_counters[11]),
+            (unsigned long long) admit_skipped);
+    }
+
+    // Plan-side staged admission (opt-in; both pointers null when the gate is off).
+    // A would-be demand miss whose look-ahead slab has already landed is served from
+    // staging, so it must not be charged to the demand side of the residency ledger.
+    // Classification only: the miss entry, its slot and its committed mapping are
+    // exactly what the loop above produced, and the gather lands the staged payload
+    // in that same slot, so this never allocates or evicts a second slot and never
+    // writes any slot table. The predicate is the gather's `staged_ready` verbatim -
+    // same positions array, same landing counter, same `position < progress` test -
+    // sampled one launch earlier. The counter only ever grows, so every expert
+    // classified here is sourced from staging by the gather below.
+    if (staging_positions != nullptr && staging_progress != nullptr) {
+        const uint32_t landed = moe_staging_progress(staging_progress);
+        for (uint32_t miss = thread; miss < plan->n_misses; miss += blockDim.x) {
+            const int32_t position = staging_positions[miss_experts[miss]];
+            if (position >= 0 && (uint32_t) position < landed) {
+                atomicAdd(&staged_admissions, 1u);
+            }
+        }
     }
 
     for (uint32_t unique = thread; unique < plan->n_unique; unique += blockDim.x) {
@@ -3284,7 +3869,38 @@ static __global__ void moe_grouped_plan_decode(
     }
     __syncthreads();
     if (thread == 0) {
+        if (staging_positions != nullptr && staged_admissions > plan->n_misses) {
+            moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+        }
         plan->status = MOE_GROUPED_PLAN_READY;
+        if (resident_slot != nullptr) {
+            // Device-side residency publish: n_unique/n_misses resolved above.
+            // A staged admission is a need the look-ahead already paid for: it stays a
+            // need (resident_slot[0]) and it is not resident at entry, so resident
+            // keeps its documented meaning, but it is not a demand miss either, so it
+            // is excluded from copied/copy_mib ([2]/[3]). Those two columns then read
+            // the demand traffic the admission removes instead of the churn it causes,
+            // and the staged-served count is the residual need - resident - copied.
+            // It was admitted exactly once, into the single victim slot chosen above,
+            // which is the slot the gather lands the staged payload in.
+            //
+            // Admission fetches (GGML_MOE_ADMIT_PREDICTED) are the opposite case and
+            // are charged here: a prefetch is still a PCIe fetch, and admitting an
+            // expert nobody demanded buys that expert's slab - from the source, or
+            // recycled out of a staged slab that had already landed - so [2]/[3] read
+            // misses = demand misses + admissions. They add no need, so with the gate
+            // on, need - resident is no longer copied, by design.
+            const uint32_t billed_fetches = plan->n_misses - staged_admissions + plan->n_admissions;
+            atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[0]),
+                static_cast<unsigned long long>(plan->n_unique));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[1]),
+                static_cast<unsigned long long>(plan->n_unique - plan->n_misses));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[2]),
+                static_cast<unsigned long long>(billed_fetches));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&resident_slot[3]),
+                static_cast<unsigned long long>(billed_fetches) * resident_bytes_per_miss);
+            resident_slot[4] = resident_tag;
+        }
     }
 }
 
@@ -3824,6 +4440,163 @@ static void moe_early_router_wait_copy(cudaStream_t stream, uint32_t * done) {
     CU_CHECK(cuStreamUpdateCaptureDependencies_v2(stream, &node, nullptr, 1, CU_STREAM_SET_CAPTURE_DEPENDENCIES));
 }
 #endif
+// ---------------------------------------------------------------------------
+// MoE look-ahead staging (decode only, default off).
+//
+// The grouped decode gather reads its misses from host-mapped memory inline
+// (moe_grouped_gather_decode below), so miss bytes cross PCIe inside the op.
+// Staging moves those bytes ahead of time: the MOE_PREFETCH producer's ids
+// are filtered device-side to predicted-and-not-resident, published to the
+// copy worker through the same mapped-host mailbox the early router uses,
+// DMA'd into per-group staging by cudaMemcpyAsync on the worker's
+// non-captured copy stream, and consumed by the gather when the ready filter
+// finds the expert's position within completed progress. Anything not ready
+// falls back to the existing demand (host-mapped) path unconditionally.
+//
+// Slot tables (slot_for_expert/expert_for_slot/device_clock/last_used) are
+// device arrays owned by the plan kernel. The host worker never writes them;
+// staging sidesteps slot selection entirely. No D2H and no host sync appear
+// in the issue path: one filter kernel plus the mailbox publish kernel, both
+// stream-ordered. Single-flight per lane is enforced with a stream WaitValue
+// on the previous copy_done, so the compute stream never blocks on the host.
+// ---------------------------------------------------------------------------
+// GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH is declared above (the plan kernel reads
+// the width-8 candidate list).
+#define GGML_CUDA_MOE_LOOKAHEAD_COUNTERS 12
+// Lane counters: [0]=staged bytes [1]=consumed bytes [2]=staged count
+// [3]=consumed count [4]=publishes [5]=dropped [6]=resident-skipped.
+// The gather adds [1]/[3]; the filter adds the rest. [7]/[8] are lifetime
+// eviction-pin counters, written by the plan kernel only under a pin policy:
+// [7]=evictions whose victim was overridden away from the default choice,
+// [8]=evictions that found every candidate resident already pinned.
+// [9]/[10]/[11] are lifetime admission counters, written by the plan kernel
+// only with a candidate list: [9]=predicted experts admitted into slots,
+// [10]=those admissions whose victim slot held a resident hence were evictions
+// rather than fills of an empty slot, [11]=candidates that found no slot (cap
+// or no room) and were therefore dropped.
+
+struct moe_copy_config {
+    bool mailbox = false;
+    bool poll = false;
+    bool batch = false;
+    bool split = false;
+    bool ready_only = false;
+    bool ready_late = false;
+    bool banks = false;
+};
+
+static moe_copy_config moe_copy_config_from_env() {
+    moe_copy_config cfg;
+    const char * mailbox = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_MAILBOX");
+    cfg.mailbox = mailbox != nullptr && strcmp(mailbox, "1") == 0;
+    const char * poll = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_POLL");
+    cfg.poll = poll != nullptr && strcmp(poll, "1") == 0;
+    const char * batch = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_BATCH");
+    cfg.batch = batch != nullptr && strcmp(batch, "1") == 0;
+    const char * split = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_SPLIT");
+    cfg.split = split != nullptr && strcmp(split, "1") == 0;
+    const char * ready_only = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_READY_ONLY");
+    cfg.ready_late = ready_only != nullptr && strcmp(ready_only, "2") == 0;
+    cfg.ready_only = cfg.ready_late || (ready_only != nullptr && strcmp(ready_only, "1") == 0);
+    const char * banks = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_BANKS");
+    cfg.banks = banks != nullptr && strcmp(banks, "1") == 0;
+    return cfg;
+}
+
+// Forced worker mode for look-ahead lanes: mailbox publish, batched DMA,
+// per-expert progress. split is set only to satisfy the ready_only assert in
+// start_copy_worker; the split event itself is never consulted on this path.
+static moe_copy_config moe_copy_config_lookahead() {
+    moe_copy_config cfg;
+    cfg.mailbox = true;
+    cfg.batch = true;
+    cfg.split = true;
+    cfg.ready_only = true;
+    return cfg;
+}
+
+// Device-side prediction filter: compact the first width ids to
+// predicted-and-not-resident, rewrite positions fully (epoch safety: no stale
+// position survives a publish), and count every outcome. Prior-plan misses
+// are treated as present because the plan kernel commits them before this
+// step's plan overwrites the shared plan, exactly like the incoming check in
+// moe_early_router_select. Single block; only thread 0 filters (width <= 8).
+//
+// predict_mask (nullable) is the same prediction kept whole instead of
+// compacted: every valid id in the first width entries is marked, resident or
+// not. That is the one form the eviction policy can use - positions is
+// predicted-AND-not-resident by construction, so it never intersects the
+// residents a victim is chosen from. Cleared and refilled in the same launch as
+// positions, so a mask is never a mixture of two predictions. Null for every
+// policy but protect: nothing is written and nothing is allocated.
+static __global__ void moe_lookahead_stage_filter(
+        const int32_t * ids, uint32_t n_ids, uint32_t width,
+        const int32_t * slot_for_expert, uint32_t n_experts,
+        const moe_grouped_decode_plan * prior, uint32_t plan_capacity,
+        int32_t * predicted, int32_t * positions, uint64_t * counters, size_t entry_bytes,
+        int32_t * predict_mask) {
+    for (uint32_t e = threadIdx.x; e < n_experts; e += blockDim.x) {
+        positions[e] = -1;
+        if (predict_mask != nullptr) {
+            predict_mask[e] = 0;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) {
+        return;
+    }
+    uint32_t n_pending = 0;
+    const int32_t * incoming = nullptr;
+    const int32_t * incoming_slots = nullptr;
+    if (prior != nullptr && prior->status == MOE_GROUPED_PLAN_READY && prior->n_misses <= plan_capacity) {
+        n_pending = prior->n_misses;
+        incoming = moe_grouped_plan_array_ptr(prior, plan_capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
+        incoming_slots = moe_grouped_plan_array_ptr(prior, plan_capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
+    }
+    uint32_t staged = 0;
+    uint32_t dropped = 0;
+    uint32_t skipped = 0;
+    const uint32_t n = n_ids < width ? n_ids : width;
+    for (uint32_t r = 0; r < n; ++r) {
+        const int32_t expert = ids[r];
+        if (predict_mask != nullptr && expert >= 0 && (uint32_t) expert < n_experts) {
+            // Whole prediction, resident or not. Marking is idempotent and
+            // independent of the residency classification below, so the
+            // compaction stays byte-for-byte the same as without a mask.
+            predict_mask[expert] = 1;
+        }
+        if (expert < 0 || (uint32_t) expert >= n_experts || staged >= width || positions[expert] >= 0) {
+            ++dropped;
+            continue;
+        }
+        const int32_t slot = slot_for_expert[expert];
+        bool present = slot >= 0;
+        for (uint32_t m = 0; m < n_pending; ++m) {
+            if (incoming[m] == expert) {
+                present = true;
+                break;
+            }
+            if (incoming_slots[m] == slot) {
+                present = false;
+            }
+        }
+        if (present) {
+            ++skipped;
+            continue;
+        }
+        predicted[staged] = expert;
+        positions[expert] = (int32_t) staged;
+        ++staged;
+    }
+    for (uint32_t p = staged; p < width; ++p) {
+        predicted[p] = -1;
+    }
+    counters[0] += (uint64_t) staged * entry_bytes;
+    counters[2] += staged;
+    counters[4] += 1;
+    counters[5] += dropped;
+    counters[6] += skipped;
+}
 
 static __global__ void moe_early_router_scores(
         const float * input, const float * attention_scale, const float * ffn_scale,
@@ -4111,6 +4884,15 @@ static __global__ void moe_early_router_stage(
     }
 }
 
+// Resident probe staging flag (full probe block further below, after impl).
+#define GGML_CUDA_MOE_RESIDENT_STAGED_BIT (1ULL << 63)
+// How many word iterations the gather runs between re-samples of the staging landing
+// counter. Re-sampling per word would cost an acquire load per 16 bytes moved; sampling
+// once per layer is what made readiness all-or-nothing. 8 iterations covers
+// 8 * gridDim * blockDim words per re-sample, a fraction of one expert slab for the
+// grids this op uses, at negligible cost next to the PCIe reads it guards.
+#define GGML_CUDA_MOE_STAGING_RESAMPLE 8
+
 template<bool debug_transfers>
 static __global__ void moe_grouped_gather_decode(
         const moe_grouped_device_bank * banks,
@@ -4126,23 +4908,42 @@ static __global__ void moe_grouped_gather_decode(
         const int32_t * early_positions = nullptr,
         uint64_t * early_counters = nullptr,
         int early_phase = 0,
-        uint32_t bank_mask = UINT32_MAX) {
+        uint32_t bank_mask = UINT32_MAX,
+        uint64_t * resident_slot = nullptr,
+        const uint32_t * early_progress = nullptr) {
     if (plan->status != MOE_GROUPED_PLAN_READY) {
         return;
     }
+    if (resident_slot != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
+        resident_slot[5] = clock64();
+    }
+    // Rolling staging readiness. When the caller supplies the copy worker's landing
+    // counter, a staged position is consumable iff it has landed BY THE TIME the gather
+    // reaches it - not merely by the time the gather started. A caller that supplies no
+    // counter keeps the legacy meaning of `position >= 0` (early router path).
+    const bool early_rolling = early_positions != nullptr && early_progress != nullptr;
+    uint32_t early_completed = early_rolling ? moe_staging_progress(early_progress) : 0;
     if constexpr (debug_transfers) {
         if (early_phase != 2 && early_phase != 3 && blockIdx.x == 0 && threadIdx.x == 0) {
+            // Admissions are fetches too (from the source, or recycled from an
+            // already-landed staged slab), so they belong in the debug transfer
+            // meters. [1] counts bytes; the staged-recycled ones counted here are
+            // not re-read from the source, which is precisely the traffic the
+            // meter would otherwise over-report.
+            const uint32_t fetches = plan->n_misses + plan->n_admissions;
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[0]),
-                static_cast<unsigned long long>(plan->n_misses) * n_banks);
+                static_cast<unsigned long long>(fetches) * n_banks);
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[1]),
-                static_cast<unsigned long long>(plan->n_misses) * words_per_miss * sizeof(uint4));
+                static_cast<unsigned long long>(fetches) * words_per_miss * sizeof(uint4));
         }
     }
     const int32_t * miss_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
     const int32_t * miss_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
     if (early_positions != nullptr && early_counters != nullptr && early_phase != 1 && blockIdx.x == 0 && threadIdx.x == 0) {
+        const uint32_t counted_at = early_rolling ? moe_staging_progress(early_progress) : 0;
         for (uint32_t m = 0; m < plan->n_misses; ++m) {
-            if (early_positions[miss_experts[m]] >= 0) {
+            const int32_t staged_position = early_positions[miss_experts[m]];
+            if (staged_position >= 0 && (!early_rolling || (uint32_t) staged_position < counted_at)) {
                 early_counters[1] += words_per_miss * sizeof(uint4);
                 early_counters[3] += 1;
             }
@@ -4151,10 +4952,23 @@ static __global__ void moe_grouped_gather_decode(
     const size_t total_words = words_per_miss * plan->n_misses;
     const size_t first = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const size_t stride = (size_t) gridDim.x * blockDim.x;
+    uint32_t resample = 0;
     for (size_t word = first; word < total_words; word += stride) {
+        if (early_rolling) {
+            // Re-sample as the sweep advances. Misses are covered in increasing order, so a
+            // later miss sees a later landing count: a copy still in flight is consumed as it
+            // lands rather than being discarded wholesale by one sample taken before the
+            // gather even started.
+            if (resample == 0) {
+                early_completed = moe_staging_progress(early_progress);
+                resample = GGML_CUDA_MOE_STAGING_RESAMPLE;
+            }
+            --resample;
+        }
         const uint32_t miss = word / words_per_miss;
         const int32_t position = early_positions != nullptr ? early_positions[miss_experts[miss]] : -1;
-        const bool prefetched = position >= 0;
+        const bool staged_ready = position >= 0 && (!early_rolling || (uint32_t) position < early_completed);
+        const bool prefetched = staged_ready;
         if ((early_phase == 1 && prefetched) || (early_phase == 2 && !prefetched) || (early_phase == 3 && position == -1)) {
             continue;
         }
@@ -4172,8 +4986,8 @@ static __global__ void moe_grouped_gather_decode(
             const int32_t expert = miss_experts[miss];
             const int32_t slot = miss_slots[miss];
             const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.source + (size_t) expert * descriptor.expert_stride);
-            if (early_positions != nullptr && early_positions[expert] >= 0) {
-                source = early_staging + (size_t) early_positions[expert] * words_per_miss + word % words_per_miss - bank_word;
+            if (staged_ready) {
+                source = early_staging + (size_t) position * words_per_miss + word % words_per_miss - bank_word;
             }
             uint4 * destination = reinterpret_cast<uint4 *>(descriptor.data + (size_t) slot * descriptor.expert_stride);
             destination[bank_word] = source[bank_word];
@@ -4197,6 +5011,81 @@ static __global__ void moe_grouped_gather_decode(
             const int32_t slot = miss_slots[miss];
             descriptor.data[(size_t) slot * descriptor.n_values + auxiliary_value] =
                 descriptor.source[(size_t) expert * descriptor.n_values + auxiliary_value];
+        }
+    }
+    // Admission transfers (opt-in): predicted experts the plan placed into slots
+    // nobody demanded. Same word walk and same rolling readiness as the misses
+    // above, so an admission whose slab has already landed in the lane's staging
+    // buffer is landed from there instead of being re-read from the source - that
+    // is bytes the look-ahead already paid to cross PCIe, and they would otherwise
+    // be overwritten unused. The plan only ever commits admissions when the host
+    // gave it a candidate list, and the host only does that for a look-ahead lane,
+    // but this block is deliberately not gated on the lane: an admission the plan
+    // committed must be transferred by whichever gather runs, staged or not.
+    if (plan->n_admissions != 0) {
+        const int32_t * admit_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ADMIT_EXPERTS);
+        const int32_t * admit_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ADMIT_SLOTS);
+        const size_t admit_words = words_per_miss * plan->n_admissions;
+        for (size_t word = first; word < admit_words; word += stride) {
+            if (early_rolling) {
+                if (resample == 0) {
+                    early_completed = moe_staging_progress(early_progress);
+                    resample = GGML_CUDA_MOE_STAGING_RESAMPLE;
+                }
+                --resample;
+            }
+            const uint32_t admit = word / words_per_miss;
+            const int32_t expert = admit_experts[admit];
+            const int32_t slot = admit_slots[admit];
+            const int32_t position = early_positions != nullptr ? early_positions[expert] : -1;
+            const bool staged_ready = position >= 0 && (!early_rolling || (uint32_t) position < early_completed);
+            size_t bank_word = word % words_per_miss;
+            for (uint32_t bank = 0; bank < n_banks; ++bank) {
+                const auto descriptor = banks[bank];
+                const size_t bank_words = descriptor.expert_stride / sizeof(uint4);
+                if (bank_word >= bank_words) {
+                    bank_word -= bank_words;
+                    continue;
+                }
+                if ((bank_mask & (uint32_t{1} << bank)) == 0) {
+                    break;
+                }
+                const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.source + (size_t) expert * descriptor.expert_stride);
+                if (staged_ready) {
+                    source = early_staging + (size_t) position * words_per_miss + word % words_per_miss - bank_word;
+                }
+                uint4 * destination = reinterpret_cast<uint4 *>(descriptor.data + (size_t) slot * descriptor.expert_stride);
+                destination[bank_word] = source[bank_word];
+                break;
+            }
+        }
+        if (n_auxiliaries != 0) {
+            const size_t admit_values = auxiliary_values_per_miss * plan->n_admissions;
+            for (size_t index = first; index < admit_values; index += stride) {
+                const uint32_t admit = index / auxiliary_values_per_miss;
+                size_t auxiliary_value = index % auxiliary_values_per_miss;
+                uint32_t auxiliary = 0;
+                while (auxiliary < n_auxiliaries && auxiliary_value >= auxiliaries[auxiliary].n_values) {
+                    auxiliary_value -= auxiliaries[auxiliary++].n_values;
+                }
+                if (auxiliary == n_auxiliaries) {
+                    continue;
+                }
+                const auto descriptor = auxiliaries[auxiliary];
+                const int32_t expert = admit_experts[admit];
+                const int32_t slot = admit_slots[admit];
+                descriptor.data[(size_t) slot * descriptor.n_values + auxiliary_value] =
+                    descriptor.source[(size_t) expert * descriptor.n_values + auxiliary_value];
+            }
+        }
+    }
+    if (resident_slot != nullptr && blockIdx.x == 0) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            resident_slot[6] = clock64();
+            if (early_positions != nullptr && early_counters != nullptr && early_phase != 1) {
+                resident_slot[7] = early_counters[1] | GGML_CUDA_MOE_RESIDENT_STAGED_BIT;
+            }
         }
     }
 }
@@ -4757,13 +5646,27 @@ static bool ggml_cuda_moe_cache_prepare_host_staged(ggml_cuda_moe_cache * cache,
 static bool ggml_cuda_moe_cache_handoff_grouped(ggml_cuda_moe_cache * cache, cudaStream_t grouped_stream);
 static bool ggml_cuda_moe_cache_abort_host_staged(ggml_cuda_moe_cache * cache, cudaStream_t compute_stream);
 
+static void ggml_cuda_moe_resident_free_for_device(int device);
+static void ggml_cuda_moe_step_ledger_free_for_device(int device);
+static void ggml_cuda_moe_demand_trace_free_for_device(int device);
 struct ggml_cuda_moe_grouped_context::impl {
     explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {
         const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
         frequency_aware = value == nullptr || strcmp(value, "0") != 0;
+        evict_policy = moe_cache_evict_policy_env();
+        if (evict_policy == MOE_CACHE_EVICT_LRU) {
+            // lru means exactly that: the frequency term is out of the victim
+            // order even if GGML_CUDA_MOE_FREQUENCY asked for it. lfu and
+            // protect leave the existing knob in charge, so an unset policy is
+            // today's code path bit for bit.
+            frequency_aware = false;
+        }
+        frequency_halflife = moe_grouped_frequency_halflife();
     }
 
     bool frequency_aware = true;
+    uint32_t frequency_halflife = MOE_GROUPED_FREQUENCY_HALFLIFE_DEFAULT;
+    moe_cache_evict_policy evict_policy = MOE_CACHE_EVICT_LFU;
 
     ~impl() {
         auto * stats = grouped_debug.load(std::memory_order_acquire);
@@ -4772,6 +5675,9 @@ struct ggml_cuda_moe_grouped_context::impl {
             moe_grouped_device_scope device_scope(device);
             (void) cudaFree(transfers);
         }
+        ggml_cuda_moe_resident_free_for_device(device);
+        ggml_cuda_moe_step_ledger_free_for_device(device);
+        ggml_cuda_moe_demand_trace_free_for_device(device);
     }
 
     struct grouped_resource;
@@ -4862,11 +5768,12 @@ struct ggml_cuda_moe_grouped_context::impl {
             }
         }
 
-        void start_copy_worker(int device, bool launch = true) {
+        void start_copy_worker(int device, bool launch = true, const moe_copy_config * cfg_arg = nullptr) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
             CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
-            const char * mailbox = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_MAILBOX");
-            copy_mailbox = mailbox != nullptr && strcmp(mailbox, "1") == 0;
+            const moe_copy_config env_cfg = moe_copy_config_from_env();
+            const moe_copy_config cfg = cfg_arg != nullptr ? *cfg_arg : env_cfg;
+            copy_mailbox = cfg.mailbox;
             if (copy_mailbox) {
                 CUDA_CHECK(cudaHostAlloc(&host_predicted, top_k * sizeof(int32_t), cudaHostAllocMapped));
                 CUDA_CHECK(cudaHostGetDevicePointer(&mapped_predicted, host_predicted, 0));
@@ -4878,17 +5785,12 @@ struct ggml_cuda_moe_grouped_context::impl {
             }
             CUDA_CHECK(cudaMalloc(&copy_done, sizeof(uint32_t)));
             copy_debug = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_DEBUG") != nullptr;
-            const char * poll = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_POLL");
-            copy_poll = copy_mailbox || (poll != nullptr && strcmp(poll, "1") == 0);
-            const char * batch = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_BATCH");
-            copy_batch = batch != nullptr && strcmp(batch, "1") == 0;
-            const char * split = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_SPLIT");
-            copy_split = split != nullptr && strcmp(split, "1") == 0;
-            const char * ready_only = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_READY_ONLY");
-            copy_ready_late = ready_only != nullptr && strcmp(ready_only, "2") == 0;
-            copy_ready_only = copy_ready_late || (ready_only != nullptr && strcmp(ready_only, "1") == 0);
-            const char * banks = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_BANKS");
-            copy_banks = banks != nullptr && strcmp(banks, "1") == 0;
+            copy_poll = copy_mailbox || cfg.poll;
+            copy_batch = cfg.batch;
+            copy_split = cfg.split;
+            copy_ready_late = cfg.ready_late;
+            copy_ready_only = cfg.ready_only;
+            copy_banks = cfg.banks;
             if (copy_banks) {
                 GGML_ASSERT(copy_split && copy_batch && copy_mailbox && !copy_ready_only);
                 CUDA_CHECK(cudaMalloc(&copy_head_done, sizeof(uint32_t)));
@@ -4913,10 +5815,26 @@ struct ggml_cuda_moe_grouped_context::impl {
 #else
             GGML_UNUSED(device);
             GGML_UNUSED(launch);
+            GGML_UNUSED(cfg_arg);
             GGML_ABORT("experimental early-router copy engine requires CUDA 12.8 or newer");
 #endif
         }
 
+        // Idle backoff for the copy-worker poll loops below: spin briefly so
+        // a flowing mailbox is picked up within microseconds, then yield,
+        // then sleep so an idle worker parks near 0% CPU instead of hot
+        // spinning a core at 100%. Shared with the early-router path; pickup
+        // latency after 4096 empty polls is bounded by the 50 us sleep.
+        static void moe_copy_worker_backoff(uint32_t & spin) {
+            if (++spin < 512) {
+                return;
+            }
+            if (spin < 4096) {
+                std::this_thread::yield();
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
         void launch_copy_worker(int device, const std::vector<early_workspace *> & clients) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
             GGML_ASSERT(!copy_worker.joinable() && !clients.empty());
@@ -4931,10 +5849,12 @@ struct ggml_cuda_moe_grouped_context::impl {
                 for (;;) {
                     copy_job * job = nullptr;
                     if (clients.size() > 1) {
+                        uint32_t idle_spin = 0;
                         while (job == nullptr) {
                             if (copy_stop.load(std::memory_order_acquire)) {
                                 return;
                             }
+                            moe_copy_worker_backoff(idle_spin);
                             for (size_t i = 0; i < clients.size(); ++i) {
                                 auto * client = clients[(copy_client_cursor + i) % clients.size()];
                                 auto request = cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(*client->host_request);
@@ -4951,19 +5871,23 @@ struct ggml_cuda_moe_grouped_context::impl {
                     } else if (copy_mailbox) {
                         auto request = cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(*host_request);
                         uint64_t value;
+                        uint32_t idle_spin = 0;
                         while ((value = request.load(cuda::memory_order_acquire)) == 0) {
                             if (copy_stop.load(std::memory_order_acquire)) {
                                 return;
                             }
+                            moe_copy_worker_backoff(idle_spin);
                         }
                         job = reinterpret_cast<copy_job *>((uintptr_t) value);
                         request.store(0, cuda::memory_order_release);
                     } else if (copy_poll) {
+                        uint32_t idle_spin = 0;
                         while ((job = pending_copy.load(std::memory_order_acquire)) == nullptr) {
                             if (copy_stop.load(std::memory_order_acquire)) {
                                 return;
                             }
                             std::atomic_signal_fence(std::memory_order_acq_rel);
+                            moe_copy_worker_backoff(idle_spin);
                         }
                         pending_copy.store(nullptr, std::memory_order_release);
                     } else {
@@ -5148,6 +6072,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             (void) cudaFree(scores);
             (void) cudaFree(predicted);
             (void) cudaFree(positions);
+            (void) cudaFree(la_predict_mask);
             (void) cudaFree(staging);
             (void) cudaFree(counters);
             (void) cudaEventDestroy(ready);
@@ -5213,15 +6138,47 @@ struct ggml_cuda_moe_grouped_context::impl {
         std::vector<const void *> copy_srcs;
         std::vector<size_t> copy_sizes;
         std::unordered_map<uint64_t, std::unique_ptr<copy_job>> copy_jobs;
+        // Look-ahead staging (decode, gated by moe_cache_lookahead_width()).
+        // Reuses the mailbox copy worker above. Never touches slot_for_expert,
+        // expert_for_slot, device_clock or last_used; the gather consumes
+        // staging bytes, never bank slots.
+        std::unique_ptr<copy_job> la_job;
+        uint32_t la_group = UINT32_MAX;
+        uint32_t la_generation = 0;
+        // Whole look-ahead prediction for this group's layer, one entry per
+        // expert, 1 when predicted for the pending plan. Allocated only in the
+        // protect policy; null everywhere else (nothing allocated, nothing read).
+        int32_t * la_predict_mask = nullptr;
+        uint64_t la_publish_seq = 0;
+        uint64_t la_consumed_seq = 0;
+        uint64_t la_evicted = 0;
+        uint64_t la_busy_skips = 0;
+        uint64_t la_emit_busy = 0;
+        uint64_t la_emit_counters[GGML_CUDA_MOE_LOOKAHEAD_COUNTERS] = {};
+        uint64_t la_emit_evicted = 0;
     };
 
     std::vector<std::unique_ptr<early_workspace>> early;
     std::vector<std::unique_ptr<moe_router_program>> early_programs;
     std::unordered_map<const ggml_tensor *, early_binding> early_bindings;
+    // Look-ahead staging lanes, one per target group, allocated lazily on the
+    // first MOE_PREFETCH issue while the lookahead gate is on. Empty (and the
+    // worker never started) when the gate is off: default-off allocates nothing.
+    std::vector<std::unique_ptr<early_workspace>> lookahead;
+    uint64_t lookahead_dispatches = 0;
 
     early_workspace * early_for_group(uint32_t group) {
         for (auto & lane : early) {
             if (lane->active_group == group) {
+                return lane.get();
+            }
+        }
+        return nullptr;
+    }
+
+    early_workspace * lookahead_for_group(uint32_t group) {
+        for (auto & lane : lookahead) {
+            if (lane->la_group == group) {
                 return lane.get();
             }
         }
@@ -5240,6 +6197,313 @@ struct ggml_cuda_moe_grouped_context::impl {
         early.clear();
         early_bindings.clear();
         early_programs.clear();
+    }
+
+    void clear_lookahead() {
+        if (lookahead.empty()) {
+            return;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(lookahead[0]->main_stream));
+        for (auto & lane : lookahead) {
+            CUDA_CHECK(cudaStreamSynchronize(lane->stream));
+        }
+        lookahead[0]->stop_copy_worker();
+        lookahead.clear();
+    }
+    // Set a lane completion flag to exactly 1. cudaMemset fills BYTES, so
+    // memset(done, 1, 4) leaves 0x01010101, which never satisfies the EQ-1
+    // stream wait in moe_early_router_wait_copy and stalls the dispatch
+    // stream forever. A 4-byte host-to-device copy writes exactly 1.
+    static void moe_lookahead_done_set(uint32_t * done) {
+        static const uint32_t one = 1;
+        CUDA_CHECK(cudaMemcpy(done, &one, sizeof(one), cudaMemcpyHostToDevice));
+    }
+    void relaunch_lookahead_worker_locked() {
+        if (lookahead.empty()) {
+            return;
+        }
+        lookahead[0]->stop_copy_worker();
+        lookahead[0]->copy_stop = false;
+        for (auto & other : lookahead) {
+            moe_lookahead_done_set(other->copy_done);
+        }
+        std::vector<early_workspace *> clients;
+        for (auto & other : lookahead) {
+            clients.push_back(other.get());
+        }
+        lookahead[0]->launch_copy_worker(device, clients);
+    }
+
+    bool lookahead_worker_running_locked() const {
+        return !lookahead.empty() && lookahead[0]->copy_worker.joinable();
+    }
+
+    // Caller holds mutex. Resolves the MOE_PREFETCH target tensor to its
+    // grouped group and returns the group's staging lane, creating or
+    // rebinding it when needed. Null means "cannot stage": the caller falls
+    // back to the legacy prefetch path. Lane creation stops and relaunches
+    // the shared worker (one-time per group); steady-state publish never
+    // blocks on the host.
+    early_workspace * ensure_lookahead_lane_locked(const ggml_tensor * experts, cudaStream_t stream) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+        if (experts == nullptr || !state.accepted) {
+            if (experts != nullptr) {
+                static std::atomic<bool> refused{false};
+                moe_cache_prefetch_warn_once(refused,
+                    "moe-cache: lookahead-stage: refused, grouped state not accepted");
+            }
+            return nullptr;
+        }
+        const auto * reverse = moe_candidate_active_reverse(table, experts);
+        if (reverse == nullptr || reverse->group_index >= table.groups.size() ||
+                reverse->group_index >= resources.size()) {
+            static std::atomic<bool> refused{false};
+            moe_cache_prefetch_warn_once(refused,
+                "moe-cache: lookahead-stage: refused, target tensor not in candidate table");
+            return nullptr;
+        }
+        const uint32_t group = reverse->group_index;
+        auto * resource = resources[group].get();
+        if (resource == nullptr || resource->device == nullptr || resource->snapshot.banks.empty() ||
+                resource->snapshot.banks.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) {
+            static std::atomic<bool> refused{false};
+            moe_cache_prefetch_warn_once(refused,
+                "moe-cache: lookahead-stage: refused, no device resource for group");
+            return nullptr;
+        }
+        auto & dev = *resource->device;
+        if (dev.n_experts <= 0 || dev.words_per_miss == 0 || dev.slot_for_expert == nullptr || dev.plan == nullptr) {
+            static std::atomic<bool> refused{false};
+            moe_cache_prefetch_warn_once(refused,
+                "moe-cache: lookahead-stage: refused, device snapshot incomplete");
+            return nullptr;
+        }
+        const size_t entry_bytes = (size_t) dev.words_per_miss * sizeof(uint4);
+        const uint32_t width = GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH;
+        const uint32_t n_experts = (uint32_t) dev.n_experts;
+        moe_grouped_device_scope device_scope(device);
+        early_workspace * lane = lookahead_for_group(group);
+        if (lane != nullptr && (lane->la_generation != state.generation || lane->experts != n_experts ||
+                lane->top_k != width || lane->staging_bytes != entry_bytes * width)) {
+            // The worker may be running this lane's old job: stop it first so
+            // the reset below cannot free banks out from under a DMA. Rare
+            // (weights/generation change); the relaunch at the end restarts.
+            if (lookahead_worker_running_locked()) {
+                lookahead[0]->stop_copy_worker();
+                lookahead[0]->copy_stop = false;
+            }
+            lane->la_job.reset();
+            lane->la_publish_seq = 0;
+            lane->la_consumed_seq = 0;
+        }
+        bool added = false;
+        if (lane == nullptr) {
+            auto fresh = std::make_unique<early_workspace>();
+            fresh->main_stream = stream;
+            fresh->width = width;
+            fresh->experts = n_experts;
+            fresh->top_k = width;
+            fresh->n_rows = 1;
+            fresh->staging_bytes = entry_bytes * width;
+            CUDA_CHECK(cudaStreamCreateWithFlags(&fresh->stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&fresh->ready, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&fresh->done, cudaEventDisableTiming));
+            CUDA_CHECK(cudaMalloc(&fresh->predicted, (size_t) width * sizeof(int32_t)));
+            CUDA_CHECK(cudaMalloc(&fresh->positions, (size_t) n_experts * sizeof(int32_t)));
+            if (evict_policy == MOE_CACHE_EVICT_PROTECT) {
+                // Sized by this group's expert count and never resized: the plan
+                // only ever indexes it under a matching experts count, so a lane
+                // whose geometry moved on can only turn the hook off, not read
+                // out of bounds.
+                CUDA_CHECK(cudaMalloc(&fresh->la_predict_mask, (size_t) n_experts * sizeof(int32_t)));
+                CUDA_CHECK(cudaMemset(fresh->la_predict_mask, 0, (size_t) n_experts * sizeof(int32_t)));
+            }
+            CUDA_CHECK(cudaMalloc(&fresh->staging, fresh->staging_bytes));
+            CUDA_CHECK(cudaMalloc(&fresh->counters, GGML_CUDA_MOE_LOOKAHEAD_COUNTERS * sizeof(uint64_t)));
+            CUDA_CHECK(cudaMemset(fresh->counters, 0, GGML_CUDA_MOE_LOOKAHEAD_COUNTERS * sizeof(uint64_t)));
+            const moe_copy_config la_cfg = moe_copy_config_lookahead();
+            fresh->start_copy_worker(device, false, &la_cfg);
+            moe_lookahead_done_set(fresh->copy_done);
+            fresh->la_group = group;
+            fresh->la_generation = state.generation;
+            lookahead.push_back(std::move(fresh));
+            lane = lookahead.back().get();
+            added = true;
+        }
+        if (lane->la_job == nullptr) {
+            auto job = std::make_unique<early_workspace::copy_job>(early_workspace::copy_job{
+                lane, width, n_experts, entry_bytes, resource->snapshot.banks});
+            for (const auto & bank : job->banks) {
+                cudaPointerAttributes attributes = {};
+                CUDA_CHECK(cudaPointerGetAttributes(&attributes, bank.source_data));
+                GGML_ASSERT(attributes.type == cudaMemoryTypeHost);
+            }
+            GGML_ASSERT(job->banks.size() == resource->snapshot.banks.size());
+            GGML_ASSERT(job->entry_bytes == entry_bytes && job->top_k == width);
+            lane->la_job = std::move(job);
+            lane->la_generation = state.generation;
+        }
+        if (added || !lookahead_worker_running_locked()) {
+            relaunch_lookahead_worker_locked();
+        }
+        return lane;
+#else
+        GGML_UNUSED(experts);
+        GGML_UNUSED(stream);
+        return nullptr;
+#endif
+    }
+
+    // Caller holds mutex and has a lane from ensure. Enqueues the filter and
+    // the mailbox publish on the issue stream: no D2H, no host sync. Returns
+    // false only before any stream work is enqueued.
+    bool publish_lookahead_locked(early_workspace * lane, const int32_t * ids_device, uint32_t n_ids,
+            cudaStream_t stream) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+        if (lane == nullptr || lane->la_job == nullptr || ids_device == nullptr || n_ids == 0 ||
+                lane->la_group >= resources.size()) {
+            return false;
+        }
+        auto * resource = resources[lane->la_group].get();
+        if (resource == nullptr || resource->device == nullptr) {
+            return false;
+        }
+        auto & dev = *resource->device;
+        if (dev.slot_for_expert == nullptr || dev.plan == nullptr || lane->copy_done == nullptr ||
+                lane->copy_progress == nullptr) {
+            return false;
+        }
+        auto * job = lane->la_job.get();
+        const uint32_t width = GGML_CUDA_MOE_LOOKAHEAD_STAGE_WIDTH;
+        const size_t entry_bytes = job->entry_bytes;
+        // Single-flight per lane: wait for the previous job's completion flag.
+        // A stream wait, not a host sync; a no-op when the worker is ahead.
+        moe_early_router_wait_copy(stream, lane->copy_done);
+        CUDA_CHECK(cudaMemsetAsync(lane->copy_done, 0, sizeof(uint32_t), stream));
+        CUDA_CHECK(cudaMemsetAsync(lane->copy_progress, 0, sizeof(uint32_t), stream));
+        moe_lookahead_stage_filter<<<1, 256, 0, stream>>>(
+            ids_device, n_ids, width, dev.slot_for_expert, (uint32_t) dev.n_experts,
+            dev.plan, resource->snapshot.n_slots, lane->predicted, lane->positions,
+            lane->counters, entry_bytes, lane->la_predict_mask);
+        CUDA_CHECK(cudaGetLastError());
+        moe_early_router_publish_copy<<<1, 32, 0, stream>>>(
+            lane->predicted, lane->mapped_predicted, job->top_k,
+            lane->mapped_request, (uint64_t) (uintptr_t) job);
+        CUDA_CHECK(cudaGetLastError());
+        // The caller skips when the previous publish is unconsumed
+        // (backpressure), so no overwrite happens here: positions always
+        // describe the staging bytes the worker is DMAing. No stale consume.
+        lane->la_publish_seq++;
+        {
+            static std::atomic<bool> announced{false};
+            if (!announced.exchange(true, std::memory_order_relaxed)) {
+                GGML_LOG("lookahead-stage: published group=%u width=%u entry_bytes=%zu\n",
+                    lane->la_group, width, entry_bytes);
+            }
+        }
+        return true;
+#else
+        GGML_UNUSED(lane);
+        GGML_UNUSED(ids_device);
+        GGML_UNUSED(n_ids);
+        GGML_UNUSED(stream);
+        return false;
+#endif
+    }
+    // Cumulative device-counter drain, every dispatch, so each emitted line is
+    // a per-step sample. Counter names reuse the prefetch family the
+    // moe-cache-phase line prints and stay interval deltas: prefetch_used
+    // is gather-consumed staged experts, prefetch_dropped is filter-invalid /
+    // duplicate / over-width, prefetch_reserve_refused is predicted-but-
+    // resident (speculation refused: no copy needed), evicted_prefetched is
+    // staged bytes overwritten by a later publish without being consumed.
+    // The consumed_*_total fields are lane-lifetime totals read straight from
+    // the device counters ([0] staged bytes, [1] consumed bytes, [3] consumed
+    // count, cumulative since the lane was created), so consume_pct_total is
+    // the lifetime staging ratio: staged bytes minus consumed bytes is the
+    // look-ahead's own accounting, distinct from the one-layer instrument.
+    // used_pct_total is a different ratio and is expert-count based: it is
+    // consumed experts / staged experts (snap[3] over snap[2], both lifetime),
+    // i.e. how often the next layer actually wanted an expert we fetched ahead
+    // of time, whereas consume_pct_total is consumed bytes / staged bytes (how
+    // much of what was transported got read). Do not conflate the two.
+    void lookahead_drain_and_emit() {
+        if (lookahead.empty()) {
+            return;
+        }
+        lookahead_dispatches++;
+        uint64_t staged_bytes = 0;
+        uint64_t used = 0;
+        uint64_t dropped = 0;
+        uint64_t refused = 0;
+        uint64_t evicted = 0;
+        uint64_t busy = 0;
+        uint64_t published = 0;
+        uint64_t staged_bytes_total = 0;
+        uint64_t staged_experts_total = 0;
+        uint64_t consumed_bytes_total = 0;
+        uint64_t consumed_total = 0;
+        // Lifetime protect-policy counters, summed over lanes and never reset:
+        // both are zero unless the protect policy ran, because nothing writes
+        // the two slots otherwise.
+        uint64_t protect_overrides_total = 0;
+        uint64_t protect_all_predicted_total = 0;
+        // Lifetime admission counters, same rule: all three are zero unless the
+        // plan was given a candidate list.
+        uint64_t admitted_experts_total = 0;
+        uint64_t admit_evictions_total = 0;
+        uint64_t admit_skipped_total = 0;
+        for (auto & lane : lookahead) {
+            uint64_t snap[GGML_CUDA_MOE_LOOKAHEAD_COUNTERS] = {};
+            {
+                moe_grouped_device_scope device_scope(device);
+                if (!moe_grouped_cuda_success(cudaMemcpy(snap, lane->counters,
+                            sizeof(snap), cudaMemcpyDeviceToHost))) {
+                    return;
+                }
+            }
+            staged_bytes += snap[0] - lane->la_emit_counters[0];
+            used += snap[3] - lane->la_emit_counters[3];
+            dropped += snap[5] - lane->la_emit_counters[5];
+            refused += snap[6] - lane->la_emit_counters[6];
+            published += snap[4] - lane->la_emit_counters[4];
+            staged_bytes_total += snap[0];
+            staged_experts_total += snap[2];
+            consumed_bytes_total += snap[1];
+            consumed_total += snap[3];
+            protect_overrides_total += snap[7];
+            protect_all_predicted_total += snap[8];
+            admitted_experts_total += snap[9];
+            admit_evictions_total += snap[10];
+            admit_skipped_total += snap[11];
+            for (int i = 0; i < GGML_CUDA_MOE_LOOKAHEAD_COUNTERS; ++i) {
+                lane->la_emit_counters[i] = snap[i];
+            }
+            evicted += lane->la_evicted - lane->la_emit_evicted;
+            lane->la_emit_evicted = lane->la_evicted;
+            busy += lane->la_busy_skips - lane->la_emit_busy;
+            lane->la_emit_busy = lane->la_busy_skips;
+        }
+        GGML_LOG("moe-lookahead-stage: dispatches=%llu lanes=%llu published=%llu staged_mib=%.2f prefetch_used=%llu prefetch_dropped=%llu prefetch_reserve_refused=%llu evicted_prefetched=%llu busy_skips=%llu consumed_mib_total=%.2f consumed_total=%llu consume_pct_total=%.2f staged_experts_total=%llu used_pct_total=%.2f protect_overrides=%llu protect_all_predicted=%llu admitted_experts=%llu admit_evictions=%llu admit_skipped=%llu staged_mib_total=%.2f\n",
+            // Field convention, because mixing the two has already cost one
+            // analysis: names ending in _total are lifetime sums over lanes and
+            // never reset, while every other field is this dispatch's delta
+            // (staged_mib is the bytes staged since the previous line, NOT a
+            // running total - compare it against staged_mib_total, which is).
+            (unsigned long long) lookahead_dispatches, (unsigned long long) lookahead.size(),
+            (unsigned long long) published, (double) staged_bytes / 1048576.0,
+            (unsigned long long) used, (unsigned long long) dropped,
+            (unsigned long long) refused, (unsigned long long) evicted, (unsigned long long) busy,
+            (double) consumed_bytes_total / 1048576.0, (unsigned long long) consumed_total,
+            100.0 * (double) consumed_bytes_total / (double) std::max<uint64_t>(1, staged_bytes_total),
+            (unsigned long long) staged_experts_total,
+            100.0 * (double) consumed_total / (double) std::max<uint64_t>(1, staged_experts_total),
+            (unsigned long long) protect_overrides_total,
+            (unsigned long long) protect_all_predicted_total,
+            (unsigned long long) admitted_experts_total,
+            (unsigned long long) admit_evictions_total,
+            (unsigned long long) admit_skipped_total,
+            (double) staged_bytes_total / 1048576.0);
     }
 
     struct grouped_device_resource {
@@ -6716,9 +7980,11 @@ ggml_cuda_moe_grouped_context::ggml_cuda_moe_grouped_context(ggml_backend_dev_t 
     auto & telemetry = moe_cache_owner_telemetry_state();
     std::lock_guard<std::mutex> lock(telemetry.mutex);
     telemetry.active.insert(this);
+    moe_cache_prefetch_register(device, this);
 }
 
 ggml_cuda_moe_grouped_context::~ggml_cuda_moe_grouped_context() {
+    moe_cache_prefetch_unregister(this);
     shutdown();
 }
 
@@ -9205,10 +10471,1050 @@ void ggml_cuda_moe_grouped_context::finish_early_router_banks(const ggml_tensor 
     moe_grouped_gather_decode<false><<<blocks, MOE_GROUPED_TRANSFER_THREADS, 0, stream>>>(
         device.device_banks, resource.snapshot.banks.size(), device.words_per_miss,
         nullptr, 0, 0, resource.snapshot.n_slots, device.plan, nullptr,
-        early->staging, early->positions, nullptr, 2, early->pending_bank_mask);
+        early->staging, early->positions, nullptr, 2, early->pending_bank_mask, nullptr);
     CUDA_CHECK(cudaGetLastError());
     early->pending_bank_mask = 0;
     early->active_group = UINT32_MAX;
+}
+
+// ---------------------------------------------------------------------------
+// Resident-at-entry probe (diagnostic, off unless GGML_CUDA_MOE_PHASE_PROBE is
+// set; same variable as the phase probes in ggml-cuda.cu, re-read here because
+// that TU's gate helper is file-local).
+//
+// Question: when a layer's grouped MoE op begins, how much of what it needs is
+// ALREADY in VRAM, measured at consumption time rather than at copy time.
+//   bank     = one expert tensor of one layer (gate, up or down).
+//   need     = one (bank, expert id) pair this op will read, deduplicated:
+//              the routed experts of this step, once per bank.
+//   resident = the expert's slab is already in a GPU slot at sample time,
+//              whoever put it there (LRU reuse, prefetch, previous step).
+//   copied   = needs - resident, so the three always reconcile.
+//
+// Sampling point: prepare_decode, after the resource is secured and the
+// early-copy wait is enqueued, immediately before the moe_grouped_plan_decode
+// launch. That launch is the first kernel that reads this op's ids and the
+// first writer of the slot maps for this op; begin_decode/reserve_clock before
+// it only wire transaction/clock bookkeeping and move no experts. So the
+// device slot maps read here are exactly the entry state. Caveat: early-copy
+// jobs serving this op may already have committed installs before this point;
+// those correctly count as resident (present at entry) rather than as this
+// op's copies. Host-staged groups (prepare_host_staged_group) take a separate
+// path and are not sampled here.
+//
+// Read-only discipline: the query is two cudaMemcpyAsync device reads (ids,
+// slot_for_expert) on the compute stream plus one event sync. It takes no
+// mutex, touches no hit counters, no last_used age, no LRU state. No existing
+// host query reads these maps without impl_->mutex (every host lookup takes
+// it; the maps themselves live in device memory and are written by the plan
+// kernel), so this separate predicate exists instead, here next to the maps.
+// Residency truth: one slot_for_expert[n_experts] array is shared by all banks
+// of the group (single map; each bank keeps its own slab pool indexed by the
+// same slot), so resident(eid) is identical per bank and copy bytes are summed
+// over the banks' expert strides. Layer L comes from the bank tensor name
+// ("blk.N..."); group_index is registration order, not a layer, and is only
+// the fallback when the name does not parse. When unset: one gate load per
+// prepare/dispatch, no counting, no output. Fixed-size static storage only;
+// oversized ops are skipped, never truncated.
+// ---------------------------------------------------------------------------
+// Device-side MoE residency + copy/gather overlap probe (diagnostic, off
+// unless GGML_CUDA_MOE_PHASE_PROBE is set).
+//
+// Review correction: a host sample taken between enqueues is unordered with
+// the device under graph capture (the plan kernel runs at execute time, not
+// enqueue time), so residency is derived from the plan kernel itself, which
+// computes n_unique/n_misses, and published to device-side counters drained
+// like the existing h2d counters: cumulative read, never memset, no locks,
+// no impl_->mutex anywhere near the sample path. Per-layer slots carry the
+// group generation so a one-step attribution shift prints as
+// moe-resident-stale instead of silently biasing resident/copied.
+// Overlap kill test: main-gather start/end ticks per layer (globaltimer runs
+// at ~1MHz so ticks read as us), staged bytes consumed, and achieved link
+// rate per step (bytes moved / step wall time). Direct-path copies happen
+// inside the gather from mapped host memory, so copy completion for that
+// path IS gather end; staging-path completion is enforced before the main
+// gather by the copy_ready_only stream wait, whose cost is the wait_us field
+// on the moe-mid-grouped-phase line.
+// ---------------------------------------------------------------------------
+#define GGML_CUDA_MOE_RESIDENT_MAX_LAYERS 64
+#define GGML_CUDA_MOE_RESIDENT_FIELDS 8
+// Per layer: [0]=need cum [1]=resident(hit) cum [2]=copied(miss) cum
+// [3]=copy bytes cum [4]=generation (last) [5]=main gather start tick (last)
+// [6]=main gather end tick (last, block-0 completion lower bound)
+// [7]=staged bytes consumed by main gather (last) with bit63 = staging used.
+#define GGML_CUDA_MOE_RESIDENT_STAGED_BIT (1ULL << 63)
+struct ggml_cuda_moe_resident_probe {
+    uint64_t last[GGML_CUDA_MOE_RESIDENT_MAX_LAYERS][4] = {};
+    std::atomic<uint32_t> expect_gen[GGML_CUDA_MOE_RESIDENT_MAX_LAYERS];
+    std::atomic<uint32_t> expect_cls[GGML_CUDA_MOE_RESIDENT_MAX_LAYERS];
+    std::atomic<uint32_t> expect_epoch[GGML_CUDA_MOE_RESIDENT_MAX_LAYERS];
+    uint64_t steps[2] = {};
+    uint64_t total_need[2] = {};
+    uint64_t total_resident[2] = {};
+    uint64_t total_copied[2] = {};
+    uint64_t total_bytes[2] = {};
+    uint64_t last_wall_us[2] = {};
+    std::atomic<uint32_t> drain_epoch{0};
+};
+static ggml_cuda_moe_resident_probe & ggml_cuda_moe_resident_state() {
+    static ggml_cuda_moe_resident_probe state;
+    return state;
+}
+// Cumulative reporter gate: the original switch, presence only, unchanged.
+static bool ggml_cuda_moe_resident_summary_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MOE_PHASE_PROBE") != nullptr;
+    return enabled;
+}
+// Per-step ledger gate: unset or "0" is off, any other value is on. Separate
+// from the cumulative switch on purpose, so the ledger can be measured against
+// a control arm with neither instrument loaded.
+static bool ggml_cuda_moe_step_ledger_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_MOE_PHASE_PROBE_PER_STEP");
+        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+// Counter publication gate: either instrument needs the device table.
+static bool ggml_cuda_moe_resident_enabled() {
+    static const bool enabled = ggml_cuda_moe_resident_summary_enabled() || ggml_cuda_moe_step_ledger_enabled();
+    return enabled;
+}
+static int ggml_cuda_moe_resident_layer_of(const char * name, uint32_t fallback) {
+    int layer = -1;
+    if (name != nullptr && name[0] == 'b' && name[1] == 'l' && name[2] == 'k' && name[3] == '.') {
+        int v = 0;
+        for (const char * c = name + 4; *c >= '0' && *c <= '9'; ++c) {
+            v = v * 10 + (*c - '0');
+        }
+        layer = v;
+    }
+    if (layer < 0 || layer >= GGML_CUDA_MOE_RESIDENT_MAX_LAYERS) {
+        layer = fallback < GGML_CUDA_MOE_RESIDENT_MAX_LAYERS ? (int) fallback : -1;
+    }
+    return layer;
+}
+static std::atomic<uint64_t *> ggml_cuda_moe_resident_device{nullptr};
+static std::atomic<int> ggml_cuda_moe_resident_device_idx{-1};
+static std::mutex ggml_cuda_moe_resident_alloc_mutex;
+static uint64_t * ggml_cuda_moe_resident_alloc(int device) {
+    if (!ggml_cuda_moe_resident_enabled() || device < 0) {
+        return nullptr;
+    }
+    uint64_t * result = ggml_cuda_moe_resident_device.load(std::memory_order_acquire);
+    if (result != nullptr) {
+        return result;
+    }
+    // Allocation path only; after the first alloc the sample path is a plain
+    // atomic load with no locks.
+    std::lock_guard<std::mutex> lock(ggml_cuda_moe_resident_alloc_mutex);
+    result = ggml_cuda_moe_resident_device.load(std::memory_order_relaxed);
+    if (result == nullptr) {
+        moe_grouped_device_scope device_scope(device);
+        const size_t bytes =
+            (size_t) GGML_CUDA_MOE_RESIDENT_MAX_LAYERS * GGML_CUDA_MOE_RESIDENT_FIELDS * sizeof(uint64_t);
+        if (!moe_grouped_cuda_success(cudaMalloc(&result, bytes)) ||
+                !moe_grouped_cuda_success(cudaMemset(result, 0, bytes))) {
+            if (result != nullptr) {
+                (void) cudaFree(result);
+            }
+            return nullptr;
+        }
+        ggml_cuda_moe_resident_device.store(result, std::memory_order_release);
+        ggml_cuda_moe_resident_device_idx.store(device, std::memory_order_release);
+    }
+    return result;
+}
+static void ggml_cuda_moe_resident_expect(int layer, uint32_t gen, uint32_t cls, uint32_t epoch) {
+    if (!ggml_cuda_moe_resident_enabled() || layer < 0 ||
+            layer >= GGML_CUDA_MOE_RESIDENT_MAX_LAYERS) {
+        return;
+    }
+    // Pure host int stores at prepare time: capture-safe, no device access.
+    ggml_cuda_moe_resident_state().expect_gen[layer].store(gen, std::memory_order_release);
+    ggml_cuda_moe_resident_state().expect_cls[layer].store(cls, std::memory_order_release);
+    ggml_cuda_moe_resident_state().expect_epoch[layer].store(epoch, std::memory_order_release);
+}
+static uint32_t ggml_cuda_moe_resident_epoch() {
+    if (!ggml_cuda_moe_resident_enabled()) {
+        return 0;
+    }
+    return ggml_cuda_moe_resident_state().drain_epoch.load(std::memory_order_acquire);
+}
+static void ggml_cuda_moe_resident_free_for_device(int device) {
+    if (ggml_cuda_moe_resident_device_idx.load(std::memory_order_acquire) != device) {
+        return;
+    }
+    uint64_t * resident = ggml_cuda_moe_resident_device.exchange(nullptr, std::memory_order_acq_rel);
+    if (resident != nullptr) {
+        moe_grouped_device_scope device_scope(device);
+        (void) cudaFree(resident);
+    }
+}
+static void ggml_cuda_moe_resident_drain_and_emit() {
+    if (!ggml_cuda_moe_resident_summary_enabled()) {
+        return;
+    }
+    uint64_t * dev = ggml_cuda_moe_resident_device.load(std::memory_order_acquire);
+    const int dev_idx = ggml_cuda_moe_resident_device_idx.load(std::memory_order_acquire);
+    if (dev == nullptr || dev_idx < 0) {
+        return;
+    }
+    // Cumulative read, never memset: a pure device read at teardown, ordered
+    // after the step's kernels. In-flight stragglers from a double-buffered
+    // next step land in the following drain; a generation mismatch flags it.
+    uint64_t snap[GGML_CUDA_MOE_RESIDENT_MAX_LAYERS][GGML_CUDA_MOE_RESIDENT_FIELDS];
+    {
+        moe_grouped_device_scope device_scope(dev_idx);
+        if (!moe_grouped_cuda_success(cudaMemcpy(snap, dev, sizeof(snap), cudaMemcpyDeviceToHost))) {
+            return;
+        }
+    }
+    auto & p = ggml_cuda_moe_resident_state();
+    static const char * resident_class_name[2] = { "decode", "prefill" };
+    const uint64_t now_us = ggml_time_us();
+    for (int cls = 0; cls < 2; ++cls) {
+        uint64_t s_need = 0, s_resident = 0, s_copied = 0, s_bytes = 0;
+        uint64_t staged_layers = 0, active_layers = 0;
+        int64_t min_gap = INT64_MAX;
+        int64_t prev_end = -1;
+        uint64_t prev_tag = UINT64_MAX;
+        // Layers are drained in index order; consecutive-layer gap pairing
+        // assumes one group per layer in execution order.
+        for (int l = 0; l < GGML_CUDA_MOE_RESIDENT_MAX_LAYERS; ++l) {
+            // Counters are cumulative with no memset; a decrease means the
+            // device buffer was freed and zero-reallocated (context
+            // teardown), so rebase instead of underflowing.
+            const uint64_t d_need = snap[l][0] >= p.last[l][0] ? snap[l][0] - p.last[l][0] : snap[l][0];
+            const uint64_t d_hit = snap[l][1] >= p.last[l][1] ? snap[l][1] - p.last[l][1] : snap[l][1];
+            const uint64_t d_miss = snap[l][2] >= p.last[l][2] ? snap[l][2] - p.last[l][2] : snap[l][2];
+            const uint64_t d_bytes = snap[l][3] >= p.last[l][3] ? snap[l][3] - p.last[l][3] : snap[l][3];
+            p.last[l][0] = snap[l][0];
+            p.last[l][1] = snap[l][1];
+            p.last[l][2] = snap[l][2];
+            p.last[l][3] = snap[l][3];
+            if (d_need == 0 && d_hit == 0 && d_miss == 0 && d_bytes == 0) {
+                continue;
+            }
+            const uint32_t layer_cls = p.expect_cls[l].load(std::memory_order_acquire);
+            if (layer_cls != (uint32_t) cls) {
+                continue;
+            }
+            const uint64_t tag = snap[l][4];
+            const uint32_t gen = (uint32_t) (tag >> 32);
+            const uint32_t epoch = (uint32_t) tag;
+            const uint32_t exp = p.expect_gen[l].load(std::memory_order_acquire);
+            const uint32_t exp_epoch = p.expect_epoch[l].load(std::memory_order_acquire);
+            const uint32_t drain_now = p.drain_epoch.load(std::memory_order_acquire);
+            s_need += d_need;
+            s_resident += d_hit;
+            s_copied += d_miss;
+            s_bytes += d_bytes;
+            ++active_layers;
+            const uint64_t staged_field = snap[l][7];
+            if ((staged_field & GGML_CUDA_MOE_RESIDENT_STAGED_BIT) != 0) {
+                ++staged_layers;
+            }
+            const int64_t t_start = (int64_t) snap[l][5];
+            const int64_t t_end = (int64_t) snap[l][6];
+            // Pair only consecutive active layers of the same generation so
+            // slots from different steps never chain into a fake gap.
+            if (prev_end >= 0 && t_start > 0 && tag == prev_tag) {
+                const int64_t gap = t_start - prev_end;
+                if (gap < min_gap) {
+                    min_gap = gap;
+                }
+            }
+            if (t_end > 0) {
+                prev_end = t_end;
+                prev_tag = tag;
+            }
+            // Three shift detectors: table rebuild (gen), expect overwrite by
+            // a newer prepare (epoch vs expect), device behind host so the
+            // data lands a drain late (epoch vs drain clock).
+            if (gen != exp || epoch != exp_epoch || epoch != drain_now) {
+                fprintf(stderr, "moe-resident-stale[%s]: step=%llu L=%d gen=%u expected=%u epoch=%u expected_epoch=%u drain_epoch=%u\n",
+                    resident_class_name[cls], (unsigned long long) (p.steps[cls] + 1),
+                    l, gen, exp, epoch, exp_epoch, drain_now);
+            }
+            fprintf(stderr,
+                "moe-resident[%s]: step=%llu L=%d need=%llu resident=%llu copied=%llu copy_kib=%.1f gen=%u epoch=%u\n",
+                resident_class_name[cls], (unsigned long long) (p.steps[cls] + 1), l,
+                (unsigned long long) d_need, (unsigned long long) d_hit,
+                (unsigned long long) d_miss, (double) d_bytes / 1024.0, gen, epoch);
+        }
+        if (s_need == 0 && s_resident == 0 && s_copied == 0 && s_bytes == 0) {
+            continue;
+        }
+        ++p.steps[cls];
+        p.total_need[cls] += s_need;
+        p.total_resident[cls] += s_resident;
+        p.total_copied[cls] += s_copied;
+        p.total_bytes[cls] += s_bytes;
+        const double pct = s_need != 0 ? 100.0 * (double) s_resident / (double) s_need : 0.0;
+        const double wall_s = p.last_wall_us[cls] != 0 ?
+            (double) (now_us - p.last_wall_us[cls]) / 1000000.0 : 0.0;
+        const double link_mibs = wall_s > 0.0 ? (double) s_bytes / wall_s / 1048576.0 : 0.0;
+        p.last_wall_us[cls] = now_us;
+        fprintf(stderr,
+            "moe-resident-step[%s]: step=%llu need=%llu resident=%llu copied=%llu copy_mib=%.1f resident_pct=%.1f link_mibs=%.1f staged=%llu/%llu\n",
+            resident_class_name[cls], (unsigned long long) p.steps[cls],
+            (unsigned long long) s_need, (unsigned long long) s_resident,
+            (unsigned long long) s_copied, (double) s_bytes / 1048576.0, pct, link_mibs,
+            (unsigned long long) staged_layers, (unsigned long long) active_layers);
+        const double total_pct = p.total_need[cls] != 0 ?
+            100.0 * (double) p.total_resident[cls] / (double) p.total_need[cls] : 0.0;
+        fprintf(stderr,
+            "moe-resident-summary[%s]: steps=%llu need=%llu resident=%llu copied=%llu copy_mib=%.1f resident_pct=%.1f\n",
+            resident_class_name[cls], (unsigned long long) p.steps[cls],
+            (unsigned long long) p.total_need[cls], (unsigned long long) p.total_resident[cls],
+            (unsigned long long) p.total_copied[cls], (double) p.total_bytes[cls] / 1048576.0, total_pct);
+        if (min_gap != INT64_MAX) {
+            fprintf(stderr, "moe-overlap[%s]: step=%llu min_gap_us=%lld staged_layers=%llu/%llu link_mibs=%.1f\n",
+                resident_class_name[cls], (unsigned long long) p.steps[cls], (long long) min_gap,
+                (unsigned long long) staged_layers, (unsigned long long) active_layers, link_mibs);
+        }
+    }
+    // Advance the prepare epoch once per drain; slots stamped earlier that
+    // land here are device-behind-host slop and compare unequal above.
+    ggml_cuda_moe_resident_state().drain_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// ---------------------------------------------------------------------------
+// Per-step MoE miss ledger (diagnostic, off unless
+// GGML_CUDA_MOE_PHASE_PROBE_PER_STEP is set to a value other than "0").
+//
+// Question: how many expert demands, cache hits and miss bytes does ONE decode
+// step cost, so a host-side joiner can pair the numbers with that token's
+// arrival time. Same counters as the cumulative reporter above, and the same
+// meaning: need = expert demands, resident = demands served from the cache at
+// entry, misses = demand misses (= copied, the column the summary prints),
+// miss_mib = the bytes those misses moved. One line per decode step:
+//
+//   moe-step: step=<n> need=<u> resident=<u> misses=<u> miss_mib=<f>
+//
+// Mechanism, chosen so the ledger does not sit on the clock it measures: the
+// counter table is read with cudaMemcpyAsync into pinned host memory, ordered
+// after the step's kernels by an event recorded on the stream those kernels
+// ran on, and copied on a private non-blocking stream. The decode loop never
+// waits for the device: cudaEventQuery polls, and a snapshot that has not
+// landed is emitted by a later drain (or by the teardown flush). No host
+// synchronize is issued per step. The step boundary is held closed device-side
+// instead: the next step's kernels cannot touch the counters until the 8 KiB
+// snapshot has been read, which costs a few microseconds per step and is the
+// ledger's only effect on the measured path.
+//
+// Every dispatch that ran grouped work is snapshotted, not only decode
+// dispatches, so the diff between consecutive snapshots is exactly one step
+// wide; the per-layer class recorded with the slot keeps prefill activity out
+// of the decode line. A step whose decode layers moved no counter is not a
+// counted step, the cumulative reporter's own rule, so the per-step lines
+// partition exactly the totals the summary prints.
+//
+// Ring wrap: the ring holds GGML_CUDA_MOE_STEP_RING undrained snapshots. If it
+// is ever full (the host more than that many steps ahead of the device, a copy
+// that never completes, or an unorderable set of streams) that step's snapshot
+// is dropped instead of synced, and it is counted, reported once at teardown.
+// A dropped step gets no line of its own; its counters land in the following
+// snapshot, which is then one step wide plus the dropped step. Worst case, if
+// the device never completes another copy, every step after the first
+// GGML_CUDA_MOE_STEP_RING is dropped, and the ring's remaining snapshots are
+// still flushed at teardown: at most steps - GGML_CUDA_MOE_STEP_RING lines can
+// be missing, and the warning says how many. Dropping is preferable to
+// syncing, which is what this ledger exists to avoid.
+// ---------------------------------------------------------------------------
+// GGML_CUDA_MOE_STEP_RING is declared with the other MoE constants, above the
+// plan kernel that the demand trace ring shares it with.
+#define GGML_CUDA_MOE_STEP_STREAMS 8
+#define GGML_CUDA_MOE_STEP_CLASS_NONE 0xFFFFFFFFu
+struct ggml_cuda_moe_step_ledger {
+    // Pinned host copy of the counter table, one slot per snapshot.
+    uint64_t * snap = nullptr;          // [RING][MAX_LAYERS][FIELDS]
+    uint8_t * slot_cls = nullptr;       // [RING][MAX_LAYERS] layer class in that step, 0xFF = untouched
+    uint32_t * slot_decode = nullptr;   // [RING] 1 = the step had at least one decode layer
+    cudaEvent_t * ev_done = nullptr;    // [RING] snapshot landed on copy_stream
+    cudaEvent_t ev_ready[GGML_CUDA_MOE_STEP_STREAMS] = {};  // one step-end marker per compute stream
+    cudaStream_t copy_stream = nullptr; // private, non-blocking: never carries the step's kernels
+    void * step_stream[GGML_CUDA_MOE_STEP_STREAMS] = {};
+    std::atomic<uint32_t> step_stream_count{0};
+    std::atomic<uint32_t> step_stream_overflow{0};
+    std::atomic<uint32_t> step_cls[GGML_CUDA_MOE_RESIDENT_MAX_LAYERS];
+    uint64_t last[GGML_CUDA_MOE_RESIDENT_MAX_LAYERS][4] = {};   // cumulative baseline for the diff
+    int device = -1;
+    bool cls_ready = false;
+    bool unavailable = false;
+    bool failed = false;
+    bool warned = false;
+    uint64_t head = 0;                                                  // next slot to fill
+    uint64_t tail = 0;                                                  // next slot to emit
+    uint64_t emitted = 0;                                               // decode steps emitted so far
+    uint64_t dropped = 0;                                               // snapshots not taken
+};
+static ggml_cuda_moe_step_ledger & ggml_cuda_moe_step_ledger_state() {
+    static ggml_cuda_moe_step_ledger state;
+    return state;
+}
+static void ggml_cuda_moe_step_ledger_reset_step(ggml_cuda_moe_step_ledger & ledger) {
+    ledger.step_stream_count.store(0, std::memory_order_release);
+    ledger.step_stream_overflow.store(0, std::memory_order_relaxed);
+}
+static bool ggml_cuda_moe_step_ledger_init(ggml_cuda_moe_step_ledger & ledger, int device) {
+    if (ledger.device >= 0) {
+        // Allocation failure is remembered: retrying it every step would be the
+        // perturbation this ledger exists to avoid.
+        return !ledger.unavailable && ledger.device == device;
+    }
+    const size_t snap_bytes = (size_t) GGML_CUDA_MOE_STEP_RING * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS *
+        GGML_CUDA_MOE_RESIDENT_FIELDS * sizeof(uint64_t);
+    const size_t cls_bytes = (size_t) GGML_CUDA_MOE_STEP_RING * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS;
+    moe_grouped_device_scope device_scope(device);
+    void * snap = nullptr;
+    bool ok = moe_grouped_cuda_success(cudaMallocHost(&snap, snap_bytes));
+    uint8_t * slot_cls = ok ? (uint8_t *) malloc(cls_bytes) : nullptr;
+    uint32_t * slot_decode = ok ? (uint32_t *) calloc(GGML_CUDA_MOE_STEP_RING, sizeof(uint32_t)) : nullptr;
+    cudaEvent_t * ev_done = ok ? (cudaEvent_t *) calloc(GGML_CUDA_MOE_STEP_RING, sizeof(cudaEvent_t)) : nullptr;
+    cudaStream_t copy_stream = nullptr;
+    ok = ok && slot_cls != nullptr && slot_decode != nullptr && ev_done != nullptr;
+    uint32_t ready_created = 0;
+    while (ok && ready_created < GGML_CUDA_MOE_STEP_STREAMS) {
+        if (!moe_grouped_cuda_success(cudaEventCreateWithFlags(&ledger.ev_ready[ready_created], cudaEventDisableTiming))) {
+            ok = false;
+            break;
+        }
+        ++ready_created;
+    }
+    if (ok && !moe_grouped_cuda_success(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking))) {
+        ok = false;
+    }
+    uint32_t events_created = 0;
+    while (ok && events_created < GGML_CUDA_MOE_STEP_RING) {
+        if (!moe_grouped_cuda_success(cudaEventCreateWithFlags(&ev_done[events_created], cudaEventDisableTiming))) {
+            ok = false;
+            break;
+        }
+        ++events_created;
+    }
+    if (ok) {
+        memset(slot_cls, 0xFF, cls_bytes);
+        ledger.snap = (uint64_t *) snap;
+        ledger.slot_cls = slot_cls;
+        ledger.slot_decode = slot_decode;
+        ledger.ev_done = ev_done;
+        ledger.copy_stream = copy_stream;
+        ledger.device = device;
+        ledger.unavailable = false;
+        return true;
+    }
+    // Allocation failure: the ledger stays off, one warning, no per-step cost.
+    for (uint32_t i = 0; i < events_created; ++i) {
+        (void) cudaEventDestroy(ev_done[i]);
+    }
+    for (uint32_t i = 0; i < ready_created; ++i) {
+        (void) cudaEventDestroy(ledger.ev_ready[i]);
+        ledger.ev_ready[i] = nullptr;
+    }
+    if (copy_stream != nullptr) {
+        (void) cudaStreamDestroy(copy_stream);
+    }
+    if (snap != nullptr) {
+        (void) cudaFreeHost(snap);
+    }
+    free(slot_cls);
+    free(slot_decode);
+    free(ev_done);
+    if (!ledger.warned) {
+        ledger.warned = true;
+        GGML_LOG_WARN("moe-ledger: per-step ledger disabled: could not allocate the snapshot ring\n");
+    }
+    ledger.device = device;
+    ledger.unavailable = true;
+    return false;
+}
+// Prepare-time notes. Both are pure host state, capture-safe, and do nothing
+// unless the ledger is enabled.
+static void ggml_cuda_moe_step_ledger_note_layer(int layer, uint32_t cls) {
+    if (!ggml_cuda_moe_step_ledger_enabled() || layer < 0 || layer >= GGML_CUDA_MOE_RESIDENT_MAX_LAYERS) {
+        return;
+    }
+    auto & ledger = ggml_cuda_moe_step_ledger_state();
+    // First note of the run: prepares happen before the first drain, so the
+    // table is seeded here, not at ring allocation, to keep the first step's
+    // classes.
+    if (!ledger.cls_ready) {
+        ledger.cls_ready = true;
+        for (int l = 0; l < GGML_CUDA_MOE_RESIDENT_MAX_LAYERS; ++l) {
+            ledger.step_cls[l].store(GGML_CUDA_MOE_STEP_CLASS_NONE, std::memory_order_relaxed);
+        }
+    }
+    ledger.step_cls[layer].store(cls, std::memory_order_relaxed);
+}
+static void ggml_cuda_moe_step_ledger_note_stream(cudaStream_t stream) {
+    if (!ggml_cuda_moe_step_ledger_enabled() || stream == nullptr) {
+        return;
+    }
+    auto & ledger = ggml_cuda_moe_step_ledger_state();
+    const uint32_t count = ledger.step_stream_count.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < count && i < GGML_CUDA_MOE_STEP_STREAMS; ++i) {
+        if (ledger.step_stream[i] == reinterpret_cast<void *>(stream)) {
+            return;
+        }
+    }
+    if (count >= GGML_CUDA_MOE_STEP_STREAMS) {
+        ledger.step_stream_overflow.store(1, std::memory_order_relaxed);
+        return;
+    }
+    ledger.step_stream[count] = reinterpret_cast<void *>(stream);
+    ledger.step_stream_count.store(count + 1, std::memory_order_release);
+}
+// Emit every snapshot that has landed, oldest first, so lines stay in step
+// order. Never waits unless `flush` (teardown): a slot still in flight is left
+// for a later call.
+static void ggml_cuda_moe_step_ledger_consume(ggml_cuda_moe_step_ledger & ledger, bool flush) {
+    while (ledger.tail != ledger.head && !ledger.failed) {
+        const size_t slot = (size_t) (ledger.tail % GGML_CUDA_MOE_STEP_RING);
+        if (flush) {
+            moe_grouped_device_scope device_scope(ledger.device);
+            if (!moe_grouped_cuda_success(cudaEventSynchronize(ledger.ev_done[slot]))) {
+                ledger.failed = true;
+                return;
+            }
+        } else {
+            const cudaError_t status = cudaEventQuery(ledger.ev_done[slot]);
+            if (status == cudaErrorNotReady) {
+                return;
+            }
+            if (status != cudaSuccess) {
+                (void) cudaGetLastError();
+                ledger.failed = true;
+                return;
+            }
+        }
+        const uint64_t * snap = ledger.snap +
+            slot * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS * GGML_CUDA_MOE_RESIDENT_FIELDS;
+        const uint8_t * slot_cls = ledger.slot_cls + slot * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS;
+        uint64_t need = 0, resident = 0, misses = 0, bytes = 0;
+        for (int l = 0; l < GGML_CUDA_MOE_RESIDENT_MAX_LAYERS; ++l) {
+            const uint64_t * row = snap + (size_t) l * GGML_CUDA_MOE_RESIDENT_FIELDS;
+            uint64_t delta[4] = {};
+            for (int f = 0; f < 4; ++f) {
+                // Counters are cumulative with no memset; a decrease means the
+                // device buffer was freed and zero-reallocated, so rebase.
+                delta[f] = row[f] >= ledger.last[l][f] ? row[f] - ledger.last[l][f] : row[f];
+                ledger.last[l][f] = row[f];
+            }
+            if (slot_cls[l] != 0) {
+                continue;
+            }
+            need += delta[0];
+            resident += delta[1];
+            misses += delta[2];
+            bytes += delta[3];
+        }
+        // A step with no decode layer at all (a prefill dispatch), or one whose
+        // decode layers moved no counter, is not a counted step: the cumulative
+        // reporter skips it too, so the per-step lines partition exactly the
+        // same totals and no zero line is invented.
+        if (ledger.slot_decode[slot] != 0 && (need != 0 || resident != 0 || misses != 0 || bytes != 0)) {
+            GGML_LOG("moe-step: step=%llu need=%llu resident=%llu misses=%llu miss_mib=%.2f\n",
+                (unsigned long long) ledger.emitted, (unsigned long long) need,
+                (unsigned long long) resident, (unsigned long long) misses, (double) bytes / 1048576.0);
+            ++ledger.emitted;
+        }
+        ++ledger.tail;
+    }
+}
+// One snapshot per dispatch: mark the end of the step's kernels on each stream
+// that ran them, copy the counters on the ledger's own stream, then hold the
+// next step's kernels until that copy has landed.
+static void ggml_cuda_moe_step_ledger_snapshot(ggml_cuda_moe_step_ledger & ledger, int device, uint64_t * dev) {
+    const uint32_t n_streams = ledger.step_stream_count.load(std::memory_order_acquire);
+    const bool overflow = ledger.step_stream_overflow.exchange(0, std::memory_order_acq_rel) != 0;
+    if (n_streams == 0 || overflow) {
+        // No grouped work this dispatch, or more distinct streams than the ring
+        // can order: no snapshot, so the step's counters move into the next
+        // window (counted, never guessed at).
+        if (overflow) {
+            ++ledger.dropped;
+        }
+        ggml_cuda_moe_step_ledger_reset_step(ledger);
+        return;
+    }
+    if (ledger.head - ledger.tail >= GGML_CUDA_MOE_STEP_RING) {
+        ++ledger.dropped;
+        ggml_cuda_moe_step_ledger_reset_step(ledger);
+        return;
+    }
+    const size_t slot = (size_t) (ledger.head % GGML_CUDA_MOE_STEP_RING);
+    uint8_t * slot_cls = ledger.slot_cls + slot * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS;
+    bool decode = false;
+    for (int l = 0; l < GGML_CUDA_MOE_RESIDENT_MAX_LAYERS; ++l) {
+        const uint32_t cls = ledger.step_cls[l].exchange(GGML_CUDA_MOE_STEP_CLASS_NONE, std::memory_order_acq_rel);
+        slot_cls[l] = cls == 0 ? 0 : (cls == 1 ? 1 : 0xFF);
+        if (cls == 0) {
+            decode = true;
+        }
+    }
+    ledger.slot_decode[slot] = decode ? 1 : 0;
+    bool ok = true;
+    {
+        moe_grouped_device_scope device_scope(device);
+        for (uint32_t i = 0; ok && i < n_streams; ++i) {
+            const cudaStream_t stream = reinterpret_cast<cudaStream_t>(ledger.step_stream[i]);
+            ok = moe_grouped_cuda_success(cudaEventRecord(ledger.ev_ready[i], stream)) &&
+                moe_grouped_cuda_success(cudaStreamWaitEvent(ledger.copy_stream, ledger.ev_ready[i], 0));
+        }
+        ok = ok && moe_grouped_cuda_success(cudaMemcpyAsync(ledger.snap +
+                slot * GGML_CUDA_MOE_RESIDENT_MAX_LAYERS * GGML_CUDA_MOE_RESIDENT_FIELDS, dev,
+                (size_t) GGML_CUDA_MOE_RESIDENT_MAX_LAYERS * GGML_CUDA_MOE_RESIDENT_FIELDS * sizeof(uint64_t),
+                cudaMemcpyDeviceToHost, ledger.copy_stream)) &&
+            moe_grouped_cuda_success(cudaEventRecord(ledger.ev_done[slot], ledger.copy_stream));
+        // The next step's kernels run on the streams that ran this one, and
+        // they write these same counters. Hold them until the snapshot has been
+        // read, so a snapshot is exactly the step boundary and never a mix of
+        // two steps. This is the ledger's only added dependency: a device-side
+        // wait on an 8 KiB read, a few microseconds, never a host sync.
+        for (uint32_t i = 0; ok && i < n_streams; ++i) {
+            const cudaStream_t stream = reinterpret_cast<cudaStream_t>(ledger.step_stream[i]);
+            ok = moe_grouped_cuda_success(cudaStreamWaitEvent(stream, ledger.ev_done[slot], 0));
+        }
+    }
+    if (!ok) {
+        // The ordering could not be expressed; skip the slot instead of
+        // emitting a snapshot that is not step-aligned.
+        ++ledger.dropped;
+        ggml_cuda_moe_step_ledger_reset_step(ledger);
+        return;
+    }
+    ++ledger.head;
+    ggml_cuda_moe_step_ledger_reset_step(ledger);
+}
+static void ggml_cuda_moe_step_ledger_drain() {
+    if (!ggml_cuda_moe_step_ledger_enabled()) {
+        return;
+    }
+    uint64_t * dev = ggml_cuda_moe_resident_device.load(std::memory_order_acquire);
+    const int dev_idx = ggml_cuda_moe_resident_device_idx.load(std::memory_order_acquire);
+    if (dev == nullptr || dev_idx < 0) {
+        return;
+    }
+    auto & ledger = ggml_cuda_moe_step_ledger_state();
+    if (ledger.failed || !ggml_cuda_moe_step_ledger_init(ledger, dev_idx)) {
+        return;
+    }
+    ggml_cuda_moe_step_ledger_consume(ledger, false);
+    ggml_cuda_moe_step_ledger_snapshot(ledger, dev_idx, dev);
+}
+static void ggml_cuda_moe_step_ledger_free_for_device(int device) {
+    auto & ledger = ggml_cuda_moe_step_ledger_state();
+    if (ledger.device != device) {
+        return;
+    }
+    // Flush the tail once, at teardown: the last steps are still in flight, and
+    // this is the only place the ledger waits for the device.
+    ggml_cuda_moe_step_ledger_consume(ledger, true);
+    if (ledger.dropped != 0 || ledger.failed) {
+        GGML_LOG_WARN("moe-ledger: dropped=%llu failed=%d: dropped steps carry no moe-step line\n",
+            (unsigned long long) ledger.dropped, ledger.failed ? 1 : 0);
+    }
+    moe_grouped_device_scope device_scope(device);
+    if (ledger.ev_done != nullptr) {
+        for (uint64_t i = 0; i < GGML_CUDA_MOE_STEP_RING; ++i) {
+            if (ledger.ev_done[i] != nullptr) {
+                (void) cudaEventDestroy(ledger.ev_done[i]);
+            }
+        }
+    }
+    for (uint32_t i = 0; i < GGML_CUDA_MOE_STEP_STREAMS; ++i) {
+        if (ledger.ev_ready[i] != nullptr) {
+            (void) cudaEventDestroy(ledger.ev_ready[i]);
+        }
+    }
+    if (ledger.copy_stream != nullptr) {
+        (void) cudaStreamDestroy(ledger.copy_stream);
+    }
+    if (ledger.snap != nullptr) {
+        (void) cudaFreeHost(ledger.snap);
+    }
+    free(ledger.slot_cls);
+    free(ledger.slot_decode);
+    free(ledger.ev_done);
+    ledger.snap = nullptr;
+    ledger.slot_cls = nullptr;
+    ledger.slot_decode = nullptr;
+    ledger.ev_done = nullptr;
+    for (uint32_t i = 0; i < GGML_CUDA_MOE_STEP_STREAMS; ++i) {
+        ledger.ev_ready[i] = nullptr;
+    }
+    ledger.copy_stream = nullptr;
+    ledger.device = -1;
+    ledger.cls_ready = false;
+    ledger.unavailable = false;
+    ledger.failed = false;
+    ledger.head = 0;
+    ledger.tail = 0;
+    ledger.emitted = 0;
+    ledger.dropped = 0;
+    memset(ledger.last, 0, sizeof(ledger.last));
+}
+// ---------------------------------------------------------------------------
+// Per-(step, layer) demanded-expert trace, host side. Gate:
+// GGML_CUDA_MOE_DEMAND_TRACE (presence only), output path:
+// GGML_CUDA_MOE_DEMAND_TRACE_FILE (default /tmp/moe-demand-trace.txt).
+//
+// The plan kernel records the ids into the preallocated device ring above, one
+// ring slot per decode step. This side drains one ring slot at a time into
+// pinned memory with the same pattern as the per-step miss ledger: an event
+// recorded on the stream that ran the step's kernels, a cudaMemcpyAsync on a
+// private non-blocking stream, and cudaEventQuery on the decode path, so the
+// decode loop never waits on the host. As in the ledger, the step boundary is
+// closed device-side instead: the next step's kernels may not touch the slot
+// until its snapshot has landed, which is what keeps a slot from being
+// overwritten before it is read. Any slot whose copy has landed is appended to
+// the output file, oldest first, so lines stay in step order.
+static std::mutex ggml_cuda_moe_demand_trace_alloc_mutex;
+struct ggml_cuda_moe_demand_trace {
+    std::atomic<ggml_cuda_moe_demand_trace_buffer *> buffer{nullptr};
+    ggml_cuda_moe_demand_trace_step * host = nullptr;   // pinned, [GGML_CUDA_MOE_STEP_RING]
+    uint64_t * slot_step = nullptr;                     // [ring] absolute step of that slot
+    cudaEvent_t * ev_done = nullptr;                    // [ring] slot landed on copy_stream
+    cudaEvent_t ev_ready[GGML_CUDA_MOE_STEP_STREAMS] = {};  // one step-end marker per compute stream
+    cudaStream_t copy_stream = nullptr;                 // private, non-blocking: never carries the step's kernels
+    uint64_t head = 0;                                  // next slot to snapshot
+    uint64_t tail = 0;                                  // next slot to write out
+    uint64_t step = 0;                                  // decode steps recorded so far
+    uint64_t emitted = 0;                               // (step, layer) lines written so far
+    uint64_t dropped = 0;                               // steps with no snapshot
+    uint64_t partial = 0;                               // steps whose layer set is incomplete
+    int device_idx = -1;
+    bool ready = false;
+    std::atomic<bool> wrote{false};                     // a grouped decode dispatch is open
+    bool unavailable = false;
+    bool failed = false;
+    bool warned = false;
+    FILE * file = nullptr;
+};
+static ggml_cuda_moe_demand_trace & ggml_cuda_moe_demand_trace_state() {
+    static ggml_cuda_moe_demand_trace state;
+    return state;
+}
+// Presence only, default off, exactly like the other gates.
+static bool ggml_cuda_moe_demand_trace_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MOE_DEMAND_TRACE") != nullptr;
+    return enabled;
+}
+// One decode step is open: the grouped plan kernels about to run advance the
+// device step counters, so the drain in finish_graph_dispatch must snapshot.
+static void ggml_cuda_moe_demand_trace_begin_step() {
+    if (ggml_cuda_moe_demand_trace_enabled()) {
+        ggml_cuda_moe_demand_trace_state().wrote.store(true, std::memory_order_release);
+    }
+}
+static const char * ggml_cuda_moe_demand_trace_path() {
+    static const char * path = []() -> const char * {
+        const char * value = getenv("GGML_CUDA_MOE_DEMAND_TRACE_FILE");
+        return value != nullptr && value[0] != '\0' ? value : "/tmp/moe-demand-trace.txt";
+    }();
+    return path;
+}
+// One device allocation for the whole run, the same shape as the residency
+// table's: the record path is a plain atomic load once it exists, and an
+// allocation failure is remembered rather than retried every step.
+static ggml_cuda_moe_demand_trace_buffer * ggml_cuda_moe_demand_trace_alloc(int device) {
+    if (!ggml_cuda_moe_demand_trace_enabled() || device < 0) {
+        return nullptr;
+    }
+    auto & trace = ggml_cuda_moe_demand_trace_state();
+    ggml_cuda_moe_demand_trace_buffer * result = trace.buffer.load(std::memory_order_acquire);
+    if (result != nullptr) {
+        // One device buffer for the process, like the residency table: a second
+        // device records nothing rather than recording into the wrong device's
+        // memory.
+        return trace.device_idx == device ? result : nullptr;
+    }
+    if (trace.unavailable) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_moe_demand_trace_alloc_mutex);
+    result = trace.buffer.load(std::memory_order_relaxed);
+    if (result == nullptr && !trace.unavailable) {
+        moe_grouped_device_scope device_scope(device);
+        if (!moe_grouped_cuda_success(cudaMalloc(&result, sizeof(ggml_cuda_moe_demand_trace_buffer))) ||
+                !moe_grouped_cuda_success(cudaMemset(result, 0, sizeof(ggml_cuda_moe_demand_trace_buffer)))) {
+            if (result != nullptr) {
+                (void) cudaFree(result);
+                result = nullptr;
+            }
+            trace.unavailable = true;
+            if (!trace.warned) {
+                trace.warned = true;
+                GGML_LOG_WARN("moe-demand-trace: disabled: could not allocate the device ring\n");
+            }
+            return nullptr;
+        }
+        trace.buffer.store(result, std::memory_order_release);
+    }
+    trace.device_idx = device;
+    return result;
+}
+// Pinned staging, private stream, one event per slot and one per compute
+// stream: allocated once, only when the gate is on.
+static bool ggml_cuda_moe_demand_trace_init(ggml_cuda_moe_demand_trace & trace, int device) {
+    if (trace.ready) {
+        return true;
+    }
+    if (trace.unavailable) {
+        return false;
+    }
+    const size_t host_bytes = (size_t) GGML_CUDA_MOE_STEP_RING * sizeof(ggml_cuda_moe_demand_trace_step);
+    moe_grouped_device_scope device_scope(device);
+    void * host = nullptr;
+    bool ok = moe_grouped_cuda_success(cudaMallocHost(&host, host_bytes));
+    uint64_t * slot_step = ok ? (uint64_t *) calloc(GGML_CUDA_MOE_STEP_RING, sizeof(uint64_t)) : nullptr;
+    cudaEvent_t * ev_done = ok ? (cudaEvent_t *) calloc(GGML_CUDA_MOE_STEP_RING, sizeof(cudaEvent_t)) : nullptr;
+    cudaStream_t copy_stream = nullptr;
+    ok = ok && slot_step != nullptr && ev_done != nullptr;
+    uint32_t ready_created = 0;
+    while (ok && ready_created < GGML_CUDA_MOE_STEP_STREAMS) {
+        if (!moe_grouped_cuda_success(cudaEventCreateWithFlags(&trace.ev_ready[ready_created], cudaEventDisableTiming))) {
+            ok = false;
+            break;
+        }
+        ++ready_created;
+    }
+    if (ok && !moe_grouped_cuda_success(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking))) {
+        ok = false;
+    }
+    uint32_t events_created = 0;
+    while (ok && events_created < GGML_CUDA_MOE_STEP_RING) {
+        if (!moe_grouped_cuda_success(cudaEventCreateWithFlags(&ev_done[events_created], cudaEventDisableTiming))) {
+            ok = false;
+            break;
+        }
+        ++events_created;
+    }
+    FILE * file = nullptr;
+    if (ok) {
+        file = fopen(ggml_cuda_moe_demand_trace_path(), "w");
+        ok = file != nullptr;
+    }
+    if (ok) {
+        trace.host = (ggml_cuda_moe_demand_trace_step *) host;
+        trace.slot_step = slot_step;
+        trace.ev_done = ev_done;
+        trace.copy_stream = copy_stream;
+        trace.file = file;
+        trace.device_idx = device;
+        trace.ready = true;
+        return true;
+    }
+    // Allocation failure: the trace stays off, one warning, no per-step cost.
+    for (uint32_t i = 0; i < events_created; ++i) {
+        (void) cudaEventDestroy(ev_done[i]);
+    }
+    for (uint32_t i = 0; i < ready_created; ++i) {
+        (void) cudaEventDestroy(trace.ev_ready[i]);
+        trace.ev_ready[i] = nullptr;
+    }
+    if (copy_stream != nullptr) {
+        (void) cudaStreamDestroy(copy_stream);
+    }
+    if (host != nullptr) {
+        (void) cudaFreeHost(host);
+    }
+    free(slot_step);
+    free(ev_done);
+    if (file != nullptr) {
+        fclose(file);
+    }
+    if (!trace.warned) {
+        trace.warned = true;
+        GGML_LOG_WARN("moe-demand-trace: disabled: could not allocate the drain ring\n");
+    }
+    trace.unavailable = true;
+    return false;
+}
+// Append every slot whose copy has landed, oldest first. Never waits unless
+// `flush` (teardown): a slot still in flight is left for a later call.
+static void ggml_cuda_moe_demand_trace_consume(ggml_cuda_moe_demand_trace & trace, bool flush) {
+    while (trace.tail != trace.head && !trace.failed && trace.file != nullptr) {
+        const size_t slot = (size_t) (trace.tail % GGML_CUDA_MOE_STEP_RING);
+        if (flush) {
+            moe_grouped_device_scope device_scope(trace.device_idx);
+            if (!moe_grouped_cuda_success(cudaEventSynchronize(trace.ev_done[slot]))) {
+                trace.failed = true;
+                return;
+            }
+        } else {
+            const cudaError_t status = cudaEventQuery(trace.ev_done[slot]);
+            if (status == cudaErrorNotReady) {
+                return;
+            }
+            if (status != cudaSuccess) {
+                (void) cudaGetLastError();
+                trace.failed = true;
+                return;
+            }
+        }
+        const ggml_cuda_moe_demand_trace_step * step_data = trace.host + slot;
+        const uint64_t step = trace.slot_step[slot];
+        uint32_t written = 0;
+        for (uint32_t layer = 0; layer < GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS; ++layer) {
+            // The per-(step, layer) length marker: 0 means this layer recorded
+            // nothing for this step, so it carries no line. A step with some
+            // but not all layers written is a partially written step.
+            const uint32_t len = step_data->len[layer];
+            if (len == 0) {
+                continue;
+            }
+            ++written;
+            if (len > GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS) {
+                // The layer demanded more experts than the trace row holds; the
+                // line below is truncated, and the step is flagged.
+                ++trace.partial;
+            }
+            const uint32_t count = len < GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS ?
+                len : (uint32_t) GGML_CUDA_MOE_DEMAND_TRACE_MAX_EXPERTS;
+            fprintf(trace.file, "step=%llu layer=%u ids=", (unsigned long long) step, layer);
+            for (uint32_t k = 0; k < count; ++k) {
+                fprintf(trace.file, k == 0 ? "%d" : ",%d", (int) step_data->ids[layer][k]);
+            }
+            fputc('\n', trace.file);
+            ++trace.emitted;
+        }
+        if (written != 0 && written != GGML_CUDA_MOE_DEMAND_TRACE_MAX_LAYERS) {
+            ++trace.partial;
+        }
+        ++trace.tail;
+    }
+}
+// Snapshot the step that just closed: mark the end of its kernels on each
+// stream that ran them, copy its slot on the trace's own stream, clear the
+// slot's markers for the next wrap, and hold the next step's kernels until the
+// copy has landed. The host never waits here.
+static void ggml_cuda_moe_demand_trace_snapshot(
+        ggml_cuda_moe_demand_trace & trace, int device,
+        ggml_cuda_moe_demand_trace_buffer * buffer, const cudaStream_t * streams, uint32_t n_streams) {
+    if (trace.head - trace.tail >= GGML_CUDA_MOE_STEP_RING) {
+        ++trace.dropped;
+        return;
+    }
+    const size_t slot = (size_t) (trace.head % GGML_CUDA_MOE_STEP_RING);
+    const uint32_t bounded = n_streams < GGML_CUDA_MOE_STEP_STREAMS ? n_streams : GGML_CUDA_MOE_STEP_STREAMS;
+    bool ok = true;
+    {
+        moe_grouped_device_scope device_scope(device);
+        for (uint32_t i = 0; ok && i < bounded; ++i) {
+            ok = moe_grouped_cuda_success(cudaEventRecord(trace.ev_ready[i], streams[i])) &&
+                moe_grouped_cuda_success(cudaStreamWaitEvent(trace.copy_stream, trace.ev_ready[i], 0));
+        }
+        ok = ok && moe_grouped_cuda_success(cudaMemcpyAsync(trace.host + slot, buffer->step + slot,
+                sizeof(ggml_cuda_moe_demand_trace_step), cudaMemcpyDeviceToHost, trace.copy_stream)) &&
+            moe_grouped_cuda_success(cudaMemsetAsync(buffer->step[slot].len, 0,
+                sizeof(buffer->step[slot].len), trace.copy_stream)) &&
+            moe_grouped_cuda_success(cudaEventRecord(trace.ev_done[slot], trace.copy_stream));
+        // The next step's kernels write this ring again. Hold them until this
+        // slot's snapshot has landed, so a slot is never overwritten before it
+        // is read: the ledger's one added dependency, a device-side wait on a
+        // 1 KiB read, never a host sync.
+        for (uint32_t i = 0; ok && i < bounded; ++i) {
+            ok = moe_grouped_cuda_success(cudaStreamWaitEvent(streams[i], trace.ev_done[slot], 0));
+        }
+    }
+    if (!ok) {
+        ++trace.dropped;
+        return;
+    }
+    trace.slot_step[slot] = trace.step++;
+    ++trace.head;
+}
+static void ggml_cuda_moe_demand_trace_drain(const cudaStream_t * streams, uint32_t n_streams) {
+    if (!ggml_cuda_moe_demand_trace_enabled()) {
+        return;
+    }
+    auto & trace = ggml_cuda_moe_demand_trace_state();
+    ggml_cuda_moe_demand_trace_buffer * buffer = trace.buffer.load(std::memory_order_acquire);
+    const int device = trace.device_idx;
+    if (buffer == nullptr || device < 0) {
+        trace.wrote.store(false, std::memory_order_release);
+        return;
+    }
+    if (!ggml_cuda_moe_demand_trace_init(trace, device)) {
+        trace.wrote.store(false, std::memory_order_release);
+        return;
+    }
+    ggml_cuda_moe_demand_trace_consume(trace, false);
+    if (!trace.wrote.load(std::memory_order_acquire)) {
+        return;
+    }
+    trace.wrote.store(false, std::memory_order_release);
+    if (trace.failed || n_streams == 0) {
+        ++trace.dropped;
+        return;
+    }
+    ggml_cuda_moe_demand_trace_snapshot(trace, device, buffer, streams, n_streams);
+}
+static void ggml_cuda_moe_demand_trace_free_for_device(int device) {
+    auto & trace = ggml_cuda_moe_demand_trace_state();
+    if (trace.device_idx != device) {
+        return;
+    }
+    // Flush the tail once, at teardown: the last steps are still in flight, and
+    // this is the only place the trace waits for the device.
+    if (trace.ready) {
+        ggml_cuda_moe_demand_trace_consume(trace, true);
+    }
+    if (trace.file != nullptr) {
+        fclose(trace.file);
+        trace.file = nullptr;
+    }
+    if (trace.dropped != 0 || trace.partial != 0 || trace.failed) {
+        GGML_LOG_WARN("moe-demand-trace: dropped=%llu partial=%llu failed=%d emitted=%llu: a dropped or partial step has an incomplete line set\n",
+            (unsigned long long) trace.dropped, (unsigned long long) trace.partial,
+            trace.failed ? 1 : 0, (unsigned long long) trace.emitted);
+    }
+    ggml_cuda_moe_demand_trace_buffer * buffer = trace.buffer.exchange(nullptr, std::memory_order_acq_rel);
+    if (buffer != nullptr || trace.ready) {
+        moe_grouped_device_scope device_scope(device);
+        if (buffer != nullptr) {
+            (void) cudaFree(buffer);
+        }
+        if (trace.ev_done != nullptr) {
+            for (uint64_t i = 0; i < GGML_CUDA_MOE_STEP_RING; ++i) {
+                if (trace.ev_done[i] != nullptr) {
+                    (void) cudaEventDestroy(trace.ev_done[i]);
+                }
+            }
+        }
+        for (uint32_t i = 0; i < GGML_CUDA_MOE_STEP_STREAMS; ++i) {
+            if (trace.ev_ready[i] != nullptr) {
+                (void) cudaEventDestroy(trace.ev_ready[i]);
+                trace.ev_ready[i] = nullptr;
+            }
+        }
+        if (trace.copy_stream != nullptr) {
+            (void) cudaStreamDestroy(trace.copy_stream);
+        }
+        if (trace.host != nullptr) {
+            (void) cudaFreeHost(trace.host);
+        }
+    }
+    free(trace.slot_step);
+    free(trace.ev_done);
+    trace.host = nullptr;
+    trace.slot_step = nullptr;
+    trace.ev_done = nullptr;
+    trace.copy_stream = nullptr;
+    trace.device_idx = -1;
+    trace.ready = false;
+    trace.wrote.store(false, std::memory_order_release);
+    trace.unavailable = false;
+    trace.failed = false;
+    trace.head = 0;
+    trace.tail = 0;
+    trace.step = 0;
+    trace.emitted = 0;
+    trace.dropped = 0;
+    trace.partial = 0;
 }
 
 ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decode(
@@ -9354,18 +11660,134 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
         if (early != nullptr) {
             CUDA_CHECK(cudaStreamWaitEvent(compute_stream, early->copy_split ? early->selected : early->done, 0));
         }
+        // Look-ahead staging consume: decode only, gate-checked, per-group
+        // lane with a generation match. No stream wait here by design: the
+        // ready filter below gates consumption on copy progress, and anything
+        // not ready falls back to demand. Group B never waits on group A.
+        impl::early_workspace * lookahead = nullptr;
+        if (early == nullptr && n_rows == 1 && moe_cache_lookahead_width() > 0) {
+            lookahead = impl_->lookahead_for_group(key.candidate.group_index);
+            if (lookahead != nullptr && (lookahead->la_group != key.candidate.group_index ||
+                    lookahead->la_generation != key.candidate.generation)) {
+                lookahead = nullptr;
+            }
+        }
+        // Device-side residency: pure host int work at prepare time (layer
+        // parse, generation record, slot pointer); the kernels publish.
+        uint64_t * resident_base = ggml_cuda_moe_resident_alloc(impl_->device);
+        const auto & resident_banks = resource->snapshot.banks;
+        const char * resident_bank_name = !resident_banks.empty() && resident_banks[0].tensor != nullptr ?
+            resident_banks[0].tensor->name : nullptr;
+        const int resident_layer =
+            ggml_cuda_moe_resident_layer_of(resident_bank_name, key.candidate.group_index);
+        uint64_t * resident_slot = nullptr;
+        if (resident_base != nullptr && resident_layer >= 0) {
+            resident_slot = resident_base + (size_t) resident_layer * GGML_CUDA_MOE_RESIDENT_FIELDS;
+        }
+        const uint32_t resident_epoch = ggml_cuda_moe_resident_epoch();
+        uint64_t resident_tag = 0;
+        if (resident_slot != nullptr) {
+            resident_tag = (static_cast<uint64_t>(key.candidate.generation) << 32) | resident_epoch;
+            const uint32_t resident_cls = n_rows == 1 ? 0 : 1;
+            ggml_cuda_moe_resident_expect(resident_layer, key.candidate.generation, resident_cls, resident_epoch);
+            // Per-step ledger bookkeeping: which layer this step touches and
+            // which stream runs its kernels, both read at the step's drain.
+            if (ggml_cuda_moe_step_ledger_enabled()) {
+                ggml_cuda_moe_step_ledger_note_layer(resident_layer, resident_cls);
+                ggml_cuda_moe_step_ledger_note_stream(compute_stream);
+            }
+        }
+        const uint64_t resident_bpm = (uint64_t) device.words_per_miss * sizeof(uint4);
+        // Opt-in plan-side admission (default off): read-only view of this group's
+        // staging lane, the same descriptors the gather consumes below. Gate off or
+        // no lane means both stay null and the plan kernel is today's.
+        const int32_t * plan_staging_positions = nullptr;
+        const uint32_t * plan_staging_progress = nullptr;
+        if (lookahead != nullptr && moe_lookahead_admit_in_plan()) {
+            plan_staging_positions = lookahead->positions;
+            plan_staging_progress = lookahead->copy_progress;
+        }
+        // Protect policy: hand the plan this layer's look-ahead prediction and its
+        // lane counters, so the victim choice can keep predicted residents. The
+        // mask stays null - and the plan kernel keeps its lfu/lru path exactly -
+        // unless the policy is protect, the lane exists for this group and
+        // generation, and its mask was sized for this group's expert count. The
+        // mask is written by the same filter launch that writes the staging
+        // positions (same stream, enqueued by the MOE_PREFETCH node ahead of this
+        // layer's plan in graph order), so in the steady state it is the
+        // prediction the look-ahead issued for this call's own plan. If a publish
+        // was skipped for backpressure it is the previous one, exactly as
+        // positions is - the hook can then only protect a staler set, never a
+        // wrong slot.
+        //
+        // recent1 needs no host input at all (its pin predicate is the slot
+        // table's own last_used), so it only borrows the lane counters when a lane
+        // exists, to report how often the hook binds.
+        const uint32_t pin_mode = impl_->evict_policy == MOE_CACHE_EVICT_PROTECT ? MOE_CACHE_PIN_PREDICTED :
+            (impl_->evict_policy == MOE_CACHE_EVICT_RECENT1 ? MOE_CACHE_PIN_RECENT1 : MOE_CACHE_PIN_NONE);
+        const int32_t * plan_predict_mask = nullptr;
+        bool pin_wants_counters = pin_mode == MOE_CACHE_PIN_RECENT1;
+        if (lookahead != nullptr && pin_mode == MOE_CACHE_PIN_PREDICTED &&
+                lookahead->la_predict_mask != nullptr && lookahead->counters != nullptr &&
+                lookahead->experts == (uint32_t) device.n_experts) {
+            plan_predict_mask = lookahead->la_predict_mask;
+            pin_wants_counters = true;
+        }
+        // Admission (GGML_MOE_ADMIT_PREDICTED): hand the plan the same lane's
+        // compacted prediction - predicted experts that were not resident at
+        // publish time, in predictor confidence order, -1 padded - plus the cap.
+        // Orthogonal to the pin policy above, so it composes with lfu/lru/protect,
+        // and additive to the workstream goal: this is what makes the prediction a
+        // residency decision instead of only a staging one. The lane counters come
+        // along whenever either mechanism is on, because both count there.
+        const int32_t * plan_admit_candidates = nullptr;
+        uint32_t plan_admit_width = 0;
+        uint32_t plan_admit_max = 0;
+        const uint32_t admit_cap = moe_cache_admit_predicted() ? moe_cache_admit_max() : 0;
+        if (lookahead != nullptr && admit_cap != 0 && lookahead->predicted != nullptr &&
+                lookahead->experts == (uint32_t) device.n_experts) {
+            plan_admit_candidates = lookahead->predicted;
+            plan_admit_width = lookahead->width;
+            plan_admit_max = admit_cap;
+        }
+        uint64_t * plan_predict_counters = nullptr;
+        if (lookahead != nullptr && lookahead->counters != nullptr && (pin_wants_counters || admit_cap != 0)) {
+            plan_predict_counters = lookahead->counters;
+        }
         const uint32_t plan_threads = moe_grouped_plan_threads(resource->snapshot.n_slots);
+        // Demand trace: one predictable branch when the gate is off (the alloc
+        // returns null), and layer -1 keeps the kernel's own branch untaken.
+        // Recording is decode-only here: a decode plan call is one row of one
+        // step, and the layer index is the same one the residency table uses.
+        ggml_cuda_moe_demand_trace_buffer * demand_trace = ggml_cuda_moe_demand_trace_alloc(impl_->device);
+        const int32_t demand_trace_layer = demand_trace != nullptr && n_rows == 1 && resident_layer >= 0 ?
+            resident_layer : -1;
+        if (demand_trace_layer >= 0) {
+            ggml_cuda_moe_demand_trace_begin_step();
+        }
         moe_grouped_plan_decode<<<1, plan_threads, 0, compute_stream>>>(
             static_cast<const int32_t *>(ids->data), n_routes, top_k, row_stride,
             device.n_experts, resource->snapshot.n_slots, resource->snapshot.n_slots,
             device.slot_for_expert, device.expert_for_slot, device.last_used,
-            device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, clock_begin, clock_end,
-            reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan);
+            device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, impl_->frequency_halflife, clock_begin, clock_end,
+            reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan,
+            resident_slot, resident_tag, resident_bpm, plan_staging_positions, plan_staging_progress,
+            demand_trace, demand_trace_layer, plan_predict_mask, plan_predict_counters,
+            plan_admit_candidates, plan_admit_width, plan_admit_max, pin_mode);
         CUDA_CHECK(cudaGetLastError());
 #if CUDART_VERSION >= 12080
         if (ready_only && !ready_late) {
             moe_early_router_ready_positions<<<1, 128, 0, compute_stream>>>(early->positions, device.n_experts, early->copy_progress);
             CUDA_CHECK(cudaGetLastError());
+        }
+        if (lookahead != nullptr) {
+            // No ready filter is enqueued for the look-ahead path. Clearing the positions
+            // array against one sample of the landing counter is what made readiness
+            // all-or-nothing: a transfer still in flight when the gather began was demoted
+            // wholesale and its bytes were paid for and thrown away. The gather now evaluates
+            // readiness per expert against the live counter instead. The sequence handoff
+            // stays here, where it releases backpressure without touching positions.
+            lookahead->la_consumed_seq = lookahead->la_publish_seq;
         }
 #endif
         auto * debug = impl_->grouped_debug.load(std::memory_order_acquire);
@@ -9378,13 +11800,13 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                     device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                     device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                     device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
-                    early->staging, early->positions, early->counters, 1);
+                    early->staging, early->positions, early->counters, 1, UINT32_MAX, resident_slot);
             } else {
                 moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                     device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                     device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                     device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
-                    early->staging, early->positions, early->counters, 1);
+                    early->staging, early->positions, early->counters, 1, UINT32_MAX, resident_slot);
             }
             CUDA_CHECK(cudaGetLastError());
 #if CUDART_VERSION >= 12080
@@ -9402,15 +11824,21 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                 device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
-                early != nullptr ? early->staging : nullptr, early != nullptr ? early->positions : nullptr,
-                early != nullptr ? early->counters : nullptr, ready_late ? 3 : split_early ? 2 : 0, head_mask);
+                early != nullptr ? early->staging : (lookahead != nullptr ? lookahead->staging : nullptr),
+                early != nullptr ? early->positions : (lookahead != nullptr ? lookahead->positions : nullptr),
+                early != nullptr ? early->counters : (lookahead != nullptr ? lookahead->counters : nullptr),
+                ready_late ? 3 : split_early ? 2 : 0, head_mask, resident_slot,
+                early != nullptr ? nullptr : (lookahead != nullptr ? lookahead->copy_progress : nullptr));
         } else {
             moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                 device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
-                early != nullptr ? early->staging : nullptr, early != nullptr ? early->positions : nullptr,
-                early != nullptr ? early->counters : nullptr, ready_late ? 3 : split_early ? 2 : 0, head_mask);
+                early != nullptr ? early->staging : (lookahead != nullptr ? lookahead->staging : nullptr),
+                early != nullptr ? early->positions : (lookahead != nullptr ? lookahead->positions : nullptr),
+                early != nullptr ? early->counters : (lookahead != nullptr ? lookahead->counters : nullptr),
+                ready_late ? 3 : split_early ? 2 : 0, head_mask, resident_slot,
+                early != nullptr ? nullptr : (lookahead != nullptr ? lookahead->copy_progress : nullptr));
         }
         if (bank_split) {
             GGML_ASSERT(early->down_reader != nullptr && early->pending_bank_mask == 0);
@@ -11057,6 +13485,26 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
     }
     auto * debug = impl_->debug_stats();
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    // Per-step ledger bookkeeping for this token: which layers it touches and
+    // which stream its kernels run on. prepare_decode is the hook for the
+    // direct path, but a replayed graph never calls it, so it must be taken
+    // here as well, once per token and before the kernels are launched,
+    // otherwise replay steps publish counters that no snapshot ever covers.
+    const auto note_ledger_groups = [&]() {
+        if (!ggml_cuda_moe_step_ledger_enabled()) {
+            return;
+        }
+        for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
+            const auto & group = execution->groups_[record_index];
+            const auto & resource = *impl_->resources[group.key.candidate.group_index];
+            const char * bank_name = !resource.snapshot.banks.empty() && resource.snapshot.banks[0].tensor != nullptr ?
+                resource.snapshot.banks[0].tensor->name : nullptr;
+            ggml_cuda_moe_step_ledger_note_layer(
+                ggml_cuda_moe_resident_layer_of(bank_name, group.key.candidate.group_index),
+                group.key.ids.ne[1] == 1 ? 0 : 1);
+            ggml_cuda_moe_step_ledger_note_stream(group.stream);
+        }
+    };
     const auto decline = [&]() {
         for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
             if (execution->groups_[record_index].state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED) {
@@ -11125,6 +13573,7 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
         for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
             execution->groups_[record_index].defer_completion = true;
         }
+        note_ledger_groups();
         return true;
     }
 
@@ -11162,6 +13611,18 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
             const uint32_t group_index = group.key.candidate.group_index;
             if (group_index < debug->ready_by_group.size()) {
                 debug->ready_by_group[group_index].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    note_ledger_groups();
+    // Graph replay runs the captured plan kernels without going through
+    // prepare_decode, so this is where a replayed decode step is armed for the
+    // demand trace. Same predicate as the direct path: a single-token group.
+    if (ggml_cuda_moe_demand_trace_enabled()) {
+        for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
+            if (execution->groups_[record_index].key.ids.ne[1] == 1) {
+                ggml_cuda_moe_demand_trace_begin_step();
+                break;
             }
         }
     }
@@ -12324,6 +14785,33 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
     for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
         execution->groups_[record_index].authority = {};
     }
+    ggml_cuda_moe_resident_drain_and_emit();
+    ggml_cuda_moe_step_ledger_drain();
+    // Demand trace: snapshot the step the grouped plan kernels just filled on
+    // the streams that ran them. The host never waits here; the slot is written
+    // out by a later drain or by the teardown flush.
+    if (ggml_cuda_moe_demand_trace_enabled()) {
+        cudaStream_t trace_streams[GGML_CUDA_MOE_STEP_STREAMS] = {};
+        uint32_t n_trace_streams = 0;
+        for (uint32_t record_index = 0; record_index < execution->n_groups_ &&
+                n_trace_streams < GGML_CUDA_MOE_STEP_STREAMS; ++record_index) {
+            const cudaStream_t stream = execution->groups_[record_index].stream;
+            if (stream == nullptr) {
+                continue;
+            }
+            bool seen = false;
+            for (uint32_t i = 0; i < n_trace_streams; ++i) {
+                seen = seen || trace_streams[i] == stream;
+            }
+            if (!seen) {
+                trace_streams[n_trace_streams++] = stream;
+            }
+        }
+        ggml_cuda_moe_demand_trace_drain(trace_streams, n_trace_streams);
+    }
+    if (moe_cache_lookahead_width() > 0) {
+        impl_->lookahead_drain_and_emit();
+    }
     return success;
 }
 
@@ -12364,9 +14852,10 @@ void ggml_cuda_moe_grouped_context::shutdown() {
             return !impl_->has_active_transaction() && impl_->active_maintenance == 0 &&
                 impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease() && !impl_->has_active_group_call();
         });
-        if (!impl_->early.empty()) {
+        if (!impl_->early.empty() || !impl_->lookahead.empty()) {
             moe_grouped_device_scope device_scope(impl_->device);
             impl_->clear_early();
+            impl_->clear_lookahead();
         }
         retired = impl_->detach_resources();
         retired_legacy = impl_->detach_legacy_records();
@@ -12471,6 +14960,9 @@ struct ggml_cuda_moe_cache {
     std::vector<uint64_t>     slot_hit_count;
     std::vector<uint64_t>     slot_fill_access;
     std::vector<uint32_t>     slot_pin_count;
+    std::vector<char>         slot_reserved;   // demand working set: speculation may not take it
+    int                       n_slots_reserved = 0;
+    int                       n_slots_reserved_high = 0; // max n_slots_reserved ever reached (never reset)
 
     // host_ptr -> slot_id, O(1) lookup.
     std::unordered_map<const void *, int> host_to_slot;
@@ -12495,6 +14987,8 @@ struct ggml_cuda_moe_cache {
     std::atomic<uint64_t> phase_prefetch_misses[2];
     std::atomic<uint64_t> phase_prefetch_used[2];
     std::atomic<uint64_t> phase_prefetch_evictions[2];
+    std::atomic<uint64_t> phase_prefetch_dropped[2];
+    std::atomic<uint64_t> phase_prefetch_reserve_refused[2];
     std::atomic<uint64_t> phase_demand_evictions[2];
     std::atomic<uint64_t> phase_evicted_prefetched[2];
     std::atomic<uint64_t> phase_evicted_hit_count_le1[2];
@@ -12509,6 +15003,14 @@ struct ggml_cuda_moe_cache {
     std::atomic<uint64_t> sampled_pages_resident{0};
     std::atomic<uint64_t> sampled_nonresident_expert_count{0};
     std::atomic<uint64_t> mincore_failures{0};
+
+    // LFRU eviction guard state (colibri PILOT_EVICT_GUARD port). Demand-only
+    // per-expert heat: speculative accesses are deliberately excluded so a
+    // prediction can never inflate the score that decides whether it may
+    // displace a resident.
+    std::vector<uint32_t> guard_heat;
+    std::vector<uint32_t> guard_last;
+    uint32_t guard_clock = 0;
 
     bool source_is_mmap = false;
     bool debug_mm = false;
@@ -12554,6 +15056,28 @@ static void ggml_cuda_moe_cache_append_expert_counts(
     }
 
     counts.insert(counts.end(), cache->expert_access_counts.begin(), cache->expert_access_counts.end());
+}
+
+// Reserve `GGML_CUDA_MOE_CACHE_RESERVED` slots per expert tensor for the demand working
+// set. A slot joins the reserve once the demand path has reused its expert twice, and
+// speculative installs may no longer victimize it: they take an unreserved slot or get
+// refused (counted as prefetch_reserve_refused) instead of evicting an expert the demand
+// path is reusing. Demand installs may still evict a reserved slot, so a reservation can
+// only ever cost speculative installs. 0 (default) keeps the previous behaviour exactly.
+static int ggml_cuda_moe_cache_reserve_requested() {
+    static const int requested = []() {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_RESERVED");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    return requested <= 0 ? 0 : requested;
+}
+
+static int ggml_cuda_moe_cache_reserve_effective(const ggml_cuda_moe_cache * cache) {
+    const int requested = ggml_cuda_moe_cache_reserve_requested();
+    if (requested <= 0 || cache == nullptr || cache->n_slots <= 0) {
+        return 0;
+    }
+    return requested < cache->n_slots ? requested : cache->n_slots;
 }
 
 static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
@@ -12739,6 +15263,9 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
     c->slot_hit_count.assign(n_slots, 0);
     c->slot_fill_access.assign(n_slots, 0);
     c->slot_pin_count.assign(n_slots, 0);
+    c->slot_reserved.assign(n_slots, 0);
+    c->n_slots_reserved = 0;
+    c->n_slots_reserved_high = 0;
     c->host_to_slot.reserve(n_slots * 2);
     for (int phase = 0; phase < 2; ++phase) {
         c->phase_hits[phase].store(0, std::memory_order_relaxed);
@@ -12751,6 +15278,8 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         c->phase_prefetch_misses[phase].store(0, std::memory_order_relaxed);
         c->phase_prefetch_used[phase].store(0, std::memory_order_relaxed);
         c->phase_prefetch_evictions[phase].store(0, std::memory_order_relaxed);
+        c->phase_prefetch_dropped[phase].store(0, std::memory_order_relaxed);
+        c->phase_prefetch_reserve_refused[phase].store(0, std::memory_order_relaxed);
         c->phase_demand_evictions[phase].store(0, std::memory_order_relaxed);
         c->phase_evicted_prefetched[phase].store(0, std::memory_order_relaxed);
         c->phase_evicted_hit_count_le1[phase].store(0, std::memory_order_relaxed);
@@ -12828,6 +15357,10 @@ static void ggml_cuda_moe_cache_clear_slots_locked(ggml_cuda_moe_cache * cache) 
     std::fill(cache->slot_prefetched.begin(), cache->slot_prefetched.end(), 0);
     std::fill(cache->slot_hit_count.begin(), cache->slot_hit_count.end(), 0);
     std::fill(cache->slot_fill_access.begin(), cache->slot_fill_access.end(), 0);
+    std::fill(cache->slot_reserved.begin(), cache->slot_reserved.end(), 0);
+    cache->n_slots_reserved = 0;
+    // n_slots_reserved_high is intentionally not reset: it is the lifetime
+    // high-water mark so a later sample still proves the reserve engaged.
     cache->host_to_slot.clear();
     cache->access_counter = 0;
 }
@@ -13079,6 +15612,155 @@ static void ggml_cuda_moe_cache_record_expert_access(ggml_cuda_moe_cache * cache
     }
 }
 
+// Least-Frequently-Recently-Used score, ported from colibri's tier_pick_lfru
+// (c/tier.h:40-43): frequency dominates, recency is the low byte and saturates
+// after 255 ticks so a merely recent expert cannot displace a hotter one.
+static uint64_t ggml_cuda_moe_cache_lfru_score(uint32_t heat, uint32_t last, uint32_t clock) {
+    const uint32_t age = clock - last;
+    const uint32_t recent = age < 255 ? 255 - age : 0;
+    return ((uint64_t) heat << 8) | recent;
+}
+
+// Demand-side heat for the eviction guard. Speculative accesses are excluded on
+// purpose: an expert that is only ever predicted has not proven demand value,
+// and counting predictions would let a speculation inflate the very score that
+// decides whether it may displace a warm resident (colibri counts demand
+// accesses only; see the "demand=0" speculative load path).
+static void ggml_cuda_moe_cache_record_demand_heat(ggml_cuda_moe_cache * cache, const void * host_src) {
+    if (cache->n_experts <= 0) {
+        return;
+    }
+    if (cache->guard_heat.empty()) {
+        cache->guard_heat.assign((size_t) cache->n_experts, 0);
+        cache->guard_last.assign((size_t) cache->n_experts, 0);
+    }
+    const int64_t eid = ggml_cuda_moe_cache_expert_id(cache, host_src);
+    if (eid < 0) {
+        return;
+    }
+    cache->guard_clock++;
+    cache->guard_heat[(size_t) eid]++;
+    cache->guard_last[(size_t) eid] = cache->guard_clock;
+}
+
+// Whether a speculative fill must NOT displace the resident currently in
+// `victim`. Ports colibri's PILOT_EVICT_GUARD (tier.h/c: a resident is
+// protected only when it is genuinely warm - at least 2 demand accesses - AND
+// clearly hotter than the speculation, by the 25% + 4-frequency hysteresis in
+// score units). When the victim is protected the speculation is dropped rather
+// than thrashing a warm, demand-loaded expert.
+static bool ggml_cuda_moe_cache_evict_guard_blocks(
+        const ggml_cuda_moe_cache * cache,
+        int                         victim,
+        int64_t                     speculative_eid) {
+    const void * resident = cache->slot_to_host[victim];
+    if (resident == nullptr || cache->guard_heat.empty() || speculative_eid < 0) {
+        return false;   // free slot, or no demand history yet: nothing warm to protect
+    }
+    const int64_t resident_eid = ggml_cuda_moe_cache_expert_id(cache, resident);
+    if (resident_eid < 0) {
+        return false;
+    }
+    const uint32_t heat = cache->guard_heat[(size_t) resident_eid];
+    if (heat < 2) {
+        return false;   // never demanded twice: not genuinely warm
+    }
+    const uint64_t victim_score =
+        ggml_cuda_moe_cache_lfru_score(heat, cache->guard_last[(size_t) resident_eid], cache->guard_clock);
+    const uint64_t spec_score =
+        ggml_cuda_moe_cache_lfru_score(cache->guard_heat[(size_t) speculative_eid],
+                                       cache->guard_last[(size_t) speculative_eid],
+                                       cache->guard_clock);
+    return victim_score + (victim_score >> 2) + (4u << 8) > spec_score;
+}
+
+// Shared victim selection for the demand and speculative paths. Picks the LRU
+// unpinned slot; a speculative fill additionally has to clear the eviction
+// guard and returns -1 (drop the speculation) when it does not.
+static int ggml_cuda_moe_cache_select_victim_locked(
+        ggml_cuda_moe_cache * cache,
+        bool                  speculative,
+        int64_t               speculative_eid,
+        bool *                out_reserve_refused = nullptr) {
+    int      victim   = -1;
+    uint64_t victim_t = std::numeric_limits<uint64_t>::max();
+    int      nonpinned  = 0;
+    int      evictable  = 0;
+    for (int i = 0; i < cache->n_slots; ++i) {
+        if (cache->slot_pin_count[i] != 0) {
+            continue;   // pinned: a running GEMM is reading this slot
+        }
+        nonpinned++;
+        if (speculative && cache->slot_reserved[i]) {
+            continue;   // reserved: the demand path is reusing this expert
+        }
+        evictable++;
+        if (cache->last_used[i] < victim_t) {
+            victim_t = cache->last_used[i];
+            victim   = i;
+        }
+    }
+    if (out_reserve_refused != nullptr) {
+        *out_reserve_refused = speculative && victim < 0 && nonpinned > 0 && evictable == 0;
+    }
+    if (victim < 0 || !speculative) {
+        return victim;
+    }
+    return ggml_cuda_moe_cache_evict_guard_blocks(cache, victim, speculative_eid) ? -1 : victim;
+}
+
+// Shared fill install: records the eviction telemetry for `victim`, publishes
+// `host_src` into it and bumps the LRU clock. `is_prefetch` only selects the
+// prefetch-vs-demand telemetry buckets; the placement itself is identical.
+static void ggml_cuda_moe_cache_install_fill_locked(
+        ggml_cuda_moe_cache * cache,
+        int                   victim,
+        const void *          host_src,
+        bool                  is_prefetch,
+        int                   phase) {
+    const void * evicted = cache->slot_to_host[victim];
+    if (evicted != nullptr) {
+        cache->host_to_slot.erase(evicted);
+        cache->evictions.fetch_add(1, std::memory_order_relaxed);
+        cache->phase_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+        if (is_prefetch) {
+            cache->phase_prefetch_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            cache->phase_demand_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (cache->slot_prefetched[victim]) {
+            cache->phase_evicted_prefetched[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (cache->slot_hit_count[victim] <= 1) {
+            cache->phase_evicted_hit_count_le1[phase].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            cache->phase_evicted_hit_count_ge2[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+        const uint64_t age = cache->access_counter >= cache->slot_fill_access[victim] ?
+            cache->access_counter - cache->slot_fill_access[victim] : 0;
+        if (age <= (uint64_t) cache->n_slots) {
+            cache->phase_evicted_age_le_l1[phase].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            cache->phase_evicted_age_gt_l1[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (cache->slot_reserved[victim]) {
+        cache->slot_reserved[victim] = 0;
+        cache->n_slots_reserved--;
+    }
+    cache->slot_to_host[victim]     = host_src;
+    cache->host_to_slot[host_src]   = victim;
+    cache->last_used[victim]        = ++cache->access_counter;
+    cache->slot_prefetched[victim]  = is_prefetch ? 1 : 0;
+    cache->slot_hit_count[victim]   = 0;
+    cache->slot_fill_access[victim] = cache->access_counter;
+    cache->misses.fetch_add(1, std::memory_order_relaxed);
+    cache->phase_misses[phase].fetch_add(1, std::memory_order_relaxed);
+    if (is_prefetch) {
+        cache->phase_prefetch_misses[phase].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 static int ggml_cuda_moe_cache_acquire_locked(
     struct ggml_cuda_moe_cache * cache,
     const void * host_src,
@@ -13096,6 +15778,11 @@ static int ggml_cuda_moe_cache_acquire_locked(
 
     const int phase = moe_cache_phase_index(is_decode);
     ggml_cuda_moe_cache_record_expert_access(cache, host_src, phase);
+    if (!is_prefetch) {
+        // Demand-only heat for the LFRU eviction guard that later decides
+        // whether a speculation may displace this expert.
+        ggml_cuda_moe_cache_record_demand_heat(cache, host_src);
+    }
 
     // Hit path: O(1) hash lookup.
     auto it = cache->host_to_slot.find(host_src);
@@ -13103,6 +15790,15 @@ static int ggml_cuda_moe_cache_acquire_locked(
         int slot = it->second;
         cache->last_used[slot] = ++cache->access_counter;
         cache->slot_hit_count[slot]++;
+        if (!is_prefetch && !cache->slot_reserved[slot] && cache->slot_hit_count[slot] >= 2 &&
+                cache->n_slots_reserved < ggml_cuda_moe_cache_reserve_effective(cache)) {
+            // Reused twice by the demand path: it is part of the working set, keep it.
+            cache->slot_reserved[slot] = 1;
+            cache->n_slots_reserved++;
+            if (cache->n_slots_reserved > cache->n_slots_reserved_high) {
+                cache->n_slots_reserved_high = cache->n_slots_reserved;
+            }
+        }
         cache->hits.fetch_add(1, std::memory_order_relaxed);
         cache->phase_hits[phase].fetch_add(1, std::memory_order_relaxed);
         if (is_prefetch) {
@@ -13115,60 +15811,11 @@ static int ggml_cuda_moe_cache_acquire_locked(
     }
 
     // Miss: pick the LRU slot. Empty slots (last_used==0) win automatically.
-    int      lru_slot = -1;
-    uint64_t lru_t    = std::numeric_limits<uint64_t>::max();
-    for (int i = 0; i < cache->n_slots; ++i) {
-        if (cache->slot_pin_count[i] != 0) {
-            continue;
-        }
-        if (cache->last_used[i] < lru_t) {
-            lru_t    = cache->last_used[i];
-            lru_slot = i;
-        }
-    }
+    const int lru_slot = ggml_cuda_moe_cache_select_victim_locked(cache, false, -1);
     if (lru_slot < 0) {
         return -1;
     }
-
-    const void * evicted = cache->slot_to_host[lru_slot];
-    if (evicted != nullptr) {
-        cache->host_to_slot.erase(evicted);
-        cache->evictions.fetch_add(1, std::memory_order_relaxed);
-        cache->phase_evictions[phase].fetch_add(1, std::memory_order_relaxed);
-        if (is_prefetch) {
-            cache->phase_prefetch_evictions[phase].fetch_add(1, std::memory_order_relaxed);
-        } else {
-            cache->phase_demand_evictions[phase].fetch_add(1, std::memory_order_relaxed);
-        }
-        if (cache->slot_prefetched[lru_slot]) {
-            cache->phase_evicted_prefetched[phase].fetch_add(1, std::memory_order_relaxed);
-        }
-        const uint64_t hit_count = cache->slot_hit_count[lru_slot];
-        if (hit_count <= 1) {
-            cache->phase_evicted_hit_count_le1[phase].fetch_add(1, std::memory_order_relaxed);
-        } else {
-            cache->phase_evicted_hit_count_ge2[phase].fetch_add(1, std::memory_order_relaxed);
-        }
-        const uint64_t age = cache->access_counter >= cache->slot_fill_access[lru_slot] ?
-            cache->access_counter - cache->slot_fill_access[lru_slot] : 0;
-        if (age <= (uint64_t) cache->n_slots) {
-            cache->phase_evicted_age_le_l1[phase].fetch_add(1, std::memory_order_relaxed);
-        } else {
-            cache->phase_evicted_age_gt_l1[phase].fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
-    cache->slot_to_host[lru_slot] = host_src;
-    cache->host_to_slot[host_src] = lru_slot;
-    cache->last_used[lru_slot]    = ++cache->access_counter;
-    cache->slot_prefetched[lru_slot] = is_prefetch ? 1 : 0;
-    cache->slot_hit_count[lru_slot] = 0;
-    cache->slot_fill_access[lru_slot] = cache->access_counter;
-    cache->misses.fetch_add(1, std::memory_order_relaxed);
-    cache->phase_misses[phase].fetch_add(1, std::memory_order_relaxed);
-    if (is_prefetch) {
-        cache->phase_prefetch_misses[phase].fetch_add(1, std::memory_order_relaxed);
-    }
+    ggml_cuda_moe_cache_install_fill_locked(cache, lru_slot, host_src, is_prefetch, phase);
     auto rollback_miss = [&]() {
         cache->slot_to_host[lru_slot] = nullptr;
         cache->host_to_slot.erase(host_src);
@@ -13254,6 +15901,390 @@ int ggml_cuda_moe_cache_acquire(
         cache->slot_pin_count[slot]++;
     }
     return slot;
+}
+
+// MoE look-ahead prefetch: reserve slots for a batch of experts with prefetch
+// accounting, then issue the H2D copies. Caller must hold cache->mu; all
+// copies are enqueued on copy_stream before the lock is released, so a
+// concurrent demand acquire cannot reuse a reserved slot mid-batch. Like
+// acquire_locked with is_prefetch=true, wait_for_compute=false, pin=false:
+// no stream wait, no sync, a failed copy rolls its booking back and the miss
+// is left for the demand path. Unknown eids are skipped, never fatal.
+static void ggml_cuda_moe_cache_prefetch_locked(
+    struct ggml_cuda_moe_cache * cache,
+    const void * base,
+    size_t stride,
+    size_t byte_count,
+    const int32_t * expert_ids,
+    int n_expert_ids,
+    int64_t n_experts,
+    cudaStream_t copy_stream,
+    bool use_l2,
+    bool is_decode) {
+    if (byte_count == 0 || byte_count > cache->slot_size_bytes) {
+        return;
+    }
+    const int phase = moe_cache_phase_index(is_decode);
+    const bool debug_mm = cache->debug_mm;
+    const int64_t enqueue_start_us = debug_mm ? ggml_time_us() : 0;
+    std::vector<std::pair<int, const void *>> reserved;
+    reserved.reserve(n_expert_ids);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    std::vector<void *> batch_dsts;
+    std::vector<const void *> batch_srcs;
+    std::vector<size_t> batch_sizes;
+    batch_dsts.reserve(n_expert_ids);
+    batch_srcs.reserve(n_expert_ids);
+    batch_sizes.reserve(n_expert_ids);
+#endif
+    auto rollback_one = [&](int slot, const void * host_src) {
+        cache->slot_to_host[slot] = nullptr;
+        cache->host_to_slot.erase(host_src);
+        cache->slot_prefetched[slot] = 0;
+    };
+    uint64_t ok_copies = 0;
+    for (int i = 0; i < n_expert_ids; ++i) {
+        const int32_t expert = expert_ids[i];
+        if (expert < 0 || (n_experts > 0 && (int64_t) expert >= n_experts)) {
+            continue;
+        }
+        const void * host_src = (const char *) base + (size_t) expert * stride;
+        ggml_cuda_moe_cache_record_expert_access(cache, host_src, phase);
+        auto hit = cache->host_to_slot.find(host_src);
+        if (hit != cache->host_to_slot.end()) {
+            const int slot = hit->second;
+            cache->last_used[slot] = ++cache->access_counter;
+            cache->slot_hit_count[slot]++;
+            cache->hits.fetch_add(1, std::memory_order_relaxed);
+            cache->phase_hits[phase].fetch_add(1, std::memory_order_relaxed);
+            cache->phase_prefetch_hits[phase].fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        // A speculative fill has to clear the LFRU eviction guard: a warm
+        // resident that is clearly hotter than this prediction must not be
+        // displaced for it (colibri PILOT_EVICT_GUARD). A blocked prediction is
+        // dropped rather than thrashing a demand-loaded expert.
+        bool reserve_refused = false;
+        const int lru_slot = ggml_cuda_moe_cache_select_victim_locked(
+            cache, true, ggml_cuda_moe_cache_expert_id(cache, host_src), &reserve_refused);
+        if (lru_slot < 0) {
+            cache->phase_prefetch_dropped[phase].fetch_add(1, std::memory_order_relaxed);
+            if (reserve_refused) {
+                cache->phase_prefetch_reserve_refused[phase].fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+        ggml_cuda_moe_cache_install_fill_locked(cache, lru_slot, host_src, true, phase);
+        const void * copy_src = use_l2 ?
+            ggml_cuda_moe_cache_l2_source(cache, host_src, byte_count, is_decode, copy_stream) : host_src;
+        if (debug_mm && copy_src == host_src) {
+            const uint64_t miss_index = g_moe_cache_mm_miss_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((miss_index % MOE_CACHE_MM_SAMPLE_RATE) == 0) {
+                moe_cache_mm_sample_mincore(
+                    host_src,
+                    byte_count,
+                    cache->sampled_mincore_checks,
+                    cache->sampled_pages_total,
+                    cache->sampled_pages_resident,
+                    cache->sampled_nonresident_expert_count,
+                    cache->mincore_failures);
+            }
+        }
+        void * dst = (char *) cache->slot_pool_d + (size_t) lru_slot * cache->slot_size_bytes;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+        batch_dsts.push_back(dst);
+        batch_srcs.push_back(copy_src);
+        batch_sizes.push_back(byte_count);
+#else
+        if (cudaMemcpyAsync(dst, copy_src, byte_count, cudaMemcpyHostToDevice, copy_stream) != cudaSuccess) {
+            fprintf(stderr, "moe-cache: prefetch copy failed, miss left for demand path\n");
+            rollback_one(lru_slot, host_src);
+            continue;
+        }
+        ok_copies++;
+#endif
+        reserved.emplace_back(lru_slot, host_src);
+    }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    if (!batch_srcs.empty()) {
+        cudaMemcpyAttributes attributes = {};
+        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+        size_t attributes_index = 0;
+        cudaError_t err;
+#if CUDART_VERSION < 13000
+        size_t fail_index = SIZE_MAX;
+        err = cudaMemcpyBatchAsync(batch_dsts.data(), batch_srcs.data(), batch_sizes.data(),
+            batch_srcs.size(), &attributes, &attributes_index, 1, &fail_index, copy_stream);
+#else
+        err = cudaMemcpyBatchAsync(batch_dsts.data(), batch_srcs.data(), batch_sizes.data(),
+            batch_srcs.size(), &attributes, &attributes_index, 1, copy_stream);
+#endif
+        if (err != cudaSuccess) {
+            fprintf(stderr, "moe-cache: prefetch batch copy failed: %s, misses left for demand path\n",
+                cudaGetErrorString(err));
+            for (const auto & entry : reserved) {
+                rollback_one(entry.first, entry.second);
+            }
+            return;
+        }
+        ok_copies = batch_srcs.size();
+    }
+#endif
+    if (debug_mm && ok_copies > 0) {
+        const uint64_t h2d_enqueue_time_us = (uint64_t) (ggml_time_us() - enqueue_start_us);
+        const uint64_t ok_bytes = ok_copies * byte_count;
+        cache->h2d_copy_count.fetch_add(ok_copies, std::memory_order_relaxed);
+        cache->h2d_copy_bytes.fetch_add(ok_bytes, std::memory_order_relaxed);
+        cache->phase_h2d_copy_count[phase].fetch_add(ok_copies, std::memory_order_relaxed);
+        cache->phase_h2d_copy_bytes[phase].fetch_add(ok_bytes, std::memory_order_relaxed);
+        cache->phase_h2d_enqueue_time_us[phase].fetch_add(h2d_enqueue_time_us, std::memory_order_relaxed);
+        cache->phase_prefetch_h2d_copy_count[phase].fetch_add(ok_copies, std::memory_order_relaxed);
+        cache->phase_prefetch_h2d_copy_bytes[phase].fetch_add(ok_bytes, std::memory_order_relaxed);
+        cache->phase_prefetch_h2d_enqueue_time_us[phase].fetch_add(h2d_enqueue_time_us, std::memory_order_relaxed);
+    }
+}
+
+void ggml_cuda_moe_grouped_context::prefetch_legacy_layer(
+        const ggml_tensor * experts,
+        const int32_t * expert_ids,
+        int n_expert_ids,
+        bool use_l2,
+        bool is_decode) {
+    if (experts == nullptr || expert_ids == nullptr || n_expert_ids <= 0) {
+        return;
+    }
+    if (moe_cache_lookahead_width() <= 0) {
+        return;
+    }
+    if (ggml_n_dims(experts) < 3 || experts->ne[2] <= 0 || experts->nb[2] == 0 || experts->data == nullptr) {
+        return;
+    }
+    if (experts->buffer == nullptr ||
+            !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(experts->buffer))) {
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned, "moe-cache: look-ahead prefetch target is not MoE-cached, skip");
+        return;
+    }
+    // Installs the next layer's pool on demand. The lease holds the pool
+    // alive; it targets a future layer, never the one being computed.
+    auto lease = acquire_legacy_cache(experts);
+    ggml_cuda_moe_cache * cache = lease.get();
+    if (cache == nullptr) {
+        // A pool can only be installed once the candidate snapshot is published, which is
+        // after the reserve-time attempt, so that attempt can legitimately find nothing
+        // yet. Retry here behind a cooldown, bounded: enough to catch the first decode
+        // step, not enough to pay for a configuration that never permits an install.
+        constexpr int max_install_attempts = 8;
+        static std::atomic<int> install_attempts{0};
+        static std::atomic<int64_t> last_attempt_us{0};
+        const int64_t now_us = ggml_time_us();
+        int64_t prev_us = last_attempt_us.load(std::memory_order_relaxed);
+        if (install_attempts.load(std::memory_order_relaxed) < max_install_attempts &&
+                now_us - prev_us > 200000 &&
+                last_attempt_us.compare_exchange_strong(prev_us, now_us, std::memory_order_relaxed)) {
+            install_attempts.fetch_add(1, std::memory_order_relaxed);
+            if (preinstall_legacy_pools() >= 0) {
+                lease = acquire_legacy_cache(experts);
+                cache = lease.get();
+            }
+        }
+    }
+    if (cache == nullptr) {
+        // Never silent: an empty lease means the target layer's pool is not installed, so
+        // the whole prediction is dropped. Reachable while the candidate snapshot is not
+        // published yet and whenever the target layer is not under legacy cache authority.
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned,
+            "moe-cache: look-ahead prefetch found no installed pool for the target layer, prediction dropped");
+        return;
+    }
+    cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache);
+    if (copy_stream == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(cache->mu);
+        ggml_cuda_moe_cache_prefetch_locked(
+            cache, experts->data, experts->nb[2], experts->nb[2],
+            expert_ids, n_expert_ids, experts->ne[2], copy_stream, use_l2, is_decode);
+    }
+    prefetch_legacy_siblings(lease, expert_ids, n_expert_ids, use_l2, is_decode);
+}
+
+void ggml_cuda_moe_grouped_context::prefetch_legacy_layer_by_name(
+        const char * tensor_name,
+        const int32_t * expert_ids,
+        int n_expert_ids,
+        bool use_l2,
+        bool is_decode) {
+    if (tensor_name == nullptr || tensor_name[0] == '\0' || expert_ids == nullptr || n_expert_ids <= 0) {
+        return;
+    }
+    if (moe_cache_lookahead_width() <= 0) {
+        return;
+    }
+    const ggml_tensor * target = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        for (const auto & entry : impl_->legacy_records) {
+            const ggml_tensor * tensor = entry.first;
+            if (tensor != nullptr && strncmp(tensor->name, tensor_name, GGML_MAX_NAME) == 0) {
+                target = tensor;
+                break;
+            }
+        }
+        if (target == nullptr && impl_->state.accepted) {
+            for (const auto & group : impl_->table.groups) {
+                for (const auto & bank : group.banks) {
+                    const ggml_tensor * tensor = bank.info.tensor;
+                    if (tensor != nullptr && strncmp(tensor->name, tensor_name, GGML_MAX_NAME) == 0) {
+                        target = tensor;
+                        break;
+                    }
+                }
+                if (target != nullptr) {
+                    break;
+                }
+            }
+        }
+    }
+    if (target == nullptr) {
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned, "moe-cache: look-ahead prefetch cannot resolve tensor name, skip");
+        return;
+    }
+    prefetch_legacy_layer(target, expert_ids, n_expert_ids, use_l2, is_decode);
+}
+// Look-ahead staging issue (PR-B): filter the producer's device-resident ids
+// into the target group's staging lane and hand the compacted list to the
+// mailbox copy worker. Stream-ordered kernels only: no D2H, no host sync.
+// True means staged (the caller skips the legacy prefetch path); false means
+// fall back to it. With the lookahead gate off this is one atomic load.
+bool ggml_cuda_moe_grouped_context::prefetch_stage_layer(const ggml_tensor * experts,
+        const int32_t * ids_device, int n_ids, bool is_decode, ggml_cuda_moe_stream_t stream) {
+    if (experts == nullptr || ids_device == nullptr || n_ids <= 0 || !is_decode || stream == nullptr) {
+        return false;
+    }
+    if (moe_cache_lookahead_width() <= 0) {
+        return false;
+    }
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || CUDART_VERSION < 12080
+    GGML_UNUSED(experts);
+    return false;
+#else
+    if (n_ids > 1 << 20) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->draining || impl_->replacement_pending) {
+        static std::atomic<bool> refused{false};
+        moe_cache_prefetch_warn_once(refused,
+            "moe-cache: lookahead-stage: refused, context draining or replacement pending");
+        return false;
+    }
+    impl::early_workspace * lane = impl_->ensure_lookahead_lane_locked(experts, stream);
+    if (lane == nullptr) {
+        static std::atomic<bool> refused{false};
+        moe_cache_prefetch_warn_once(refused,
+            "moe-cache: lookahead-stage: refused, no staging lane for target (see ensure reason)");
+        return false;
+    }
+    // Fail-fast backpressure: no unbounded wait on the decode path. A lane
+    // whose previous publish is unconsumed keeps valid staging (positions
+    // intact, the ready filter progress-gates), so skip instead of queueing
+    // another stream wait; the prediction falls back to demand. A worker
+    // that is not live can never satisfy a wait, so skip the same way.
+    if (!impl_->lookahead_worker_running_locked()) {
+        static std::atomic<bool> refused{false};
+        moe_cache_prefetch_warn_once(refused,
+            "moe-cache: lookahead-stage: refused, copy worker not running");
+        return false;
+    }
+    if (lane->la_publish_seq != lane->la_consumed_seq) {
+        lane->la_busy_skips++;
+        static std::atomic<bool> busy{false};
+        moe_cache_prefetch_warn_once(busy,
+            "moe-cache: lookahead-stage: skipped, previous publish unconsumed (backpressure)");
+        return false;
+    }
+    return impl_->publish_lookahead_locked(lane, ids_device, (uint32_t) n_ids, stream);
+#endif
+}
+
+int ggml_cuda_moe_grouped_context::preinstall_legacy_pools() {
+    if (moe_cache_lookahead_width() <= 0) {
+        return 0;
+    }
+    // legacy_records is only populated lazily by acquire_legacy_cache, so the
+    // tensors to install come from the published candidate snapshot itself.
+    std::vector<const ggml_tensor *> targets;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->state.generation == 0 || impl_->state.n_slots == 0) {
+            // Not ready, not a shortfall: the caller has to retry once the snapshot is
+            // published, so this must be distinguishable from installing zero pools.
+            return -1;
+        }
+        if (impl_->state.accepted) {
+            for (const auto & group : impl_->table.groups) {
+                for (const auto & bank : group.banks) {
+                    const ggml_tensor * tensor = bank.info.tensor;
+                    if (tensor != nullptr) {
+                        targets.push_back(tensor);
+                    }
+                }
+            }
+        }
+        for (const auto & entry : impl_->legacy_records) {
+            if (entry.first != nullptr) {
+                targets.push_back(entry.first);
+            }
+        }
+    }
+
+    int failed = 0;
+    for (const ggml_tensor * tensor : targets) {
+        // acquire_legacy_cache installs the per-layer pool on first use and keeps it
+        // for the context lifetime; the lease is dropped immediately.
+        auto lease = acquire_legacy_cache(tensor);
+        if (lease.get() == nullptr) {
+            failed++;
+        }
+    }
+    if (failed > 0) {
+        // A pool can only be installed while its group is under legacy cache authority
+        // with admission open. When the certified grouped path owns the group, no pool can
+        // ever be installed and the look-ahead has nothing to page into, so report the
+        // shortfall once rather than on every retry.
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_ERROR("moe-cache: look-ahead could not install %d of %zu MoE expert cache pools; the target "
+                    "layers are not under legacy cache authority, so look-ahead prefetch is inert\n",
+                    failed, targets.size());
+        }
+    }
+    return failed;
+}
+
+extern "C"
+int ggml_backend_cuda_moe_preinstall_lookahead_pools(void) {
+    if (moe_cache_lookahead_width() <= 0) {
+        return 0;
+    }
+    int failed = 0;
+    const int n_devices = ggml_backend_cuda_get_device_count();
+    for (int device = 0; device < n_devices; ++device) {
+        ggml_cuda_moe_grouped_context * context = moe_cache_prefetch_context(device);
+        if (context == nullptr) {
+            continue;
+        }
+        const int device_failed = context->preinstall_legacy_pools();
+        if (device_failed < 0) {
+            return -1;
+        }
+        failed += device_failed;
+    }
+    return failed;
 }
 
 extern "C"
@@ -13660,6 +16691,9 @@ bool ggml_cuda_moe_cache_grow_pool(
     std::fill(cache->slot_prefetched.begin(), cache->slot_prefetched.end(), 0);
     std::fill(cache->slot_hit_count.begin(), cache->slot_hit_count.end(), 0ull);
     std::fill(cache->slot_pin_count.begin(), cache->slot_pin_count.end(), 0u);
+    std::fill(cache->slot_reserved.begin(), cache->slot_reserved.end(), 0);
+    cache->n_slots_reserved = 0;
+    // n_slots_reserved_high is intentionally not reset (lifetime high-water).
     std::fill(cache->slot_fill_access.begin(), cache->slot_fill_access.end(), 0ull);
     cache->host_to_slot.clear();
     cache->access_counter = 0;
@@ -13826,6 +16860,11 @@ static moe_cache_phase_stats ggml_cuda_moe_cache_phase_stats(const struct ggml_c
     s.prefetch_misses = cache->phase_prefetch_misses[phase].load(std::memory_order_relaxed);
     s.prefetch_used = cache->phase_prefetch_used[phase].load(std::memory_order_relaxed);
     s.prefetch_evictions = cache->phase_prefetch_evictions[phase].load(std::memory_order_relaxed);
+    s.prefetch_dropped = cache->phase_prefetch_dropped[phase].load(std::memory_order_relaxed);
+    s.prefetch_reserve_refused = cache->phase_prefetch_reserve_refused[phase].load(std::memory_order_relaxed);
+    s.l1_reserved = (uint64_t) cache->n_slots_reserved;
+    s.l1_reserved_high = (uint64_t) cache->n_slots_reserved_high;
+    s.l1_reserve_budget = (uint64_t) ggml_cuda_moe_cache_reserve_effective(cache);
     s.demand_evictions = cache->phase_demand_evictions[phase].load(std::memory_order_relaxed);
     s.evicted_prefetched = cache->phase_evicted_prefetched[phase].load(std::memory_order_relaxed);
     s.evicted_hit_count_le1 = cache->phase_evicted_hit_count_le1[phase].load(std::memory_order_relaxed);
@@ -13844,6 +16883,33 @@ static moe_cache_phase_stats ggml_cuda_moe_cache_phase_stats(const struct ggml_c
         s.l2_fill_time_us = cache->l2.phase_fill_time_us[phase].load(std::memory_order_relaxed);
     }
     return s;
+}
+
+extern "C"
+void ggml_cuda_moe_cache_prefetch_stats_for_test(
+    const struct ggml_cuda_moe_cache * cache,
+    bool is_decode,
+    uint64_t * out_hits,
+    uint64_t * out_misses,
+    uint64_t * out_used,
+    uint64_t * out_h2d_bytes,
+    uint64_t * out_dropped) {
+    const int phase = moe_cache_phase_index(is_decode);
+    if (out_hits != nullptr) {
+        *out_hits = cache != nullptr ? cache->phase_prefetch_hits[phase].load(std::memory_order_relaxed) : 0;
+    }
+    if (out_misses != nullptr) {
+        *out_misses = cache != nullptr ? cache->phase_prefetch_misses[phase].load(std::memory_order_relaxed) : 0;
+    }
+    if (out_used != nullptr) {
+        *out_used = cache != nullptr ? cache->phase_prefetch_used[phase].load(std::memory_order_relaxed) : 0;
+    }
+    if (out_h2d_bytes != nullptr) {
+        *out_h2d_bytes = cache != nullptr ? cache->phase_prefetch_h2d_copy_bytes[phase].load(std::memory_order_relaxed) : 0;
+    }
+    if (out_dropped != nullptr) {
+        *out_dropped = cache != nullptr ? cache->phase_prefetch_dropped[phase].load(std::memory_order_relaxed) : 0;
+    }
 }
 
 static moe_cache_phase_stats moe_cache_take_op_stats(moe_cache_op_phase_stats & op, bool reset) {
@@ -13880,6 +16946,11 @@ static void ggml_cuda_moe_add_phase_stats(moe_cache_phase_stats & dst, const moe
     dst.prefetch_misses += src.prefetch_misses;
     dst.prefetch_used += src.prefetch_used;
     dst.prefetch_evictions += src.prefetch_evictions;
+    dst.prefetch_dropped += src.prefetch_dropped;
+    dst.prefetch_reserve_refused += src.prefetch_reserve_refused;
+    dst.l1_reserved += src.l1_reserved;
+    dst.l1_reserved_high += src.l1_reserved_high;
+    dst.l1_reserve_budget += src.l1_reserve_budget;
     dst.demand_evictions += src.demand_evictions;
     dst.evicted_prefetched += src.evicted_prefetched;
     dst.evicted_hit_count_le1 += src.evicted_hit_count_le1;
@@ -13919,7 +16990,7 @@ static void ggml_cuda_moe_log_phase_stats(const char * name, const moe_cache_pha
     const double l2_hit_rate = l2_total > 0 ? 100.0 * (double) s.l2_hits / (double) l2_total : 0.0;
     const double avg_unique = s.ops > 0 ? (double) s.unique_experts / (double) s.ops : 0.0;
     GGML_LOG(
-        "moe-cache-phase: phase=%s ops=%llu staged_ops=%llu split_staged_ops=%llu overflow_ops=%llu unique_avg=%.2f unique_max=%llu ids_mib=%.2f ids_d2h_mib=%.2f ids_d2h_ms=%.3f ids_d2h_syncs=%llu ids_cache_hits=%llu acquire_ms=%.3f remap_ms=%.3f copy_wait_events=%llu copy_wait_event_ms=%.3f op_cpu_ms=%.3f l1_hits=%llu l1_misses=%llu l1_evictions=%llu l1_hit_rate=%.2f%% l2_hits=%llu l2_misses=%llu l2_fills=%llu l2_evictions=%llu l2_fill_mib=%.2f l2_fill_ms=%.3f l2_hit_rate=%.2f%% h2d_copies=%llu h2d_mib=%.2f h2d_enqueue_ms=%.3f prefetch_hits=%llu prefetch_misses=%llu prefetch_used=%llu prefetch_h2d_copies=%llu prefetch_h2d_mib=%.2f prefetch_h2d_enqueue_ms=%.3f\n",
+        "moe-cache-phase: phase=%s ops=%llu staged_ops=%llu split_staged_ops=%llu overflow_ops=%llu unique_avg=%.2f unique_max=%llu ids_mib=%.2f ids_d2h_mib=%.2f ids_d2h_ms=%.3f ids_d2h_syncs=%llu ids_cache_hits=%llu acquire_ms=%.3f remap_ms=%.3f copy_wait_events=%llu copy_wait_event_ms=%.3f op_cpu_ms=%.3f l1_hits=%llu l1_misses=%llu l1_evictions=%llu l1_hit_rate=%.2f%% l2_hits=%llu l2_misses=%llu l2_fills=%llu l2_evictions=%llu l2_fill_mib=%.2f l2_fill_ms=%.3f l2_hit_rate=%.2f%% h2d_copies=%llu h2d_mib=%.2f h2d_enqueue_ms=%.3f prefetch_hits=%llu prefetch_misses=%llu prefetch_used=%llu prefetch_h2d_copies=%llu prefetch_h2d_mib=%.2f prefetch_h2d_enqueue_ms=%.3f prefetch_dropped=%llu prefetch_reserve_refused=%llu l1_reserved=%llu l1_reserved_high=%llu l1_reserve_budget=%llu evicted_prefetched_unused=%llu\n",
         name,
         (unsigned long long) s.ops,
         (unsigned long long) s.staged_ops,
@@ -13956,7 +17027,13 @@ static void ggml_cuda_moe_log_phase_stats(const char * name, const moe_cache_pha
         (unsigned long long) s.prefetch_used,
         (unsigned long long) s.prefetch_h2d_copy_count,
         (double) s.prefetch_h2d_copy_bytes / 1024.0 / 1024.0,
-        (double) s.prefetch_h2d_enqueue_time_us / 1000.0);
+        (double) s.prefetch_h2d_enqueue_time_us / 1000.0,
+        (unsigned long long) s.prefetch_dropped,
+        (unsigned long long) s.prefetch_reserve_refused,
+        (unsigned long long) s.l1_reserved,
+        (unsigned long long) s.l1_reserved_high,
+        (unsigned long long) s.l1_reserve_budget,
+        (unsigned long long) s.evicted_prefetched);
 }
 
 static uint64_t ggml_cuda_moe_cache_top_accesses(std::vector<uint64_t> counts, size_t n_top) {
@@ -14181,6 +17258,8 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache) {
         cache->phase_prefetch_misses[phase].store(0, std::memory_order_relaxed);
         cache->phase_prefetch_used[phase].store(0, std::memory_order_relaxed);
         cache->phase_prefetch_evictions[phase].store(0, std::memory_order_relaxed);
+        cache->phase_prefetch_dropped[phase].store(0, std::memory_order_relaxed);
+        cache->phase_prefetch_reserve_refused[phase].store(0, std::memory_order_relaxed);
         cache->phase_demand_evictions[phase].store(0, std::memory_order_relaxed);
         cache->phase_evicted_prefetched[phase].store(0, std::memory_order_relaxed);
         cache->phase_evicted_hit_count_le1[phase].store(0, std::memory_order_relaxed);
@@ -14545,6 +17624,19 @@ size_t ggml_backend_cuda_moe_get_l2_pinned_cache_size(void) {
 }
 
 extern "C"
+void ggml_backend_cuda_moe_set_lookahead(int n) {
+    if (n < 0) {
+        n = 0;
+    }
+    g_moe_cache_lookahead.store(n, std::memory_order_relaxed);
+}
+
+extern "C"
+int ggml_backend_cuda_moe_get_lookahead(void) {
+    return g_moe_cache_lookahead.load(std::memory_order_relaxed);
+}
+
+extern "C"
 void ggml_backend_cuda_moe_set_debug_mm(bool enabled) {
     g_moe_cache_mm_debug.store(enabled, std::memory_order_relaxed);
 }
@@ -14583,12 +17675,63 @@ void ggml_backend_cuda_moe_prefetch_experts(
     int             n_eids,
     bool            use_l2,
     bool            is_decode) {
-    GGML_UNUSED(device);
-    GGML_UNUSED(tensor_name);
-    GGML_UNUSED(eids);
-    GGML_UNUSED(n_eids);
-    GGML_UNUSED(use_l2);
-    GGML_UNUSED(is_decode);
+    // Inert until the lookahead gate is on. The graph-level producer (a later
+    // PR) is the only caller; with the default 0 this is stock behavior.
+    if (eids == nullptr || n_eids <= 0 || moe_cache_lookahead_width() <= 0) {
+        return;
+    }
+    if (tensor_name == nullptr || tensor_name[0] == '\0') {
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned, "moe-cache: look-ahead prefetch called without tensor name, skip");
+        return;
+    }
+    // The observation hook carries no tensor pointers, so resolution goes
+    // through the device's grouped context (known expert tensors). Logs
+    // loudly when nothing can serve the request.
+    ggml_cuda_moe_grouped_context * context = moe_cache_prefetch_context(device);
+    if (context == nullptr) {
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned, "moe-cache: look-ahead prefetch has no grouped context for device, skip");
+        return;
+    }
+    context->prefetch_legacy_layer_by_name(tensor_name, eids, n_eids, use_l2, is_decode);
+}
+
+// Pointer-based entry for the in-tree producer. Same gate, no name lookup.
+extern "C"
+void ggml_backend_cuda_moe_prefetch_experts_tensor(
+    int device,
+    const ggml_tensor * experts,
+    const int32_t * expert_ids,
+    int n_expert_ids,
+    bool use_l2,
+    bool is_decode) {
+    if (experts == nullptr || expert_ids == nullptr || n_expert_ids <= 0 || moe_cache_lookahead_width() <= 0) {
+        return;
+    }
+    ggml_cuda_moe_grouped_context * context = moe_cache_prefetch_context(device);
+    if (context == nullptr) {
+        static std::atomic<bool> warned{false};
+        moe_cache_prefetch_warn_once(warned, "moe-cache: look-ahead prefetch has no grouped context for device, skip");
+        return;
+    }
+    context->prefetch_legacy_layer(experts, expert_ids, n_expert_ids, use_l2, is_decode);
+}
+// Staging issue for the in-tree producer. ids_device must be device-resident
+// predicted ids (the MOE_PREFETCH node's ids tensor data); stream is the
+// dispatch stream the node runs on. True when staged, false to fall back.
+extern "C"
+bool ggml_backend_cuda_moe_stage_lookahead(int device, const ggml_tensor * experts,
+        const int32_t * ids_device, int n_ids, ggml_cuda_moe_stream_t stream) {
+    if (experts == nullptr || ids_device == nullptr || n_ids <= 0 || stream == nullptr ||
+            moe_cache_lookahead_width() <= 0) {
+        return false;
+    }
+    ggml_cuda_moe_grouped_context * context = moe_cache_prefetch_context(device);
+    if (context == nullptr) {
+        return false;
+    }
+    return context->prefetch_stage_layer(experts, ids_device, n_ids, true, stream);
 }
 
 // Deprecated singular-pool entry point; superseded by preallocate_pools (plural).

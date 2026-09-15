@@ -1423,6 +1423,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         if (set_l2_fn != nullptr) {
             set_l2_fn(params.moe_expert_cache_l2_pinned_size);
         }
+        auto set_lookahead_fn = (ggml_backend_moe_cache_set_lookahead_t) ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_MOE_CACHE_SET_LOOKAHEAD_PROC_NAME);
+        if (set_lookahead_fn != nullptr) {
+            set_lookahead_fn(params.n_moe_lookahead);
+        }
         if (set_debug_fn != nullptr) {
             set_debug_fn(params.experimental_logs);
         }
@@ -1711,6 +1716,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.n_gpu_layers          = params.n_gpu_layers;
     mparams.moe_expert_cache_slots = params.n_moe_expert_cache_slots;
+    mparams.moe_lookahead             = params.n_moe_lookahead;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;

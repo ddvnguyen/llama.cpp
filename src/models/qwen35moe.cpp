@@ -1,6 +1,30 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+#include <cstring>
+
+// WHERE the look-ahead for layer il+1 is ISSUED, chosen at run time.
+//
+// Both positions form the same prediction from the same post-attention state, but each
+// couples it to a different part of the layer:
+//
+//   after this layer's FFN (default) - the staging transfer rides the NEXT layer's
+//     attention, where nothing is reading host memory. The filter that decides WHICH
+//     experts to stage then runs at a different point relative to the plan, so it stages
+//     a different set of experts.
+//   before this layer's FFN (legacy) - the filter matches the plan as computed, but the
+//     transfer is issued while this layer's MoE demand gather is running: both read over
+//     the same PCIe link, so the staging displaces the gather one byte for one byte
+//     (displacement coefficient 1.00, measured over three runs).
+//
+// Neither position is free, so this knob exists to A/B the two couplings in one binary.
+static bool moe_lookahead_issue_after_ffn() {
+    static const bool after_ffn = getenv("GGML_MOE_LOOKAHEAD_ISSUE_AFTER_FFN") == nullptr ||
+            strcmp(getenv("GGML_MOE_LOOKAHEAD_ISSUE_AFTER_FFN"), "0") != 0;
+    return after_ffn;
+}
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -206,6 +230,42 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // Save the tensor before post-attention norm for residual connection
         ggml_tensor * ffn_residual = cur;
 
+        // MoE look-ahead: predict layer il+1's experts from this layer's post-attention
+        // state and page them into the window where the fabric is actually idle, which is
+        // the NEXT layer's attention.
+        //
+        // The MoE bucket is not compute-bound: of its 81.04 ms, ~77 ms is the demand
+        // gather reading the experts' host memory over the same PCIe link this transfer
+        // needs. Issued BEFORE this layer's FFN - the legacy position - the transfer runs
+        // alongside that gather and displaces it one byte for one byte (measured
+        // displacement coefficient 1.00, three runs). Issued AFTER the FFN - the default -
+        // it rides the following attention instead, where nothing is reading host memory,
+        // but the filter that decides WHICH experts to stage then runs at a different
+        // point relative to the plan and stages a different set of experts.
+        //
+        // Neither position is free, so GGML_MOE_LOOKAHEAD_ISSUE_AFTER_FFN A/Bs the two
+        // couplings in one binary.
+        //
+        // Kept outside the FFN block so the router chain stays contiguous for the router
+        // fusions.
+        auto issue_lookahead = [&](ggml_tensor * post_attn) {
+            if (il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr && moe_lookahead_enabled()) {
+                ggml_tensor * lookahead_state = build_norm(post_attn,
+                        model.layers[il + 1].attn_post_norm, nullptr, LLM_NORM_RMS, il + 1);
+                ggml_tensor * lookahead = build_moe_lookahead(lookahead_state,
+                        model.layers[il + 1].ffn_gate_inp,
+                        model.layers[il + 1].ffn_up_exps,
+                        il + 1);
+                if (lookahead != nullptr) {
+                    ggml_build_forward_expand(gf, lookahead);
+                }
+            }
+        };
+
+        if (!moe_lookahead_issue_after_ffn()) {
+            issue_lookahead(ffn_residual);
+        }
+
         // Post-attention norm
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
@@ -217,6 +277,10 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_moe", il);
+
+        if (moe_lookahead_issue_after_ffn()) {
+            issue_lookahead(ffn_residual);
+        }
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
