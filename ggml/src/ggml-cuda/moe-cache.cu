@@ -5845,6 +5845,11 @@ struct ggml_cuda_moe_grouped_context::impl {
     // count, cumulative since the lane was created), so consume_pct_total is
     // the lifetime staging ratio: staged bytes minus consumed bytes is the
     // look-ahead's own accounting, distinct from the one-layer instrument.
+    // used_pct_total is a different ratio and is expert-count based: it is
+    // consumed experts / staged experts (snap[3] over snap[2], both lifetime),
+    // i.e. how often the next layer actually wanted an expert we fetched ahead
+    // of time, whereas consume_pct_total is consumed bytes / staged bytes (how
+    // much of what was transported got read). Do not conflate the two.
     void lookahead_drain_and_emit() {
         if (lookahead.empty()) {
             return;
@@ -5858,6 +5863,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint64_t busy = 0;
         uint64_t published = 0;
         uint64_t staged_bytes_total = 0;
+        uint64_t staged_experts_total = 0;
         uint64_t consumed_bytes_total = 0;
         uint64_t consumed_total = 0;
         for (auto & lane : lookahead) {
@@ -5875,6 +5881,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             refused += snap[6] - lane->la_emit_counters[6];
             published += snap[4] - lane->la_emit_counters[4];
             staged_bytes_total += snap[0];
+            staged_experts_total += snap[2];
             consumed_bytes_total += snap[1];
             consumed_total += snap[3];
             for (int i = 0; i < GGML_CUDA_MOE_LOOKAHEAD_COUNTERS; ++i) {
@@ -5885,13 +5892,15 @@ struct ggml_cuda_moe_grouped_context::impl {
             busy += lane->la_busy_skips - lane->la_emit_busy;
             lane->la_emit_busy = lane->la_busy_skips;
         }
-        GGML_LOG("moe-lookahead-stage: dispatches=%llu lanes=%llu published=%llu staged_mib=%.2f prefetch_used=%llu prefetch_dropped=%llu prefetch_reserve_refused=%llu evicted_prefetched=%llu busy_skips=%llu consumed_mib_total=%.2f consumed_total=%llu consume_pct_total=%.2f\n",
+        GGML_LOG("moe-lookahead-stage: dispatches=%llu lanes=%llu published=%llu staged_mib=%.2f prefetch_used=%llu prefetch_dropped=%llu prefetch_reserve_refused=%llu evicted_prefetched=%llu busy_skips=%llu consumed_mib_total=%.2f consumed_total=%llu consume_pct_total=%.2f staged_experts_total=%llu used_pct_total=%.2f\n",
             (unsigned long long) lookahead_dispatches, (unsigned long long) lookahead.size(),
             (unsigned long long) published, (double) staged_bytes / 1048576.0,
             (unsigned long long) used, (unsigned long long) dropped,
             (unsigned long long) refused, (unsigned long long) evicted, (unsigned long long) busy,
             (double) consumed_bytes_total / 1048576.0, (unsigned long long) consumed_total,
-            100.0 * (double) consumed_bytes_total / (double) std::max<uint64_t>(1, staged_bytes_total));
+            100.0 * (double) consumed_bytes_total / (double) std::max<uint64_t>(1, staged_bytes_total),
+            (unsigned long long) staged_experts_total,
+            100.0 * (double) consumed_total / (double) std::max<uint64_t>(1, staged_experts_total));
     }
 
     struct grouped_device_resource {
