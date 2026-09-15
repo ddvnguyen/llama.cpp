@@ -5,12 +5,23 @@
 # width (8). Arm ev0 is the shipped baseline and shows what the feature costs on its own.
 #
 #   ev0    la=0  policy=lfu                  shipped baseline
+#   ev0p   la=0  policy=protect              RECENT1 alone - the only retention policy with a
+#                                            measured POSITIVE sign in the offline engine
+#                                            (+1.2%, and model-dependent, so it needs the rig)
 #   ev8f   la=8  policy=lfu                  look-ahead as it ships today (side lane only)
-#   ev8p   la=8  policy=protect              prediction-guided VICTIM selection
+#   ev8p   la=8  policy=protect              protect, composed with look-ahead
 #   ev8a   la=8  policy=lfu      admit=1     owner request: store predictions INTO the cache
 #   ev8ap  la=8  policy=protect  admit=1     both, composed
 #
-# Five arms, about 1.5 min each. Reports decode t/s, misses/step, and the stage counters.
+# Six arms, about 1.5 min each. Reports decode t/s, misses/step, and the stage counters.
+#
+# EXPECTATIONS, from the offline policy engine (which replays the shipped policy exactly):
+#   ev0p  ~+1.2%  (223.57 vs 225.00 misses/step), sign is model-dependent -> this is the test
+#   ev8p  ~0.0%   the tree's predictor targets a different LAYER, so it carries no retention
+#                 signal for the layer being evicted; this arm verifies that null on hardware
+#   ev8a  the only arm whose mechanism can pay: it turns the 2.05 MiB staging lane into cache
+#                 slots, so staged data stops being thrown away (1.91% -> toward 95.5% useful).
+#                 The win is TIMING, not bytes: no arm here can reduce traffic except ev0p.
 set -u
 D=/mnt/WorkDisk/harness/multiturn-ctx
 N=42
@@ -51,6 +62,7 @@ arm() {
 }
 
 arm ev0   0 "lfu"
+arm ev0p  0 "protect"
 arm ev8f  "$WIDTH" lfu
 arm ev8p  "$WIDTH" protect
 arm ev8a  "$WIDTH" lfu     1
