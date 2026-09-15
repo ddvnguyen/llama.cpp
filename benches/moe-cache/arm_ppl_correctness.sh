@@ -25,7 +25,7 @@ CHUNKS=15
 run_arm() {
   TAG=$1; LA=$2
   echo "########## PPL $TAG lookahead=$LA ##########"
-  pkill -f 'llama-perplexity' 2>/dev/null; pkill -f 'llama-server' 2>/dev/null; sleep 5
+  pkill -f 'bin/llama-perplexity' 2>/dev/null; pkill -f 'bin/llama-server' 2>/dev/null; sleep 5
   CUDA_VISIBLE_DEVICES=1 "$BIN" -m "$M" -f "$CORPUS" --chunks $CHUNKS -c 512 -b 512 \
     --split-mode layer -fit off -ngl 99 --n-cpu-moe 99 \
     --override-tensor per_layer_token_embd=CPU \
@@ -46,5 +46,5 @@ echo "########## SUMMARY ##########"
 for t in ppl0 ppl0b ppl8; do
   printf "  %-7s %s\n" "$t" "$(grep -oE 'Final estimate: PPL = [0-9.]+' "$D/ppl-$t.log" | tail -1)"
 done
-pkill -f 'llama-perplexity' 2>/dev/null
+pkill -f 'bin/llama-perplexity' 2>/dev/null
 echo "########## DONE ##########"

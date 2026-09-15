@@ -5,7 +5,7 @@
 # and logs:  moe-cache-lookahead-debug: prefetch_calls= predicted_ids= checks= recall=%
 set -u
 D=/mnt/WorkDisk/harness/multiturn-ctx
-hyg() { pkill -f 'llama-server' 2>/dev/null; sleep 5; echo "[hyg] gpu: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits|tr '\n' ' ')"; }
+hyg() { pkill -f 'bin/llama-server' 2>/dev/null; sleep 5; echo "[hyg] gpu: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits|tr '\n' ' ')"; }
 arm() {
   TAG=$1; W=$2
   echo "########## RECALL $TAG width=$W ##########"

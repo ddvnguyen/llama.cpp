@@ -21,7 +21,7 @@ OUT="$D/width-results.txt"
 : > "$OUT"
 
 hyg() {
-  pkill -f 'llama-server' 2>/dev/null
+  pkill -f 'bin/llama-server' 2>/dev/null
   sleep 5
   echo "  [hyg] gpu: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | tr '\n' ' ')"
 }

@@ -4,7 +4,7 @@
 # OFF arm: the distribution control at the same cache size.
 set -u
 D=/mnt/WorkDisk/harness/multiturn-ctx
-hyg() { pkill -f 'llama-server' 2>/dev/null; sleep 5; echo "[hyg] gpu: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits|tr '\n' ' ')"; }
+hyg() { pkill -f 'bin/llama-server' 2>/dev/null; sleep 5; echo "[hyg] gpu: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits|tr '\n' ' ')"; }
 arm() {
   TAG=$1; LA=$2
   echo "########## N42 $TAG lookahead=$LA ##########"

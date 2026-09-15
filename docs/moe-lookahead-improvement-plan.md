@@ -1491,3 +1491,127 @@ No admission result exists yet; do not cite one.
 
 In any case, the admission arm's premise is now weak on its own terms: an admission adds a fetch and
 can remove at most one, and the width results show staged bytes are additive on this fabric.
+
+---
+
+## 7.30 Rev 21 - mechanism resolved, the admission question answered, and the operating point settled
+
+### The width curve reproduces on the fixed binary
+
+w4 is repeated because its first run closed ~2 s before an unrelated build window opened, which is a
+margin rather than a guarantee. It reproduces.
+
+| width | misses | staged experts | used% | t/s (run 1) | t/s (run 2) |
+|---|---|---|---|---|---|
+| 1 | 225.00 | 3221  | 94.85 | 10.3841 | 10.4260 |
+| 2 | 225.00 | 6932  | 69.72 | 10.4677 | 10.4707 |
+| 4 | 225.00 | 15370 | 43.21 | 10.0130 | 10.0246 |
+| 8 | 225.00 | 35222 |  2.26 |  8.0052 |  8.0166 |
+
+Within 0.4% everywhere, so the curve is solid and width 8's cost is reproducible to 0.14%.
+
+### Mechanism: the shipped width is a traffic problem, the small widths are a fixed-cost problem
+
+`staged_mib` on the stage line is a **per-dispatch delta**, not a lifetime total; `*_total` fields on
+that line are lifetime sums. Conflating the two produced a 150x phantom mismatch earlier. Per-step
+staging, cross-checked two ways (staged_experts x 1.796 MiB / 198 dispatches, against the mean of the
+per-dispatch staged_mib), agrees to 0.4%: w1 29.2, w2 62.9, w4 139.4, w8 319.5 MiB/step.
+
+Waste is staged minus consumed, and it fits a two-term model against the measured loss:
+
+| width | staged/step | waste/step | loss/token |
+|---|---|---|---|
+| 1 |  29.2 MiB |   1.5 MiB | 3.6 ms |
+| 2 |  62.9     |  19.0     | 3.2    |
+| 4 | 139.4     |  79.3     | 7.6    |
+| 8 | 319.5     | 312.0     | 32.6   |
+
+**~1.3 ms fixed + ~0.10 ms per MiB/step of wasted staging** (about 10 GB/s effective for the wasted
+copies). At width 8 the byte term is 31 of the 32.6 ms, so the shipped width is additive traffic; at
+width 1 the byte term is 0.15 ms of 3.6 ms, so the small-width loss is a fixed per-feature cost.
+Demand is 225 misses x 1.79 MiB = ~401 MiB/step, so width 8 stages ~80% of the demand volume and
+wastes ~78% of it, which is also why hits cannot move. This closes the look-ahead axis: the feature
+is evaluated, explained, and off.
+
+### The admission request: it works, it is coherent, and it loses 9.1%
+
+With the plan-residency trap fixed, both admission arms complete 199 steps with no CUDA error.
+
+| arm | misses/step | admitted/step | real traffic | admit_evictions | t/s |
+|---|---|---|---|---|---|
+| ev8f  la=8 lfu     admit=0 | 225.00 |  0.00 | 225.0 | - | 8.0052 |
+| ev8a  la=8 lfu     admit=1 | 268.80 | 44.92 | **223.9** | 8790 of 8940 | **7.2730** |
+| ev8ap la=8 protect admit=1 | 266.80 | 43.65 | **223.2** | 8537 of 8687 | **7.3412** |
+
+The owner's request is coherent and the mechanism does what it was meant to: real traffic (misses net
+of admissions) falls below the no-admission case, 225.0 to 223.9 and 223.2, so some predicted experts
+do become hits. But the exchange rate is the whole story - **~1.1 fewer misses/step bought with 45
+extra fetches/step, a 41:1 loss ratio** - and 98.3% of admissions evict a resident rather than filling
+an empty slot, so the cost is displacement as well as transport. Net effect **-9.1%** (lfu) and
+-8.7% (protect) on top of the look-ahead's own -26.1%: 7.2730 against 10.8320 with both off is
+**-32.9%**.
+
+The candidates the plan can admit are predicted AND not resident AND not demanded, i.e. this step's
+prediction false positives, ~45/step as measured against EvictPolicy's static estimate of ~51.8, and
+its predicted ledger of ~278 against the measured 268.8. The static model was right; the arm confirms
+it on hardware.
+
+### The operating point
+
+Same session, same binary, look-ahead off:
+
+| N | misses/step | t/s | vs N=42 |
+|---|---|---|---|
+| 42 | 225.00 | 10.8776 | - |
+| 48 | 211.50 | 11.3891 | **+4.70%** |
+| 53 | 201.54 | 11.7824 | **+8.32%** |
+
+**-2.25 misses per slot** between 42 and 48, consistent with the Belady slope of -2.0, and +0.76%/slot.
+The step model holds across the new points to within 0.9%. Since the look-ahead is a loss at every
+width, the recorded mutual exclusion is void: **N=53 with the look-ahead off dominates every
+look-ahead configuration, +8.32% over the current operating point, by flag change alone.**
+
+### Retention, closed among the four implemented policies
+
+At la=0, `protect` IS `recent1` - the predicted-mask pin needs a mask that does not exist at width 0 -
+which is why ev0p reproduced the offline RECENT1 prediction exactly.
+
+- **shipped LFU-16**: 225.00 misses/step, 10.8320 t/s. Stands.
+- **recent1**: 223.57, a deterministic 0.64% miss gain, free, no VRAM, no look-ahead. Invisible in
+  time: 10.8316 against 10.8320, wrong sign, against a 0.41 ms/token model prediction. Below arm
+  resolution, so recorded as a miss-count fact and not a throughput claim.
+- **protect** (LFU + recent1 + predicted-mask pin): 223.49, i.e. -0.08 against recent1 alone. The mask
+  half is nothing, as the cross-layer argument required.
+- **LRU**: 242.1 offline, strictly worse.
+
+The capacity axis is the only lever with a measurable coefficient.
+
+### Retention at the operating point: the headroom closes with capacity
+
+One extra arm, same session and binary, look-ahead off, N=53:
+
+| N=53, la=0 | misses/step | t/s |
+|---|---|---|
+| shipped LFU-16 | 201.54 | 11.7824 |
+| recent1 | **201.33** | 11.7962 |
+| delta | **-0.21 (-0.10%)** | +0.12% |
+
+At N=42 the same policy bought -1.43 misses/step (-0.64%); at N=53 it buys -0.21 (-0.10%). The gain
+shrinks five-fold as capacity grows, which is what the mechanism predicts: recent1 repairs an integer
+decay artifact (`freq >> elapsed` zeroes count-1 experts at an epoch boundary, so a one-step-old
+resident can lose to an older one), and the damage that artifact can do falls as slots stop being
+scarce. The miss count is deterministic, so this decides the axis even though 0.12% of t/s does not.
+
+**Conclusion for the live axis: at the operating point, the best implementable retention policy is
+worth 0.2 misses per step.** The remaining 34.3% of avoidable misses needs a same-layer predictor
+with 8-16 steps of horizon, and section 7.28 shows such a predictor cannot exist for a
+non-speculative decoder. The axis is closed by information, not by effort.
+
+### Harness hazard found and fixed
+
+A wrapper command whose command line contains the string `--target llama-server` is killed by the
+harness's own `pkill -f 'llama-server'` hygiene - the job killed its own parent shell. Anchored all 20
+scripts to `bin/llama-server` / `bin/llama-perplexity` / `bin/test-moe-cache`, which still matches the
+real argv[0] (`$BIN/llama-server`) and cannot match a build command. Also added TAG_PREFIX to
+arm_cache_sweep.sh and an arm selector to arm_evict_policy.sh, so a single arm can be run without
+overwriting another arm's logs.

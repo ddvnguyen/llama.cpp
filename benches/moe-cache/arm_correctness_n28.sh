@@ -31,7 +31,7 @@ PORT=18336
 N=28
 
 hygiene() {
-  pkill -f 'llama-server' 2>/dev/null
+  pkill -f 'bin/llama-server' 2>/dev/null
   sleep 5
   echo "[hygiene] gpu: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | tr '\n' ' ')"
 }

@@ -37,7 +37,7 @@ OUT="$D/evict-policy-results.txt"
 : > "$OUT"
 
 hyg() {
-  pkill -f 'llama-server' 2>/dev/null
+  pkill -f 'bin/llama-server' 2>/dev/null
   sleep 5
   echo "  [hyg] gpu: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | tr '\n' ' ')"
 }
@@ -78,13 +78,19 @@ arm() {
   sleep 6
 }
 
-arm ev0   0 "lfu"
-arm ev0p  0 "protect"
-arm ev8f  "$WIDTH" lfu
-arm ev8p  "$WIDTH" protect
-arm ev8r  "$WIDTH" recent1
-arm ev8a  "$WIDTH" lfu     1
-arm ev8ap "$WIDTH" protect 1
+# usage: arm_evict_policy.sh [arm ...]      default: all seven
+# Selecting a subset matters when only some arms are safe to run: the admit arms aborted the server
+# before the plan-residency fix, and a crash costs the whole run.
+WANT="${*:-ev0 ev0p ev8f ev8p ev8r ev8a ev8ap}"
+want() { case " $WANT " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+want ev0   && arm ev0   0 "lfu"
+want ev0p  && arm ev0p  0 "protect"
+want ev8f  && arm ev8f  "$WIDTH" lfu
+want ev8p  && arm ev8p  "$WIDTH" protect
+want ev8r  && arm ev8r  "$WIDTH" recent1
+want ev8a  && arm ev8a  "$WIDTH" lfu     1
+want ev8ap && arm ev8ap "$WIDTH" protect 1
 
 hyg
 echo "########## results ##########"

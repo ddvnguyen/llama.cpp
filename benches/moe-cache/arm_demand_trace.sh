@@ -9,7 +9,7 @@ D=/mnt/WorkDisk/harness/multiturn-ctx
 TAG=dt42
 TRACE="$D/demand-trace-$TAG.txt"
 rm -f "$TRACE"
-pkill -f 'llama-server' 2>/dev/null
+pkill -f 'bin/llama-server' 2>/dev/null
 sleep 5
 echo "[hyg] gpu before: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | tr '\n' ' ')"
 env GGML_CUDA_MOE_PHASE_PROBE_PER_STEP=1 \
@@ -32,7 +32,7 @@ echo "--- ledger ---"
 [ -f "$D/server-$TAG.log" ] && grep 'moe-step:' "$D/server-$TAG.log" > "$D/moe-steps-$TAG.log" \
   && echo "  ledger lines: $(wc -l < "$D/moe-steps-$TAG.log")" \
   && tail -3 "$D/moe-steps-$TAG.log"
-pkill -f 'llama-server' 2>/dev/null
+pkill -f 'bin/llama-server' 2>/dev/null
 sleep 4
 echo "[hyg] gpu after: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | tr '\n' ' ')"
 echo "########## DONE ##########"
