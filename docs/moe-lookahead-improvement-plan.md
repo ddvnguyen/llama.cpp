@@ -1413,3 +1413,81 @@ and the shipped LFU-16 is the optimum of that family (4: 235.20, 8: 229.47, 16: 
 
 Harness now travels with the code: benches/moe-cache/ + docs/moe-lookahead-improvement-plan.md,
 commit bb2ca31a3.
+
+---
+
+## 7.29 Rev 20 - the look-ahead is a net loss at every width, and the N=53 exclusion is therefore moot
+
+Seven-arm matrix at N=42, `arm_evict_policy.sh`, 200 tokens, real prompt, one build. Width 0 arms
+first, because the whole table is only meaningful if the patched binary still runs the shipped path.
+
+| arm | width | policy | admit | misses/step | staged | used% | decode t/s | vs width 0 |
+|---|---|---|---|---|---|---|---|---|
+| ev0  | 0 | lfu     | 0 | 225.00 | 0     | -     | **10.8320** | - |
+| ev0p | 0 | protect | 0 | 223.57 | 0     | -     | 10.8316 | -0.00% |
+| w1   | 1 | lfu     | 0 | 225.00 | 3221  | 94.78 | 10.3841 | **-4.14%** |
+| w2   | 2 | lfu     | 0 | 225.00 | 6932  | 69.73 | 10.4677 | **-3.36%** |
+| ev8f | 8 | lfu     | 0 | 225.00 | 35222 | 2.33  | 8.0052  | **-26.08%** |
+| ev8p | 8 | protect | 0 | 223.49 | 34978 | 2.91  | 8.0368  | -25.81% |
+| ev8r | 8 | recent1 | 0 | 223.57 | 35022 | 2.39  | 8.0343  | -25.83% |
+
+### The default path is proven, not asserted
+
+`ev0`'s ledger is **byte-identical** to the recorded baseline: `cmp` clean against
+`moe-steps-dt42.log`, 199 steps, 225.00 misses/step, `decode_tps=10.8320`. The 587-line eviction patch
+does not move the shipped path. This is the check that makes every other row trustworthy.
+
+### RECENT1 is real, exact, and worthless
+
+`ev0p` measured **223.57** misses/step. PolicyEval's engine predicted **223.57** from replay alone, on
+a different implementation, offline. That is a full end-to-end validation of the simulator: it is not
+a model of the shipped policy, it is the shipped policy. The effect is nonetheless worth nothing -
+223.57 vs 225.00 is 1.43 fewer misses/step, which the step model prices at +0.4%, and the rig
+delivers 10.8316 against 10.8320, i.e. no change outside noise.
+
+`ev8p - ev8r = -0.08` misses/step: **the predicted-mask pin is a no-op on hardware**, confirming the
+cross-layer finding below. It was never going to work, for the reason in 7.28.
+
+### The look-ahead loses at EVERY width, with identical misses
+
+This is the result that matters. Misses are **225.00 at widths 0, 1, 2, 4 and 8** - the feature never
+changes the hit rate, at any setting. Its only possible win was moving bytes in time (link is ~69%
+busy, so a perfect overlap would give +28%). Measured, it does the opposite: it loses 4.1% at width 1,
+3.4% at width 2, 7.6% at width 4 and 26.1% at width 8.
+
+And it is not a tuning failure. At width 1 the staging ratio is **94.78% useful** - the mechanism is
+working exactly as designed, staging 16.2 experts/step of which 15.3 are consumed - and it still
+loses 4.1%. With a displacement coefficient of 1.00 the fabric is serial, so a staged fetch displaces
+a demand fetch and the demand fetch still has to happen; the staging adds transport without removing
+any. Width 8 is the same effect amplified: 35222 staged experts at 2.33% useful is 26% of the
+scheduler's time handed to the link for nothing.
+
+The earlier "1.91% usefulness at width 8" reading was right but was misread as a lateness problem.
+It is not: at width 1 lateness is gone (94.78% used) and the loss is still there. **The staged fetch
+is additive, not substitutive.**
+
+### Consequence: the recorded trade no longer exists
+
+The owner's record has N=53 (11.738 t/s) as mutually exclusive with look-ahead, and named N=42 as the
+operating point. Both halves of that trade have now moved:
+
+- the look-ahead, which is what N=53 excluded, is a **pessimization at every width** (-4.1% best case),
+- the capacity axis it was traded against is **+8.9%**: N=53 recomputed from `perftok-n53.tsv` is
+  11.79 t/s against 10.832 today, both measured with `lookahead=0` (confirmed at arm_cache_sweep.sh:25).
+
+So N=53 with the look-ahead off **dominates every look-ahead configuration**, and the exclusion costs
+nothing because there is nothing on the other side of it. Recommended operating point: **N=53,
+look-ahead off, +8.9% over 10.832**, by flag change alone.
+
+### Blocker: the admission path crashes
+
+`ev8a` and `ev8ap` (`GGML_MOE_ADMIT_PREDICTED=1`) **abort the server on step 2**:
+`ggml-cuda.cu:117: CUDA error: unspecified launch failure`. Both died with
+`staged_experts_total=344 admitted_experts=0 admit_evictions=0 admit_skipped=0`, i.e. **before any
+admission was committed** - so it is the admission-enabled plan path, not the commit path. The
+`admit=0` arms ran clean in the same build. Fix delegated back to the implementing agent with the
+hypothesis that the host plan sizing and the device indexing disagree once `admit_cap != 0`.
+No admission result exists yet; do not cite one.
+
+In any case, the admission arm's premise is now weak on its own terms: an admission adds a fetch and
+can remove at most one, and the width results show staged bytes are additive on this fabric.

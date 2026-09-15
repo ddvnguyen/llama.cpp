@@ -12,8 +12,15 @@
 #   ev8p   la=8  policy=protect              protect, composed with look-ahead
 #   ev8a   la=8  policy=lfu      admit=1     owner request: store predictions INTO the cache
 #   ev8ap  la=8  policy=protect  admit=1     both, composed
+#   ev8r   la=8  policy=recent1  admit=0     recent1 alone at width 8
 #
-# Six arms, about 1.5 min each. Reports decode t/s, misses/step, and the stage counters.
+# protect is the UNION of two pin sources: the recent1 warm-set pin and the predicted-mask pin.
+# recent1 is the warm-set half alone. At la=0 there is no lane, so the mask half is inert and
+# ev0p IS the recent1 rule. At la=8 the union and the half differ, and
+#     ev8p - ev8r  = the look-ahead mask's marginal retention effect
+#     ev8p - ev0p  = the whole look-ahead's effect on retention (mask + lane interaction)
+#
+# Seven arms, about 1.5 min each. Reports decode t/s, misses/step, and the stage counters.
 #
 # EXPECTATIONS, from the offline policy engine (which replays the shipped policy exactly):
 #   ev0p  ~+1.2%  (223.57 vs 225.00 misses/step), sign is model-dependent -> this is the test
@@ -53,11 +60,21 @@ arm() {
   lines=$(wc -l < "$D/moe-steps-$TAG.log")
   miss=$(awk -F'misses=' '{split($2,a," "); s+=a[1]} END {printf "%.1f", (NR? s/NR:0)}' "$D/moe-steps-$TAG.log")
   tps=$(grep -oE 'decode_tps=[0-9.]+' "$D/arm-$TAG.out" | tail -1 | cut -d= -f2)
-  echo "  ledger lines: $lines   misses/step: $miss   decode_tps: ${tps:-n/a}"
+  local adm=0
+  if [ "$LA" -gt 0 ]; then
+    adm=$(grep 'moe-lookahead-stage:' "$log" | tail -1 | grep -oE 'admitted_experts=[0-9]+' | cut -d= -f2)
+    adm=${adm:-0}
+  fi
+  # Admissions are billed as fetches by design, so with admit=1 the ledger is inflated and
+  # misses/step is NOT comparable across arms. Real traffic is misses minus admissions.
+  local admps real
+  admps=$(awk -v a="$adm" -v n="$lines" 'BEGIN{printf "%.2f", (n? a/n : 0)}')
+  real=$(awk -v m="$miss" -v a="$admps" 'BEGIN{printf "%.1f", m-a}')
+  echo "  ledger lines: $lines   misses/step: $miss   admitted/step: $admps   real traffic: $real   decode_tps: ${tps:-n/a}"
   if [ "$LA" -gt 0 ]; then
     echo "  stage: $(grep 'moe-lookahead-stage:' "$log" | tail -1 | cut -c1-400)"
   fi
-  echo "$TAG la=$LA policy=$POL admit=$ADMIT misses_per_step=$miss decode_tps=${tps:-n/a}" >> "$OUT"
+  echo "$TAG la=$LA policy=$POL admit=$ADMIT misses_per_step=$miss admitted_per_step=$admps real_traffic=$real decode_tps=${tps:-n/a}" >> "$OUT"
   sleep 6
 }
 
@@ -65,6 +82,7 @@ arm ev0   0 "lfu"
 arm ev0p  0 "protect"
 arm ev8f  "$WIDTH" lfu
 arm ev8p  "$WIDTH" protect
+arm ev8r  "$WIDTH" recent1
 arm ev8a  "$WIDTH" lfu     1
 arm ev8ap "$WIDTH" protect 1
 
