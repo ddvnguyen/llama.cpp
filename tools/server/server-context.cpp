@@ -5664,7 +5664,7 @@ static void hydra_write_res(int fd, uint8_t status, uint32_t meta_len, uint64_t 
 // ── Op handlers ───────────────────────────────────────────────────────────────
 
 // STATE_GET (0x30): serialize full KV state and send as response payload.
-// n_past = n_prompt_tokens_cache + n_decoded (total KV positions).
+// n_past = stats.n_prompt_cached + stats.n_gen (total KV positions).
 static void hydra_handle_state_get(int fd, server_slot & slot) {
     if (slot.is_processing()) {
         hydra_write_res(fd, HYDRA_STATUS_BUSY, 0, 0);
@@ -5674,7 +5674,7 @@ static void hydra_handle_state_get(int fd, server_slot & slot) {
     std::vector<uint8_t> buf(state_size);
     llama_state_seq_get_data(slot.ctx_tgt, buf.data(), buf.size(), slot.id);
 
-    const int32_t n_past = slot.n_prompt_tokens_cache + slot.n_decoded;
+    const int32_t n_past = (int32_t) (slot.stats.n_prompt_cached + slot.stats.n_gen);
     const json meta_j = {{"n_past", n_past}, {"state_size", (uint64_t)state_size}};
     const std::string meta_str = meta_j.dump();
 
@@ -5684,7 +5684,7 @@ static void hydra_handle_state_get(int fd, server_slot & slot) {
 }
 
 // STATE_PUT (0x31): receive KV state from client and restore into slot.
-// Note: slot->n_prompt_tokens_cache / n_decoded are NOT updated by llama_state_seq_set_data.
+// Note: stats.n_prompt_cached / stats.n_gen are NOT updated by llama_state_seq_set_data.
 // The caller must track n_past from the preceding STATE_GET response.
 // TODO(M1): update slot cache bookkeeping after restore.
 static void hydra_handle_state_put(int fd, server_slot & slot, uint64_t payload_len) {
@@ -5727,7 +5727,7 @@ static void hydra_handle_state_put(int fd, server_slot & slot, uint64_t payload_
 // adapted to server_slot fields of this tree (n_remaining() is a method,
 // timing comes from slot.stats, no hydra_transferring flag exists here).
 static void hydra_handle_state_meta(int fd, server_slot & slot) {
-    const int32_t n_past = slot.n_prompt_tokens_cache + slot.n_decoded;
+    const int32_t n_past = (int32_t) (slot.stats.n_prompt_cached + slot.stats.n_gen);
     std::string operation = "unknown";
     float progress = 0.0f;
     int32_t tokens_processed = 0;
@@ -5749,11 +5749,11 @@ static void hydra_handle_state_meta(int fd, server_slot & slot) {
             break;
         case SLOT_STATE_GENERATING:
             operation = "decode";
-            tokens_processed = slot.n_decoded;
+            tokens_processed = (int32_t) slot.stats.n_gen;
             // n_remaining() == -1 is the unlimited-generation sentinel; only
             // compute progress when a finite remainder is known.
             if (slot.n_remaining() > 0) {
-                tokens_total = slot.n_decoded + slot.n_remaining();
+                tokens_total = (int32_t) slot.stats.n_gen + slot.n_remaining();
                 progress = (float) tokens_processed / (float) tokens_total;
             }
             break;
