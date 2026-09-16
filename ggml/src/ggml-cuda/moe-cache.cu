@@ -93,6 +93,85 @@ static bool moe_cache_mm_verbose_enabled() {
     return moe_cache_mm_debug_enabled();
 }
 
+// T-2b directed engagement arm: permanent per-dispatch CPU-vs-GPU expert counter.
+// Unlike the debug-gated split_probe/cpu_replace counters (which need
+// GGML_CUDA_MOE_MM_DEBUG=1), these are ALWAYS counted from host-side data only
+// (zero stream ops, zero D2H, zero behavior change) and ALWAYS logged: a
+// rate-limited running line plus one final line per process at telemetry time.
+// The final line auto-asserts: under GGML_CUDA_MOE_DEVICE_SPLIT=cpu,
+// cpu_fraction ~0/~1 prints ENGAGE-FAIL (loud, never a third silent
+// non-engagement); the 0.42+-0.05 band verdict is informational. Log-only;
+// never aborts, never alters dispatch.
+static std::atomic<uint64_t> g_split_engage_completions{0};
+static std::atomic<uint64_t> g_split_engage_routes{0};
+static std::atomic<uint64_t> g_split_engage_cpu_dispatches{0};
+static std::atomic<uint64_t> g_split_engage_cpu_rows{0};
+// cpu_replace_miss_rows validation stage at first failure: 1 tensors/names,
+// 2 resource/banks/dims, 3 plan fetch, 4 arrays/miss-chain, 5 strides,
+// 6 backend, 7 row loop. Distinguishes structural skips from engagement loss.
+static std::atomic<uint64_t> g_split_engage_skip_stage[8]{};
+static std::atomic<bool> g_split_engage_cpu_armed{false};
+static std::atomic<int> g_split_engage_first_skip_logged{0};
+static void moe_split_engage_note_skip(int stage) {
+    if (stage >= 1 && stage <= 7) {
+        g_split_engage_skip_stage[stage].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (g_split_engage_first_skip_logged.exchange(1) == 0) {
+        GGML_LOG("moe-split-engage: first cpu_replace skip at validation stage %d "
+            "(1=tensors/names 2=resource/banks 3=plan 4=arrays/chain 5=strides 6=backend 7=rowloop)\n",
+            stage);
+    }
+}
+static void moe_split_engage_note_completion(uint64_t routes) {
+    const uint64_t n = g_split_engage_completions.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t tot = g_split_engage_routes.fetch_add(routes, std::memory_order_relaxed) + routes;
+    if (n == 1 || n % 1024 == 0) {
+        const uint64_t rows = g_split_engage_cpu_rows.load(std::memory_order_relaxed);
+        const double frac = tot > 0 ? (double) rows / (double) tot : 0.0;
+        GGML_LOG("moe-split-engage: completions=%llu routes=%llu cpu_rows=%llu cpu_fraction=%.4f%s\n",
+            (unsigned long long) n, (unsigned long long) tot, (unsigned long long) rows, frac,
+            g_split_engage_cpu_armed.load(std::memory_order_relaxed) ? " (cpu-armed)" : "");
+    }
+}
+static void moe_split_engage_note_cpu(uint64_t replaced) {
+    if (replaced > 0) {
+        g_split_engage_cpu_dispatches.fetch_add(1, std::memory_order_relaxed);
+        g_split_engage_cpu_rows.fetch_add(replaced, std::memory_order_relaxed);
+    }
+}
+static void moe_split_engage_log_final(void) {
+    const uint64_t n = g_split_engage_completions.load(std::memory_order_relaxed);
+    const uint64_t tot = g_split_engage_routes.load(std::memory_order_relaxed);
+    const uint64_t cpu_d = g_split_engage_cpu_dispatches.load(std::memory_order_relaxed);
+    const uint64_t rows = g_split_engage_cpu_rows.load(std::memory_order_relaxed);
+    const double frac = tot > 0 ? (double) rows / (double) tot : 0.0;
+    const bool armed = g_split_engage_cpu_armed.load(std::memory_order_relaxed);
+    const char * verdict;
+    if (!armed || tot == 0) {
+        verdict = "ENGAGE-NA";
+    } else if (rows == 0) {
+        verdict = "ENGAGE-FAIL(~0)";
+    } else if (frac > 0.95) {
+        verdict = "ENGAGE-FAIL(~1)";
+    } else if (frac >= 0.37 && frac <= 0.47) {
+        verdict = "ENGAGE-OK(band-pass)";
+    } else {
+        verdict = "ENGAGE-OK(band-miss)";
+    }
+    GGML_LOG("moe-split-engage-final: completions=%llu routes=%llu cpu_dispatches=%llu cpu_rows=%llu "
+        "cpu_fraction=%.4f verdict=%s (band 0.42+-0.05, cpu-armed=%d)\n",
+        (unsigned long long) n, (unsigned long long) tot,
+        (unsigned long long) cpu_d, (unsigned long long) rows, frac, verdict, armed ? 1 : 0);
+    GGML_LOG("moe-split-engage-skipstages: s1=%llu s2=%llu s3=%llu s4=%llu s5=%llu s6=%llu s7=%llu\n",
+        (unsigned long long) g_split_engage_skip_stage[1].load(std::memory_order_relaxed),
+        (unsigned long long) g_split_engage_skip_stage[2].load(std::memory_order_relaxed),
+        (unsigned long long) g_split_engage_skip_stage[3].load(std::memory_order_relaxed),
+        (unsigned long long) g_split_engage_skip_stage[4].load(std::memory_order_relaxed),
+        (unsigned long long) g_split_engage_skip_stage[5].load(std::memory_order_relaxed),
+        (unsigned long long) g_split_engage_skip_stage[6].load(std::memory_order_relaxed),
+        (unsigned long long) g_split_engage_skip_stage[7].load(std::memory_order_relaxed));
+}
+
 static int moe_cache_phase_index(bool is_decode) {
     return is_decode ? 1 : 0;
 }
@@ -4828,6 +4907,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         device_split_shadow = split != nullptr &&
             (strcmp(split, "shadow") == 0 || strcmp(split, "cpu") == 0);
         device_split_cpu = split != nullptr && strcmp(split, "cpu") == 0;
+        if (device_split_cpu) {
+            g_split_engage_cpu_armed.store(true, std::memory_order_relaxed);
+        }
     }
 
     bool frequency_aware = true;
@@ -12346,6 +12428,12 @@ uint64_t ggml_cuda_moe_grouped_context::impl::cpu_replace_miss_rows(
         down_node->type == GGML_TYPE_F32 && ggml_is_contiguous(down_node) &&
         down_node->data != nullptr && down_node->ne[0] > 0 && down_node->ne[1] > 0 &&
         down_node->nb[1] > 0;
+    // T-2b: behavior-identical early exit; attributes the skip to tensors/names.
+    if (!ok) {
+        moe_split_engage_note_skip(1);
+        *skip = true;
+        return 0;
+    }
     struct bank_info {
         ggml_type type = GGML_TYPE_COUNT;
         const void * base = nullptr;
@@ -12395,6 +12483,12 @@ uint64_t ggml_cuda_moe_grouped_context::impl::cpu_replace_miss_rows(
     const int64_t cp_d = ok ? cp_down.ne1 : 0;
     ok = ok && cp_tokens > 0 && cp_din > 0 && cp_dh > 0 && cp_d > 0 &&
         cp_gate.ne2 > 0 && cp_gate.ne2 == cp_up.ne2 && cp_gate.ne2 == cp_down.ne2;
+    // T-2b: behavior-identical early exit; attributes the skip to resource/banks/dims.
+    if (!ok) {
+        moe_split_engage_note_skip(2);
+        *skip = true;
+        return 0;
+    }
     moe_grouped_decode_plan cp_host_plan{};
     std::vector<int32_t> cp_route_unique, cp_miss_unique, cp_miss_experts, cp_unique_experts;
     std::vector<char> cp_x_host;
@@ -12410,6 +12504,13 @@ uint64_t ggml_cuda_moe_grouped_context::impl::cpu_replace_miss_rows(
             cp_host_plan.n_routes % (uint32_t) cp_tokens == 0 &&
             (uint64_t) down_node->ne[1] == cp_host_plan.n_routes &&
             down_node->ne[0] == cp_d;
+    }
+    // T-2b: behavior-identical early exit (all phases below are if(ok)-gated and would
+    // no-op into the stage-4 exit); attributes the skip to the plan-fetch stage.
+    if (!ok) {
+        moe_split_engage_note_skip(3);
+        *skip = true;
+        return 0;
     }
     const uint32_t cp_n = ok ? cp_host_plan.n_routes : 0;
     const uint32_t cp_k = ok && cp_tokens > 0 ? cp_n / (uint32_t) cp_tokens : 0;
@@ -12457,6 +12558,7 @@ uint64_t ggml_cuda_moe_grouped_context::impl::cpu_replace_miss_rows(
             cp_tokens < UINT32_MAX && cp_k > 0;
     }
     if (!ok) {
+        moe_split_engage_note_skip(4);
         *skip = true;
         return 0;
     }
@@ -12467,6 +12569,7 @@ uint64_t ggml_cuda_moe_grouped_context::impl::cpu_replace_miss_rows(
         cp_up.stride >= (uint64_t) ggml_row_size(cp_up.type, cp_din * cp_dh) &&
         cp_down.stride >= (uint64_t) ggml_row_size(cp_down.type, cp_dh * cp_d);
     if (!ok) {
+        moe_split_engage_note_skip(5);
         *skip = true;
         return 0;
     }
@@ -12478,6 +12581,7 @@ uint64_t ggml_cuda_moe_grouped_context::impl::cpu_replace_miss_rows(
         }
     }
     if (moe_cpu_replace_backend == nullptr) {
+        moe_split_engage_note_skip(6);
         *skip = true;
         return 0;
     }
@@ -12536,6 +12640,7 @@ uint64_t ggml_cuda_moe_grouped_context::impl::cpu_replace_miss_rows(
         }
     }
     if (!ok) {
+        moe_split_engage_note_skip(7);
         *skip = true;
         return replaced;
     }
@@ -12573,6 +12678,11 @@ bool ggml_cuda_moe_grouped_context::finish_graph_group(
     if (group->defer_completion) {
         return true;
     }
+    // T-2b permanent engagement counter (host-side dims only, zero stream ops).
+    if (group->key.ids.ne[0] > 0 && group->key.ids.ne[1] > 0) {
+        moe_split_engage_note_completion(
+            (uint64_t) group->key.ids.ne[0] * (uint64_t) group->key.ids.ne[1]);
+    }
     // Phase D move (Approach A). DIRECT eager path only: capture returns
     // above via defer_completion, replay never reaches per-node finish, and
     // the env gate is a single bool when off. Overwrites DOWN rows of
@@ -12580,6 +12690,7 @@ bool ggml_cuda_moe_grouped_context::finish_graph_group(
     if (impl_->device_split_cpu) {
         bool cp_skip = false;
         const uint64_t cp_replaced = impl_->cpu_replace_miss_rows(group, node, stream, &cp_skip);
+        moe_split_engage_note_cpu(cp_replaced);
         auto * cp_stats = impl_->debug_stats();
         if (cp_stats != nullptr) {
             if (cp_replaced > 0) {
@@ -13183,6 +13294,30 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
         }
         if (grouped && ((group.state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE && group.defer_completion) ||
                 group.state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_REPLAY)) {
+            // T-2b H1 fix: run the CPU/GPU split in the deferred completion path so the
+            // split survives graph capture. Capture-safe: this runs after capture ends and
+            // the graph launched (same posture as the probe/shadow above), and
+            // cpu_replace_miss_rows is self-validating (structural non-MoE groups skip).
+            if (group.key.ids.ne[0] > 0 && group.key.ids.ne[1] > 0) {
+                moe_split_engage_note_completion(
+                    (uint64_t) group.key.ids.ne[0] * (uint64_t) group.key.ids.ne[1]);
+            }
+            if (impl_->device_split_cpu && group.last_reader != nullptr && group.stream != nullptr) {
+                bool df_skip = false;
+                const uint64_t df_replaced =
+                    impl_->cpu_replace_miss_rows(&group, group.last_reader, group.stream, &df_skip);
+                moe_split_engage_note_cpu(df_replaced);
+                auto * df_stats = impl_->debug_stats();
+                if (df_stats != nullptr) {
+                    if (df_replaced > 0) {
+                        df_stats->cpu_replace_dispatches.fetch_add(1, std::memory_order_relaxed);
+                        df_stats->cpu_replace_rows.fetch_add(df_replaced, std::memory_order_relaxed);
+                    }
+                    if (df_skip) {
+                        df_stats->cpu_replace_skip.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
             ggml_cuda_moe_grouped_decode_acquisition decode;
             decode.transaction = group.transaction;
             if (!finish_decode(decode, group.stream)) {
@@ -15558,6 +15693,9 @@ void ggml_backend_cuda_moe_preallocate_pool(int device) {
 }
 
 static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
+    // T-2b: permanent engagement verdict, ungated (every run proves or denies split engagement).
+    moe_split_engage_log_final();
+
     const size_t n_caches = telemetry.n_caches;
     const uint64_t total_hits = telemetry.total_hits;
     const uint64_t total_misses = telemetry.total_misses;
