@@ -306,3 +306,76 @@ found negative or structurally impossible. The prediction machinery already
 built is not wasted — its honest consumer is **eviction/victim choice** within
 T1, which is plan 7.31's own conclusion and which this design leaves open as a
 later increment on top of T-5.
+
+---
+
+## 9. Closure (proposed 2026-09-16 — pending owner decision)
+
+**Recommendation: stop the hybrid. Do not spend a fifth arm.**
+
+### Why it stopped
+
+Five arms never engaged the split once. T-2g removed the stage-3 veto entirely
+(`down_n1` eliminated, vetoes 0) and engagement still read `cpu_fraction`
+**0.0048**. The layout audit then settled the question **in the negative on its
+own terms**, which is a result, not a failure:
+
+1. **The mapping does not exist at finish time.** The plan is token-major; the
+   reader is an expert-sorted view; rows are noncontiguous (T-2d oracle: a
+   contiguous slice matches 2 of 3408 dispatches). No per-reader index survives
+   in the dispatch/plan structs, and finish-time reader-ids read back garbage
+   for ~98.6% of groups. You cannot reconstruct information that was never
+   retained.
+2. **Residency is consulted after admission.** The split's lookup runs after
+   §7.15's unconditional admission, so every demanded expert reads as resident
+   and any post-hoc splice duplicates work. Unpassable without a kernel change.
+
+Either alone is beyond one arm. Together they are a change to plan structure
+*and* kernel ordering — an epic, not an experiment.
+
+### What did not fail
+
+The **premise** was never falsified. §5.1's decomposition stands: a resident hit
+costs 0.0029 ms against 0.2842 ms for a miss, **99x**. Tier 1 is as cheap as
+claimed. What failed is the path to exploiting it *in this codebase*.
+
+The durable finding is a hardware one, and it is worth more than the design was:
+**on this rig the expert cache is strictly worse than CPU-MoE at every tested
+N**, because the x4 link moves an expert in 0.342 ms where host DDR computes one
+in 0.0677 ms — **5x**. The best configuration on this hardware uses **none** of
+the machinery this track built: `cache-0 + --cpu-moe + --decode-overlap`.
+
+Also closed: static pins, on two independent methods (global-42 at 6.4%/5%
+recall with ~0% transfer; per-layer-42 heldout **0.406/0.421**, at or below the
+online policy it would replace — VRAM additionality moot, same slots).
+
+### What closure does NOT mean
+
+**The original goal is unverified, and current evidence says it is not met.**
+The goal was 15-20 t/s **at ctx 64K**. 21.23 is a **767-token** number.
+Extrapolating the measured depth costs (767->13.9K = 0.777; 13.9K->47.5K =
+0.856) puts arm 000 at **~14 t/s at 47.5K and ~13 t/s at 64K — below the
+15 t/s floor.** 64K has still never been measured on this track.
+
+**The best configuration is currently unbuildable.** Arm 000's 21.23 came from
+an older binary; base `0fc51e039` has a **pre-existing** 47 GB allocation bug
+(not co-worker dirt) that OOMs cache-0. The same-binary floor that does build is
+`t2g-cpu32` at 10.374, a different configuration and not a substitute.
+
+### Follow-ups, in order — none of them tiering
+
+1. **Fix the base 47 GB allocation bug.** It now owns the project's headline
+   number: the recommended configuration cannot be rebuilt until it is fixed.
+   Bisect base history for the commit that introduced it. File as its own issue.
+2. **Then measure arm 000's configuration at 64K.** That, not 21.23, is the
+   answer to the question the track was started to ask.
+
+### What would reopen the tiering design
+
+- **A x16 slot.** At 26 GB/s the link stops being 5x worse than host DDR,
+  `f_link` rebalances to ~0.45, and tier 2 becomes genuinely competitive. This
+  single change inverts the finding above.
+- **More VRAM.** N=42 with 425 MiB free is the binding limit on this box.
+- **A plan-structure change made for other reasons.** If per-reader indices ever
+  survive to finish time, blocker 1 evaporates and this design is implementable
+  as written.
