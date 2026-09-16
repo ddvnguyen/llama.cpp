@@ -107,9 +107,24 @@ Note the decay law: the counter halves every **16 grouped planning steps**
 tokens (`899d8ec7a`). A seed is therefore erased ~11 tokens into decode — by
 design, and it is why the rig keeps d16's edge under prefill pollution.
 
-**T1 capacity rises in the hybrid.** With experts no longer all routed to
-VRAM, roughly 4.5-5 GiB is free for slots against 3.53 GiB at N=42, i.e.
-N ~ 65-70 and `h ~ 0.62-0.64` from the measured capacity curve. Free.
+**T1 capacity does NOT rise in the hybrid — corrected 2026-09-16.** An earlier
+draft of this document claimed the hybrid frees 4.5-5 GiB, reaching N ~ 65-70
+and `h ~ 0.62-0.64`. **That was wrong.** Plan 7.15 measured the ceiling directly:
+at N=28 the 3060 reports 9293 MiB used / 2619 MiB free, the marginal cost is
+48 x 2.148 = 103 MiB per slot, and **N=64 is a hard cudaMalloc OOM**. That puts
+the ceiling at **N ~ 53-57**.
+
+The hybrid does not move it. Backing the slot cost out of the N=28 figure leaves
+a ~6.4 GiB base of non-expert weights + KV + compute buffers, and the hybrid
+reduces none of those — it only avoids some staging buffers, worth 1-2 slots.
+The N=53 control arm is therefore already at the ceiling, and the capacity lever
+above it is worth **~1pp of `h`, not 6**.
+
+**64K KV is already paid for.** Every arm in the capacity sweep ran at
+`-c 81920` (plan section 0's `phase.sh 1 81920 ...`), so the 80K KV cache is
+already inside the 9293 MiB and inside the 1.55/2.2 GiB headroom figures. A 64K
+run does not add a new VRAM tenant. This was a live concern and it is closed by
+the measurement regime, not by argument.
 
 **T2 (link) — who streams.** The `f_link` highest-frequency experts *among the
 misses*. Rationale: a streamed expert is a candidate for promotion into T1, so
@@ -130,7 +145,7 @@ Anchored on the measured MTP dispatch shape (3.76 positions, 3.43 tokens,
 | measured today: MTP + CPU-MoE, no cache | 2.647 | 132.4 | 46.8 | **21.4** |
 | + T1 at h=0.58 (hybrid, all misses to CPU) | 1.112 | 86.7 | 25.3 | ~40 |
 | **+ T2 bandwidth split** | **0.922** | **77.6** | **22.6** | **~44** |
-| + T1 at h=0.64 (free VRAM) | 0.831 | 73.2 | 21.3 | ~47 |
+| + T1 at ceiling N~55, h=0.59 | 0.910 | 77.0 | 22.4 | ~44.5 |
 
 T2 contributes **+11%** on top of the hybrid. Modest, but it is prediction-free,
 self-tuning and cheap. The hybrid itself (T1 existing at all) is the +85% step.
@@ -163,8 +178,11 @@ env-gated and unmeasured. Report `h` and t/s against the cache-0 control.
 Route the top-`f_link` fraction of misses by frequency to the existing demand
 path; the remainder to CPU. *Gate:* >= +5% over T-2 (projection is +11%).
 
-**T-4. Raise N to the hybrid's free VRAM.** Flag-only sweep N=53/60/70.
-*Gate:* follows the measured capacity curve within the model's 1.2% error.
+**T-4. Confirm the ceiling. DEMOTED — do this last, or not at all.**
+The N=65-70 upside this step was written for does not exist (see section 4).
+Reachable is N=55-57 against a 53 control, worth ~1pp `h` and ~0.5 t/s.
+Flag-only sweep N=53/55/57; stop at the first OOM. *Gate:* none worth setting —
+run it only if the rig is otherwise idle.
 
 **T-5. Seeded T1 priors.** Only after the sim clears calibration gate 3
 (offset stable across N). *Gate:* >= +3pp `h` over unseeded.
@@ -185,10 +203,14 @@ only. Every 64K number in this document is extrapolation.
    **-9.5%** (`contend/`, after separating the thread-halving confound). The
    probe used 6 of 8 P-cores, so this is a measurement at one config, not a
    ceiling.
-3. **Per-expert byte size is not pinned down.** The GGUF inventory gives
-   2.15 MiB; the per-step ledger derives 1.79-1.88 MiB. A ~20% discrepancy that
-   moves every number in section 5. Reconcile before trusting absolute
-   projections; ratios are unaffected.
+3. **Per-expert byte size: use 2.148 MiB for VRAM sizing.** The GGUF inventory
+   gives 2.148 MiB (gate 0.598 + up 0.671 + down 0.879); the per-step transfer
+   ledger derives 1.793 MiB. The gap is ~20% and it moves every absolute number
+   in section 5. For *VRAM* the GGUF figure is the better-evidenced one — it is
+   what plan 7.15 used to predict a ceiling near N=55, and N=64 then OOM'd as
+   predicted. The ledger figure plausibly excludes padding or head overhead.
+   Ratios and the `f_link` rule are unaffected either way, so this does not
+   need its own arm — fold it into T-1/T-2 rig time.
 4. **`f_link` assumes the two pipes do not interfere.** A DMA into VRAM and a
    host FFN both touch host memory. If they contend, the effective aggregate is
    below `B_link + B_cpu` and `f_link` should be fitted empirically rather than
