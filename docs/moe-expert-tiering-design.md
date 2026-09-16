@@ -156,6 +156,34 @@ out-of-sample across N=28/40/53 to 1.2%. They are not measurements.
 
 ---
 
+### 5.1 T-2 result (2026-09-16): the hybrid did not run
+
+Measured **10.40 / 10.08 t/s** against a 21.36 control (control reproduces at
+21.23; accepted tokens bit-stable). Recorded `d-ce1e9913f5`, gitlink `7e9cbdc40`.
+
+**This is not a refutation of the design, because the split never engaged.**
+H1 is unengaged under CUDA graphs (`defer_completion`); H2 engages off-graphs but
+is skip-heavy and lands equal to cache-32 no-split (10.53). Both legs measured
+the **cache-only** path — every miss over PCIe, nothing to the CPU.
+
+10.40 is a known number. It is where the capacity sweep already sat (N=36 →
+10.36, N=42 → 10.84), and the model predicts it: at h=0.58 the cache-only path
+sends 15.8 misses/layer over a 0.342 ms link where CPU-MoE computes 37.6 demands
+at 0.0704 ms, so cache-on *should* be ~2x slower than CPU-MoE. It is
+(21.36/10.40 = 2.05x).
+
+**Direct evidence that the hybrid's premise holds.** Decompose the two exp1 arms
+with a shared fixed term: N=53 cache-on is 86.43 - 201.6x0.2842 = **F 29.14**
+with 278 hits/token; N=0 CPU-MoE is 62.13 - 480x0.0704 = **F 28.34** with zero
+hits. The same fixed term falls out of both, so a resident hit costs
+**0.0029 ms against 0.2842 ms for a miss — 99x cheaper**. Tier 1 is as close to
+free as the design assumed. What was never tested is routing misses to tier 3.
+
+**Honest haircut.** The measured cache-only point is 10.40 where the model says
+11.7-13.8, so the miss term runs **1.14x** my nominal. Applying that same factor
+to the hybrid moves the projection from ~40 to **~36 t/s**. Section 5's table is
+nominal and should be read with this factor.
+
 ## 6. Implementation plan
 
 Sequenced so each step is independently measurable.
