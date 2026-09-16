@@ -746,6 +746,18 @@ struct moe_grouped_decode_debug_stats {
     std::atomic<uint64_t> required_unsupported{0};
     std::atomic<uint64_t> prepare_error{0};
     std::atomic<uint64_t> finish_error{0};
+    // S1+S2 (MTP verify combine) record-only counters. Bumped only under the
+    // S1+S2 env flag, host-side in finish_graph_dispatch (post-capture, so
+    // capture-safe). Zero when OFF.
+    std::atomic<uint64_t> mtp_vfy_dispatch{0};
+    std::atomic<uint64_t> mtp_vfy_routes{0};
+    std::atomic<uint64_t> mtp_vfy_miss_routes{0};
+    std::atomic<uint64_t> mtp_vfy_miss_unique{0};
+    std::atomic<uint64_t> mtp_pf_check{0};
+    std::atomic<uint64_t> mtp_pf_pred{0};
+    std::atomic<uint64_t> mtp_pf_hit{0};
+    std::atomic<uint64_t> mtp_pf_pred_missing{0};
+    std::atomic<uint64_t> mtp_pf_gap{0};
     std::array<std::atomic<uint64_t>, (GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS + 63) / 64> covered;
     std::array<std::atomic<uint64_t>, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> ready_by_group;
     std::array<std::atomic<uint64_t>, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> completed_by_group;
@@ -3758,6 +3770,18 @@ static bool moe_early_router_enabled() {
     return enabled;
 }
 
+// S1+S2 (MTP verify combine): record-only verify/prefetch telemetry. Default
+// OFF. When ON, finish_graph_dispatch samples executed verify-domain grouped
+// dispatches (plan misses/step + predicted-vs-actual) via post-capture D2H.
+// No stream ops, no copies, no quota changes; dispatch decisions untouched.
+static bool moe_mtp_verify_telemetry_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_MOE_MTP_VERIFY_TELEMETRY");
+        return value != nullptr && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 static uint32_t moe_early_router_lookahead() {
     static const uint32_t distance = [] {
         const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER_LOOKAHEAD");
@@ -5603,6 +5627,15 @@ struct ggml_cuda_moe_grouped_context::impl {
         result.required_unsupported = take(stats->required_unsupported);
         result.prepare_error = take(stats->prepare_error);
         result.finish_error = take(stats->finish_error);
+        result.mtp_vfy_dispatch = take(stats->mtp_vfy_dispatch);
+        result.mtp_vfy_routes = take(stats->mtp_vfy_routes);
+        result.mtp_vfy_miss_routes = take(stats->mtp_vfy_miss_routes);
+        result.mtp_vfy_miss_unique = take(stats->mtp_vfy_miss_unique);
+        result.mtp_pf_check = take(stats->mtp_pf_check);
+        result.mtp_pf_pred = take(stats->mtp_pf_pred);
+        result.mtp_pf_hit = take(stats->mtp_pf_hit);
+        result.mtp_pf_pred_missing = take(stats->mtp_pf_pred_missing);
+        result.mtp_pf_gap = take(stats->mtp_pf_gap);
         uint64_t ready_min = UINT64_MAX;
         uint64_t completed_min = UINT64_MAX;
         for (uint32_t group_index = 0; group_index < GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS; ++group_index) {
@@ -12647,6 +12680,203 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
         auto & group = execution->groups_[record_index];
         const bool grouped = group.authority.authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED;
         const bool host_staged = group.authority.authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED_HOST_STAGED;
+        // S1+S2 (MTP verify combine) record-only telemetry. Same capture-safe
+        // posture as the split probe below: runs after capture ends and the
+        // plan kernel executed, so stream sync + D2H readback are legal here.
+        // Read-only sampling of verify-domain grouped dispatches; never alters
+        // outcome, performs no copies, changes no quotas. S1 records plan
+        // misses/step + resident-vs-missing from the moe_grouped_plan_decode
+        // plan; S2 resolves same-layer early-router predicted ids against the
+        // actual verify ids + residency (hit rate, would-pin). Cert/dormant
+        // gates in configure_early_router / launch_early_router / prepare_decode
+        // are untouched. Zero overhead when the env flag is OFF (one cached
+        // getenv branch per dispatch).
+        if (grouped && moe_mtp_verify_telemetry_enabled() && execution->outcome() ==
+                GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution->plan_ != nullptr &&
+                group.transaction.transaction_token != 0 && group.stream != nullptr &&
+                group.key.ids.ne[0] > 0 && group.key.ids.ne[1] > 0) {
+            const auto & vfy_cert = execution->plan_->execution_certificate_;
+            const bool vfy_main = vfy_cert.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
+                vfy_cert.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
+            const bool vfy_mtp = vfy_cert.domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP &&
+                (vfy_cert.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ||
+                 vfy_cert.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL);
+            if (vfy_main || vfy_mtp) {
+                auto * vfy_stats = impl_->debug_stats();
+                moe_grouped_decode_plan * vfy_plan = nullptr;
+                uint32_t vfy_cap = 0;
+                int32_t * vfy_slots = nullptr;
+                uint32_t vfy_n_experts = 0;
+                if (vfy_stats != nullptr) {
+                    std::lock_guard<std::mutex> lock(impl_->mutex);
+                    auto * resource = impl_->find_resource(group.transaction);
+                    if (resource != nullptr && resource->device != nullptr) {
+                        vfy_plan = resource->device->plan;
+                        vfy_cap = resource->snapshot.n_slots;
+                        vfy_slots = resource->device->slot_for_expert;
+                        vfy_n_experts = resource->device->n_experts;
+                    }
+                }
+                const uint64_t vfy_routes64 =
+                    (uint64_t) group.key.ids.ne[0] * (uint64_t) group.key.ids.ne[1];
+                bool vfy_ok = vfy_stats != nullptr && vfy_plan != nullptr &&
+                    vfy_routes64 > 0 && vfy_routes64 <= UINT32_MAX && vfy_cap >= vfy_routes64;
+                moe_grouped_decode_plan vfy_host{};
+                const uint32_t vfy_n = vfy_ok ? (uint32_t) vfy_routes64 : 0;
+                if (vfy_ok) {
+                    vfy_ok =
+                        moe_grouped_cuda_success(cudaStreamSynchronize(group.stream)) &&
+                        moe_grouped_cuda_success(cudaMemcpy(&vfy_host, vfy_plan,
+                            sizeof(vfy_host), cudaMemcpyDeviceToHost)) &&
+                        vfy_host.status == MOE_GROUPED_PLAN_READY && vfy_host.n_routes == vfy_n &&
+                        vfy_host.n_unique > 0 && vfy_host.n_unique <= vfy_host.n_routes &&
+                        vfy_host.n_misses <= vfy_host.n_unique;
+                }
+                std::vector<int32_t> vfy_route_unique;
+                std::vector<int32_t> vfy_miss_unique;
+                if (vfy_ok) {
+                    vfy_route_unique.assign(vfy_n, -1);
+                    vfy_miss_unique.assign(vfy_host.n_misses, -1);
+                    const int32_t * d_route_unique =
+                        moe_grouped_plan_array_ptr(vfy_plan, vfy_cap, MOE_GROUPED_PLAN_ROUTE_UNIQUE);
+                    const int32_t * d_miss_unique =
+                        moe_grouped_plan_array_ptr(vfy_plan, vfy_cap, MOE_GROUPED_PLAN_MISS_UNIQUE);
+                    if (!moe_grouped_cuda_success(cudaMemcpy(vfy_route_unique.data(), d_route_unique,
+                            (size_t) vfy_n * sizeof(int32_t), cudaMemcpyDeviceToHost))) {
+                        vfy_ok = false;
+                    } else if (!vfy_miss_unique.empty() && !moe_grouped_cuda_success(cudaMemcpy(
+                            vfy_miss_unique.data(), d_miss_unique,
+                            (size_t) vfy_host.n_misses * sizeof(int32_t), cudaMemcpyDeviceToHost))) {
+                        vfy_ok = false;
+                    }
+                }
+                uint64_t vfy_miss_routes = 0;
+                if (vfy_ok) {
+                    // Never index host memory by unchecked device data.
+                    std::vector<char> vfy_unique_is_miss(vfy_host.n_unique, 0);
+                    for (uint32_t miss = 0; vfy_ok && miss < vfy_host.n_misses; ++miss) {
+                        const int32_t unique = vfy_miss_unique[miss];
+                        vfy_ok = unique >= 0 && (uint32_t) unique < vfy_host.n_unique;
+                        if (vfy_ok) {
+                            vfy_unique_is_miss[unique] = 1;
+                        }
+                    }
+                    for (uint32_t route = 0; vfy_ok && route < vfy_n; ++route) {
+                        const int32_t unique = vfy_route_unique[route];
+                        vfy_ok = unique >= 0 && (uint32_t) unique < vfy_host.n_unique;
+                        if (vfy_ok) {
+                            vfy_miss_routes += vfy_unique_is_miss[unique] != 0 ? 1 : 0;
+                        }
+                    }
+                }
+                if (vfy_ok) {
+                    vfy_stats->mtp_vfy_dispatch.fetch_add(1, std::memory_order_relaxed);
+                    vfy_stats->mtp_vfy_routes.fetch_add(vfy_n, std::memory_order_relaxed);
+                    vfy_stats->mtp_vfy_miss_routes.fetch_add(vfy_miss_routes, std::memory_order_relaxed);
+                    vfy_stats->mtp_vfy_miss_unique.fetch_add(vfy_host.n_misses, std::memory_order_relaxed);
+                }
+                // S2: wire same-layer early-router predicted ids to cache
+                // residency ahead of the verify dispatch. Same-layer first via
+                // the configure-time binding for this group; the draft->verify
+                // row mapping must be trivially correct (packed top_k rows,
+                // identical top_k x n_rows shape) or the gap is recorded and
+                // this dispatch is skipped. Reuses the staging/predicted
+                // buffers read-only; quotas untouched; residency is resolved
+                // (hit / would-pin), never moved -- eager bring-up is S3.
+                bool vfy_pf_gap = true;
+                if (vfy_ok && vfy_stats != nullptr) {
+                    const impl::early_binding * vfy_bind = nullptr;
+                    for (const auto & entry : impl_->early_bindings) {
+                        if (entry.second.group == group.key.candidate.group_index) {
+                            vfy_bind = &entry.second;
+                            break;
+                        }
+                    }
+                    const uint32_t vfy_tk = (uint32_t) group.key.ids.ne[0];
+                    const uint32_t vfy_nr = (uint32_t) group.key.ids.ne[1];
+                    const auto * vfy_lane =
+                        vfy_bind != nullptr && vfy_bind->lane < impl_->early.size() ?
+                        impl_->early[vfy_bind->lane].get() : nullptr;
+                    const bool vfy_trivial = vfy_bind != nullptr && vfy_lane != nullptr &&
+                        vfy_bind->top_k == vfy_tk && vfy_bind->n_rows == vfy_nr &&
+                        (uint64_t) vfy_tk * (uint64_t) vfy_nr <= (uint64_t) vfy_lane->top_k &&
+                        vfy_slots != nullptr && vfy_n_experts > 0 && vfy_n_experts <= (1u << 20) &&
+                        group.key.ids.nb[1] % sizeof(int32_t) == 0 &&
+                        group.key.ids.nb[1] / sizeof(int32_t) >= vfy_tk &&
+                        (uint64_t) vfy_nr * (group.key.ids.nb[1] / sizeof(int32_t)) <= (1u << 20);
+                    if (vfy_trivial) {
+                        const uint32_t vfy_stride = (uint32_t) (group.key.ids.nb[1] / sizeof(int32_t));
+                        std::vector<int32_t> vfy_pred((size_t) vfy_tk * vfy_nr, -1);
+                        std::vector<int32_t> vfy_ids((size_t) vfy_stride * vfy_nr, -1);
+                        std::vector<int32_t> vfy_slot_host(vfy_n_experts, -1);
+                        const bool vfy_got =
+                            moe_grouped_cuda_success(cudaStreamSynchronize(vfy_lane->stream)) &&
+                            moe_grouped_cuda_success(cudaMemcpy(vfy_pred.data(), vfy_lane->predicted,
+                                vfy_pred.size() * sizeof(int32_t), cudaMemcpyDeviceToHost)) &&
+                            moe_grouped_cuda_success(cudaMemcpy(vfy_ids.data(), group.key.ids.data,
+                                vfy_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost)) &&
+                            moe_grouped_cuda_success(cudaMemcpy(vfy_slot_host.data(), vfy_slots,
+                                vfy_slot_host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                        if (vfy_got) {
+                            uint64_t vfy_pred_n = 0, vfy_hit_n = 0, vfy_missing_n = 0;
+                            for (uint32_t row = 0; row < vfy_nr; ++row) {
+                                for (uint32_t rank = 0; rank < vfy_tk; ++rank) {
+                                    const int32_t expert = vfy_pred[(size_t) row * vfy_tk + rank];
+                                    if (expert < 0 || (uint32_t) expert >= vfy_n_experts) {
+                                        continue;
+                                    }
+                                    ++vfy_pred_n;
+                                    bool hit = false;
+                                    for (uint32_t k = 0; k < vfy_tk; ++k) {
+                                        if (vfy_ids[(size_t) row * vfy_stride + k] == expert) {
+                                            hit = true;
+                                            break;
+                                        }
+                                    }
+                                    vfy_hit_n += hit ? 1 : 0;
+                                    vfy_missing_n += vfy_slot_host[expert] < 0 ? 1 : 0;
+                                }
+                            }
+                            vfy_stats->mtp_pf_check.fetch_add(1, std::memory_order_relaxed);
+                            vfy_stats->mtp_pf_pred.fetch_add(vfy_pred_n, std::memory_order_relaxed);
+                            vfy_stats->mtp_pf_hit.fetch_add(vfy_hit_n, std::memory_order_relaxed);
+                            vfy_stats->mtp_pf_pred_missing.fetch_add(vfy_missing_n, std::memory_order_relaxed);
+                            vfy_pf_gap = false;
+                        }
+                    }
+                }
+                if (vfy_pf_gap && vfy_stats != nullptr) {
+                    vfy_stats->mtp_pf_gap.fetch_add(1, std::memory_order_relaxed);
+                }
+                static std::atomic<uint64_t> vfy_print_next{25};
+                const uint64_t vfy_total = vfy_stats != nullptr ?
+                    vfy_stats->mtp_vfy_dispatch.load(std::memory_order_relaxed) : 0;
+                uint64_t vfy_next = vfy_print_next.load(std::memory_order_relaxed);
+                if (vfy_total >= vfy_next &&
+                        vfy_print_next.compare_exchange_strong(vfy_next, vfy_total + 25, std::memory_order_relaxed)) {
+                    fprintf(stderr, "moe-mtp-verify-telemetry: vfy_dispatch=%llu routes=%llu miss_routes=%llu "
+                        "miss_unique=%llu pf_check=%llu pred=%llu hit=%llu pred_missing=%llu gap=%llu\n",
+                        (unsigned long long) (vfy_stats != nullptr ?
+                            vfy_stats->mtp_vfy_dispatch.load(std::memory_order_relaxed) : 0),
+                        (unsigned long long) (vfy_stats != nullptr ?
+                            vfy_stats->mtp_vfy_routes.load(std::memory_order_relaxed) : 0),
+                        (unsigned long long) (vfy_stats != nullptr ?
+                            vfy_stats->mtp_vfy_miss_routes.load(std::memory_order_relaxed) : 0),
+                        (unsigned long long) (vfy_stats != nullptr ?
+                            vfy_stats->mtp_vfy_miss_unique.load(std::memory_order_relaxed) : 0),
+                        (unsigned long long) (vfy_stats != nullptr ?
+                            vfy_stats->mtp_pf_check.load(std::memory_order_relaxed) : 0),
+                        (unsigned long long) (vfy_stats != nullptr ?
+                            vfy_stats->mtp_pf_pred.load(std::memory_order_relaxed) : 0),
+                        (unsigned long long) (vfy_stats != nullptr ?
+                            vfy_stats->mtp_pf_hit.load(std::memory_order_relaxed) : 0),
+                        (unsigned long long) (vfy_stats != nullptr ?
+                            vfy_stats->mtp_pf_pred_missing.load(std::memory_order_relaxed) : 0),
+                        (unsigned long long) (vfy_stats != nullptr ?
+                            vfy_stats->mtp_pf_gap.load(std::memory_order_relaxed) : 0));
+                }
+            }
+        }
         // Step-1 split probe. This runs after graph capture ends and the plan
         // kernel executed (inline, or via graph launch), so stream sync and
         // D2H readback are legal here. Read-only sampling, never alters outcome.
@@ -14983,6 +15213,15 @@ static void moe_grouped_add_telemetry(
     dst.required_unsupported += src.required_unsupported;
     dst.prepare_error += src.prepare_error;
     dst.finish_error += src.finish_error;
+    dst.mtp_vfy_dispatch += src.mtp_vfy_dispatch;
+    dst.mtp_vfy_routes += src.mtp_vfy_routes;
+    dst.mtp_vfy_miss_routes += src.mtp_vfy_miss_routes;
+    dst.mtp_vfy_miss_unique += src.mtp_vfy_miss_unique;
+    dst.mtp_pf_check += src.mtp_pf_check;
+    dst.mtp_pf_pred += src.mtp_pf_pred;
+    dst.mtp_pf_hit += src.mtp_pf_hit;
+    dst.mtp_pf_pred_missing += src.mtp_pf_pred_missing;
+    dst.mtp_pf_gap += src.mtp_pf_gap;
     dst.h2d_banks += src.h2d_banks;
     dst.h2d_bytes += src.h2d_bytes;
 }
@@ -15343,7 +15582,7 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
 
     if (moe_cache_mm_debug_enabled()) {
         GGML_LOG(
-            "moe-grouped-decode: registered=%llu covered=%llu plan_calls=%llu plan_compiles=%llu plan_reuses=%llu calls=%llu ready=%llu ready_min=%llu ready_max=%llu completed=%llu completed_min=%llu completed_max=%llu admitted_banks=%llu fallback=%llu rollback=%llu host_calls=%llu host_ops=%llu host_split_ops=%llu split_dispatches=%llu split_routes=%llu split_unique=%llu split_misses=%llu split_miss_routes=%llu shadow_dispatches=%llu shadow_rows=%llu shadow_skip=%llu cpu_replace_dispatches=%llu cpu_replace_rows=%llu cpu_replace_skip=%llu strategy_switches=%llu required_unsupported=%llu prepare_error=%llu finish_error=%llu h2d_banks=%llu h2d_bytes=%llu\n",
+            "moe-grouped-decode: registered=%llu covered=%llu plan_calls=%llu plan_compiles=%llu plan_reuses=%llu calls=%llu ready=%llu ready_min=%llu ready_max=%llu completed=%llu completed_min=%llu completed_max=%llu admitted_banks=%llu fallback=%llu rollback=%llu host_calls=%llu host_ops=%llu host_split_ops=%llu split_dispatches=%llu split_routes=%llu split_unique=%llu split_misses=%llu split_miss_routes=%llu shadow_dispatches=%llu shadow_rows=%llu shadow_skip=%llu cpu_replace_dispatches=%llu cpu_replace_rows=%llu cpu_replace_skip=%llu strategy_switches=%llu required_unsupported=%llu prepare_error=%llu finish_error=%llu h2d_banks=%llu h2d_bytes=%llu mtp_vfy_dispatch=%llu mtp_vfy_routes=%llu mtp_vfy_miss_routes=%llu mtp_vfy_miss_unique=%llu mtp_pf_check=%llu mtp_pf_pred=%llu mtp_pf_hit=%llu mtp_pf_pred_missing=%llu mtp_pf_gap=%llu\n",
             (unsigned long long) grouped.registered,
             (unsigned long long) grouped.covered,
             (unsigned long long) grouped.plan_calls,
@@ -15378,7 +15617,16 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
             (unsigned long long) grouped.prepare_error,
             (unsigned long long) grouped.finish_error,
             (unsigned long long) grouped.h2d_banks,
-            (unsigned long long) grouped.h2d_bytes);
+            (unsigned long long) grouped.h2d_bytes,
+            (unsigned long long) grouped.mtp_vfy_dispatch,
+            (unsigned long long) grouped.mtp_vfy_routes,
+            (unsigned long long) grouped.mtp_vfy_miss_routes,
+            (unsigned long long) grouped.mtp_vfy_miss_unique,
+            (unsigned long long) grouped.mtp_pf_check,
+            (unsigned long long) grouped.mtp_pf_pred,
+            (unsigned long long) grouped.mtp_pf_hit,
+            (unsigned long long) grouped.mtp_pf_pred_missing,
+            (unsigned long long) grouped.mtp_pf_gap);
         const moe_cache_proc_snapshot proc = moe_cache_get_proc_delta();
         const double h2d_mib = (double) mm.h2d_copy_bytes / 1024.0 / 1024.0;
         const double h2d_enqueue_ms = (double) mm.h2d_enqueue_time_us / 1000.0;

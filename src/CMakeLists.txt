@@ -73,6 +73,10 @@ target_precompile_headers (llama PRIVATE models/models.h)
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (LLAMA_MOE_GROUPED_DEBUG)
+    target_compile_definitions(llama PRIVATE LLAMA_MOE_GROUPED_DEBUG)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

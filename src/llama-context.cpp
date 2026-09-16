@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -64,6 +65,43 @@ static uint32_t required_grouped_execution_flags(uint32_t cache_slots, bool back
         GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED : GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE;
 }
 
+// S1 (MTP verify combine): record-only telemetry admission. Default OFF.
+// When ON, MTP-domain dispatches carry the grouped execution intent purely
+// for telemetry; required_grouped_execution_flags() above is untouched, so no
+// dispatch decision (flags / fail-closed) changes. Reads env once per process.
+static bool llama_mtp_verify_grouped_telemetry_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_MOE_MTP_VERIFY_TELEMETRY");
+        return value != nullptr && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+// S1 record-only counters (host atomics: capture-safe by construction, only
+// bumped on the llama thread outside graph capture). All zero when OFF.
+static std::atomic<uint64_t> llama_mtp_verify_record_admitted { 0 };
+static std::atomic<uint64_t> llama_mtp_verify_record_shape_skip { 0 };
+static std::atomic<uint64_t> llama_mtp_verify_record_fallback { 0 };
+static std::atomic<uint64_t> llama_mtp_verify_record_printed { 0 };
+
+static void llama_mtp_verify_record_log(const char * site, uint64_t admitted) {
+    // Throttled aggregate line for rig greps; every 100 admissions.
+    // fprintf (not LLAMA_LOG_*): the server filters lib INFO logs, while
+    // stderr is captured to the server log (established moe-cache.cu pattern).
+    const uint64_t mark = (admitted / 100) * 100;
+    uint64_t prev = llama_mtp_verify_record_printed.load(std::memory_order_relaxed);
+    while (mark > prev &&
+            !llama_mtp_verify_record_printed.compare_exchange_weak(prev, mark, std::memory_order_relaxed)) {
+    }
+    if (mark > prev) {
+        fprintf(stderr, "llama-mtp-verify-telemetry: site=%s admitted=%llu shape_skip=%llu fallback=%llu\n",
+            site,
+            (unsigned long long) admitted,
+            (unsigned long long) llama_mtp_verify_record_shape_skip.load(std::memory_order_relaxed),
+            (unsigned long long) llama_mtp_verify_record_fallback.load(std::memory_order_relaxed));
+    }
+}
+
 static bool ubatch_has_independent_rows(const llama_ubatch & ubatch) {
     if (ubatch.n_tokens == 0 || ubatch.n_seq_tokens != 1 ||
             ubatch.n_seqs != ubatch.n_tokens || ubatch.n_seqs_unq != ubatch.n_tokens ||
@@ -97,7 +135,43 @@ struct llama_graph_execution_intent {
     uint32_t domain = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
     uint32_t row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
     uint32_t verification_span = 0;
+    // S1: record-only grouped intent (MTP verify combine). True only under the
+    // S1 env flag; mismatches fall back to legacy dispatch, never fail closed.
+    bool record_only = false;
 };
+
+#ifdef LLAMA_MOE_GROUPED_DEBUG
+// Gated debug only, no behavior change when OFF.
+static void llama_moe_grouped_debug_log_ubatch(
+        const char * site,
+        llama_context_type ctx_type,
+        uint32_t cache_slots,
+        const llama_ubatch & ubatch,
+        const llama_graph_execution_intent & intent,
+        bool match) {
+    // ERROR so the failing-shape log shows at default verbosity.
+    LLAMA_LOG_ERROR("%s: site=%s ctx=%d slots=%u ubatch(n=%u seqs=%u unq=%u spt=%u) intent(dom=%u row=%u span=%u) match=%d\n",
+        __func__, site, (int) ctx_type, cache_slots,
+        ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seqs_unq, ubatch.n_seq_tokens,
+        intent.domain, intent.row_semantics, intent.verification_span, (int) match);
+}
+
+static void llama_moe_grouped_debug_log_stamp(
+        const char * site,
+        llama_context_type ctx_type,
+        uint32_t cache_slots,
+        bool backend_supported,
+        uint32_t flags,
+        uint32_t domain,
+        uint32_t row_semantics,
+        uint32_t n_rows,
+        uint32_t n_seqs) {
+    // ERROR so the failing-shape log shows at default verbosity.
+    LLAMA_LOG_ERROR("%s: site=%s ctx=%d slots=%u supported=%d flags=%u domain=%u row=%u rows=%u seqs=%u\n",
+        __func__, site, (int) ctx_type, cache_slots, (int) backend_supported,
+        flags, domain, row_semantics, n_rows, n_seqs);
+}
+#endif
 
 static bool verification_position_matches(llama_pos first, uint32_t offset, llama_pos current) {
     if (offset > (uint64_t) std::numeric_limits<llama_pos>::max() ||
@@ -185,6 +259,40 @@ static llama_speculative_execution_policy speculative_execution_policy_for(
     }
     result.flags = required_grouped_execution_flags(cache_slots, backend_supported);
     if (cache_slots == 0) {
+        // S1 (MTP verify combine) policy exception: admit the MTP domain into
+        // the grouped-plan path as RECORD-ONLY telemetry. result.flags above
+        // is intentionally untouched (NONE here), so no dispatch decision
+        // changes; fail_closed stays false. Shapes without valid row semantics
+        // are skipped (counted), never failed.
+        if (result.domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP &&
+                llama_mtp_verify_grouped_telemetry_enabled()) {
+            // One-time engaged line so rig logs prove the exception path runs.
+            static std::atomic<int> s1_engaged_logged { 0 };
+            if (s1_engaged_logged.exchange(1) == 0) {
+                fprintf(stderr, "llama-mtp-verify-telemetry: engaged (record-only, flags unchanged)\n");
+            }
+            result.row_semantics = speculative_batch_row_semantics(batch);
+            if (result.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID) {
+                const uint64_t skip =
+                    llama_mtp_verify_record_shape_skip.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (skip == 1) {
+                    fprintf(stderr, "llama-mtp-verify-telemetry: first shape_skip (batch n_tokens=%d; "
+                        "MTP hook batches share one seq so rows are neither independent nor sequential)\n",
+                        batch.n_tokens);
+                }
+                if (skip % 50 == 0) {
+                    fprintf(stderr, "llama-mtp-verify-telemetry: site=policy-skip admitted=%llu shape_skip=%llu fallback=%llu\n",
+                        (unsigned long long) llama_mtp_verify_record_admitted.load(std::memory_order_relaxed),
+                        (unsigned long long) skip,
+                        (unsigned long long) llama_mtp_verify_record_fallback.load(std::memory_order_relaxed));
+                }
+                return result;
+            }
+            result.preserve_intent = true;
+            result.record_only = true;
+            llama_mtp_verify_record_log("policy",
+                llama_mtp_verify_record_admitted.fetch_add(1, std::memory_order_relaxed) + 1);
+        }
         return result;
     }
     result.row_semantics = speculative_batch_row_semantics(batch);
@@ -3232,6 +3340,7 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
         if (speculative_policy.preserve_intent) {
             execution_intent.domain = speculative_policy.domain;
             execution_intent.row_semantics = speculative_policy.row_semantics;
+            execution_intent.record_only = speculative_policy.record_only;
             has_execution_intent = true;
         }
     }
@@ -3292,7 +3401,9 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
     const bool moe_verification_grouped = required_grouped_execution_flags(
         model.moe_expert_cache_slots(), moe_required_grouped_execution_supported) !=
         GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE;
-    const bool use_verification_intent = has_execution_intent &&
+    // S1: record_only intents may be dropped per-ubatch on shape mismatch
+    // (legacy fallback) without failing the decode; see the ubatch check below.
+    bool use_verification_intent = has_execution_intent &&
         (execution_intent.domain != GGML_GRAPH_EXECUTION_DOMAIN_MAIN || moe_verification_grouped);
 
     balloc->set_verification_span(
@@ -3374,10 +3485,26 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+#ifdef LLAMA_MOE_GROUPED_DEBUG
+        if (use_verification_intent) {
+            const bool dbg_match = ubatch_matches_graph_execution_intent(
+                cparams.ctx_type, model.moe_expert_cache_slots(), ubatch, execution_intent);
+            llama_moe_grouped_debug_log_ubatch("decode:3378", cparams.ctx_type,
+                model.moe_expert_cache_slots(), ubatch, execution_intent, dbg_match);
+        }
+#endif
         if (use_verification_intent && !ubatch_matches_graph_execution_intent(
                 cparams.ctx_type, model.moe_expert_cache_slots(), ubatch, execution_intent)) {
-            LLAMA_LOG_ERROR("%s: ubatch does not match the validated execution intent\n", __func__);
-            return -2;
+            if (execution_intent.record_only) {
+                // S1 record-only: the dispatch decision is unchanged by
+                // construction, so drop the telemetry intent for this ubatch
+                // and continue on the legacy path instead of failing.
+                llama_mtp_verify_record_fallback.fetch_add(1, std::memory_order_relaxed);
+                use_verification_intent = false;
+            } else {
+                LLAMA_LOG_ERROR("%s: ubatch does not match the validated execution intent\n", __func__);
+                return -2;
+            }
         }
 
         // count the outputs in this ubatch
@@ -4109,6 +4236,14 @@ ggml_status llama_context::graph_compute(
     ggml_status status;
     if (ubatch != nullptr && execution_intent != nullptr &&
             execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN) {
+#ifdef LLAMA_MOE_GROUPED_DEBUG
+        {
+            const bool dbg_match = ubatch_matches_graph_execution_intent(
+                cparams.ctx_type, model.moe_expert_cache_slots(), *ubatch, *execution_intent);
+            llama_moe_grouped_debug_log_ubatch("graph:4133-main", cparams.ctx_type,
+                model.moe_expert_cache_slots(), *ubatch, *execution_intent, dbg_match);
+        }
+#endif
         if (!ubatch_matches_graph_execution_intent(
                 cparams.ctx_type, model.moe_expert_cache_slots(), *ubatch, *execution_intent)) {
             LLAMA_LOG_ERROR("%s: target verification ubatch does not match the validated intent\n", __func__);
@@ -4120,6 +4255,12 @@ ggml_status llama_context::graph_compute(
         certificate.struct_size = sizeof(certificate);
         certificate.flags = required_grouped_execution_flags(
             model.moe_expert_cache_slots(), moe_required_grouped_execution_supported);
+#ifdef LLAMA_MOE_GROUPED_DEBUG
+        llama_moe_grouped_debug_log_stamp("stamp:4121-main", cparams.ctx_type,
+            model.moe_expert_cache_slots(), moe_required_grouped_execution_supported,
+            certificate.flags, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE, ubatch->n_tokens, ubatch->n_seqs_unq);
+#endif
         certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
         certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
         certificate.owner_namespace = graph_execution_owner_namespace;
@@ -4130,24 +4271,46 @@ ggml_status llama_context::graph_compute(
     } else if (ubatch != nullptr && execution_intent != nullptr &&
             (execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT ||
              execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP)) {
+#ifdef LLAMA_MOE_GROUPED_DEBUG
+        {
+            const bool dbg_match = ubatch_matches_graph_execution_intent(
+                cparams.ctx_type, model.moe_expert_cache_slots(), *ubatch, *execution_intent);
+            llama_moe_grouped_debug_log_ubatch("graph:4133-spec", cparams.ctx_type,
+                model.moe_expert_cache_slots(), *ubatch, *execution_intent, dbg_match);
+        }
+#endif
         if (!ubatch_matches_graph_execution_intent(
                 cparams.ctx_type, model.moe_expert_cache_slots(), *ubatch, *execution_intent)) {
-            LLAMA_LOG_ERROR("%s: speculative ubatch does not match the validated grouped intent\n", __func__);
-            return GGML_STATUS_FAILED;
+            if (execution_intent->record_only) {
+                // S1 record-only: drop the telemetry intent and run the legacy
+                // path (plain async, no certificate). Dispatch unchanged.
+                llama_mtp_verify_record_fallback.fetch_add(1, std::memory_order_relaxed);
+                status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+            } else {
+                LLAMA_LOG_ERROR("%s: speculative ubatch does not match the validated grouped intent\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
+        } else {
+            ggml_graph_execution_certificate certificate = {};
+            certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
+            certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
+            certificate.struct_size = sizeof(certificate);
+            certificate.flags = required_grouped_execution_flags(
+                model.moe_expert_cache_slots(), moe_required_grouped_execution_supported);
+#ifdef LLAMA_MOE_GROUPED_DEBUG
+            llama_moe_grouped_debug_log_stamp("stamp:4142-spec", cparams.ctx_type,
+                model.moe_expert_cache_slots(), moe_required_grouped_execution_supported,
+                certificate.flags, execution_intent->domain, execution_intent->row_semantics,
+                ubatch->n_tokens, ubatch->n_seqs_unq);
+#endif
+            certificate.domain = execution_intent->domain;
+            certificate.row_semantics = execution_intent->row_semantics;
+            certificate.owner_namespace = graph_execution_owner_namespace;
+            certificate.owner_generation = graph_execution_owner_generation;
+            certificate.n_rows = ubatch->n_tokens;
+            certificate.n_sequences = ubatch->n_seqs_unq;
+            status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
         }
-        ggml_graph_execution_certificate certificate = {};
-        certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
-        certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
-        certificate.struct_size = sizeof(certificate);
-        certificate.flags = required_grouped_execution_flags(
-            model.moe_expert_cache_slots(), moe_required_grouped_execution_supported);
-        certificate.domain = execution_intent->domain;
-        certificate.row_semantics = execution_intent->row_semantics;
-        certificate.owner_namespace = graph_execution_owner_namespace;
-        certificate.owner_generation = graph_execution_owner_generation;
-        certificate.n_rows = ubatch->n_tokens;
-        certificate.n_sequences = ubatch->n_seqs_unq;
-        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
     } else if (execution_intent != nullptr) {
         LLAMA_LOG_ERROR("%s: unsupported graph execution intent\n", __func__);
         return GGML_STATUS_FAILED;
@@ -4170,8 +4333,23 @@ ggml_status llama_context::graph_compute(
             certificate.flags = required_grouped_execution_flags(
                 model.moe_expert_cache_slots(), moe_required_grouped_execution_supported);
         }
+#ifdef LLAMA_MOE_GROUPED_DEBUG
+        llama_moe_grouped_debug_log_stamp("stamp:4170-indep", cparams.ctx_type,
+            model.moe_expert_cache_slots(), moe_required_grouped_execution_supported,
+            certificate.flags, certificate.domain, certificate.row_semantics,
+            ubatch->n_tokens, ubatch->n_seqs_unq);
+#endif
         status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
     } else {
+#ifdef LLAMA_MOE_GROUPED_DEBUG
+        {
+            const uint32_t dbg_flags = required_grouped_execution_flags(
+                model.moe_expert_cache_slots(), moe_required_grouped_execution_supported);
+            llama_moe_grouped_debug_log_stamp("stamp:4176-fallback", cparams.ctx_type,
+                model.moe_expert_cache_slots(), moe_required_grouped_execution_supported,
+                dbg_flags, 0, 0, ubatch ? ubatch->n_tokens : 0, ubatch ? ubatch->n_seqs_unq : 0);
+        }
+#endif
         if ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) &&
                 required_grouped_execution_flags(model.moe_expert_cache_slots(), moe_required_grouped_execution_supported) !=
                     GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE) {

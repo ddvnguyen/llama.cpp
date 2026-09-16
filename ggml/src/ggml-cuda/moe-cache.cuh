@@ -477,6 +477,17 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t cpu_replace_dispatches = 0;
     uint64_t cpu_replace_rows = 0;
     uint64_t cpu_replace_skip = 0;
+    // S1+S2 (MTP verify combine) record-only telemetry. Appended at the end;
+    // zero unless GGML_CUDA_MOE_MTP_VERIFY_TELEMETRY=1.
+    uint64_t mtp_vfy_dispatch = 0;
+    uint64_t mtp_vfy_routes = 0;
+    uint64_t mtp_vfy_miss_routes = 0;
+    uint64_t mtp_vfy_miss_unique = 0;
+    uint64_t mtp_pf_check = 0;
+    uint64_t mtp_pf_pred = 0;
+    uint64_t mtp_pf_hit = 0;
+    uint64_t mtp_pf_pred_missing = 0;
+    uint64_t mtp_pf_gap = 0;
 };
 
 struct ggml_cuda_moe_legacy_debug_telemetry {

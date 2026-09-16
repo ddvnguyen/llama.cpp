@@ -25,6 +25,11 @@ struct llama_speculative_execution_policy {
     uint32_t flags = GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE;
     bool preserve_intent = false;
     bool fail_closed = false;
+    // S1 (MTP verify combine): record-only grouped intent. When true the
+    // dispatch carries the grouped certificate for telemetry but the flags
+    // (dispatch decision) are unchanged and any shape mismatch falls back to
+    // the legacy path instead of failing closed. Default false = old behavior.
+    bool record_only = false;
 };
 
 struct llama_speculative_grouped_intent_test_access {
