@@ -114,6 +114,12 @@ at N=28 the 3060 reports 9293 MiB used / 2619 MiB free, the marginal cost is
 48 x 2.148 = 103 MiB per slot, and **N=64 is a hard cudaMalloc OOM**. That puts
 the ceiling at **N ~ 53-57**.
 
+**Corrected again 2026-09-16 (second overstatement, same author).** A fresh
+footprint measurement — load 10639/1273, decode ~11487 used / **425 MiB free** —
+retires the 9293 MiB ledger this section was built on. The box maximum is
+**N=42**, not 53-57. 425 MiB is four slots. **T-4 is dead**, not demoted.
+From here the measured footprint is authoritative over any ledger arithmetic.
+
 The hybrid does not move it. Backing the slot cost out of the N=28 figure leaves
 a ~6.4 GiB base of non-expert weights + KV + compute buffers, and the hybrid
 reduces none of those — it only avoids some staging buffers, worth 1-2 slots.
@@ -184,6 +190,40 @@ free as the design assumed. What was never tested is routing misses to tier 3.
 to the hybrid moves the projection from ~40 to **~36 t/s**. Section 5's table is
 nominal and should be read with this factor.
 
+### 5.2 T-2b / T-2c (2026-09-16): the veto, and an open conflict
+
+T-2b stopped at `cpu_fraction` **0.0074** — 100% skips at stage-3. T-2c found
+why: MTP verify-combine packs 3 positions x topK10 = **30 routes/plan**, and
+stage-3 validates a 10-row reader node against it
+(`down_node->ne[1] != host.n_routes`, `moe-cache.cu:12601`). A width mismatch,
+i.e. an implementation gap, not a design result.
+
+**Recalibration.** Arm 000's `queued=reused=72` gives 200/72 = **2.78 tokens per
+dispatch**, correcting the 3.43 used in section 5 (mean accepted len 2.76
+agrees). Re-fitting on arm 000 (21.23 t/s, pure `--cpu-moe`) yields
+`t_cpu = 0.0677 ms/expert` against the nominal 0.0704 — the model holds to 4% on
+a configuration it was not fitted to.
+
+**The machinery is not free.** cache-32 + `--cpu-moe` measures 19.85 vs 21.23
+with `covered=1 bank, split_dispatches=0`: the cache did nothing and still cost
+**6.5%**. Every projection below pays it.
+
+| miss rate | hybrid with the 6.5% tax | vs 21.23 control |
+|---|---|---|
+| 54% (T-2c live) | **30.2 t/s** | +42% |
+| 18% (bank ledger) | ~51 t/s | +140% |
+
+**OPEN — the two miss rates conflict by 3x, in the wrong direction.** T-2c reads
+54% at N=42; cache-32's own ledger (96.8 GB over 152208 banks = 0.636 MB/bank,
+about one of gate/up/down) implies ~18% at N=32. More slots cannot yield more
+misses. One measures something other than its label — possibly the same
+10-vs-30 width error as the veto. Unresolved, and it does not block: the
+continue decision is the same under either.
+
+**Consequence for gating.** Never assert `cpu_fraction` against a target
+imported from another configuration. Assert (1) `cpu_fraction > 0.10`, and
+(2) agreement within +/-0.05 with *that arm's own* miss ledger.
+
 ## 6. Implementation plan
 
 Sequenced so each step is independently measurable.
@@ -206,11 +246,8 @@ env-gated and unmeasured. Report `h` and t/s against the cache-0 control.
 Route the top-`f_link` fraction of misses by frequency to the existing demand
 path; the remainder to CPU. *Gate:* >= +5% over T-2 (projection is +11%).
 
-**T-4. Confirm the ceiling. DEMOTED — do this last, or not at all.**
-The N=65-70 upside this step was written for does not exist (see section 4).
-Reachable is N=55-57 against a 53 control, worth ~1pp `h` and ~0.5 t/s.
-Flag-only sweep N=53/55/57; stop at the first OOM. *Gate:* none worth setting —
-run it only if the rig is otherwise idle.
+**T-4. DEAD — do not run.** The box maximum is N=42 with 425 MiB free
+(section 4). There is no capacity lever on this hardware.
 
 **T-5. Seeded T1 priors.** Only after the sim clears calibration gate 3
 (offset stable across N). *Gate:* >= +3pp `h` over unseeded.
@@ -220,6 +257,13 @@ only. Every 64K number in this document is extrapolation.
 *Gate:* >= 15 t/s at 64K.
 
 ---
+
+**Gates are relative, not absolute.** Every throughput gate in this section is
+against a control measured on **the same binary**. Arm 000's 21.23 was taken on
+an older binary, and comparing across binaries is the error that has already
+cost this track three arms. Continue at **>= +30%** over that control, kill at
+**< +15%**, decide on the increment's own merits in between. Every arm asserts
+engagement (section 5.2) before any throughput number is recorded.
 
 ## 7. Risks
 
@@ -239,7 +283,15 @@ only. Every 64K number in this document is extrapolation.
    predicted. The ledger figure plausibly excludes padding or head overhead.
    Ratios and the `f_link` rule are unaffected either way, so this does not
    need its own arm — fold it into T-1/T-2 rig time.
-4. **`f_link` assumes the two pipes do not interfere.** A DMA into VRAM and a
+4. **Width-scope error (new, highest open risk).** Stage-3 validated a 10-row
+   node against a 30-route plan. Anything else consuming routes-per-plan may
+   share it: miss counts, `f_link` denominators, bank totals, the section 5.2
+   miss-rate conflict. Audit every consumer, not just the one that failed.
+   Related: a recurrence figure of 0.2136 has been measured and is **not**
+   `f_link` (= 0.165 = `t_cpu/(t_link+t_cpu)`). Do not wire it as one; if it is
+   a recurrence probability it belongs to victim choice (section 8).
+
+5. **`f_link` assumes the two pipes do not interfere.** A DMA into VRAM and a
    host FFN both touch host memory. If they contend, the effective aggregate is
    below `B_link + B_cpu` and `f_link` should be fitted empirically rather than
    computed. T-3's env override exists for this.
