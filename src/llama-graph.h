@@ -903,6 +903,7 @@ public:
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+    ggml_tensor * get_moe_topk(int il) const { return t_moe_topk[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -938,6 +939,9 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    // per-layer MoE expert ids, filled in build_moe_ffn, read out by the route tracer
+    std::vector<ggml_tensor *> t_moe_topk;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
