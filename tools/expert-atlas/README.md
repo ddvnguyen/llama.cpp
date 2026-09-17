@@ -39,4 +39,8 @@ production stats path once it lands.
 - `sweep.sh` — driver: greedy confound-controlled generation + per-probe delta
 - `analyze.py` — statistics port (mean share, p(c|e), spec = 1 − H/log C,
   replication gate) emitting the observability-tier `experts.json` + provenance
+- `export_pinfile.py` — `experts.json`/`expert-ranks.json` → pin file
+  (`L <il> <ids...>`, hot-first, wrap-aware). Engine-agnostic: `--expect-engine-id`
+  refusal + optional `--check-url` live geometry match. Round-trip verified
+  byte-identical to the parent repo artifact
 - `validate.py` — leave-one-prompt-out validation (added when real spectra exist)
