@@ -1387,6 +1387,9 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_moe_topk.resize(LLAMA_MAX_LAYERS + 1);
+    std::fill(t_moe_topk.begin(), t_moe_topk.end(), nullptr);
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1446,6 +1449,17 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
+            }
+        }
+    }
+    // route tracer / HYDRA consult outputs, env-gated, off by default.
+    // Any post-hoc reader (trace dump or pin consult) needs these marked:
+    // unmarked intermediates may have their buffers recycled by the time
+    // extraction runs, yielding stale float-bit contents instead of ids.
+    if (getenv("HYDRA_TRACE_ROUTES") || getenv("HYDRA_PIN_FILE")) {
+        for (auto * tensor : t_moe_topk) {
+            if (tensor != nullptr) {
+                ggml_set_output(tensor);
             }
         }
     }
@@ -2185,6 +2199,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+
+    // stash the ids tensor for the route tracer (read out in llama_context, env-gated)
+    if (res && il >= 0 && (size_t) il < res->t_moe_topk.size()) {
+        res->t_moe_topk[il] = selected_experts;
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
