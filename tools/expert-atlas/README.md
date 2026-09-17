@@ -43,4 +43,11 @@ production stats path once it lands.
   (`L <il> <ids...>`, hot-first, wrap-aware). Engine-agnostic: `--expect-engine-id`
   refusal + optional `--check-url` live geometry match. Round-trip verified
   byte-identical to the parent repo artifact
-- `validate.py` — leave-one-prompt-out validation (added when real spectra exist)
+- `validate.py` — leave-one-prompt-out validation (LLM pop review #175): the
+  atlas is only real if a specialist set learned from some prompts predicts
+  routing on a prompt it never saw. hydra LEAK FIX vs Colibri original: the
+  held-out run is excluded from EVERY category's training (numerator and
+  denominator) — the original let it leak into other categories' lift
+  denominators, scoring ~84% on pure noise at chance 20%. Null verified at
+  chance on random-routing controls; signal verified on banded synthetic
+  spectra. Runs once real spectra exist.
