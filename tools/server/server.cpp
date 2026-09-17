@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-atlas.h" // hydra: expert-atlas read surface (#771)
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -302,6 +303,21 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/v1/stream",                ex_wrapper(stream_get_h));
     ctx_http.post("/v1/streams/lookup",        ex_wrapper(streams_lookup_h));
     ctx_http.del ("/v1/stream",                ex_wrapper(stream_delete_h));
+
+    // hydra: expert-atlas read surface (hydra_vortex#771) — Colibri EMAP encoding verbatim. Env-gated no-op.
+    // Geometry init is lazy + idempotent. (RPC 0x33 not ported: this lineage has no Hydra RPC listener.)
+    ctx_http.get("/experts", ex_wrapper([&params](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        hydra_atlas::init(params.model.path);
+        auto body = hydra_atlas::experts_json();
+        if (!body) {
+            res->status = 503;
+            res->data   = safe_json_to_str(json{{"error", "expert meta disabled (HYDRA_EXPERT_META unset or geometry unavailable)"}});
+            return res;
+        }
+        res->data = *body;
+        return res;
+    }));
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();

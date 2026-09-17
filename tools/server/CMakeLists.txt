@@ -13,6 +13,8 @@ endif()
 set(TARGET server-context)
 
 add_library(${TARGET} STATIC
+    server-atlas.cpp
+    server-atlas.h
     server-chat.cpp
     server-chat.h
     server-task.cpp
