@@ -5,6 +5,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-rpc.h"
+#include "server-atlas.h" // hydra: expert-atlas read surface (#771)
 #include "server-schema.h"
 #include "server-stream.h"
 
@@ -5783,7 +5784,10 @@ static void hydra_handle_state_meta(int fd, server_slot & slot) {
 // ── Per-connection loop ───────────────────────────────────────────────────────
 // Persistent: one TCP connection handles many sequential requests.
 
-static void hydra_handle_connection(int fd, std::vector<server_slot> * slots) {
+static void hydra_handle_connection(int fd, std::vector<server_slot> * slots,
+                                    const std::shared_ptr<std::string> & model_path) {
+    // hydra #771: lazy geometry init on first connection (idempotent).
+    if (model_path) hydra_atlas::init(*model_path);
     while (true) {
         uint8_t hdr[HYDRA_REQ_HEADER_SIZE];
         if (!hydra_recv_all(fd, hdr, HYDRA_REQ_HEADER_SIZE)) break;
@@ -5807,6 +5811,22 @@ static void hydra_handle_connection(int fd, std::vector<server_slot> * slots) {
         std::string trace_id(trace_len, '\0');
         if (!hydra_recv_all(fd, key.data(),      key_len))   break;
         if (!hydra_recv_all(fd, trace_id.data(), trace_len)) break;
+
+        // hydra #771: EXPERT_META (0x33) — model-scoped read, no slot key required.
+        // Serves the same JSON as HTTP GET /experts (Colibri EMAP encoding verbatim).
+        if (op == HYDRA_OP_EXPERT_META) {
+            SRV_DBG("hydra rpc: EXPERT_META trace=%s\n", trace_id.c_str());
+            auto body = hydra_atlas::experts_json();
+            if (!body) {
+                const std::string err = "{\"error\":\"expert meta disabled (HYDRA_EXPERT_META unset or geometry unavailable)\"}";
+                hydra_write_res(fd, HYDRA_STATUS_ERROR, (uint32_t) err.size(), 0);
+                hydra_send_all(fd, err.data(), err.size());
+                continue;
+            }
+            hydra_write_res(fd, HYDRA_STATUS_OK, 0, (uint64_t) body->size());
+            hydra_send_all(fd, body->data(), body->size());
+            continue;
+        }
 
         int slot_id = -1;
         try { slot_id = std::stoi(key); }
@@ -5860,7 +5880,11 @@ void server_context::start_rpc_server(int port) {
     // thread instead). Ported only its hydra_send/recv_all failure-logging hunk above.
     auto * slots_ptr = &impl->slots;
 
-    std::thread([port, slots_ptr]() {
+    // hydra #771: EXPERT_META (0x33) is model-scoped — resolve the model path
+    // here (member scope) and keep it alive for the detached handler threads.
+    auto model_path = std::make_shared<std::string>(impl->params_base.model.path);
+
+    std::thread([port, slots_ptr, model_path]() {
         const int srv_fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (srv_fd < 0) {
             SRV_ERR("hydra rpc: socket() failed: %s\n", strerror(errno));
@@ -5885,7 +5909,7 @@ void server_context::start_rpc_server(int port) {
         while (true) {
             const int conn_fd = ::accept(srv_fd, nullptr, nullptr);
             if (conn_fd < 0) continue;
-            std::thread(hydra_handle_connection, conn_fd, slots_ptr).detach();
+            std::thread(hydra_handle_connection, conn_fd, slots_ptr, model_path).detach();
         }
     }).detach();
 }

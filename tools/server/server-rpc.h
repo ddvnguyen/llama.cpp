@@ -17,6 +17,7 @@ static constexpr uint16_t HYDRA_MAGIC           = 0x4859; // "HY", little-endian
 static constexpr uint8_t  HYDRA_OP_STATE_GET    = 0x30; // stream KV state out
 static constexpr uint8_t  HYDRA_OP_STATE_PUT    = 0x31; // stream KV state in
 static constexpr uint8_t  HYDRA_OP_STATE_META   = 0x32; // metadata only, no payload
+static constexpr uint8_t  HYDRA_OP_EXPERT_META  = 0x33; // expert-atlas read surface (hydra_vortex#771)
 
 // ── Status codes (shared with full Hydra spec) ────────────────────────────────
 static constexpr uint8_t  HYDRA_STATUS_OK        = 0x00;
