@@ -88,6 +88,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -1886,6 +1887,268 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// HYDRA static pin store + mm_id sync instrumentation. Env-gated, off by default.
+// HYDRA_SYNC_STATS=1 enables path/sync counters. HYDRA_PIN_FILE=<path> loads a
+// pin set (format: "L <il> <expert ids...>" per line, "#" comments). Absent env
+// means zero behavior change: no extra copies, no extra syncs, one branch.
+static std::atomic<int64_t> hydra_n_mmvq{0};
+static std::atomic<int64_t> hydra_n_mmq{0};
+static std::atomic<int64_t> hydra_n_mmf{0};
+static std::atomic<int64_t> hydra_n_fallback{0};
+static std::atomic<int64_t> hydra_n_sync{0};
+static std::atomic<int64_t> hydra_sync_us{0};
+static std::atomic<int64_t> hydra_hit_exp{0};
+static std::atomic<int64_t> hydra_miss_exp{0};
+static std::atomic<int64_t> hydra_hit_ls[256][4]{};
+static std::atomic<int64_t> hydra_miss_ls[256][4]{};
+
+static bool hydra_stats_on = false;
+static std::vector<std::vector<int32_t>> hydra_pins;
+static std::once_flag hydra_init_once;
+
+struct hydra_pin_store {
+    int device = -1;
+    int il = -1;
+    int site = -1;
+    size_t row_bytes = 0;
+    void * dev_ptr = nullptr;
+    std::vector<int> slot_of; // per expert, -1 = MISS
+};
+
+static std::mutex hydra_pin_mu;
+static std::map<int64_t, hydra_pin_store> hydra_stores;
+
+static void hydra_dump_stats(void) {
+    fprintf(stderr, "[HYDRA mmid] mmvq=%lld mmq=%lld mmf=%lld fallback=%lld sync_waits=%lld sync_us=%lld hit_exp=%lld miss_exp=%lld\n",
+        (long long) hydra_n_mmvq.load(), (long long) hydra_n_mmq.load(), (long long) hydra_n_mmf.load(),
+        (long long) hydra_n_fallback.load(), (long long) hydra_n_sync.load(), (long long) hydra_sync_us.load(),
+        (long long) hydra_hit_exp.load(), (long long) hydra_miss_exp.load());
+    for (int il = 0; il < 256; ++il) {
+        for (int s = 0; s < 4; ++s) {
+            const long long h = (long long) hydra_hit_ls[il][s].load();
+            const long long m = (long long) hydra_miss_ls[il][s].load();
+            if (h || m) {
+                fprintf(stderr, "[HYDRA miss] il=%d site=%d hit=%lld miss=%lld\n", il, s, h, m);
+            }
+        }
+    }
+}
+
+static void hydra_init_once_fn(void) {
+    hydra_stats_on = getenv("HYDRA_SYNC_STATS") != nullptr;
+    const char * pin_path = getenv("HYDRA_PIN_FILE");
+    if (pin_path) {
+        FILE * f = fopen(pin_path, "r");
+        if (f) {
+            char line[8192];
+            while (fgets(line, sizeof(line), f)) {
+                if (line[0] == '#' || line[0] == '\n') {
+                    continue;
+                }
+                int il = -1;
+                if (sscanf(line, "L %d", &il) != 1 || il < 0) {
+                    continue;
+                }
+                if ((size_t) il >= hydra_pins.size()) {
+                    hydra_pins.resize(il + 1);
+                }
+                const char * p = strchr(line, ' ');
+                p = p ? strchr(p + 1, ' ') : nullptr;
+                while (p && *p) {
+                    int e = -1, nch = 0;
+                    if (sscanf(p, "%d%n", &e, &nch) != 1 || e < 0) {
+                        break;
+                    }
+                    hydra_pins[il].push_back(e);
+                    p += nch;
+                }
+            }
+            fclose(f);
+        }
+    }
+    if (hydra_stats_on || !hydra_pins.empty()) {
+        atexit(hydra_dump_stats);
+    }
+}
+
+static inline bool hydra_active(void) {
+    std::call_once(hydra_init_once, hydra_init_once_fn);
+    return hydra_stats_on || !hydra_pins.empty();
+}
+
+// site ids for the 4 mm_id weight tensors, parsed from the gguf tensor name
+// fork names: blk.<il>.ffn_{gate_up,up,gate,down}(_exps)?.(weight|bias)
+static int hydra_site_of(const char * name) {
+    if (strstr(name, "ffn_gate_up")) {
+        return 0;
+    }
+    if (strstr(name, "ffn_up")) {
+        return 1;
+    }
+    if (strstr(name, "ffn_gate")) {
+        return 2;
+    }
+    if (strstr(name, "ffn_down")) {
+        return 3;
+    }
+    return -1;
+}
+
+// lazily build (device, layer, site) GPU store on first encounter; caller holds no lock
+static hydra_pin_store * hydra_store_for(int device, int il, int site, const ggml_tensor * src0, int64_t n_expert, cudaStream_t stream) {
+    if (il < 0 || site < 0 || (size_t) il >= hydra_pins.size() || hydra_pins[il].empty()) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(hydra_pin_mu);
+    const int64_t key = ((int64_t) device << 42) | ((int64_t) il << 21) | (int64_t) site;
+    auto it = hydra_stores.find(key);
+    if (it != hydra_stores.end()) {
+        return &it->second;
+    }
+    hydra_pin_store st;
+    st.device = device;
+    st.il = il;
+    st.site = site;
+    // Coupling hard-fail: the store is filled with cudaMemcpyHostToDevice from
+    // src0, so src0 must be CPU-resident. Abort here instead of copying garbage
+    // when experts live on the device (run with --cpu-moe or unset HYDRA_PIN_FILE).
+    if (src0->buffer == nullptr || !ggml_backend_buffer_is_host(src0->buffer)) {
+        GGML_ABORT("hydra: layer %d site %d expert weights are not CPU-resident", il, site);
+    }
+    st.row_bytes = src0->nb[2];
+    st.slot_of.assign(n_expert, -1);
+    const size_t n_slot = hydra_pins[il].size();
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaMalloc(&st.dev_ptr, n_slot * st.row_bytes));
+    int slot = 0;
+    for (int32_t e : hydra_pins[il]) {
+        if (e < 0 || e >= n_expert || st.slot_of[e] >= 0) {
+            continue;
+        }
+        st.slot_of[e] = slot;
+        CUDA_CHECK(cudaMemcpyAsync((char *) st.dev_ptr + (size_t) slot * st.row_bytes,
+            (const char *) src0->data + (size_t) e * st.row_bytes, st.row_bytes,
+            cudaMemcpyHostToDevice, stream));
+        slot++;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    auto res = hydra_stores.emplace(key, std::move(st));
+    return &res.first->second;
+}
+
+// Phase-B pilot (PROCEED-A): dispatch-time compact-gather for the MMVQ decode path.
+// Per call, gather the used expert rows (store slots for hits, H2D for misses) into a
+// compact device tensor, remap ids to compact indices, run the existing kernel unmodified.
+// Values are bit-identical to the direct path (same bytes); only fetch location changes.
+// Decode-only (ne12==1), mirroring the old graph-side gate. Returns true when handled.
+// NOTE: performs a D2H ids readback + stream sync; needs_sync must veto CUDA graphs
+// for every node this engages on (mirrored conditions there, no side effects).
+static bool hydra_gather_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t n_expert_used = ids->ne[0];
+    if (ne12 != 1 || !hydra_active() || hydra_pins.empty()) {
+        return false;
+    }
+    const char * wname = ggml_get_name(src0);
+    int il = -1;
+    if (!wname || sscanf(wname, "blk.%d.", &il) != 1) {
+        return false;
+    }
+    const int site = hydra_site_of(wname);
+    if (site < 0) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    hydra_pin_store * st = hydra_store_for(ggml_cuda_get_device(), il, site, src0, ne02, stream);
+    if (!st) {
+        return false; // no pins for this layer: plain path, zero gather overhead past here
+    }
+    // read back the (tiny) ids tensor to determine used experts on the host
+    const size_t n_ids = (size_t) (ne12 * n_expert_used);
+    std::vector<int32_t> ids_host(n_ids);
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, n_ids * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<int> compact_of(ne02, -1);
+    std::vector<int32_t> used;
+    used.reserve((size_t) n_ids);
+    for (int64_t i12 = 0; i12 < ne12; ++i12) {
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t e = *(const int32_t *) ((const char *) ids_host.data() + i12 * ids->nb[1] + iex * ids->nb[0]);
+            if (e < 0 || e >= ne02) {
+                continue; // topk always emits valid ids; guard is memory-safety only
+            }
+            if (compact_of[e] < 0) {
+                compact_of[e] = (int) used.size();
+                used.push_back(e);
+            }
+        }
+    }
+    if (used.empty()) {
+        return false;
+    }
+    const size_t row_bytes = st->row_bytes; // == src0->nb[2]: slot rows are verbatim expert rows
+    ggml_cuda_pool_alloc<char> compact_buf(ctx.pool(), used.size() * row_bytes);
+    ggml_cuda_pool_alloc<char> ids_buf(ctx.pool(), n_ids * sizeof(int32_t));
+    std::vector<int32_t> ids_new(n_ids);
+    for (size_t u = 0; u < used.size(); ++u) {
+        const int32_t e = used[u];
+        const int slot = (e < (int64_t) st->slot_of.size()) ? st->slot_of[e] : -1;
+        if (slot >= 0) {
+            CUDA_CHECK(cudaMemcpyAsync(compact_buf.ptr + u * row_bytes,
+                (const char *) st->dev_ptr + (size_t) slot * row_bytes, row_bytes,
+                cudaMemcpyDeviceToDevice, stream));
+            if (hydra_stats_on) {
+                hydra_hit_exp++;
+                if (il >= 0 && il < 256 && site >= 0) {
+                    hydra_hit_ls[il][site]++;
+                }
+            }
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(compact_buf.ptr + u * row_bytes,
+                (const char *) src0->data + (size_t) e * src0->nb[2], row_bytes,
+                cudaMemcpyHostToDevice, stream));
+            if (hydra_stats_on) {
+                hydra_miss_exp++;
+                if (il >= 0 && il < 256 && site >= 0) {
+                    hydra_miss_ls[il][site]++;
+                }
+            }
+        }
+    }
+    for (int64_t i12 = 0; i12 < ne12; ++i12) {
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t e = *(const int32_t *) ((const char *) ids_host.data() + i12 * ids->nb[1] + iex * ids->nb[0]);
+            ids_new[(size_t) (i12 * n_expert_used + iex)] = (e >= 0 && e < ne02) ? compact_of[e] : 0;
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(ids_buf.ptr, ids_new.data(), n_ids * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    // compact src0 view: same type/strides as src0, expert dim collapsed to used rows
+    ggml_tensor src0_c = *src0;
+    src0_c.ne[2]    = (int64_t) used.size();
+    src0_c.nb[2]    = row_bytes;
+    src0_c.nb[3]    = used.size() * row_bytes;
+    src0_c.data     = compact_buf.ptr;
+    src0_c.op       = GGML_OP_VIEW;
+    src0_c.view_src = dst->src[0];
+    // ids view: same layout as ids, remapped values
+    ggml_tensor ids_c;
+    memset(&ids_c, 0, sizeof(ids_c));
+    ids_c.buffer = ids->buffer;
+    ids_c.type   = GGML_TYPE_I32;
+    ids_c.ne[0]  = ids->ne[0];
+    ids_c.ne[1]  = ids->ne[1];
+    ids_c.ne[2]  = ids->ne[2];
+    ids_c.ne[3]  = ids->ne[3];
+    ids_c.nb[0]  = ids->nb[0];
+    ids_c.nb[1]  = ids->nb[1];
+    ids_c.nb[2]  = ids->nb[2];
+    ids_c.nb[3]  = ids->nb[3];
+    ids_c.data   = ids_buf.ptr;
+    ggml_cuda_mul_mat_vec_q(ctx, &src0_c, src1, &ids_c, dst);
+    return true;
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -1894,6 +2157,21 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
+    }
+
+    // Phase-B pilot: the compact-gather path syncs (D2H ids readback), so any node it
+    // engages on must veto CUDA graphs. Side-effect-free mirror of the gather engage
+    // conditions (no store creation here; pins vector is process-static).
+    if (src1->ne[2] == 1 && hydra_active() && !hydra_pins.empty()) {
+        const char * wname = ggml_get_name(src0);
+        int il = -1;
+        if (wname && sscanf(wname, "blk.%d.", &il) == 1 && hydra_site_of(wname) >= 0 &&
+            il >= 0 && (size_t) il < hydra_pins.size() && !hydra_pins[(size_t) il].empty()) {
+            if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE && ggml_is_quantized(src0->type) &&
+                dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+                return true;
+            }
+        }
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
@@ -1936,6 +2214,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    if (hydra_active()) {
+                        hydra_n_mmvq++;
+                    }
+                    if (hydra_gather_mmvq(ctx, src0, src1, ids, dst)) {
+                        return;
+                    }
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -1948,14 +2232,25 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            if (hydra_active()) {
+                hydra_n_mmq++;
+            }
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            if (hydra_active()) {
+                hydra_n_mmf++;
+            }
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
+    }
+
+    const bool hydra_on = hydra_active();
+    if (hydra_on) {
+        hydra_n_fallback++;
     }
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
@@ -1987,7 +2282,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     std::vector<char> ids_host(ggml_nbytes(ids));
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (hydra_on) {
+        const int64_t t0 = ggml_time_us();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        hydra_sync_us += ggml_time_us() - t0;
+        hydra_n_sync++;
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
@@ -2008,7 +2310,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
     CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (hydra_on) {
+        const int64_t t0 = ggml_time_us();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        hydra_sync_us += ggml_time_us() - t0;
+        hydra_n_sync++;
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
     const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
     const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
@@ -2021,6 +2330,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
+
+    // HYDRA static pins: resolve (device, layer, site) store once per call.
+    // Decode-only: ne12 is the token count here, mirror the graph-side
+    // n_tokens == 1 gate so prefill neither swaps w_ptr nor pollutes stats.
+    hydra_pin_store * hydra_st = nullptr;
+    int hydra_il = -1, hydra_site = -1;
+    if (hydra_on && !hydra_pins.empty() && ne12 == 1) {
+        const char * wname = ggml_get_name(src0);
+        if (wname && sscanf(wname, "blk.%d.", &hydra_il) == 1) {
+            hydra_site = hydra_site_of(wname);
+            hydra_st = hydra_store_for(ggml_cuda_get_device(), hydra_il, hydra_site, src0, ne02, stream);
+        }
+    }
+
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
         if (tokens_per_expert[i02] == 0) {
             continue;
@@ -2031,7 +2354,25 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src0_slice.nb[3]    = src0_slice.nb[2];
         src0_slice.op       = GGML_OP_VIEW;
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        src0_slice.data     = (char *) src0->data + i02*nb02;
+        char * w_ptr = (char *) src0->data + i02*nb02;
+        if (hydra_st) {
+            const int slot = (i02 < (int64_t) hydra_st->slot_of.size()) ? hydra_st->slot_of[i02] : -1;
+            if (slot >= 0) {
+                w_ptr = (char *) hydra_st->dev_ptr + (size_t) slot * hydra_st->row_bytes;
+                if (hydra_stats_on) {
+                    hydra_hit_exp++;
+                    if (hydra_il >= 0 && hydra_il < 256 && hydra_site >= 0) {
+                        hydra_hit_ls[hydra_il][hydra_site]++;
+                    }
+                }
+            } else if (hydra_stats_on) {
+                hydra_miss_exp++;
+                if (hydra_il >= 0 && hydra_il < 256 && hydra_site >= 0) {
+                    hydra_miss_ls[hydra_il][hydra_site]++;
+                }
+            }
+        }
+        src0_slice.data     = w_ptr;
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));

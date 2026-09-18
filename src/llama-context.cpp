@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cpp.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -15,7 +16,9 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -52,7 +55,7 @@ static const llm_fused_op_probe llm_fused_op_gdn_ar_probe = {
 
 static const llm_fused_op_probe llm_fused_op_gdn_ch_probe = {
     /*.op               =*/ LLM_FUSED_OP_GDN_CH,
-    /*.name             =*/ "fused Gated Delta Net (chunked)",
+    /*.name             =*/ "fused Gated Delta Net (autoregressive)",
     /*.n_tokens_per_seq =*/ 16,
 };
 
@@ -1959,6 +1962,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
+        extract_moe_topk(res, ubatch.n_tokens);
+
+        extract_moe_hydra(res, ubatch.n_tokens);
+
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
         {
@@ -2239,6 +2246,186 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+    }
+}
+
+// Route tracer: dump per-layer MoE expert ids for single-token decode steps.
+// Env-gated (HYDRA_TRACE_ROUTES=1, path in HYDRA_TRACE_OUT), decode-only so prefill is untouched.
+void llama_context::extract_moe_topk(const llm_graph_result * res, uint32_t n_tokens) {
+    if (!getenv("HYDRA_TRACE_ROUTES") || n_tokens != 1) {
+        return;
+    }
+    static FILE * f = nullptr;
+    static int64_t n_dumped = 0;
+    if (!f) {
+        const char * path = getenv("HYDRA_TRACE_OUT");
+        if (!path) {
+            path = "/tmp/opencode/phase0-rank/trace-64k/routes.txt";
+        }
+        f = fopen(path, "w");
+        if (!f) {
+            return;
+        }
+        fprintf(f, "# hydra route trace: decode-only, tok = decode ordinal (global idx = prompt_n + tok)\n");
+    }
+    const uint32_t n_layer = model.hparams.n_layer();
+    fprintf(f, "tok %lld nlayers %u\n", (long long) n_dumped, n_layer);
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        ggml_tensor * t = res->get_moe_topk((int) il);
+        if (!t || t->type != GGML_TYPE_I32) {
+            continue;
+        }
+        const int64_t k = t->ne[0];
+        if (k <= 0 || k > 128) {
+            continue;
+        }
+        int32_t ids[128];
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        if (!backend) {
+            continue;
+        }
+        ggml_backend_tensor_get_async(backend, t, ids, 0, (size_t) k * sizeof(int32_t));
+        ggml_backend_sched_synchronize(sched.get());
+        fprintf(f, "L %u", il);
+        for (int64_t j = 0; j < k; ++j) {
+            fprintf(f, " %d", ids[j]);
+        }
+        fprintf(f, "\n");
+    }
+    fflush(f);
+    n_dumped++;
+}
+
+// HYDRA CPU-side consult (measurement-only, item 2 first increment).
+// Adjudicates every expert admitted at the build_lora_mm_id sites in build_moe
+// (gate_up/up/gate/down share one selected_experts tensor per layer, so a single
+// readout here counts each (layer, token, slot) exactly once — per-site counters
+// would 4x-count and violate the hit+miss == 48*topk*n_tokens identity).
+// Env-gated (HYDRA_PIN_FILE=<path>, format "L <il> <expert ids...>", "#" comments).
+// Absent env: single getenv branch, zero behavior change. No side-store, no H2D
+// on miss, no backend crossing: misses execute on CPU as before, we only count.
+static std::atomic<int64_t> hydra_cpu_hit{0};
+static std::atomic<int64_t> hydra_cpu_miss{0};
+static std::atomic<int64_t> hydra_cpu_hit_l[256]{};
+static std::atomic<int64_t> hydra_cpu_miss_l[256]{};
+static std::vector<std::vector<int32_t>> hydra_cpu_pins;
+static std::once_flag hydra_cpu_init_once;
+static bool hydra_cpu_on = false;
+
+static void hydra_cpu_dump(void) {
+    fprintf(stderr, "[HYDRA cpu] hit=%lld miss=%lld total=%lld\n",
+        (long long) hydra_cpu_hit.load(), (long long) hydra_cpu_miss.load(),
+        (long long) (hydra_cpu_hit.load() + hydra_cpu_miss.load()));
+    for (int il = 0; il < 256; ++il) {
+        const long long h = (long long) hydra_cpu_hit_l[il].load();
+        const long long m = (long long) hydra_cpu_miss_l[il].load();
+        if (h || m) {
+            fprintf(stderr, "[HYDRA cpulayer] il=%d hit=%lld miss=%lld\n", il, h, m);
+        }
+    }
+}
+
+static void hydra_cpu_init(void) {
+    const char * path = getenv("HYDRA_PIN_FILE");
+    if (!path) {
+        return;
+    }
+    FILE * f = fopen(path, "r");
+    if (!f) {
+        return;
+    }
+    char line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') {
+            continue;
+        }
+        int il = -1;
+        if (sscanf(line, "L %d", &il) != 1 || il < 0 || il >= 256) {
+            continue;
+        }
+        if ((size_t) il >= hydra_cpu_pins.size()) {
+            hydra_cpu_pins.resize(il + 1);
+        }
+        const char * p = strchr(line, ' ');
+        p = p ? strchr(p + 1, ' ') : nullptr;
+        while (p && *p) {
+            int e = -1, nch = 0;
+            if (sscanf(p, "%d%n", &e, &nch) != 1 || e < 0) {
+                break;
+            }
+            hydra_cpu_pins[il].push_back(e);
+            p += nch;
+        }
+    }
+    fclose(f);
+    size_t nl = 0, np = 0;
+    for (const auto & v : hydra_cpu_pins) { if (!v.empty()) { ++nl; } np += v.size(); }
+    fprintf(stderr, "[HYDRA cpu] pins from %s: %zu layers, %zu ids\n", path, nl, np);
+    hydra_cpu_on = true;
+    atexit(hydra_cpu_dump);
+}
+
+void llama_context::extract_moe_hydra(const llm_graph_result * res, uint32_t n_tokens) {
+    std::call_once(hydra_cpu_init_once, hydra_cpu_init);
+    if (!hydra_cpu_on || n_tokens == 0) {
+        return;
+    }
+    // Decode-only: the proven-clean read pattern (same gate as extract_moe_topk).
+    // Prefill-chunk topk tensors are unreliable here: MoE dispatch shards across
+    // CUDA0/CUDA1 and prefill async reads return stale float-bit data on most
+    // layers, so prefill admits are out of scope for this measurement.
+    if (n_tokens != 1) {
+        return;
+    }
+    const uint32_t n_layer = model.hparams.n_layer();
+    std::vector<int32_t> ids;
+    for (uint32_t il = 0; il < n_layer && il < 256; ++il) {
+        ggml_tensor * t = res->get_moe_topk((int) il);
+        if (!t || t->type != GGML_TYPE_I32) {
+            continue;
+        }
+        const int64_t k = t->ne[0];
+        if (k <= 0 || k > 128) {
+            continue;
+        }
+        size_t n = (size_t) k;
+        const size_t avail_n = ggml_nbytes(t) / sizeof(int32_t);
+        if (n > avail_n) {
+            n = avail_n;
+        }
+        if (n == 0) {
+            continue;
+        }
+        ids.resize(n);
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        if (!backend) {
+            continue;
+        }
+        // Fence the tensor's backend before enqueueing the D2H copy: without
+        // this, the copy can observe the argsort buffer before this ubatch's
+        // compute completes (stale float-bit contents -> systematic all-miss).
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get_async(backend, t, ids.data(), 0, ids.size() * sizeof(int32_t));
+        ggml_backend_sched_synchronize(sched.get());
+        // membership: linear scan over the layer's pin list (N<=512, k<=10 — trivial)
+        for (size_t j = 0; j < ids.size(); ++j) {
+            bool hit = false;
+            if (il < hydra_cpu_pins.size()) {
+                for (int32_t p : hydra_cpu_pins[(size_t) il]) {
+                    if (p == ids[j]) {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            if (hit) {
+                hydra_cpu_hit++;
+                hydra_cpu_hit_l[il]++;
+            } else {
+                hydra_cpu_miss++;
+                hydra_cpu_miss_l[il]++;
+            }
+        }
     }
 }
 

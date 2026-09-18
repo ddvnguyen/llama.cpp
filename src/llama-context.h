@@ -234,6 +234,8 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_moe_topk(const llm_graph_result * res, uint32_t n_tokens);
+    void extract_moe_hydra(const llm_graph_result * res, uint32_t n_tokens);
 
     //
     // graph
