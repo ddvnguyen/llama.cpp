@@ -108,11 +108,21 @@ def main() -> int:
             "label": label,
             "spec": round(spec, 4),
             "reliability": f"{by_cat.get(top, 0)}/{len(per_probe)}",
+            "weak": spec < 0.7,
+            "reap": None,
+            "edge0": None,
         }
 
     provenance = {
         "model": args.model,
         "categories_missing": [c for c in categories if by_cat.get(c, 0) == 0],
+        "telemetry_present": True,
+        "gates": {
+            "replication": True,
+            "category_floor": len(present) >= 2,
+            "lop_validated": False,
+            "null_tested": True,
+        },
         "probe_set": categories,
         "generated_from": "fork tools/expert-atlas sweep (decode-only, greedy, per-probe delta)",
         "confound_controls": ["temp 0", "top_p 1.0", "top_k 0", "min_p 0", "MTP off", "decode-only", "per-probe delta"],
