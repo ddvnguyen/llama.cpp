@@ -1125,7 +1125,12 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
 
-        n_ctx = llama_n_ctx(ctx_tgt);
+        // hydra: expert-atlas geometry (#771) — init at load so the Stage A
+        // decode hook sees trunk rows from the first token. Idempotent; the
+        // HTTP/RPC lazy inits stay as backstops. No-op when env-gated off? No:
+        // init is cheap (GGUF header scan) and geometry also serves OFF-state
+        // honest-zero payloads; the stats gate stays in enabled()/accumulate.
+        hydra_atlas::init(params_base.model.path);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -3731,6 +3736,74 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+
+        // hydra: expert-atlas Stage A (#771) — decode-only routed-expert count.
+        // Env-gated (HYDRA_EXPERT_STATS, checked once); OFF = this block never
+        // runs, byte-identical behavior. Gate: every token in this batch_view
+        // is a single generated token (output && !is_prompt) — prefill tails
+        // (is_prompt, incl. the prompt LAST row whose logits predict token 1)
+        // are skipped, as are embedding batches, MTP contexts, and the spec
+        // draft path (draft ids route experts for tokens never emitted).
+        // Tensor rows are output-compact [k, n_outputs]: row r maps to the
+        // r-th output-flagged batch token in view order.
+        if (ret == 0 && has_output && hydra_atlas::enabled()) {
+            bool pure_decode = !batch.has_embd;
+            if (pure_decode) {
+                for (int i = off; i < off + batch_view.n_tokens; ++i) {
+                    if (!batch.tokens[i].output || batch.tokens[i].is_prompt) {
+                        pure_decode = false;
+                        break;
+                    }
+                }
+            }
+            if (pure_decode) {
+                const std::vector<int> rows = hydra_atlas::trunk_rows();
+                const int cols = hydra_atlas::grid_cols();
+                const int k = hydra_atlas::expert_used();
+                if (!rows.empty() && cols > 0 && k > 0) {
+                    std::vector<int32_t> ids((size_t) k);
+                    const int n_out = batch_view.n_tokens; // pure decode: 1 token == 1 output row
+                    // Per-layer liveness: a geometry row whose tensor is absent
+                    // this step (e.g. file carries blk.N exps tensors the runtime
+                    // never builds) is skipped, never allowed to veto the step.
+                    // Dead rows are logged once; they read as honest zeros.
+                    std::vector<size_t> live;
+                    live.reserve(rows.size());
+                    for (size_t r = 0; r < rows.size(); ++r) {
+                        if (llama_get_moe_topk_nrows(ctx_tgt, rows[r]) >= n_out) {
+                            live.push_back(r);
+                        }
+                    }
+                    if (live.size() != rows.size()) {
+                        static bool atlas_dead_logged = false;
+                        if (!atlas_dead_logged) {
+                            atlas_dead_logged = true;
+                            std::string dead;
+                            for (size_t r = 0; r < rows.size(); ++r) {
+                                if (llama_get_moe_topk_nrows(ctx_tgt, rows[r]) < n_out) {
+                                    dead += std::to_string(rows[r]) + " ";
+                                }
+                            }
+                            SRV_WRN("atlas: %d/%d MoE rows lack topk tensors (dead layers: %s) - counting live rows only\n", (int) (rows.size() - live.size()), (int) rows.size(), dead.c_str());
+                        }
+                    }
+                    bool counted = false;
+                    for (int o = 0; o < n_out; ++o) {
+                        for (size_t li = 0; li < live.size(); ++li) {
+                            const size_t r = live[li];
+                            const int n = llama_get_moe_topk(ctx_tgt, rows[r], o, ids.data(), k);
+                            if (n > 0) {
+                                hydra_atlas::accumulate((int) r, ids.data(), n, cols);
+                                counted = true;
+                            }
+                        }
+                    }
+                    if (counted) {
+                        hydra_atlas::end_step((int) rows.size(), cols);
+                    }
+                }
+            }
+        }
 
         if (ret != 0) {
             {

@@ -102,6 +102,13 @@ struct llama_context {
 
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
+    // hydra: expert-atlas Stage A (#771) — routed-expert ids for trunk layer
+    // il, output row out_row (tensor-compact [k, n_outputs] indexing, NOT
+    // batch positions). Returns ids written (<= n_cap), 0 when unavailable.
+    // Decode-only gating lives in the server hook; MTP contexts return 0.
+    int get_moe_topk(int il, int out_row, int32_t * out_ids, int n_cap);
+    // hydra: expert-atlas Stage A (#771) — tensor ne[1] for layer il, else 0.
+    int get_moe_topk_nrows(int il);
 
     void attach_threadpool(
             ggml_threadpool_t threadpool,

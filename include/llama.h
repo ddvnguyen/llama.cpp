@@ -1027,6 +1027,20 @@ extern "C" {
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+    // hydra: expert-atlas Stage A (#771) — routed-expert ids for one trunk layer.
+    // Copies ids for output row out_row (0-based over the decode's output
+    // rows, NOT batch positions — the tensor is [k, n_outputs] compact) into
+    // out_ids (cap n_cap); returns ids written, 0 when unavailable
+    // (env-gated outputs off, MTP/draft context, layer/row out of range, or
+    // no decode yet). Read-only: no graph, sched, sampler, or routing change.
+    // Thread-unsafe vs decode (call from the decode thread while the result
+    // buffer is live, before the next decode overwrites it).
+    LLAMA_API int llama_get_moe_topk(struct llama_context * ctx, int il, int out_row, int32_t * out_ids, int n_cap);
+    // hydra: expert-atlas Stage A (#771) — output-row count of the most
+    // recent decode's MoE top-k tensors (tensor ne[1]). The server hook loops
+    // [0, n) rows; decode-only gating (single-gen vs prefill) is the hook's
+    // job via batch flags, not this function's. 0 when unavailable.
+    LLAMA_API int llama_get_moe_topk_nrows(struct llama_context * ctx, int il);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
