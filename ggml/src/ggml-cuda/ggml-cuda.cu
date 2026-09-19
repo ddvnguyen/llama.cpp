@@ -1919,15 +1919,24 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
 #include "../hydra-pins.h"
 
-// E0 measurement foundation (epic #148): pin-load arming + engagement
-// counter. Env-gated, off by default: HYDRA_PIN_FILE loads + arms the pin
-// set, HYDRA_E0_STATS=1 arms counters with no pins. Absent both: one getenv
-// branch per call site, zero behavior change. E1 (ARM 008 spike) is the
-// first consumer. Timing recorder (#143) is a hook parameter: E1 measures
-// (CUDA events, lazily harvested, for the GPU branch; host wall time for
-// the CPU branch) and records branch samples here. Branches are NEVER
-// merged; the report prints gpu/cpu/combine apart.
-
+// E0 measurement foundation (epic #148): mechanism-agnostic instrumentation
+// for per-expert backend selection. Env-gated, off by default: HYDRA_PIN_FILE
+// loads + arms the pin set, HYDRA_E0_STATS=1 enables counters with no pins.
+// Absent both: one getenv branch per call site, zero behavior change.
+// E1 (ARM 008 spike) is the first consumer; these hooks wrap nothing and
+// assume nothing about the engaged path. Caller contracts:
+// - decode-only: record only when ne12 == 1 (prefill must not pollute stats).
+// - GPU branch timing MUST be CUDA-event measured (host timers around async
+//   calls measure launch, not execution; a launch-timed number reads ~5 us
+//   and fails toward false GO). Record events on the stream, harvest elapsed
+//   times LAZILY on a later call or at teardown; never cudaEventSynchronize
+//   on the critical path. CPU branch: host wall time is correct.
+// - the engaged path MUST stay graph-capturable (no sync); restoring CUDA
+//   graphs is load-bearing for the 34.5 us bar, not hygiene.
+// Instrument cost: one atomic inc per hook plus, for timing, a mutex-guarded
+// ring insert at decode rates (~3 kHz worst case) - sub-0.1 us per call on
+// the CPU side, two orders under the 11.5 us margin. Event recording cost
+// (a few hundred ns per event pair) is E1's to state per its launch budget.
 static std::atomic<int64_t> hydra_e0_engaged{0}; // engaged-path invocations
 
 enum hydra_e0_branch { HYDRA_E0_GPU = 0, HYDRA_E0_CPU = 1, HYDRA_E0_COMBINE = 2 };
@@ -1935,6 +1944,8 @@ enum hydra_e0_branch { HYDRA_E0_GPU = 0, HYDRA_E0_CPU = 1, HYDRA_E0_COMBINE = 2 
 struct hydra_e0_cell {
     int64_t inv = 0;       // engaged invocations
     int64_t launches = 0;  // kernel launches (attribution vs event time)
+    int64_t hits = 0;      // lookup-basis hits (k per token)
+    int64_t lookups = 0;   // lookup-basis denominator
     int64_t t_us[3][1024]{}; // per-branch ring, last 1024 samples
     int t_n[3] = {};       // samples kept per branch
     int t_pos[3] = {};     // ring write cursor per branch
@@ -1956,6 +1967,9 @@ static void hydra_e0_dump(void) {
         const int il = (int) (kv.first >> 3);
         const int site = (int) (kv.first & 7);
         const hydra_e0_cell & c = kv.second;
+        th += c.hits;
+        tl += c.lookups;
+        fprintf(stderr, "[HYDRA e0-look] il=%d site=%d inv=%lld launches=%lld hits=%lld lookups=%lld h=%.4f (decode-only)\n",
             il, site, (long long) c.inv, (long long) c.launches,
             (long long) c.hits, (long long) c.lookups,
             c.lookups ? (double) c.hits / (double) c.lookups : 0.0);
@@ -1981,6 +1995,7 @@ static void hydra_e0_dump(void) {
                 (long long) p50, (long long) p99, (long long) (sum / n));
         }
     }
+    fprintf(stderr, "[HYDRA e0-look] total hits=%lld lookups=%lld h=%.4f (decode-only)\n",
         (long long) th, (long long) tl, tl ? (double) th / (double) tl : 0.0);
 }
 
@@ -2048,6 +2063,16 @@ static inline bool hydra_e0_active(void) {
     if (c.t_n[branch] < 1024) {
         c.t_n[branch]++;
     }
+}
+
+// Lookup-basis counting: hits over lookups with k experts per token, the
+// paper's h. Exactly one path records (no second path exists on this base),
+// so no blended semantics are possible by construction.
+[[maybe_unused]] static void hydra_e0_lookups(int il, int site, int64_t hits, int64_t lookups) {
+    std::lock_guard<std::mutex> lock(hydra_e0_mu);
+    hydra_e0_cell & c = hydra_e0_cells[((int64_t) il << 3) | site];
+    c.hits += hits;
+    c.lookups += lookups;
 }
 
 // Attach-time VRAM fit check (E1 calls BEFORE allocating): fails loudly with
