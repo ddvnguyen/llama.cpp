@@ -28,6 +28,20 @@ struct geometry {
 
 // Parse geometry for the model file. Thread-safe; caches on first success.
 bool init(const std::string & model_path);
+// Stage A accumulator (HYDRA_EXPERT_STATS). Called once per decode step from
+// the decode thread with the routed-expert ids of that step, keyed by grid
+// row (trunk moe_rows order; NextN/MTP rows never passed). Thread-safe.
+// No-op unless enabled() (env read once at startup).
+bool enabled();
+void accumulate(int grid_row, const int32_t * ids, int n_ids, int cols);
+void end_step(int rows, int cols);
+// Trunk geometry snapshot for the Stage A decode hook (copies under lock;
+// empty when geometry unavailable). reset() clears counts/seq/hits_step for
+// the per-probe reset protocol (confound control); thread-safe.
+std::vector<int> trunk_rows();
+int grid_cols();
+int expert_used();
+void reset();
 
 // Stage B payload (Colibri EMAP encoding verbatim: tier=byte>>6, heat=byte&63).
 // nullopt when disabled (env unset or geometry unavailable) — callers no-op.

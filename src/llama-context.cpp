@@ -2240,6 +2240,60 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
 
     return embd_layer_inp[lid].data;
 }
+// hydra: expert-atlas Stage A (#771) — member half of the public readout.
+// Tensor-compact rows: res->t_moe_topk[il] is [k, n_outputs] (argsort_top_k
+// over [n_expert, n_tokens] then rows gathered per output); out_row indexes
+// output rows 0..n-1, NOT batch token positions. Server hook maps batch
+// positions -> output rows via n_outputs==n_tokens (single-gen fast path) or
+// output_ids[] (prefill/multi-slot); the hook skips non-decode rows.
+// SYNC D2H (ggml_backend_tensor_get, not async): payload is tiny (k int32,
+// ~32B/layer) and the hook consumes ids[] immediately after return — an
+// async copy would still be in flight and accumulate would read stale stack
+// garbage (observed: seq stuck at 0, all ids out of range). Server decode()
+// already synchronized the compute before the hook; this sync only waits the
+// small D2H. Returns ids written, 0 when unavailable.
+int llama_context::get_moe_topk(int il, int out_row, int32_t * out_ids, int n_cap) {
+    if (out_ids == nullptr || n_cap <= 0 || il < 0 || out_row < 0) {
+        return 0;
+    }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return 0; // MTP/draft rows excluded (#175 trap 2)
+    }
+    auto * res = get_gf_res_prev();
+    if (res == nullptr) {
+        return 0;
+    }
+    ggml_tensor * t = res->get_moe_topk(il);
+    if (t == nullptr || t->type != GGML_TYPE_I32) {
+        return 0; // outputs not marked (HYDRA_EXPERT_STATS unset) or dense layer
+    }
+    const int64_t k = t->ne[0];
+    const int64_t n_rows = t->ne[1];
+    if (k <= 0 || out_row >= n_rows) {
+        return 0;
+    }
+    const int64_t n = k < n_cap ? k : n_cap;
+    ggml_backend_tensor_get(t, out_ids, (size_t) out_row * (size_t) k * sizeof(int32_t), (size_t) n * sizeof(int32_t));
+    return (int) n;
+}
+// hydra: expert-atlas Stage A (#771) — row count for the hook loop bound.
+int llama_context::get_moe_topk_nrows(int il) {
+    if (il < 0) {
+        return 0;
+    }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return 0;
+    }
+    auto * res = get_gf_res_prev();
+    if (res == nullptr) {
+        return 0;
+    }
+    ggml_tensor * t = res->get_moe_topk(il);
+    if (t == nullptr || t->type != GGML_TYPE_I32) {
+        return 0;
+    }
+    return (int) t->ne[1];
+}
 
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
@@ -5751,6 +5805,19 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+// hydra: expert-atlas Stage A (#771) — C API halves; delegate to the member.
+int llama_get_moe_topk(llama_context * ctx, int il, int out_row, int32_t * out_ids, int n_cap) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->get_moe_topk(il, out_row, out_ids, n_cap);
+}
+int llama_get_moe_topk_nrows(llama_context * ctx, int il) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->get_moe_topk_nrows(il);
 }
 
 void llama_context::prof_note(double t_draft_ms, double t_verify_ms, int32_t n_drafted, int32_t n_accepted) {

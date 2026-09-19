@@ -1452,11 +1452,10 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             }
         }
     }
-    // route tracer / HYDRA consult outputs, env-gated, off by default.
-    // Any post-hoc reader (trace dump or pin consult) needs these marked:
-    // unmarked intermediates may have their buffers recycled by the time
-    // extraction runs, yielding stale float-bit contents instead of ids.
-    if (getenv("HYDRA_TRACE_ROUTES") || getenv("HYDRA_PIN_FILE")) {
+    // hydra: expert-atlas Stage A counters (#771) share the same stash/output
+    // gate — no new tensor, just one more env name on the existing condition.
+    // Decode-only + MTP exclusion enforced at the extraction site, not here.
+    if (getenv("HYDRA_TRACE_ROUTES") || getenv("HYDRA_PIN_FILE") || getenv("HYDRA_EXPERT_STATS")) {
         for (auto * tensor : t_moe_topk) {
             if (tensor != nullptr) {
                 ggml_set_output(tensor);

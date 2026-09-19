@@ -9,12 +9,15 @@
 #include "gguf.h"
 
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <vector>
 
 namespace hydra_atlas {
 
@@ -37,13 +40,6 @@ std::string hex64(const uint64_t v) {
     return buf;
 }
 
-bool kv_u32(const gguf_context * gguf, const std::string & key, uint32_t & out) {
-    const int idx = gguf_find_key(gguf, key.c_str());
-    if (idx < 0) return false;
-    if (gguf_get_kv_type(gguf, idx) != GGUF_TYPE_UINT32) return false;
-    out = gguf_get_val_u32(gguf, idx);
-    return true;
-}
 
 // Layer index from a gguf tensor name "blk.<il>.<rest>"; -1 if not a blk tensor.
 int blk_layer(const char * name) {
@@ -64,12 +60,27 @@ bool load_impl(const std::string & path, geometry & g) {
     }
     g.arch = gguf_get_val_str(gguf, ai);
 
+    // hydra #771: expert_count/expert_used_count live under the *model*
+    // block namespace (e.g. qwen3next), not general.architecture — probe all
+    // "*.<key>" KV names so a new MoE arch inherits the surface (design §B).
+    auto kv_find_u32 = [&](const char * key, uint32_t & out) {
+        for (int i = 0; i < gguf_get_n_kv(gguf); i++) {
+            const char * kn = gguf_get_key(gguf, i);
+            if (kn == nullptr || gguf_get_kv_type(gguf, i) != GGUF_TYPE_UINT32) continue;
+            const char * dot = std::strrchr(kn, '.');
+            if (dot != nullptr && std::strcmp(dot + 1, key) == 0) {
+                out = gguf_get_val_u32(gguf, i);
+                return true;
+            }
+        }
+        return false;
+    };
     uint32_t block_count = 0, expert_count = 0, expert_used = 0, nextn = 0;
-    kv_u32(gguf, g.arch + ".block_count", block_count);
-    kv_u32(gguf, g.arch + ".expert_count", expert_count);
-    kv_u32(gguf, g.arch + ".expert_used_count", expert_used);
+    kv_find_u32("block_count", block_count);
+    kv_find_u32("expert_count", expert_count);
+    kv_find_u32("expert_used_count", expert_used);
     // NextN/MTP layers are optional (kv stays 0 when absent).
-    kv_u32(gguf, g.arch + ".nextn_predict_layers", nextn);
+    kv_find_u32("nextn_predict_layers", nextn);
 
     if (expert_count == 0) { // dense model: no expert atlas surface
         gguf_free(gguf);
@@ -110,6 +121,14 @@ bool load_impl(const std::string & path, geometry & g) {
 
 std::mutex g_mtx;
 std::optional<geometry> g_geom;
+// Stage A counters. counts[] indexed gridRow*cols+expert; hits_step[] is the
+// last-decode-step bitmap; seq++ once per counted decode step. Sized lazily
+// on first accumulate (geometry known by then). Mutex = the file mutex.
+std::vector<uint64_t> g_counts;
+uint64_t g_seq = 0;
+std::vector<uint8_t> g_hits_step;
+bool g_stats_on = false;
+bool g_stats_checked = false;
 
 } // namespace
 
@@ -122,6 +141,77 @@ bool init(const std::string & model_path) {
     g_geom = std::move(g);
     return true;
 }
+bool enabled() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_stats_checked) {
+        g_stats_on = std::getenv("HYDRA_EXPERT_STATS") != nullptr;
+        g_stats_checked = true;
+    }
+    return g_stats_on;
+}
+
+void accumulate(int grid_row, const int32_t * ids, int n_ids, int cols) {
+    if (ids == nullptr || n_ids <= 0 || cols <= 0 || grid_row < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_stats_on || !g_geom) {
+        return;
+    }
+    const size_t cells = (size_t) g_geom->rows * (size_t) g_geom->cols;
+    if (g_counts.size() != cells) {
+        g_counts.assign(cells, 0);
+        g_hits_step.assign((cells + 7) / 8, 0);
+    }
+    if (grid_row >= g_geom->rows) {
+        return;
+    }
+    for (int i = 0; i < n_ids; ++i) {
+        const int32_t id = ids[i];
+        if (id < 0 || id >= cols || id >= g_geom->cols) {
+            continue;
+        }
+        const size_t cell = (size_t) grid_row * (size_t) g_geom->cols + (size_t) id;
+        g_counts[cell] += 1;
+        g_hits_step[cell >> 3] |= (uint8_t) (1u << (cell & 7));
+    }
+}
+
+void end_step(int rows, int cols) {
+    (void) rows;
+    (void) cols;
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_stats_on) {
+        return;
+    }
+    g_seq += 1; // one counted decode step
+}
+
+std::vector<int> trunk_rows() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_geom) return {};
+    return g_geom->moe_rows;
+}
+
+int grid_cols() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_geom) return 0;
+    return g_geom->cols;
+}
+
+int expert_used() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_geom) return 0;
+    return g_geom->n_expert_used;
+}
+
+void reset() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    g_counts.clear();
+    g_hits_step.clear();
+    g_seq = 0;
+}
+
 
 std::optional<std::string> experts_json() {
     if (std::getenv("HYDRA_EXPERT_META") == nullptr) return std::nullopt;
@@ -130,17 +220,45 @@ std::optional<std::string> experts_json() {
     const geometry & g = *g_geom;
 
     const size_t cells = (size_t) g.rows * (size_t) g.cols;
-    // Telemetry (Stage A) absent: honest zeros — tier 0 / heat 0 everywhere.
-    std::string map_hex(cells * 2, '0');
-    std::string hits_hex(((cells + 7) / 8) * 2, '0');
+    const bool live = g_stats_on && g_counts.size() == cells;
+
+    // Colibri EMAP byte encoding verbatim (tier=byte>>6, heat=byte&63).
+    // Tier bits are PROVISIONAL (design §8 honesty rule): our fork has no
+    // disk tier, so counted experts report tier 1 (RAM-resident, the truth
+    // until hybrid residency exists); never-counted cells stay tier 0/heat
+    // 0 (honest zeros). Heat saturates at 63 (EMAP encoding).
+    auto to_hex = [](const uint8_t * data, size_t n) {
+        static const char * digits = "0123456789abcdef";
+        std::string s;
+        s.resize(n * 2);
+        for (size_t i = 0; i < n; i++) {
+            s[2 * i]     = digits[(data[i] >> 4) & 0xF];
+            s[2 * i + 1] = digits[data[i] & 0xF];
+        }
+        return s;
+    };
+    std::string map_hex;
+    std::string hits_hex;
+    if (live) {
+        std::vector<uint8_t> bytes(cells);
+        for (size_t i = 0; i < cells; i++) {
+            const uint64_t c = g_counts[i];
+            bytes[i] = c == 0 ? 0 : (uint8_t) ((1 << 6) | (c > 63 ? 63 : (int) c));
+        }
+        map_hex = to_hex(bytes.data(), bytes.size());
+        hits_hex = to_hex(g_hits_step.data(), g_hits_step.size());
+    } else {
+        map_hex.assign(cells * 2, '0');
+        hits_hex.assign(((cells + 7) / 8) * 2, '0');
+    }
 
     const json j = {
-        {"seq",               0},
+        {"seq",               (int) g_seq},
         {"rows",              g.rows},
         {"cols",              g.cols},
         {"map",               map_hex},
         {"hits",              hits_hex},
-        {"telemetry_enabled", false}, // Stage A flips this and fills map/hits
+        {"telemetry_enabled", live},
         {"geometry", {
             {"engine_id",      g.engine_id},
             {"model_hash",     g.model_hash},
