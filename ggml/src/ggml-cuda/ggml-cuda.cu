@@ -1917,6 +1917,83 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+#include "../hydra-pins.h"
+
+// E0 measurement foundation (epic #148): pin-load arming + engagement
+// counter. Env-gated, off by default: HYDRA_PIN_FILE loads + arms the pin
+// set, HYDRA_E0_STATS=1 arms counters with no pins. Absent both: one getenv
+// branch per call site, zero behavior change. E1 (ARM 008 spike) is the
+// first consumer; timing (#143) and lookup counters (#144) attach in later
+// commits on this branch.
+
+static std::atomic<int64_t> hydra_e0_engaged{0}; // engaged-path invocations
+
+static hydra_pin_set hydra_e0_pins;
+static bool hydra_e0_on = false;
+static bool hydra_e0_armed = false;
+static std::once_flag hydra_e0_once;
+
+static void hydra_e0_dump(void) {
+    fprintf(stderr, "[HYDRA e0] engaged=%lld armed=%d (decode-only)\n",
+        (long long) hydra_e0_engaged.load(), hydra_e0_armed ? 1 : 0);
+}
+
+static void hydra_e0_init(void) {
+    hydra_e0_on = getenv("HYDRA_E0_STATS") != nullptr;
+    const char * pin_path = getenv("HYDRA_PIN_FILE");
+    if (pin_path) {
+        std::string err;
+        if (!hydra_pins_load(pin_path, hydra_e0_pins, err)) {
+            GGML_ABORT("hydra E0: %s", err.c_str());
+        }
+        hydra_e0_armed = true;
+        hydra_e0_on = true;
+        int64_t lo = INT64_MAX, hi = 0;
+        int nl = 0;
+        for (const auto & v : hydra_e0_pins.layers) {
+            if (v.empty()) {
+                continue;
+            }
+            ++nl;
+            lo = std::min<int64_t>(lo, (int64_t) v.size());
+            hi = std::max<int64_t>(hi, (int64_t) v.size());
+        }
+        fprintf(stderr, "[HYDRA pins:cuda] file=%s layers=%d total_pins=%lld pins_per_layer=min%lld/max%lld dups_removed=%lld (bytes at attach)\n",
+            pin_path, nl, (long long) hydra_e0_pins.n_pins,
+            (long long) lo, (long long) hi, (long long) hydra_e0_pins.n_dups);
+    }
+    if (hydra_e0_on) {
+        atexit(hydra_e0_dump);
+    }
+}
+
+static inline bool hydra_e0_active(void) {
+    std::call_once(hydra_e0_once, hydra_e0_init);
+    return hydra_e0_on;
+}
+
+// One engaged invocation of whatever path E1 builds. The ONLY writer of the
+// engagement counter; the gate test asserts this is non-zero before any
+// effect number may be read.
+[[maybe_unused]] static void hydra_e0_engage(int il, int site) {
+    (void) il;
+    (void) site;
+    hydra_e0_engaged++;
+}
+
+// Attach-time VRAM fit check (E1 calls BEFORE allocating): fails loudly with
+// the full arithmetic when the bytes do not fit. Never truncate, never spill.
+[[maybe_unused]] static void hydra_e0_fit_check(const char * what, size_t required_bytes) {
+    size_t free_b = 0, total_b = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+    if (required_bytes > free_b) {
+        GGML_ABORT("hydra E0: %s needs %zu bytes but only %zu of %zu free (shortfall %zu)",
+            what, required_bytes, free_b, total_b, required_bytes - free_b);
+    }
+    fprintf(stderr, "[HYDRA pins:cuda] attach %s: %zu bytes, %zu of %zu free (fits)\n",
+        what, required_bytes, free_b, total_b);
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -1928,6 +2005,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    // E0 measurement foundation: arm the pin set / stats registry once per
+    // process. Disarmed this is one branch; armed, E1's hooks record from
+    // here on. Load failures abort here, before any effect number exists.
+    hydra_e0_active();
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
