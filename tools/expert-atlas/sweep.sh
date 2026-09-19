@@ -96,7 +96,7 @@ def counts(path):
         real = (g["nextn_rows"][r - len(g["moe_rows"])] if r >= len(g["moe_rows"])
                 else g["moe_rows"][r])
         for c in range(cols):
-            h = m[(r * cols + c) * 2] & 63
+            h = m[r * cols + c] & 63
             if h:
                 out[f"{real}:{c}"] = h   # heat saturates at 63 (EMAP encoding)
     return out
