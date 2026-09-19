@@ -1923,11 +1923,25 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 // counter. Env-gated, off by default: HYDRA_PIN_FILE loads + arms the pin
 // set, HYDRA_E0_STATS=1 arms counters with no pins. Absent both: one getenv
 // branch per call site, zero behavior change. E1 (ARM 008 spike) is the
-// first consumer; timing (#143) and lookup counters (#144) attach in later
-// commits on this branch.
+// first consumer. Timing recorder (#143) is a hook parameter: E1 measures
+// (CUDA events, lazily harvested, for the GPU branch; host wall time for
+// the CPU branch) and records branch samples here. Branches are NEVER
+// merged; the report prints gpu/cpu/combine apart.
 
 static std::atomic<int64_t> hydra_e0_engaged{0}; // engaged-path invocations
 
+enum hydra_e0_branch { HYDRA_E0_GPU = 0, HYDRA_E0_CPU = 1, HYDRA_E0_COMBINE = 2 };
+
+struct hydra_e0_cell {
+    int64_t inv = 0;       // engaged invocations
+    int64_t launches = 0;  // kernel launches (attribution vs event time)
+    int64_t t_us[3][1024]{}; // per-branch ring, last 1024 samples
+    int t_n[3] = {};       // samples kept per branch
+    int t_pos[3] = {};     // ring write cursor per branch
+};
+
+static std::mutex hydra_e0_mu;
+static std::map<int64_t, hydra_e0_cell> hydra_e0_cells; // key (il << 3) | site
 static hydra_pin_set hydra_e0_pins;
 static bool hydra_e0_on = false;
 static bool hydra_e0_armed = false;
@@ -1936,6 +1950,38 @@ static std::once_flag hydra_e0_once;
 static void hydra_e0_dump(void) {
     fprintf(stderr, "[HYDRA e0] engaged=%lld armed=%d (decode-only)\n",
         (long long) hydra_e0_engaged.load(), hydra_e0_armed ? 1 : 0);
+    std::lock_guard<std::mutex> lock(hydra_e0_mu);
+    int64_t th = 0, tl = 0;
+    for (const auto & kv : hydra_e0_cells) {
+        const int il = (int) (kv.first >> 3);
+        const int site = (int) (kv.first & 7);
+        const hydra_e0_cell & c = kv.second;
+            il, site, (long long) c.inv, (long long) c.launches,
+            (long long) c.hits, (long long) c.lookups,
+            c.lookups ? (double) c.hits / (double) c.lookups : 0.0);
+        for (int b = 0; b < 3; ++b) {
+            if (!c.t_n[b]) {
+                continue;
+            }
+            int64_t v[1024];
+            const int n = c.t_n[b] < 1024 ? c.t_n[b] : 1024;
+            for (int i = 0; i < n; ++i) {
+                v[i] = c.t_us[b][i];
+            }
+            std::nth_element(v, v + n / 2, v + n);
+            const int64_t p50 = v[n / 2];
+            std::nth_element(v, v + (n * 99) / 100, v + n);
+            const int64_t p99 = v[(n * 99) / 100];
+            int64_t sum = 0;
+            for (int i = 0; i < n; ++i) {
+                sum += v[i];
+            }
+            fprintf(stderr, "[HYDRA e0-time] il=%d site=%d branch=%s n=%d p50=%lldus p99=%lldus mean=%lldus (decode-only)\n",
+                il, site, b == 0 ? "gpu" : (b == 1 ? "cpu" : "combine"), n,
+                (long long) p50, (long long) p99, (long long) (sum / n));
+        }
+    }
+        (long long) th, (long long) tl, tl ? (double) th / (double) tl : 0.0);
 }
 
 static void hydra_e0_init(void) {
@@ -1976,9 +2022,32 @@ static inline bool hydra_e0_active(void) {
 // engagement counter; the gate test asserts this is non-zero before any
 // effect number may be read.
 [[maybe_unused]] static void hydra_e0_engage(int il, int site) {
-    (void) il;
-    (void) site;
     hydra_e0_engaged++;
+    std::lock_guard<std::mutex> lock(hydra_e0_mu);
+    hydra_e0_cells[((int64_t) il << 3) | site].inv++;
+}
+
+// Kernel-launch attribution for E1: launches per invocation, kept apart from
+// event-measured time so the two separate instead of inferred.
+[[maybe_unused]] static void hydra_e0_launches(int il, int site, int64_t n) {
+    std::lock_guard<std::mutex> lock(hydra_e0_mu);
+    hydra_e0_cells[((int64_t) il << 3) | site].launches += n;
+}
+
+// Branch timing sample in microseconds. GPU branch values MUST come from
+// lazily-harvested CUDA events (see contract above); CPU branch from host
+// wall time. Branches are NEVER merged: report prints gpu/cpu/combine apart
+// so a healthy result stays distinguishable from GPU overhead eating the
+// CPU-side saving (serialised cost is the SUM, ggml-backend-sched overlaps
+// nothing here - state sum-vs-max in the E1 report, never assume).
+[[maybe_unused]] static void hydra_e0_branch(int il, int site, hydra_e0_branch branch, int64_t us) {
+    std::lock_guard<std::mutex> lock(hydra_e0_mu);
+    hydra_e0_cell & c = hydra_e0_cells[((int64_t) il << 3) | site];
+    c.t_us[branch][c.t_pos[branch]] = us;
+    c.t_pos[branch] = (c.t_pos[branch] + 1) % 1024;
+    if (c.t_n[branch] < 1024) {
+        c.t_n[branch]++;
+    }
 }
 
 // Attach-time VRAM fit check (E1 calls BEFORE allocating): fails loudly with
