@@ -1097,6 +1097,15 @@ extern "C" {
     // hydra #787 S-C3: output-row count of the most recent decode's MoE
     // gate-weight tensors (tensor ne[2]). 0 when unavailable.
     LLAMA_API int llama_get_moe_weight_nrows(struct llama_context * ctx, int il);
+    // hydra #786 Edge0: router-input hidden state readout for linear-probe
+    // prerouter. Copies n_embd floats for output row out_row into out_hidden
+    // (cap n_cap); returns floats written, 0 when unavailable (HYDRA_EXPERT_CAPTURE
+    // unset at build, MTP/draft context, layer/row out of range, no decode yet).
+    // Read-only: no graph, sched, sampler, or routing change.
+    LLAMA_API int llama_get_moe_hidden(struct llama_context * ctx, int il, int out_row, float * out_hidden, int n_cap);
+    // hydra #786 Edge0: output-row count of the most recent decode's hidden
+    // state tensors (tensor ne[1]). 0 when unavailable.
+    LLAMA_API int llama_get_moe_hidden_nrows(struct llama_context * ctx, int il);
 
     // In-source decode profiler: attach draft/verify timing of one speculative iteration
     // to the target context's current window. No-op when ctx is NULL or profiling is disabled.
