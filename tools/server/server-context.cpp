@@ -1136,6 +1136,28 @@ private:
         // copy, never ctx_server); breakdown needs the live context, so it
         // must be captured here, not in the handler.
         hydra_atlas::snapshot_alloc(ctx_tgt);
+        // hydra #788: per-layer expert residency for honest EMAP tier bits.
+        // Sources: user n_gpu_layers (explicit -ngl wins; fit is a no-op
+        // when ngl is user-set so params_base carries the deployed value),
+        // trunk layer count from the loaded model (public API), and the raw
+        // tensor_buft_overrides patterns (--n-cpu-moe / --cpu-moe push CPU
+        // entries; fit overflow contributes the same shape when it runs).
+        // Only string patterns cross the boundary (header stays POD-only);
+        // matching happens inside server-atlas.cpp. Sleep-safe copy.
+        {
+            std::vector<std::string> cpu_pats;
+            for (const auto & o : params_base.tensor_buft_overrides) {
+                if (o.pattern == nullptr) break; // null-terminated list
+                bool is_cpu = false;
+                try {
+                    is_cpu = (o.buft == ggml_backend_cpu_buffer_type());
+                } catch (...) { is_cpu = false; }
+                if (is_cpu) cpu_pats.emplace_back(o.pattern);
+            }
+            hydra_atlas::set_residency(params_base.n_gpu_layers,
+                                       llama_model_n_layer(model_tgt),
+                                       cpu_pats);
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
