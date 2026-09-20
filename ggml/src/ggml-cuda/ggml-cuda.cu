@@ -6798,7 +6798,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // decode-profiler bracket (--profile-decode): record-only, never sync. With CUDA-graph
     // execution the segment still orders start -> graph kernels -> end on this stream, so the
     // pair spans kernel execution, not just the launch call.
-    if (cuda_ctx->prof_enabled && cuda_ctx->prof_start != nullptr) {
+    if (cuda_ctx->prof_enabled && cuda_ctx->prof_start != nullptr && !cuda_ctx->prof_span_open) {
         cudaEventRecord(cuda_ctx->prof_start, cuda_ctx->stream());
         cuda_ctx->prof_armed = true;
     }
@@ -7079,11 +7079,36 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             !graph_evaluated ? "grouped evaluator failed" : "grouped finalization failed") : GGML_STATUS_FAILED;
     }
 
-    if (cuda_ctx->prof_enabled && cuda_ctx->prof_end != nullptr) {
+    if (cuda_ctx->prof_enabled && cuda_ctx->prof_end != nullptr && !cuda_ctx->prof_span_open) {
         cudaEventRecord(cuda_ctx->prof_end, cuda_ctx->stream());
     }
 
     return GGML_STATUS_SUCCESS;
+}
+
+void ggml_backend_cuda_profiling_span_begin(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (!cuda_ctx->prof_enabled || cuda_ctx->prof_start == nullptr) {
+        return;
+    }
+    cudaEventRecord(cuda_ctx->prof_start, cuda_ctx->stream());
+    cuda_ctx->prof_span_open = true;
+}
+
+void ggml_backend_cuda_profiling_span_end(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (!cuda_ctx->prof_enabled || !cuda_ctx->prof_span_open) {
+        return;
+    }
+    cudaEventRecord(cuda_ctx->prof_end, cuda_ctx->stream());
+    cuda_ctx->prof_span_open = false;
+    cuda_ctx->prof_armed     = true;
 }
 
 void ggml_backend_cuda_profiling_enable(ggml_backend_t backend, bool enable) {

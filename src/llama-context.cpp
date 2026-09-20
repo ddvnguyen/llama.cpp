@@ -720,6 +720,8 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
 
 const ggml_backend_moe_candidate_snapshot_v2 & llama_moe_candidate_snapshot::get() const {
     return snapshot;
+}
+
 //
 // in-source decode profiler (--profile-decode).
 // Accumulated in prof across decode() calls; one stderr window line per 64 steps,
@@ -4308,6 +4310,9 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+#ifdef GGML_USE_CUDA
+    if (prof.enabled && prof.cuda_backend) ggml_backend_cuda_profiling_span_begin(prof.cuda_backend);
+#endif
     if (shared_workspace_peer() != nullptr) {
         workspace_in_flight = true;
     }
@@ -4386,6 +4391,9 @@ ggml_status llama_context::graph_compute(
         }
         status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     }
+#ifdef GGML_USE_CUDA
+    if (prof.enabled && prof.cuda_backend) ggml_backend_cuda_profiling_span_end(prof.cuda_backend);
+#endif
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
