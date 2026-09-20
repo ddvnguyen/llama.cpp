@@ -1923,6 +1923,177 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+#include "../hydra-pins.h"
+
+// E0 measurement foundation (epic #148): mechanism-agnostic instrumentation
+// for per-expert backend selection. Env-gated, off by default: HYDRA_PIN_FILE
+// loads + arms the pin set, HYDRA_E0_STATS=1 enables counters with no pins.
+// Absent both: one getenv branch per call site, zero behavior change.
+// E1 (ARM 008 spike) is the first consumer; these hooks wrap nothing and
+// assume nothing about the engaged path. Caller contracts:
+// - decode-only: record only when ne12 == 1 (prefill must not pollute stats).
+// - GPU branch timing MUST be CUDA-event measured (host timers around async
+//   calls measure launch, not execution; a launch-timed number reads ~5 us
+//   and fails toward false GO). Record events on the stream, harvest elapsed
+//   times LAZILY on a later call or at teardown; never cudaEventSynchronize
+//   on the critical path. CPU branch: host wall time is correct.
+// - the engaged path MUST stay graph-capturable (no sync); restoring CUDA
+//   graphs is load-bearing for the 34.5 us bar, not hygiene.
+// Instrument cost: one atomic inc per hook plus, for timing, a mutex-guarded
+// ring insert at decode rates (~3 kHz worst case) - sub-0.1 us per call on
+// the CPU side, two orders under the 11.5 us margin. Event recording cost
+// (a few hundred ns per event pair) is E1's to state per its launch budget.
+static std::atomic<int64_t> hydra_e0_engaged{0}; // engaged-path invocations
+
+enum hydra_e0_branch { HYDRA_E0_GPU = 0, HYDRA_E0_CPU = 1, HYDRA_E0_COMBINE = 2 };
+
+struct hydra_e0_cell {
+    int64_t inv = 0;       // engaged invocations
+    int64_t launches = 0;  // kernel launches (attribution vs event time)
+    int64_t hits = 0;      // lookup-basis hits (k per token)
+    int64_t lookups = 0;   // lookup-basis denominator
+    int64_t t_us[3][1024]{}; // per-branch ring, last 1024 samples
+    int t_n[3] = {};       // samples kept per branch
+    int t_pos[3] = {};     // ring write cursor per branch
+};
+
+static std::mutex hydra_e0_mu;
+static std::map<int64_t, hydra_e0_cell> hydra_e0_cells; // key (il << 3) | site
+static hydra_pin_set hydra_e0_pins;
+static bool hydra_e0_on = false;
+static bool hydra_e0_armed = false;
+static std::once_flag hydra_e0_once;
+
+static void hydra_e0_dump(void) {
+    fprintf(stderr, "[HYDRA e0] engaged=%lld armed=%d (decode-only)\n",
+        (long long) hydra_e0_engaged.load(), hydra_e0_armed ? 1 : 0);
+    std::lock_guard<std::mutex> lock(hydra_e0_mu);
+    int64_t th = 0, tl = 0;
+    for (const auto & kv : hydra_e0_cells) {
+        const int il = (int) (kv.first >> 3);
+        const int site = (int) (kv.first & 7);
+        const hydra_e0_cell & c = kv.second;
+        th += c.hits;
+        tl += c.lookups;
+        fprintf(stderr, "[HYDRA e0-look] il=%d site=%d inv=%lld launches=%lld hits=%lld lookups=%lld h=%.4f (decode-only)\n",
+            il, site, (long long) c.inv, (long long) c.launches,
+            (long long) c.hits, (long long) c.lookups,
+            c.lookups ? (double) c.hits / (double) c.lookups : 0.0);
+        for (int b = 0; b < 3; ++b) {
+            if (!c.t_n[b]) {
+                continue;
+            }
+            int64_t v[1024];
+            const int n = c.t_n[b] < 1024 ? c.t_n[b] : 1024;
+            for (int i = 0; i < n; ++i) {
+                v[i] = c.t_us[b][i];
+            }
+            std::nth_element(v, v + n / 2, v + n);
+            const int64_t p50 = v[n / 2];
+            std::nth_element(v, v + (n * 99) / 100, v + n);
+            const int64_t p99 = v[(n * 99) / 100];
+            int64_t sum = 0;
+            for (int i = 0; i < n; ++i) {
+                sum += v[i];
+            }
+            fprintf(stderr, "[HYDRA e0-time] il=%d site=%d branch=%s n=%d p50=%lldus p99=%lldus mean=%lldus (decode-only)\n",
+                il, site, b == 0 ? "gpu" : (b == 1 ? "cpu" : "combine"), n,
+                (long long) p50, (long long) p99, (long long) (sum / n));
+        }
+    }
+    fprintf(stderr, "[HYDRA e0-look] total hits=%lld lookups=%lld h=%.4f (decode-only)\n",
+        (long long) th, (long long) tl, tl ? (double) th / (double) tl : 0.0);
+}
+
+static void hydra_e0_init(void) {
+    hydra_e0_on = getenv("HYDRA_E0_STATS") != nullptr;
+    const char * pin_path = getenv("HYDRA_PIN_FILE");
+    if (pin_path) {
+        std::string err;
+        if (!hydra_pins_load(pin_path, hydra_e0_pins, err)) {
+            GGML_ABORT("hydra E0: %s", err.c_str());
+        }
+        hydra_e0_armed = true;
+        hydra_e0_on = true;
+        int64_t lo = INT64_MAX, hi = 0;
+        int nl = 0;
+        for (const auto & v : hydra_e0_pins.layers) {
+            if (v.empty()) {
+                continue;
+            }
+            ++nl;
+            lo = std::min<int64_t>(lo, (int64_t) v.size());
+            hi = std::max<int64_t>(hi, (int64_t) v.size());
+        }
+        fprintf(stderr, "[HYDRA pins:cuda] file=%s layers=%d total_pins=%lld pins_per_layer=min%lld/max%lld dups_removed=%lld (bytes at attach)\n",
+            pin_path, nl, (long long) hydra_e0_pins.n_pins,
+            (long long) lo, (long long) hi, (long long) hydra_e0_pins.n_dups);
+    }
+    if (hydra_e0_on) {
+        atexit(hydra_e0_dump);
+    }
+}
+
+static inline bool hydra_e0_active(void) {
+    std::call_once(hydra_e0_once, hydra_e0_init);
+    return hydra_e0_on;
+}
+
+// One engaged invocation of whatever path E1 builds. The ONLY writer of the
+// engagement counter; the gate test asserts this is non-zero before any
+// effect number may be read.
+[[maybe_unused]] static void hydra_e0_engage(int il, int site) {
+    hydra_e0_engaged++;
+    std::lock_guard<std::mutex> lock(hydra_e0_mu);
+    hydra_e0_cells[((int64_t) il << 3) | site].inv++;
+}
+
+// Kernel-launch attribution for E1: launches per invocation, kept apart from
+// event-measured time so the two separate instead of inferred.
+[[maybe_unused]] static void hydra_e0_launches(int il, int site, int64_t n) {
+    std::lock_guard<std::mutex> lock(hydra_e0_mu);
+    hydra_e0_cells[((int64_t) il << 3) | site].launches += n;
+}
+
+// Branch timing sample in microseconds. GPU branch values MUST come from
+// lazily-harvested CUDA events (see contract above); CPU branch from host
+// wall time. Branches are NEVER merged: report prints gpu/cpu/combine apart
+// so a healthy result stays distinguishable from GPU overhead eating the
+// CPU-side saving (serialised cost is the SUM, ggml-backend-sched overlaps
+// nothing here - state sum-vs-max in the E1 report, never assume).
+[[maybe_unused]] static void hydra_e0_branch(int il, int site, hydra_e0_branch branch, int64_t us) {
+    std::lock_guard<std::mutex> lock(hydra_e0_mu);
+    hydra_e0_cell & c = hydra_e0_cells[((int64_t) il << 3) | site];
+    c.t_us[branch][c.t_pos[branch]] = us;
+    c.t_pos[branch] = (c.t_pos[branch] + 1) % 1024;
+    if (c.t_n[branch] < 1024) {
+        c.t_n[branch]++;
+    }
+}
+
+// Lookup-basis counting: hits over lookups with k experts per token, the
+// paper's h. Exactly one path records (no second path exists on this base),
+// so no blended semantics are possible by construction.
+[[maybe_unused]] static void hydra_e0_lookups(int il, int site, int64_t hits, int64_t lookups) {
+    std::lock_guard<std::mutex> lock(hydra_e0_mu);
+    hydra_e0_cell & c = hydra_e0_cells[((int64_t) il << 3) | site];
+    c.hits += hits;
+    c.lookups += lookups;
+}
+
+// Attach-time VRAM fit check (E1 calls BEFORE allocating): fails loudly with
+// the full arithmetic when the bytes do not fit. Never truncate, never spill.
+[[maybe_unused]] static void hydra_e0_fit_check(const char * what, size_t required_bytes) {
+    size_t free_b = 0, total_b = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+    if (required_bytes > free_b) {
+        GGML_ABORT("hydra E0: %s needs %zu bytes but only %zu of %zu free (shortfall %zu)",
+            what, required_bytes, free_b, total_b, required_bytes - free_b);
+    }
+    fprintf(stderr, "[HYDRA pins:cuda] attach %s: %zu bytes, %zu of %zu free (fits)\n",
+        what, required_bytes, free_b, total_b);
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -1934,6 +2105,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    // E0 measurement foundation: arm the pin set / stats registry once per
+    // process. Disarmed this is one branch; armed, E1's hooks record from
+    // here on. Load failures abort here, before any effect number exists.
+    hydra_e0_active();
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
