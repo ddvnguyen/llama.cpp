@@ -1067,6 +1067,9 @@ extern "C" {
     // hydra #786 Edge0: output-row count of the most recent decode's hidden
     // state tensors (tensor ne[1]). 0 when unavailable.
     LLAMA_API int llama_get_moe_hidden_nrows(struct llama_context * ctx, int il);
+    // hydra #786 Edge0: embedding dimension of the hidden-state tensor (ne[0]).
+    // 0 when unavailable.
+    LLAMA_API int llama_get_moe_hidden_embd(struct llama_context * ctx, int il);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
