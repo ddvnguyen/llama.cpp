@@ -334,10 +334,80 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get("/experts", ex_wrapper([&params](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         hydra_atlas::init(params.model.path);
+        // hydra #787: ?turn=N serves map+hits as of turn N (cumulative
+        // reconstruction from retained sparse deltas). Unknown/evicted N
+        // 404s honestly; delta is computed client-side (vs N-1).
+        const std::string turn_arg = req.get_param("turn");
+        if (!turn_arg.empty()) {
+            uint64_t seq = 0;
+            try {
+                seq = (uint64_t) std::stoull(turn_arg);
+            } catch (...) {
+                seq = 0;
+            }
+            auto body = seq > 0 ? hydra_atlas::experts_json_at(seq) : std::nullopt;
+            if (!body) {
+                res->status = 404;
+                res->data   = safe_json_to_str(json{{"error", "turn not retained (unknown turn_seq or per-turn capture disabled)"}});
+                return res;
+            }
+            res->data = *body;
+            return res;
+        }
         auto body = hydra_atlas::experts_json();
         if (!body) {
             res->status = 503;
             res->data   = safe_json_to_str(json{{"error", "expert meta disabled (HYDRA_EXPERT_META unset or geometry unavailable)"}});
+            return res;
+        }
+        res->data = *body;
+        return res;
+    }));
+
+    // hydra #787 sub-task 1: per-turn telemetry surfaces. Upstream-compatible
+    // GET /profile revives the Profiling tab unmodified (ProfileTurn shape;
+    // phases honest zeros until instrumented). GET /turns lists recent turn
+    // summaries; GET /turns/:seq serves the full record incl. the sparse
+    // routing slice. All three 503 while HYDRA_EXPERT_STATS capture is off.
+    ctx_http.get("/profile", ex_wrapper([](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        auto body = hydra_atlas::profile_json();
+        if (!body) {
+            res->status = 503;
+            res->data   = safe_json_to_str(json{{"error", "per-turn capture disabled (HYDRA_EXPERT_STATS unset)"}});
+            return res;
+        }
+        res->data = *body;
+        return res;
+    }));
+    ctx_http.get("/turns", ex_wrapper([](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        auto body = hydra_atlas::turns_json();
+        if (!body) {
+            res->status = 503;
+            res->data   = safe_json_to_str(json{{"error", "per-turn capture disabled (HYDRA_EXPERT_STATS unset)"}});
+            return res;
+        }
+        res->data = *body;
+        return res;
+    }));
+    ctx_http.get("/turns/:seq", ex_wrapper([](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        if (!hydra_atlas::enabled()) {
+            res->status = 503;
+            res->data   = safe_json_to_str(json{{"error", "per-turn capture disabled (HYDRA_EXPERT_STATS unset)"}});
+            return res;
+        }
+        uint64_t seq = 0;
+        try {
+            seq = (uint64_t) std::stoull(req.get_param("seq"));
+        } catch (...) {
+            seq = 0;
+        }
+        auto body = seq > 0 ? hydra_atlas::turn_json(seq) : std::nullopt;
+        if (!body) {
+            res->status = 404;
+            res->data   = safe_json_to_str(json{{"error", "turn not retained (unknown turn_seq)"}});
             return res;
         }
         res->data = *body;

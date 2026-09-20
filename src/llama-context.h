@@ -109,6 +109,14 @@ struct llama_context {
     int get_moe_topk(int il, int out_row, int32_t * out_ids, int n_cap);
     // hydra: expert-atlas Stage A (#771) — tensor ne[1] for layer il, else 0.
     int get_moe_topk_nrows(int il);
+    // hydra #787 S-C3: EAN readout — per-slot unweighted expert-output L2
+    // norms for output row out_row (<= n_cap floats); slot count; final
+    // router gate weights for output row out_row (<= n_cap floats); weight
+    // tensor ne[2]. All return 0 when unavailable (env off, MTP, OOR).
+    int get_moe_ean(int il, int out_row, float * out_norms, int n_cap);
+    int get_moe_ean_nslots(int il);
+    int get_moe_weight(int il, int out_row, float * out_w, int n_cap);
+    int get_moe_weight_nrows(int il);
 
     void attach_threadpool(
             ggml_threadpool_t threadpool,

@@ -904,6 +904,13 @@ public:
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
     ggml_tensor * get_moe_topk(int il) const { return t_moe_topk[il]; }
+    // hydra: expert-atlas Stage C EAN (#787 S-C3) — per-slot expert-output
+    // L2 norms ([1, n_tokens] each, unweighted pre-router-multiply) and the
+    // final router gate weights ([1, n_expert_used, n_tokens]). Empty unless
+    // HYDRA_EAN_STATS was set at graph build; decode-only gating lives in
+    // the server hook, MTP contexts read out as 0.
+    const std::vector<ggml_tensor *> & get_moe_ean(int il) const { return t_moe_ean[il]; }
+    ggml_tensor * get_moe_weight(int il) const { return t_moe_weights[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -942,6 +949,11 @@ public:
 
     // per-layer MoE expert ids, filled in build_moe_ffn, read out by the route tracer
     std::vector<ggml_tensor *> t_moe_topk;
+
+    // per-layer MoE EAN instrumentation (Stage C #787 S-C3), filled in
+    // build_moe_ffn only when HYDRA_EAN_STATS is set at build time
+    std::vector<std::vector<ggml_tensor *>> t_moe_ean;
+    std::vector<ggml_tensor *> t_moe_weights;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
