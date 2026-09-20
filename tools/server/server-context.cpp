@@ -1025,6 +1025,10 @@ private:
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
+    // decode-profiler: timestamp taken right after a draft completes; the next central
+    // decode is then the speculative verify step. -1 = no verify pending.
+    double prof_spec_verify_t0 = -1.0;
+
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -3417,6 +3421,8 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            // the next central decode is the speculative verify step for these slots
+            prof_spec_verify_t0 = ggml_time_ms();
         }
 
         // make checkpoints if needed
@@ -4180,6 +4186,9 @@ private:
                 slot.discard_decode_overlap();
             }
         }
+
+        const bool prof_verify = prof_spec_verify_t0 >= 0.0;
+        const double prof_verify_t0 = prof_verify ? prof_spec_verify_t0 : 0.0;
         queue_tasks.yield_to_queue([&]() {
             bool snapshot_mode_enabled = false;
             if (sparse_snapshots && !llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, selected_token)) {
@@ -4212,7 +4221,12 @@ private:
             if (snapshot_mode_enabled) {
                 snapshot_mode_restored = llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, false, -1);
             }
+            if (prof_verify) {
+                // verify step latency: queue yield + decode + sync (exact for --parallel 1)
+                llama_profile_note(ctx_tgt, 0.0, (double)(ggml_time_ms() - prof_verify_t0), 0, 0);
+            }
         });
+        prof_spec_verify_t0 = -1.0;
 
         if (!snapshot_mode_restored) {
             if (replay_slot != nullptr) {

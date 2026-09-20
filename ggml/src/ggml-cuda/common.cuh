@@ -1472,6 +1472,13 @@ struct ggml_backend_cuda_context {
     std::vector<std::unique_ptr<ggml_backend_cuda_context>> moe_router_contexts;
     std::unique_ptr<ggml_cuda_moe_ids_cache_state> moe_ids_cache;
 
+    // decode-profiler hook state (--profile-decode): two persistent events bracketing
+    // the graph-compute segment. Allocated only via profiling_enable(true); never synced.
+    bool        prof_enabled = false;
+    bool        prof_armed   = false; // a start event was recorded at least once
+    cudaEvent_t prof_start   = nullptr;
+    cudaEvent_t prof_end     = nullptr;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

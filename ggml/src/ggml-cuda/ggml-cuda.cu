@@ -2365,6 +2365,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (prof_start != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(prof_start));
+    }
+    if (prof_end != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(prof_end));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -6789,6 +6795,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // decode-profiler bracket (--profile-decode): record-only, never sync. With CUDA-graph
+    // execution the segment still orders start -> graph kernels -> end on this stream, so the
+    // pair spans kernel execution, not just the launch call.
+    if (cuda_ctx->prof_enabled && cuda_ctx->prof_start != nullptr) {
+        cudaEventRecord(cuda_ctx->prof_start, cuda_ctx->stream());
+        cuda_ctx->prof_armed = true;
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     bool graph_has_cached_mmid      = false;
@@ -7065,7 +7079,65 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             !graph_evaluated ? "grouped evaluator failed" : "grouped finalization failed") : GGML_STATUS_FAILED;
     }
 
+    if (cuda_ctx->prof_enabled && cuda_ctx->prof_end != nullptr) {
+        cudaEventRecord(cuda_ctx->prof_end, cuda_ctx->stream());
+    }
+
     return GGML_STATUS_SUCCESS;
+}
+
+void ggml_backend_cuda_profiling_enable(ggml_backend_t backend, bool enable) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    if (enable && cuda_ctx->prof_start == nullptr) {
+        // timing events, created once per backend; destroyed with the context
+        if (cudaEventCreateWithFlags(&cuda_ctx->prof_start, cudaEventDefault) != cudaSuccess) {
+            cuda_ctx->prof_start = nullptr;
+            return;
+        }
+        if (cudaEventCreateWithFlags(&cuda_ctx->prof_end, cudaEventDefault) != cudaSuccess) {
+            cudaEventDestroy(cuda_ctx->prof_start);
+            cuda_ctx->prof_start = nullptr;
+            return;
+        }
+    }
+    if (!enable && cuda_ctx->prof_start != nullptr) {
+        cudaEventDestroy(cuda_ctx->prof_start);
+        cudaEventDestroy(cuda_ctx->prof_end);
+        cuda_ctx->prof_start = nullptr;
+        cuda_ctx->prof_end   = nullptr;
+        cuda_ctx->prof_armed = false;
+    }
+    cuda_ctx->prof_enabled = enable && cuda_ctx->prof_start != nullptr;
+}
+
+float ggml_backend_cuda_profiling_elapsed_ms(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return -1.0f;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (!cuda_ctx->prof_enabled || !cuda_ctx->prof_armed) {
+        return -1.0f;
+    }
+    // out-of-band read: complete pair only, never wait
+    if (cudaEventQuery(cuda_ctx->prof_end) != cudaSuccess) {
+        return -1.0f;
+    }
+    float ms = -1.0f;
+    if (cudaEventElapsedTime(&ms, cuda_ctx->prof_start, cuda_ctx->prof_end) != cudaSuccess) {
+        return -1.0f;
+    }
+    return ms;
+}
+
+int ggml_backend_cuda_profiling_device(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return -1;
+    }
+    return ((ggml_backend_cuda_context *) backend->context)->device;
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {

@@ -23,6 +23,9 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
+#include <ctime>
+#include <dlfcn.h>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -717,6 +720,176 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
 
 const ggml_backend_moe_candidate_snapshot_v2 & llama_moe_candidate_snapshot::get() const {
     return snapshot;
+//
+// in-source decode profiler (--profile-decode).
+// Accumulated in prof across decode() calls; one stderr window line per 64 steps,
+// a PROF summary at teardown. Device/NVML failures degrade to timing-only. When the
+// flag is off only a single branch per decode is added; no allocation, no sync.
+//
+
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
+namespace {
+
+// steps per PROF window line
+constexpr uint32_t LLAMA_PROF_WIN_STEPS = 64;
+
+double llama_prof_clock_ms(clockid_t clk) {
+    timespec ts;
+    clock_gettime(clk, &ts);
+    return (double) ts.tv_sec * 1000.0 + (double) ts.tv_nsec / 1000000.0;
+}
+
+double llama_prof_median(std::vector<double> v) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    const size_t m = v.size() / 2;
+    return v.size() % 2 ? v[m] : 0.5 * (v[m - 1] + v[m]);
+}
+
+#ifdef GGML_USE_CUDA
+// NVML_PCIE_UTIL_RX_BYTES_COUNTER = 0x1, NVML_PCIE_UTIL_TX_BYTES_COUNTER = 0x2
+unsigned long long llama_prof_nvml_tput(llama_prof_decode & p, unsigned counter) {
+    if (!p.nvml_pcie_tput || !p.nvml_dev) return 0;
+    unsigned long long v = 0;
+    if (p.nvml_pcie_tput(p.nvml_dev, counter, &v) != 0) return 0;
+    return v;
+}
+#endif
+
+} // namespace
+
+void llama_context::prof_init(bool flag) {
+    if (!flag) return;
+    prof.enabled = true;
+#ifdef GGML_USE_CUDA
+    for (auto * b : backend_ptrs) {
+        if (ggml_backend_is_cuda(b)) { prof.cuda_backend = b; break; }
+    }
+    if (prof.cuda_backend) {
+        ggml_backend_cuda_profiling_enable(prof.cuda_backend, true);
+        prof.cuda_device = ggml_backend_cuda_profiling_device(prof.cuda_backend);
+        void * h = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+        if (h) {
+            auto sym = [&](const char * n) { return dlsym(h, n); };
+            prof.nvml_init_fn    = (int (*)(void))              sym("nvmlInit");
+            prof.nvml_dev_by_idx = (int (*)(unsigned, void **)) sym("nvmlDeviceGetHandleByIndex");
+            prof.nvml_link_gen   = (int (*)(void *, unsigned *)) sym("nvmlDeviceGetCurrPcieLinkGeneration");
+            prof.nvml_link_width = (int (*)(void *, unsigned *)) sym("nvmlDeviceGetCurrPcieLinkWidth");
+            prof.nvml_pcie_tput  = (int (*)(void *, unsigned, unsigned long long *)) sym("nvmlDeviceGetPcieThroughput");
+            if (prof.nvml_init_fn    && prof.nvml_dev_by_idx && prof.nvml_link_gen &&
+                prof.nvml_link_width && prof.nvml_pcie_tput  &&
+                prof.nvml_init_fn() == 0 &&
+                prof.nvml_dev_by_idx((unsigned) prof.cuda_device, &prof.nvml_dev) == 0) {
+                prof.nvml_h = h;
+            } else {
+                dlclose(h);
+            }
+        }
+    }
+    if (!prof.nvml_h) {
+        fprintf(stderr, "%s: profiling on cuda dev %d, timing-only (no NVML PCIe counters)\n", __func__, prof.cuda_device);
+    } else {
+        unsigned gen = 0, width = 0;
+        prof.nvml_link_gen(prof.nvml_dev, &gen);
+        prof.nvml_link_width(prof.nvml_dev, &width);
+        fprintf(stderr, "%s: profiling on cuda dev %d, link gen %u x%u\n", __func__, prof.cuda_device, gen, width);
+    }
+#else
+    fprintf(stderr, "%s: profiling on, timing-only (no CUDA backend)\n", __func__);
+#endif
+}
+
+void llama_context::prof_step(double wall_ms, double cpu_ms, double dev_ms, double sync_ms, uint32_t n_out) {
+    llama_prof_decode & p = prof;
+#ifdef GGML_USE_CUDA
+    if (p.win_steps == 0) {
+        p.win_rx0 = llama_prof_nvml_tput(p, 0x1);
+        p.win_tx0 = llama_prof_nvml_tput(p, 0x2);
+    }
+#endif
+    p.win_wall_ms += wall_ms;
+    p.win_cpu_ms  += cpu_ms;
+    p.win_dev_ms  += dev_ms;
+    p.win_sync_ms += sync_ms;
+    p.win_steps++;
+    p.win_out += n_out;
+    p.steps++;
+    p.out_tokens += n_out;
+    if (p.win_steps < LLAMA_PROF_WIN_STEPS) return;
+
+    const double wall_s = p.win_wall_ms / 1000.0;
+    const double tps = wall_s > 0.0 ? (double) p.win_out / wall_s : 0.0;
+    int gen = -1;
+    unsigned width = 0;
+    unsigned long long rx1 = 0, tx1 = 0;
+#ifdef GGML_USE_CUDA
+    if (p.nvml_dev) {
+        unsigned g = 0, w = 0;
+        if (p.nvml_link_gen(p.nvml_dev, &g) == 0 && p.nvml_link_width(p.nvml_dev, &w) == 0) {
+            gen = (int) g;
+            width = w;
+        }
+        rx1 = llama_prof_nvml_tput(p, 0x1);
+        tx1 = llama_prof_nvml_tput(p, 0x2);
+    }
+#endif
+    const unsigned long long rxb = rx1 >= p.win_rx0 ? rx1 - p.win_rx0 : 0;
+    const unsigned long long txb = tx1 >= p.win_tx0 ? tx1 - p.win_tx0 : 0;
+    const double rx_mbs = wall_s > 0.0 ? (double) rxb / 1048576.0 / wall_s : 0.0;
+    const double tx_mbs = wall_s > 0.0 ? (double) txb / 1048576.0 / wall_s : 0.0;
+    const double bps_mib = p.win_steps ? (double)(rxb + txb) / 1048576.0 / (double) p.win_steps : 0.0;
+    const double acc = p.win_drafted ? (double) p.win_accepted / (double) p.win_drafted : 0.0;
+    fprintf(stderr, "PROF ctx=%p win=%u steps=%u tps=%.2f gen=%d width=x%u rx_mbs=%.0f tx_mbs=%.0f "
+            "t_wall_ms=%.1f t_cpu_ms=%.1f t_dev_ms=%.1f t_sync_ms=%.1f bytes_per_step_mib=%.1f "
+            "draft_ms=%.1f verify_ms=%.1f drafted=%d accepted=%d acc=%.3f\n",
+            (void*) this, p.win_id, p.win_steps, tps, gen, width, rx_mbs, tx_mbs,
+            p.win_wall_ms, p.win_cpu_ms, p.win_dev_ms, p.win_sync_ms, bps_mib,
+            p.win_draft_ms, p.win_verify_ms, (int) p.win_drafted, (int) p.win_accepted, acc);
+    p.h_tps.push_back(tps);
+    p.h_rx.push_back(rx_mbs);
+    p.h_tx.push_back(tx_mbs);
+    p.h_wall.push_back(p.win_wall_ms);
+    p.h_cpu.push_back(p.win_cpu_ms);
+    p.h_dev.push_back(p.win_dev_ms);
+    p.h_sync.push_back(p.win_sync_ms);
+    p.h_bps.push_back(bps_mib);
+    p.h_acc.push_back(acc);
+    p.win_id++;
+    p.win_steps = 0;
+    p.win_out = 0;
+    p.win_rx0 = 0;
+    p.win_tx0 = 0;
+    p.win_wall_ms = 0.0;
+    p.win_cpu_ms  = 0.0;
+    p.win_dev_ms  = 0.0;
+    p.win_sync_ms = 0.0;
+    p.win_draft_ms   = 0.0;
+    p.win_verify_ms  = 0.0;
+    p.win_drafted  = 0;
+    p.win_accepted = 0;
+}
+
+void llama_context::prof_finish() {
+    if (!prof.enabled) return;
+    if (!prof.h_tps.empty()) {
+        fprintf(stderr, "PROF summary ctx=%p windows=%zu tps=%.2f rx_mbs=%.0f tx_mbs=%.0f "
+                "t_wall_ms=%.1f t_cpu_ms=%.1f t_dev_ms=%.1f t_sync_ms=%.1f bytes_per_step_mib=%.1f acc=%.3f\n",
+                (void*) this, prof.h_tps.size(), llama_prof_median(prof.h_tps), llama_prof_median(prof.h_rx),
+                llama_prof_median(prof.h_tx), llama_prof_median(prof.h_wall), llama_prof_median(prof.h_cpu),
+                llama_prof_median(prof.h_dev), llama_prof_median(prof.h_sync),
+                llama_prof_median(prof.h_bps), llama_prof_median(prof.h_acc));
+    }
+#ifdef GGML_USE_CUDA
+    if (prof.cuda_backend) ggml_backend_cuda_profiling_enable(prof.cuda_backend, false);
+    if (prof.nvml_h) {
+        dlclose(prof.nvml_h);
+        prof.nvml_h = nullptr;
+    }
+#endif
+    prof.enabled = false;
 }
 
 llama_context::llama_context(
@@ -1107,6 +1280,8 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+    prof_init(params.profile_decode);
+
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
@@ -1188,6 +1363,7 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+    prof_finish();
 
     if (sched_buffer_owner != nullptr && sched_buffer_owner->sched_buffer_borrower == this) {
         sched_buffer_owner->sched_buffer_borrower = nullptr;
@@ -3167,6 +3343,13 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
         return -1;
     }
 
+    // decode profiler: single gate, timestamps only when enabled
+    const bool prof_on = prof.enabled;
+    const double prof_t0_wall = prof_on ? llama_prof_clock_ms(CLOCK_MONOTONIC) : 0.0;
+    const double prof_t0_cpu  = prof_on ? llama_prof_clock_ms(CLOCK_PROCESS_CPUTIME_ID) : 0.0;
+    double prof_sync_ms = 0.0;
+    double prof_sync_t0 = 0.0;
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -3447,6 +3630,7 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
         }
 
         // extract logits
+        if (prof_on) prof_sync_t0 = llama_prof_clock_ms(CLOCK_MONOTONIC);
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
@@ -3552,6 +3736,8 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
 
+        if (prof_on) prof_sync_ms += llama_prof_clock_ms(CLOCK_MONOTONIC) - prof_sync_t0;
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -3608,6 +3794,16 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (prof_on) {
+        double dev_ms = -1.0;
+#ifdef GGML_USE_CUDA
+        if (prof.cuda_backend) dev_ms = ggml_backend_cuda_profiling_elapsed_ms(prof.cuda_backend);
+#endif
+        prof_step(llama_prof_clock_ms(CLOCK_MONOTONIC) - prof_t0_wall,
+                  llama_prof_clock_ms(CLOCK_PROCESS_CPUTIME_ID) - prof_t0_cpu,
+                  dev_ms, prof_sync_ms, (uint32_t) n_outputs_all);
+    }
 
     return 0;
 }
@@ -5329,6 +5525,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.profile_decode              =*/ false,
     };
 
     return result;
@@ -5536,6 +5733,21 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+void llama_context::prof_note(double t_draft_ms, double t_verify_ms, int32_t n_drafted, int32_t n_accepted) {
+    if (!prof.enabled) return;
+    prof.win_draft_ms  += t_draft_ms;
+    prof.win_verify_ms += t_verify_ms;
+    prof.win_drafted  += n_drafted;
+    prof.win_accepted += n_accepted;
+}
+
+void llama_profile_note(llama_context * ctx, double t_draft_ms, double t_verify_ms, int32_t n_drafted, int32_t n_accepted) {
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->prof_note(t_draft_ms, t_verify_ms, n_drafted, n_accepted);
 }
 
 float * llama_get_logits(llama_context * ctx) {

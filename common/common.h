@@ -603,6 +603,7 @@ struct common_params {
     bool phase_aware_workspace = false; // resize compute schedulers between prompt and generation phases
     bool live_context_workspace = false; // size supported attention workspaces from the padded live KV extent
     bool warmup            = true;  // warmup run
+    bool profile_decode    = false; // in-source decode profiler (PROF lines on stderr)
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)

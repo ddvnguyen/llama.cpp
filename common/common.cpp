@@ -1781,6 +1781,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.live_context_workspace = params.live_context_workspace;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
+    cparams.profile_decode    = params.profile_decode;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 

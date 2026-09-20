@@ -90,6 +90,50 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// In-source decode profiler state (--profile-decode). Device/NVML handles stay opaque
+// here; llama-context.cpp owns the mechanics. Plain data: zero cost unless enabled at init.
+struct llama_prof_decode {
+    bool enabled = false;
+    struct ggml_backend * cuda_backend = nullptr; // first CUDA backend, not owned
+    int  cuda_device = -1;
+    void * nvml_h   = nullptr; // dlopen("libnvidia-ml.so.1") handle, null = timing-only
+    void * nvml_dev = nullptr; // opaque nvmlDevice_t
+    int (*nvml_init_fn)     (void)               = nullptr;
+    int (*nvml_dev_by_idx)  (unsigned, void **)  = nullptr;
+    int (*nvml_link_gen)    (void *, unsigned *) = nullptr;
+    int (*nvml_link_width)  (void *, unsigned *) = nullptr;
+    int (*nvml_pcie_tput)   (void *, unsigned, unsigned long long *) = nullptr;
+
+    uint64_t steps      = 0; // successful decode() calls accumulated
+    uint64_t out_tokens = 0;
+    uint32_t win_id     = 0;
+
+    // current window accumulators
+    uint32_t win_steps = 0;
+    uint64_t win_out   = 0;
+    uint64_t win_rx0   = 0;
+    uint64_t win_tx0   = 0;
+    double win_wall_ms = 0.0;
+    double win_cpu_ms  = 0.0;
+    double win_dev_ms  = 0.0;
+    double win_sync_ms = 0.0;
+    double win_draft_ms   = 0.0;
+    double win_verify_ms  = 0.0;
+    int64_t win_drafted  = 0;
+    int64_t win_accepted = 0;
+
+    // per-window history for the final medians
+    std::vector<double> h_tps;
+    std::vector<double> h_rx;
+    std::vector<double> h_tx;
+    std::vector<double> h_wall;
+    std::vector<double> h_cpu;
+    std::vector<double> h_dev;
+    std::vector<double> h_sync;
+    std::vector<double> h_bps;
+    std::vector<double> h_acc;
+};
+
 struct llama_context {
     struct sched_reserve_plan {
         uint32_t n_tokens_max    = 0;
@@ -260,6 +304,10 @@ struct llama_context {
 
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
+
+    // decode profiler (--profile-decode): attach one speculative iteration's draft/verify
+    // timing to the current window; no-op unless profiling is enabled
+    void prof_note(double t_draft_ms, double t_verify_ms, int32_t n_drafted, int32_t n_accepted);
 
     llama_memory_breakdown memory_breakdown() const;
 
@@ -520,4 +568,10 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // in-source decode profiler (--profile-decode); inert unless enabled at init
+    llama_prof_decode prof;
+    void prof_init(bool flag);
+    void prof_step(double wall_ms, double cpu_ms, double dev_ms, double sync_ms, uint32_t n_out);
+    void prof_finish();
 };

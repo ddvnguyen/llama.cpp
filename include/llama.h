@@ -447,6 +447,8 @@ extern "C" {
 
         // A source/target/parent context that can share results or llama_memory.
         struct llama_context * ctx_other;
+
+        bool profile_decode; // in-source decode profiler (PROF lines on stderr, default false)
     };
 
     struct llama_model_tensor_override {
@@ -1064,6 +1066,10 @@ extern "C" {
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+
+    // In-source decode profiler: attach draft/verify timing of one speculative iteration
+    // to the target context's current window. No-op when ctx is NULL or profiling is disabled.
+    LLAMA_API void llama_profile_note(struct llama_context * ctx, double t_draft_ms, double t_verify_ms, int32_t n_drafted, int32_t n_accepted);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
