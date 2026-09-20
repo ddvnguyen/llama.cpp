@@ -7122,8 +7122,11 @@ float ggml_backend_cuda_profiling_elapsed_ms(ggml_backend_t backend) {
     if (!cuda_ctx->prof_enabled || !cuda_ctx->prof_armed) {
         return -1.0f;
     }
-    // out-of-band read: complete pair only, never wait
-    if (cudaEventQuery(cuda_ctx->prof_end) != cudaSuccess) {
+    // event-guarded read: wait for THIS step's end event only. The server loop
+    // synchronizes the stream right after decode anyway (sampling needs the logits),
+    // so this wait is bounded by work the caller already forces — it does not add
+    // serialization to an async pipeline.
+    if (cudaEventSynchronize(cuda_ctx->prof_end) != cudaSuccess) {
         return -1.0f;
     }
     float ms = -1.0f;

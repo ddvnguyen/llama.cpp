@@ -3804,7 +3804,8 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_decode_exec
         const double cpu_ms  = llama_prof_clock_ms(CLOCK_PROCESS_CPUTIME_ID) - prof_t0_cpu;
         // 93: the first large-batch step (prompt eval) gets its own line, never averaged
         // into the decode-window aggregate.
-        if (!prof.prefill_done && n_tokens_all > 32) {
+        // warmup batches (42 tok) must not steal the prefill tag; real prompt is ~767 tok
+        if (!prof.prefill_done && n_tokens_all > 256) {
             prof.prefill_done = true;
             const double tps = wall_ms > 0.0 ? (double) n_tokens_all / (wall_ms / 1000.0) : 0.0;
             fprintf(stderr, "PROF prefill ctx=%p n_tokens=%u tps=%.2f t_wall_ms=%.1f t_cpu_ms=%.1f t_dev_ms=%.1f t_sync_ms=%.1f\n",
