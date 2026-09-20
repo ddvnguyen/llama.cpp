@@ -5,12 +5,12 @@
 #
 # Port of JustVugg/colibri c/tools/expert_atlas/sweep.sh, driving llama-server
 # over HTTP instead of the coli CLI. The CONFOUNDS section is Colibri's, kept
-# verbatim in spirit — each one silently corrupts the atlas:
+# verbatim in spirit:
 #
 #   temp 0, top-p 1.0, top-k 0, min-p 0
 #              Greedy, no distribution pruning: with pruning on you profile
 #              the pruner, not the model (Colibri measured -38% experts seen
-#              at top-p 0.7 — and pruning is the recommended speed setting).
+#              at top-p 0.7 -- and pruning is the recommended speed setting).
 #
 #   MTP/DRAFT off
 #              Speculative drafts route experts for tokens that are later
@@ -25,14 +25,19 @@
 #
 #   per-probe reset
 #              Colibri removes .coli_usage before EVERY run so each dump is
-#              exactly one probe, not a lifetime histogram. Our engine-side
-#              equivalent is the Stage-A reset affordance (S-A2, gated behind
-#              the Stage-1 workstream). Until it lands this harness measures
-#              by DELTA of GET /experts between probes, which is reset-free
-#              by construction, and reports honestly when telemetry is off.
+#              exactly one probe, not a lifetime histogram. S-A2 adds the
+#              /capture/flush + /capture/reset endpoints for hidden-state
+#              sidecar files; the harness calls flush after each probe.
 #
 # Prompt lengths are kept in a narrow band across categories (probes.json):
 # prefill routes the prompt tokens too, so a verbose category would look busy.
+#
+# Edge0 sidecar mode (HYDRA_EXPERT_CAPTURE=1):
+#   When the engine is started with HYDRA_EXPERT_CAPTURE=1 and
+#   HYDRA_CAPTURE_OUTDIR=<dir>, this harness calls POST /capture/flush
+#   after each probe to write per-probe sidecar JSONs (hidden states +
+#   topk per layer per token). The sidecar files are consumed by
+#   analyze_edge0.py for the linear-probe prerouter analysis.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -41,14 +46,18 @@ OUT="${2:-./atlas_out}"
 SERVER_URL="${SERVER_URL:?set SERVER_URL to the llama-server base URL, e.g. http://127.0.0.1:8086}"
 NGEN="${NGEN:-64}"
 MAX_TOKENS="${MAX_TOKENS:-$NGEN}"
+# Edge0 sidecar: set HYDRA_CAPTURE_OUTDIR to enable sidecar dump alongside stats.
+# The engine reads this env var at startup; sweep.sh uses it to locate the sidecar
+# files it flushes via /capture/flush. Default is "./atlas_out/sidecars".
+SIDECAR_DIR="${HYDRA_CAPTURE_OUTDIR:-$OUT/sidecars}"
 
 [ -f "$PROBES" ] || { echo "no probe file: $PROBES" >&2; exit 1; }
-mkdir -p "$OUT/stats"
+mkdir -p "$OUT/stats" "$SIDECAR_DIR"
 
 # engine reachability + Stage B surface
 curl -sf -m 5 "$SERVER_URL/health" >/dev/null || { echo "server unreachable: $SERVER_URL" >&2; exit 1; }
 META="$OUT/experts_before.json"
-curl -sf -m 10 "$SERVER_URL/experts" -o "$META" || { echo "GET /experts failed — is HYDRA_EXPERT_META=1 on the engine?" >&2; exit 1; }
+curl -sf -m 10 "$SERVER_URL/experts" -o "$META" || { echo "GET /experts failed -- is HYDRA_EXPERT_META=1 on the engine?" >&2; exit 1; }
 python3 - "$META" <<'PY' || exit 1
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -110,9 +119,17 @@ else:
     json.dump({"telemetry": True, "category": cat, "idx": idx,
                "selections": delta}, open(sys.argv[3], "w"), indent=0)
 PY
-  echo "  [$i/$n] $cat/$idx done"
+
+  # Edge0 S-A2: flush hidden-state sidecar for this probe (when capture enabled)
+  curl -sf -m 10 -X POST "$SERVER_URL/capture/flush?cat=$cat&idx=$idx" \
+    -o "$OUT/.flush.json" 2>/dev/null && \
+    echo "  [$i/$n] $cat/$idx done (sidecar flushed)" || \
+    echo "  [$i/$n] $cat/$idx done"
 done < "$OUT/runlist.tsv"
 
 echo
 echo "next:"
-echo "  python3 $HERE/analyze.py --stats $OUT/stats --probes $PROBES --out $OUT/experts.json"
+echo "  python3 $HERE/analyze.py --stats $OUT/stats --probes $PROBES --out $OUT/experts.json --meta $OUT/experts_before.json"
+echo
+echo "Edge0 (when HYDRA_EXPERT_CAPTURE=1):"
+echo "  python3 $HERE/analyze_edge0.py --sidecars $SIDECAR_DIR --probes $PROBES --out $OUT/edge0.json --meta $OUT/experts_before.json --model <gguf-name>"

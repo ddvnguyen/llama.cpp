@@ -188,6 +188,18 @@ bool g_res_ready = false;
 // hydra #785: load-time allocation snapshot for /health (sleep-safe copy).
 alloc_info g_alloc;
 bool g_alloc_ready = false;
+// hydra #786 Edge0 S-A2: hidden-state capture state. Sized lazily on first
+// capture_hidden (geometry known by then). Mutex = the file mutex.
+bool g_cap_on = false;
+bool g_cap_checked = false;
+std::string g_cap_outdir;
+struct cap_entry {
+    std::vector<float>  hidden;
+    std::vector<int32_t> topk;
+};
+std::vector<std::vector<cap_entry>> g_cap_data;
+int g_cap_k = 0;
+int g_cap_embd = 0;
 } // namespace
 
 bool init(const std::string & model_path) {
@@ -326,6 +338,13 @@ void reset() {
     // hydra #787 S-C3: EAN joins the per-probe reset (no cross-probe leak).
     g_ean_gxn.clear();
     g_ean_nsel.clear();
+    // hydra #786 Edge0 S-A2: capture sidecar joins the per-probe reset.
+    for (auto & v : g_cap_data) {
+        v.clear();
+    }
+    g_cap_data.clear();
+    g_cap_k = 0;
+    g_cap_embd = 0;
 }
 
 // hydra #785: one-shot load-time capture. Breakdown split mirrors
@@ -785,6 +804,126 @@ std::optional<std::string> experts_json_at(uint64_t seq) {
         }},
     };
     return j.dump();
+}
+
+// hydra #786 Edge0 S-A2: hidden-state capture for linear-probe prerouter.
+// Env-gated (HYDRA_EXPERT_CAPTURE, checked once); OFF = all no-ops.
+// Accumulates hidden states + topk per decode step; flushed to per-probe
+// sidecar JSONs by flush_sidecar(); cleared by capture_reset().
+// State variables live in the hydra_atlas anonymous namespace above.
+
+bool capture_enabled() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_cap_checked) {
+        g_cap_on = std::getenv("HYDRA_EXPERT_CAPTURE") != nullptr;
+        g_cap_checked = true;
+    }
+    return g_cap_on;
+}
+
+void capture_hidden(int grid_row, const float * hidden, int n_embd,
+                    const int32_t * topk, int k) {
+    if (hidden == nullptr || n_embd <= 0 || grid_row < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_cap_on || !g_geom) {
+        return;
+    }
+    const size_t nrows = g_geom->moe_rows.size() + g_geom->nextn_rows.size();
+    if ((size_t) grid_row >= nrows) {
+        return;
+    }
+    if (g_cap_data.size() != nrows) {
+        g_cap_data.resize(nrows);
+    }
+    if (g_cap_k == 0 && k > 0) {
+        g_cap_k = k;
+    }
+    if (g_cap_embd == 0 && n_embd > 0) {
+        g_cap_embd = n_embd;
+    }
+    cap_entry e;
+    e.hidden.assign(hidden, hidden + n_embd);
+    if (topk != nullptr && k > 0) {
+        e.topk.assign(topk, topk + k);
+    }
+    g_cap_data[(size_t) grid_row].push_back(std::move(e));
+}
+
+void set_capture_outdir(const std::string & dir) {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    g_cap_outdir = dir;
+}
+
+std::optional<std::string> flush_sidecar(const std::string & probe_cat,
+                                         int probe_idx) {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_cap_on || !g_geom) {
+        return std::nullopt;
+    }
+    if (g_cap_data.empty()) {
+        return std::nullopt;
+    }
+    // Build sidecar JSON matching analyze_edge0.py input contract:
+    // {category, idx, layers: {layer_idx: {hidden: [[...]], topk: [[...]]}}}
+    json layers = json::object();
+    const auto & moe = g_geom->moe_rows;
+    for (size_t r = 0; r < moe.size() && r < g_cap_data.size(); ++r) {
+        const auto & entries = g_cap_data[r];
+        if (entries.empty()) {
+            continue;
+        }
+        json hidden_arr = json::array();
+        json topk_arr = json::array();
+        for (const auto & e : entries) {
+            json h_row = json::array();
+            for (float v : e.hidden) {
+                h_row.push_back(v);
+            }
+            hidden_arr.push_back(std::move(h_row));
+            json t_row = json::array();
+            for (int32_t id : e.topk) {
+                t_row.push_back(id);
+            }
+            topk_arr.push_back(std::move(t_row));
+        }
+        layers[std::to_string(moe[r])] = {
+            {"hidden", std::move(hidden_arr)},
+            {"topk",   std::move(topk_arr)},
+        };
+    }
+    if (layers.empty()) {
+        return std::nullopt;
+    }
+    json sidecar = {
+        {"category", probe_cat},
+        {"idx",      probe_idx},
+        {"layers",   std::move(layers)},
+    };
+    // Write sidecar file
+    std::string outdir = g_cap_outdir.empty() ? "." : g_cap_outdir;
+    std::error_code ec;
+    std::filesystem::create_directories(outdir, ec);
+    const std::string fname = outdir + "/" + probe_cat + "_" +
+                              std::to_string(probe_idx) + "_sidecar.json";
+    std::ofstream ofs(fname);
+    if (!ofs.is_open()) {
+        return std::nullopt;
+    }
+    ofs << sidecar.dump();
+    ofs.close();
+    return fname;
+}
+
+void capture_reset() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    for (auto & v : g_cap_data) {
+        v.clear();
+    }
+    g_cap_data.clear();
+    g_cap_k = 0;
+    g_cap_embd = 0;
 }
 
 } // namespace hydra_atlas
