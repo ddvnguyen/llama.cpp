@@ -177,10 +177,17 @@ std::string hex_of(const uint8_t * data, size_t n) {
     }
     return s;
 }
+// hydra #788: per-layer expert residency for honest EMAP tier bits. Load
+// fact (not probe state): survives reset(). Set once by set_residency()
+// from server params at model load; encoders fall back to tier 0 when
+// unknown (never guess). g_res_cpu[il]=1 → layer il's experts on CPU.
+int g_res_ngl = -1;
+int g_res_nlayer = 0;
+std::vector<char> g_res_cpu;
+bool g_res_ready = false;
 // hydra #785: load-time allocation snapshot for /health (sleep-safe copy).
 alloc_info g_alloc;
 bool g_alloc_ready = false;
-
 } // namespace
 
 bool init(const std::string & model_path) {
@@ -421,7 +428,80 @@ bool health_snapshot(alloc_info & out) {
     return true;
 }
 
+// hydra #788: match one --n-cpu-moe / --cpu-moe / fit-overflow pattern
+// against "blk.<il>.<rest>". Patterns are regex fragments ("blk\\.3\\.ffn_"
+// or "blk\\.\\d+\\.ffn_...exps"); the all-layers exps pattern has no digit
+// after "blk\\." so it matches every il. Returns cpu iff some pattern hits.
+bool res_pat_cpu(const std::string & pat, int il) {
+    const char * b = std::strstr(pat.c_str(), "blk");
+    if (b == nullptr) return false; // not a layer override — ignore
+    const char * bs = std::strchr(b, '\\');
+    if (bs == nullptr) return true; // "blk.N..." unescaped — treat as all-layer
+    // "blk\\." (literal dot) vs "blk\\d" (digit class): digit class with no
+    // literal layer number matches every layer (the --cpu-moe all-exps case).
+    if (bs[1] == '.') {
+        // literal "blk.<N>.": parse N after the escaped dot.
+        const char * p = bs + 2;
+        if (!std::isdigit((unsigned char) *p)) return true; // "blk\.<rest>" — all
+        return std::atoi(p) == il;
+    }
+    return true; // "blk\\d..." — layer class, matches all
+}
 
+void set_residency(int n_gpu_layers, int n_layer,
+                   const std::vector<std::string> & cpu_patterns) {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    // hydra #788 fix: n_layer arrives as llama_model_n_layer() = trunk only
+    // (excludes NextN). Geometry rows may still reference il == trunk (the
+    // MTP expert row). Size the table to cover every geometry row so no
+    // trunk row falls off the end into the tier-0 fallback.
+    int need = n_layer;
+    if (g_geom) {
+        for (int il : g_geom->moe_rows) need = std::max(need, il + 1);
+        for (int il : g_geom->nextn_rows) need = std::max(need, il + 1);
+    }
+    g_res_ngl = n_gpu_layers;
+    g_res_nlayer = need;
+    g_res_cpu.assign(need > 0 ? (size_t) need : 0, 0);
+    for (int il = 0; il < need; il++) {
+        // Rule 1: above the device window → CPU. i_gpu_start mirrors
+        // llama-model.cpp:1502 (back-to-front offload; +1 = output layer).
+        // The trunk window uses the trunk count; the NextN row inherits the
+        // trunk verdict (same weights, llama-model.cpp:2317 filter).
+        if (n_gpu_layers >= 0 && n_layer > 0 &&
+            il < n_layer + 1 - std::min(n_gpu_layers, n_layer + 1)) {
+            g_res_cpu[(size_t) il] = 1;
+            continue;
+        }
+        // Rule 2: a CPU override pattern names this layer's experts.
+        for (const auto & pat : cpu_patterns) {
+            if (res_pat_cpu(pat, il)) {
+                g_res_cpu[(size_t) il] = 1;
+                break;
+            }
+        }
+    }
+    g_res_ready = need > 0;
+}
+
+// hydra #788: shared EMAP encoder (Colibri byte layout verbatim:
+// tier=byte>>6, heat=byte&63). Tier is a LOAD fact from set_residency();
+// heat is the routing count clamped to 63. Disk unused (tier 0 = unknown,
+// honest omit). Applies to every cell: never-routed experts are still
+// resident, so their tier is real with heat 0. Callers hold g_mtx.
+uint8_t encode_cell(const geometry & g, size_t row, uint64_t count) {
+    uint8_t tier = 0;
+    const size_t nrows = g.moe_rows.size() + g.nextn_rows.size();
+    if (g_res_ready && row < nrows) {
+        const size_t nr = g.moe_rows.size();
+        const int il = row < nr ? g.moe_rows[row]
+                               : g.nextn_rows[row - nr];
+        if (il >= 0 && (size_t) il < g_res_cpu.size()) {
+            tier = g_res_cpu[(size_t) il] ? 1 : 2;
+        }
+    }
+    return (uint8_t) ((tier << 6) | (count > 63 ? 63 : (int) count));
+}
 
 std::optional<std::string> experts_json() {
     if (std::getenv("HYDRA_EXPERT_META") == nullptr) return std::nullopt;
@@ -433,10 +513,10 @@ std::optional<std::string> experts_json() {
     const bool live = g_stats_on && g_counts.size() == cells;
 
     // Colibri EMAP byte encoding verbatim (tier=byte>>6, heat=byte&63).
-    // Tier bits are PROVISIONAL (design §8 honesty rule): our fork has no
-    // disk tier, so counted experts report tier 1 (RAM-resident, the truth
-    // until hybrid residency exists); never-counted cells stay tier 0/heat
-    // 0 (honest zeros). Heat saturates at 63 (EMAP encoding).
+    // hydra #788: tier is a LOAD fact (encode_cell ← set_residency), heat
+    // is the routing count clamped to 63. Every live cell carries its real
+    // tier (never-routed still resident, heat 0); OFF state stays honest
+    // zeros (tier unknown until a load captures residency).
     auto to_hex = [](const uint8_t * data, size_t n) {
         static const char * digits = "0123456789abcdef";
         std::string s;
@@ -452,8 +532,7 @@ std::optional<std::string> experts_json() {
     if (live) {
         std::vector<uint8_t> bytes(cells);
         for (size_t i = 0; i < cells; i++) {
-            const uint64_t c = g_counts[i];
-            bytes[i] = c == 0 ? 0 : (uint8_t) ((1 << 6) | (c > 63 ? 63 : (int) c));
+            bytes[i] = encode_cell(g, i / (size_t) g.cols, g_counts[i]);
         }
         map_hex = to_hex(bytes.data(), bytes.size());
         hits_hex = to_hex(g_hits_step.data(), g_hits_step.size());
@@ -679,8 +758,7 @@ std::optional<std::string> experts_json_at(uint64_t seq) {
     }
     std::vector<uint8_t> bytes(cells);
     for (size_t i = 0; i < cells; i++) {
-        const uint64_t c = cum[i];
-        bytes[i] = c == 0 ? 0 : (uint8_t) ((1 << 6) | (c > 63 ? 63 : (int) c));
+        bytes[i] = encode_cell(g, i / (size_t) g.cols, cum[i]); // hydra #788: same load-fact tiers
     }
     const std::string map_hex = hex_of(bytes.data(), bytes.size());
     std::string hits_hex;

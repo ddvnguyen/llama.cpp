@@ -77,6 +77,16 @@ struct alloc_info {
 };
 void snapshot_alloc(const struct llama_context * ctx);
 bool health_snapshot(alloc_info & out);
+// Per-expert EMAP tier residency (hydra_vortex#788). Captured once at
+// model-load time from server params (plain PODs only — no llama/common
+// types leak into this header): user n_gpu_layers, trunk layer count
+// (llama_model_n_layer), and the CPU-targeted tensor-buffer override
+// patterns (--n-cpu-moe / --cpu-moe / fit overflow). Layer experts on
+// device → tier 2, CPU-offloaded → tier 1, Disk unused (no expert paging).
+// Unknown (e.g. auto-fit ngl<0) → per-row tier 0 (honest omit, never guess).
+// Survives reset() (load fact, not probe state); thread-safe.
+void set_residency(int n_gpu_layers, int n_layer,
+                   const std::vector<std::string> & cpu_patterns);
 // Stage B payload (Colibri EMAP encoding verbatim: tier=byte>>6, heat=byte&63).
 // nullopt when disabled (env unset or geometry unavailable) — callers no-op.
 std::optional<std::string> experts_json();
