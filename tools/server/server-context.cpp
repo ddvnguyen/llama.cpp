@@ -1131,6 +1131,11 @@ private:
         // init is cheap (GGUF header scan) and geometry also serves OFF-state
         // honest-zero payloads; the stats gate stays in enabled()/accumulate.
         hydra_atlas::init(params_base.model.path);
+        // hydra #785: one-shot allocation snapshot for honest tier/hwinfo on
+        // /health. Sleep-safe by construction (get_health reads the stored
+        // copy, never ctx_server); breakdown needs the live context, so it
+        // must be captured here, not in the handler.
+        hydra_atlas::snapshot_alloc(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -4780,7 +4785,37 @@ void server_routes::init_routes() {
         bool ctx_server; // do NOT delete this line
         GGML_UNUSED(ctx_server);
 
-        res->ok({{"status", "ok"}});
+        // hydra #785: honest tier/hwinfo from the load-time alloc snapshot
+        // (server-atlas.cpp; never ctx_server — sleep-unsafe). Tiers are
+        // device/host buffer bytes from llama_get_memory_breakdown():
+        // vram = device-side model + KV + compute, ram = host-side buffers,
+        // disk = 0 (nothing is disk-paged). Omitted entirely when the
+        // snapshot has no breakdown — never fabricated.
+        json body = {{"status", "ok"}};
+        hydra_atlas::alloc_info alloc;
+        if (hydra_atlas::health_snapshot(alloc)) {
+            constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+            json hwinfo = {
+                {"cores",        alloc.cores},
+                {"ram_total_gb", alloc.ram_total / GB},
+                {"ram_avail_gb", alloc.ram_avail / GB},
+                {"gpus",         alloc.gpus},
+                {"vram_total_gb", alloc.vram_total / GB},
+                {"cpu",          alloc.cpu},
+                {"gpu",          alloc.gpu},
+            };
+            body["hwinfo"] = std::move(hwinfo);
+            if (alloc.have_tiers) {
+                body["tiers"] = {
+                    {"vram",    alloc.vram_bytes},
+                    {"ram",     alloc.ram_bytes},
+                    {"disk",    0},
+                    {"vram_gb", alloc.vram_bytes / GB},
+                    {"ram_gb",  alloc.ram_bytes / GB},
+                };
+            }
+        }
+        res->ok(body);
         return res;
     };
 

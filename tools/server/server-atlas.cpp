@@ -3,10 +3,20 @@
 // tensor presence), so no architecture is hardcoded and the UI never guesses a
 // layer mapping — the Colibri GLM `row+3`/MTP-78 hardcode dies here (design §D).
 
+// hydra #785: allocation snapshot for honest tier/hwinfo reporting on engine
+// /health. Uses the public llama_get_memory_breakdown() API (declared in
+// ../src/llama-ext.h — a staging header, included here and NOT leaked into
+// server-atlas.h, which only forward-declares llama_context). Device/host
+// split: ggml_backend_buft_is_host() → ram; else vram (device-side model +
+// KV + compute). disk = 0 always (nothing is disk-paged in this mode).
 #include "server-atlas.h"
 
+#include "../src/llama-ext.h"
+
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
+#include "llama.h"
 
 #include <cctype>
 #include <cstdint>
@@ -14,10 +24,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <nlohmann/json.hpp>
-#include <optional>
+#include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 namespace hydra_atlas {
 
@@ -129,6 +144,9 @@ uint64_t g_seq = 0;
 std::vector<uint8_t> g_hits_step;
 bool g_stats_on = false;
 bool g_stats_checked = false;
+// hydra #785: load-time allocation snapshot for /health (sleep-safe copy).
+alloc_info g_alloc;
+bool g_alloc_ready = false;
 
 } // namespace
 
@@ -204,13 +222,113 @@ int expert_used() {
     if (!g_geom) return 0;
     return g_geom->n_expert_used;
 }
-
 void reset() {
     std::lock_guard<std::mutex> lock(g_mtx);
     g_counts.clear();
     g_hits_step.clear();
     g_seq = 0;
 }
+
+// hydra #785: one-shot load-time capture. Breakdown split mirrors
+// common/memory_breakdown_print (fit.cpp:938-965): host buft → ram,
+// device buft → vram. Device totals via ggml_backend_dev_memory; host
+// totals via /proc/meminfo (Linux) with CPU-device fallback. Never throws:
+// on any failure the snapshot stays partial and have_tiers=false so the
+// /health handler omits tiers instead of fabricating them.
+void snapshot_alloc(const struct llama_context * ctx) {
+    alloc_info a;
+    a.cores = (int) std::thread::hardware_concurrency();
+    try {
+        const size_t ndev = ggml_backend_dev_count();
+        for (size_t i = 0; i < ndev; i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev) continue;
+            const auto type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                if (total > 0) {
+                    a.gpus++;
+                    a.vram_total += (uint64_t) total;
+                    if (a.gpu.empty()) {
+                        const char * d = ggml_backend_dev_description(dev);
+                        if (d) a.gpu = d;
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+#if !defined(_WIN32)
+    try {
+        std::ifstream mi("/proc/meminfo");
+        std::string k;
+        unsigned long long v = 0;
+        std::string u;
+        while (mi >> k >> v >> u) {
+            if (k == "MemTotal:") a.ram_total = v * 1024ULL;
+            else if (k == "MemAvailable:") a.ram_avail = v * 1024ULL;
+            if (a.ram_total && a.ram_avail) break;
+        }
+    } catch (...) {}
+    if (a.cpu.empty()) {
+        try {
+            std::ifstream ci("/proc/cpuinfo");
+            std::string line;
+            while (std::getline(ci, line)) {
+                if (line.compare(0, 10, "model name") == 0) {
+                    const auto p = line.find(':');
+                    if (p != std::string::npos) {
+                        a.cpu = line.substr(p + 1);
+                        while (!a.cpu.empty() && (a.cpu.front() == ' ' || a.cpu.front() == '\t')) a.cpu.erase(a.cpu.begin());
+                    }
+                    break;
+                }
+            }
+        } catch (...) {}
+    }
+#endif
+    if (a.ram_total == 0) {
+        try {
+            ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(cpu, &free, &total);
+                a.ram_total = (uint64_t) total;
+                a.ram_avail = (uint64_t) free;
+            }
+        } catch (...) {}
+    }
+    if (ctx != nullptr) {
+        try {
+            const llama_memory_breakdown bd = llama_get_memory_breakdown(ctx);
+            uint64_t vram = 0, ram = 0;
+            for (const auto & kv : bd) {
+                const uint64_t self = (uint64_t) kv.second.model +
+                                      (uint64_t) kv.second.context +
+                                      (uint64_t) kv.second.compute;
+                if (ggml_backend_buft_is_host(kv.first)) ram += self;
+                else vram += self;
+            }
+            if (!bd.empty()) {
+                a.vram_bytes = vram;
+                a.ram_bytes  = ram;
+                a.have_tiers = true;
+            }
+        } catch (...) {}
+    }
+    std::lock_guard<std::mutex> lock(g_mtx);
+    g_alloc = a;
+    g_alloc_ready = true;
+}
+
+bool health_snapshot(alloc_info & out) {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_alloc_ready) return false;
+    out = g_alloc;
+    return true;
+}
+
 
 
 std::optional<std::string> experts_json() {
