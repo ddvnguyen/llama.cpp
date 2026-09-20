@@ -899,6 +899,10 @@ private:
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
+    // decode-profiler: timestamp taken right after a draft completes; the next central
+    // decode is then the speculative verify step. -1 = no verify pending.
+    double prof_spec_verify_t0 = -1.0;
+
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -3091,6 +3095,8 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            // the next central decode is the speculative verify step for these slots
+            prof_spec_verify_t0 = ggml_time_ms();
         }
 
         // make checkpoints if needed
@@ -3724,12 +3730,19 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool prof_verify = prof_spec_verify_t0 >= 0.0;
+        const double prof_verify_t0 = prof_verify ? prof_spec_verify_t0 : 0.0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            if (prof_verify) {
+                // verify step latency: queue yield + decode + sync (exact for --parallel 1)
+                llama_profile_note(ctx_tgt, 0.0, (double)(ggml_time_ms() - prof_verify_t0), 0, 0);
+            }
         });
+        prof_spec_verify_t0 = -1.0;
 
         if (ret != 0) {
             {

@@ -2192,6 +2192,9 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // target context for decode-profiler annotations (llama_profile_note); may be null
+    llama_context * ctx_tgt = nullptr;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2733,6 +2736,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
+        /* .ctx_tgt     = */ params.draft.ctx_tgt,
     });
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
@@ -2810,6 +2814,8 @@ void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
     }
+
+    const int64_t t_draft0_ms = ggml_time_ms();
 
     auto & dparams = spec->dparams;
 
@@ -2889,6 +2895,15 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+
+    // decode-profiler annotation for the target context; no-op unless --profile-decode
+    if (spec->ctx_tgt) {
+        int32_t n_drafted = 0;
+        for (auto & dp : dparams) {
+            if (dp.result) n_drafted += (int32_t) dp.result->size();
+        }
+        llama_profile_note(spec->ctx_tgt, (double)(ggml_time_ms() - t_draft0_ms), 0.0, n_drafted, 0);
+    }
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
@@ -2898,6 +2913,8 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         GGML_ASSERT(n_accepted == 0);
         return;
     }
+
+    const int64_t t_verify0_ms = ggml_time_ms();
 
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
@@ -2924,6 +2941,11 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
         }
+    }
+
+    // decode-profiler annotation for the target context; no-op unless --profile-decode
+    if (spec->ctx_tgt) {
+        llama_profile_note(spec->ctx_tgt, 0.0, (double)(ggml_time_ms() - t_verify0_ms), 0, n_accepted);
     }
 }
 

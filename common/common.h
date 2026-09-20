@@ -578,6 +578,7 @@ struct common_params {
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
     bool warmup            = true;  // warmup run
+    bool profile_decode    = false; // in-source decode profiler (PROF lines on stderr)
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
