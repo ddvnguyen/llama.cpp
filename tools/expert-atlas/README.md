@@ -82,7 +82,14 @@ Sidecar JSON format (consumed by `analyze_edge0.py`):
 
 Env vars:
 - `HYDRA_EXPERT_CAPTURE` (set=on, unset=off): enables capture hook
-- `HYDRA_CAPTURE_OUTDIR`: sidecar output directory (default: `.`)
+- `HYDRA_CAPTURE_OUTDIR` (**hard requirement**: must equal `$OUT/sidecars`):
+  sidecar output directory. sweep.sh validates every flushed sidecar path
+  against this directory; engine started with a different outdir is rejected.
+
+**`.coli_usage`-style per-probe dumps are subsumed by the sidecar/flush
+surface.** The `/capture/flush` endpoint writes per-probe sidecar JSONs
+(hidden states + topk) that fully replace the legacy `.coli_usage` file;
+no separate dump file is produced or expected.
 
 sweep.sh calls `/capture/flush` after each probe when capture is enabled.
 When capture is disabled, the flush endpoint returns 503 and sweep.sh

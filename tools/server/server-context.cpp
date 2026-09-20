@@ -3970,7 +3970,7 @@ private:
 
                 if (n_batch == 1 && ret == 1) {
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the batch too
+                    //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";
                 }
 
@@ -3979,7 +3979,7 @@ private:
                 }
 
                 if (ret < -1) {
-                    // TODO: handle ret == 2 (abort) when we start aborting
+                    // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
                     err = "Compute error.";
                 }
 
