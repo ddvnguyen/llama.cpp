@@ -1333,6 +1333,10 @@ void llm_graph_result::reset() {
     t_moe_topk.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_moe_topk.begin(), t_moe_topk.end(), nullptr);
 
+    // hydra #786 Edge0: hidden-state stash stays null unless build_moe_ffn fills it (env-gated)
+    t_moe_hidden.resize(LLAMA_MAX_LAYERS + 1);
+    std::fill(t_moe_hidden.begin(), t_moe_hidden.end(), nullptr);
+
     // hydra #787 S-C3: EAN stash stays empty unless build_moe_ffn fills it (env-gated)
     t_moe_ean.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_moe_ean.begin(), t_moe_ean.end(), std::vector<ggml_tensor *>());
@@ -1398,6 +1402,16 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     // below, so Stage A alone never pays for them).
     if (getenv("HYDRA_TRACE_ROUTES") || getenv("HYDRA_PIN_FILE") || getenv("HYDRA_EXPERT_STATS") || getenv("HYDRA_EAN_STATS")) {
         for (auto * tensor : t_moe_topk) {
+            if (tensor != nullptr) {
+                ggml_set_output(tensor);
+            }
+        }
+    }
+    // hydra #786 Edge0: hidden-state tensors ride their own env
+    // (HYDRA_EXPERT_CAPTURE). Sweep-corpus-only, never on serving path.
+    // Unset = no tensor marked, stash never read, graph bit-identical.
+    if (getenv("HYDRA_EXPERT_CAPTURE")) {
+        for (auto * tensor : t_moe_hidden) {
             if (tensor != nullptr) {
                 ggml_set_output(tensor);
             }
@@ -2153,6 +2167,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // stash the ids tensor for the route tracer (read out in llama_context, env-gated)
     if (res && il >= 0 && (size_t) il < res->t_moe_topk.size()) {
         res->t_moe_topk[il] = selected_experts;
+    }
+
+    // hydra #786 Edge0: stash router-input hidden state for linear-probe
+    // prerouter. The cur tensor entering build_moe_ffn is the post-ffn_norm
+    // residual — the same tensor the router reads (gate_inp @ cur). Pointer
+    // stash only, no new compute node. Env-gated: HYDRA_EXPERT_CAPTURE unset
+    // means no stash, graph bit-identical to today.
+    if (res && il >= 0 && (size_t) il < res->t_moe_hidden.size() && getenv("HYDRA_EXPERT_CAPTURE")) {
+        res->t_moe_hidden[il] = cur;
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {

@@ -904,6 +904,10 @@ public:
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
     ggml_tensor * get_moe_topk(int il) const { return t_moe_topk[il]; }
+    // hydra #786 Edge0: router-input hidden state ([n_embd, n_tokens]) for
+    // the linear-probe prerouter. Pointer stash only; tensor null unless
+    // HYDRA_EXPERT_CAPTURE was set at graph build time.
+    ggml_tensor * get_moe_hidden(int il) const { return t_moe_hidden[il]; }
     // hydra: expert-atlas Stage C EAN (#787 S-C3) — per-slot expert-output
     // L2 norms ([1, n_tokens] each, unweighted pre-router-multiply) and the
     // final router gate weights ([1, n_expert_used, n_tokens]). Empty unless
@@ -949,6 +953,11 @@ public:
 
     // per-layer MoE expert ids, filled in build_moe_ffn, read out by the route tracer
     std::vector<ggml_tensor *> t_moe_topk;
+
+    // per-layer MoE router-input hidden state ([n_embd, n_tokens] each),
+    // stashed in build_moe_ffn for Edge0 linear-probe prerouter (#786).
+    // Filled only when HYDRA_EXPERT_CAPTURE is set at build time.
+    std::vector<ggml_tensor *> t_moe_hidden;
 
     // per-layer MoE EAN instrumentation (Stage C #787 S-C3), filled in
     // build_moe_ffn only when HYDRA_EAN_STATS is set at build time

@@ -117,6 +117,12 @@ struct llama_context {
     int get_moe_ean_nslots(int il);
     int get_moe_weight(int il, int out_row, float * out_w, int n_cap);
     int get_moe_weight_nrows(int il);
+    // hydra #786 Edge0: router-input hidden state readout for linear-probe
+    // prerouter. Copies n_embd floats for output row out_row into out_hidden
+    // (cap n_cap); returns floats written, 0 when unavailable (HYDRA_EXPERT_CAPTURE
+    // unset at build, MTP/draft context, layer/row out of range, no decode yet).
+    int get_moe_hidden(int il, int out_row, float * out_hidden, int n_cap);
+    int get_moe_hidden_nrows(int il);
 
     void attach_threadpool(
             ggml_threadpool_t threadpool,

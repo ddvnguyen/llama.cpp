@@ -51,3 +51,51 @@ production stats path once it lands.
   denominators, scoring ~84% on pure noise at chance 20%. Null verified at
   chance on random-routing controls; signal verified on banded synthetic
   spectra. Runs once real spectra exist.
+- `analyze_edge0.py` — Edge0 linear-probe prerouter analyzer (#786): trains
+  per-layer one-vs-rest logistic regression on router-input hidden state to
+  predict top-k expert selection. Leave-one-prompt-out cross-validation
+  (by prompt, never by token — Rider 1). LTR baseline column present from
+  day one. See **Edge0 predictor definition** below.
+
+## Edge0 predictor definition (verbatim, schema_version edge0-v1)
+
+> `predictability[layer]` = top-k hit-rate @k of a per-layer linear probe
+> mapping the router-input hidden state (post-ffn_norm residual) to the top-k
+> expert set, measured on HELD-OUT tokens of the probe corpus (leave-one-prompt-
+> out per category). StandardScaler + LogisticRegression(C=1.0, lbfgs,
+> max_iter=1000). `prefetch_gain[layer]` = (sum over hit tokens of hit experts'
+> weight bytes) / (sum over all routed experts' weight bytes) under that probe's
+> hits.
+>
+> Comparison baseline column: `predictability_ltr[layer]` = last-token-routing-
+> repeat hit-rate @k computed capture-free from the Stage-A topk stream (fraction
+> of tokens whose topk set is a subset of the previous token's topk set, per
+> layer). Follow-up column: per-layer LRU-k (k=4).
+>
+> **Any change of predictor = new schema_version.**
+
+### Riders (acceptance criteria)
+
+1. **Leak discipline — by PROMPT, not token**: leave-one-prompt-out must hold
+   out entire prompts. Token-level splits leak within a prompt's shared context.
+2. **Probe provenance**: seed + hyperparameters (C, max_iter, solver) recorded
+   in artifact provenance per run. `predictability` is not comparable across
+   runs otherwise.
+3. **Compute budget**: 41 MoE layers x 256 one-vs-rest logistic fits = ~10.5k
+   small fits per sweep fold. StandardScaler + LogisticRegression per fit.
+   Estimated runtime: < 5 min on CPU. Estimated memory: < 50 MB.
+
+### Data flow
+
+```
+sweep (HYDRA_EXPERT_CAPTURE=1)
+  -> per-probe sidecar JSON (hidden states + topk per layer per token)
+  -> analyze_edge0.py (per-layer logistic probe, leave-one-prompt-out)
+  -> edge0.json (predictability, prefetch_gain, LTR baseline)
+```
+
+### OFF-parity
+
+Env-unset (HYDRA_EXPERT_CAPTURE not set): `t_moe_hidden` stash never filled,
+`ggml_set_output` never called, graph bit-identical to today. Same class of
+evidence as the verified Stage-A honest-OFF runs.
