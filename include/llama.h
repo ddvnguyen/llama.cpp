@@ -1080,6 +1080,23 @@ extern "C" {
     // [0, n) rows; decode-only gating (single-gen vs prefill) is the hook's
     // job via batch flags, not this function's. 0 when unavailable.
     LLAMA_API int llama_get_moe_topk_nrows(struct llama_context * ctx, int il);
+    // hydra #787 S-C3: EAN (expert activation norm) readout for REAP
+    // saliency — per-slot unweighted expert-output L2 norms for output row
+    // out_row into out_norms (cap n_cap); returns norms written, 0 when
+    // unavailable (HYDRA_EAN_STATS unset at build, MTP/draft context,
+    // layer/row out of range, no decode yet). Read-only: no graph, sched,
+    // sampler, or routing change. Same thread discipline as topk readout.
+    LLAMA_API int llama_get_moe_ean(struct llama_context * ctx, int il, int out_row, float * out_norms, int n_cap);
+    // hydra #787 S-C3: slot count of the most recent decode's MoE EAN
+    // tensors for layer il (hook loop bound). 0 when unavailable.
+    LLAMA_API int llama_get_moe_ean_nslots(struct llama_context * ctx, int il);
+    // hydra #787 S-C3: final router gate weights for output row out_row
+    // into out_w (cap n_cap); returns weights written, 0 when unavailable.
+    // Same gates that multiply the expert outputs (REAP Eq. 9 g_j term).
+    LLAMA_API int llama_get_moe_weight(struct llama_context * ctx, int il, int out_row, float * out_w, int n_cap);
+    // hydra #787 S-C3: output-row count of the most recent decode's MoE
+    // gate-weight tensors (tensor ne[2]). 0 when unavailable.
+    LLAMA_API int llama_get_moe_weight_nrows(struct llama_context * ctx, int il);
 
     // In-source decode profiler: attach draft/verify timing of one speculative iteration
     // to the target context's current window. No-op when ctx is NULL or profiling is disabled.

@@ -2276,6 +2276,97 @@ int llama_context::get_moe_topk(int il, int out_row, int32_t * out_ids, int n_ca
     ggml_backend_tensor_get(t, out_ids, (size_t) out_row * (size_t) k * sizeof(int32_t), (size_t) n * sizeof(int32_t));
     return (int) n;
 }
+// hydra #787 S-C3: EAN (expert activation norm) readout for REAP saliency.
+// Per-slot unweighted expert-output L2 norms ([1, n_tokens] each) for output
+// row out_row into out_norms (cap n_cap); returns norms written, 0 when
+// unavailable (HYDRA_EAN_STATS unset at build, MTP/draft context, layer/row
+// out of range, or no decode yet). Same sync-D2H discipline as get_moe_topk:
+// the hook consumes the values immediately, so no async copy.
+int llama_context::get_moe_ean(int il, int out_row, float * out_norms, int n_cap) {
+    if (out_norms == nullptr || n_cap <= 0 || il < 0 || out_row < 0) {
+        return 0;
+    }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return 0; // MTP/draft rows excluded (#175 trap 2)
+    }
+    auto * res = get_gf_res_prev();
+    if (res == nullptr) {
+        return 0;
+    }
+    const auto & slots = res->get_moe_ean(il);
+    int n = 0;
+    for (auto * t : slots) {
+        if (n >= n_cap) {
+            break;
+        }
+        if (t == nullptr || t->type != GGML_TYPE_F32 || out_row >= t->ne[1]) {
+            return 0;
+        }
+        ggml_backend_tensor_get(t, &out_norms[n], (size_t) out_row * sizeof(float), sizeof(float));
+        ++n;
+    }
+    return n;
+}
+// hydra #787 S-C3: slot count for the hook loop bound (0 when unavailable).
+int llama_context::get_moe_ean_nslots(int il) {
+    if (il < 0) {
+        return 0;
+    }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return 0;
+    }
+    auto * res = get_gf_res_prev();
+    if (res == nullptr) {
+        return 0;
+    }
+    return (int) res->get_moe_ean(il).size();
+}
+// hydra #787 S-C3: final router gate weights for output row out_row
+// (tensor [1, k, n_tokens], row o = k contiguous floats) into out_w;
+// returns weights written, 0 when unavailable. Same gates that multiply the
+// expert outputs, so hook-side S_j = mean(g * norm) matches REAP Eq. 9.
+int llama_context::get_moe_weight(int il, int out_row, float * out_w, int n_cap) {
+    if (out_w == nullptr || n_cap <= 0 || il < 0 || out_row < 0) {
+        return 0;
+    }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return 0; // MTP/draft rows excluded (#175 trap 2)
+    }
+    auto * res = get_gf_res_prev();
+    if (res == nullptr) {
+        return 0;
+    }
+    ggml_tensor * t = res->get_moe_weight(il);
+    if (t == nullptr || t->type != GGML_TYPE_F32) {
+        return 0; // outputs not marked (HYDRA_EAN_STATS unset) or dense layer
+    }
+    const int64_t k = t->ne[1];
+    const int64_t n_rows = t->ne[2];
+    if (k <= 0 || out_row >= n_rows) {
+        return 0;
+    }
+    const int64_t n = k < n_cap ? k : n_cap;
+    ggml_backend_tensor_get(t, out_w, (size_t) out_row * (size_t) k * sizeof(float), (size_t) n * sizeof(float));
+    return (int) n;
+}
+// hydra #787 S-C3: output-row count (tensor ne[2]) for the hook loop bound.
+int llama_context::get_moe_weight_nrows(int il) {
+    if (il < 0) {
+        return 0;
+    }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return 0;
+    }
+    auto * res = get_gf_res_prev();
+    if (res == nullptr) {
+        return 0;
+    }
+    ggml_tensor * t = res->get_moe_weight(il);
+    if (t == nullptr || t->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    return (int) t->ne[2];
+}
 // hydra: expert-atlas Stage A (#771) — row count for the hook loop bound.
 int llama_context::get_moe_topk_nrows(int il) {
     if (il < 0) {
@@ -5818,6 +5909,31 @@ int llama_get_moe_topk_nrows(llama_context * ctx, int il) {
         return 0;
     }
     return ctx->get_moe_topk_nrows(il);
+}
+// hydra #787 S-C3: EAN + gate-weight C API halves; delegate to the member.
+int llama_get_moe_ean(llama_context * ctx, int il, int out_row, float * out_norms, int n_cap) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->get_moe_ean(il, out_row, out_norms, n_cap);
+}
+int llama_get_moe_ean_nslots(llama_context * ctx, int il) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->get_moe_ean_nslots(il);
+}
+int llama_get_moe_weight(llama_context * ctx, int il, int out_row, float * out_w, int n_cap) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->get_moe_weight(il, out_row, out_w, n_cap);
+}
+int llama_get_moe_weight_nrows(llama_context * ctx, int il) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->get_moe_weight_nrows(il);
 }
 
 void llama_context::prof_note(double t_draft_ms, double t_verify_ms, int32_t n_drafted, int32_t n_accepted) {

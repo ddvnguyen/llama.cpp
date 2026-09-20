@@ -19,10 +19,13 @@
 #include "llama.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -144,6 +147,36 @@ uint64_t g_seq = 0;
 std::vector<uint8_t> g_hits_step;
 bool g_stats_on = false;
 bool g_stats_checked = false;
+// hydra #787 S-C3: EAN state. gxn[] = sum(g*norm) per cell, nsel[] =
+// selection count per cell; S = gxn/nsel. Sized lazily like g_counts.
+// Mutex = the file mutex.
+std::vector<double> g_ean_gxn;
+std::vector<uint64_t> g_ean_nsel;
+bool g_ean_on = false;
+bool g_ean_checked = false;
+// hydra #787: per-turn capture. turn_seq++ once per completed completion
+// cycle (record_turn, slot-aware). g_turn_base = counts snapshot at the last
+// turn boundary; each turn stores the sparse window diff (no new graph
+// hooks). g_turn_hits ORs every step bitmap since the last boundary, so a
+// turn keeps its window hits even though g_hits_step only holds the latest
+// step. Ring capped at kTurnCap; evicted turns 404 honestly. Window-diff
+// caveat: with parallel slots the shared counters attribute to whichever
+// turn ends first — the slice is a window, not slot-isolated.
+uint64_t g_turn_seq = 0;
+std::deque<turn_record> g_turns;
+std::vector<uint64_t> g_turn_base;
+std::vector<uint8_t> g_turn_hits;
+
+std::string hex_of(const uint8_t * data, size_t n) {
+    static const char * digits = "0123456789abcdef";
+    std::string s;
+    s.resize(n * 2);
+    for (size_t i = 0; i < n; i++) {
+        s[2 * i]     = digits[(data[i] >> 4) & 0xF];
+        s[2 * i + 1] = digits[data[i] & 0xF];
+    }
+    return s;
+}
 // hydra #785: load-time allocation snapshot for /health (sleep-safe copy).
 alloc_info g_alloc;
 bool g_alloc_ready = false;
@@ -203,6 +236,58 @@ void end_step(int rows, int cols) {
         return;
     }
     g_seq += 1; // one counted decode step
+    // hydra #787: fold this step into the current turn window. Cheap
+    // (bytes = cells/8) and lock-local; cleared at each record_turn.
+    if (g_turn_hits.size() != g_hits_step.size()) {
+        g_turn_hits.assign(g_hits_step.size(), 0);
+    }
+    for (size_t i = 0; i < g_hits_step.size(); i++) {
+        g_turn_hits[i] |= g_hits_step[i];
+    }
+}
+
+bool ean_enabled() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_ean_checked) {
+        g_ean_on = std::getenv("HYDRA_EAN_STATS") != nullptr;
+        g_ean_checked = true;
+    }
+    return g_ean_on;
+}
+
+void accumulate_ean(int grid_row, const int32_t * ids, const float * gates, const float * norms, int n, int cols) {
+    if (ids == nullptr || gates == nullptr || norms == nullptr || n <= 0 || cols <= 0 || grid_row < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_ean_on || !g_geom) {
+        return;
+    }
+    const size_t cells = (size_t) g_geom->rows * (size_t) g_geom->cols;
+    if (g_ean_gxn.size() != cells) {
+        g_ean_gxn.assign(cells, 0.0);
+        g_ean_nsel.assign(cells, 0);
+    }
+    if (grid_row >= g_geom->rows) {
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        const int32_t id = ids[i];
+        if (id < 0 || id >= cols || id >= g_geom->cols) {
+            continue;
+        }
+        const float g = gates[i];
+        const float v = norms[i];
+        if (!(g >= 0.0f) || !(v >= 0.0f)) {
+            continue; // NaN/negative guard: never poison the mean
+        }
+        if (!std::isfinite(g) || !std::isfinite(v)) {
+            continue;
+        }
+        const size_t cell = (size_t) grid_row * (size_t) g_geom->cols + (size_t) id;
+        g_ean_gxn[cell] += (double) g * (double) v;
+        g_ean_nsel[cell] += 1;
+    }
 }
 
 std::vector<int> trunk_rows() {
@@ -227,6 +312,13 @@ void reset() {
     g_counts.clear();
     g_hits_step.clear();
     g_seq = 0;
+    // hydra #787: rebase the turn window too (next delta diffs vs zeros);
+    // recorded turn history survives probe resets.
+    g_turn_base.clear();
+    g_turn_hits.clear();
+    // hydra #787 S-C3: EAN joins the per-probe reset (no cross-probe leak).
+    g_ean_gxn.clear();
+    g_ean_nsel.clear();
 }
 
 // hydra #785: one-shot load-time capture. Breakdown split mirrors
@@ -370,13 +462,241 @@ std::optional<std::string> experts_json() {
         hits_hex.assign(((cells + 7) / 8) * 2, '0');
     }
 
-    const json j = {
+    // hydra #787 S-C3: EAN saliency section. Served only when EAN counted
+    // this run (own env HYDRA_EAN_STATS, accumulators sized); otherwise the
+    // key is absent (never null-fabricated). Keys are real layer indices
+    // "<realLayer>:<expert>" so offline consumers merge without geometry.
+    json ean_j = nullptr;
+    const bool ean_live = g_ean_on && g_ean_gxn.size() == cells && g_ean_nsel.size() == cells;
+    if (ean_live) {
+        json sal = json::object();
+        uint64_t ean_cells = 0;
+        for (size_t r = 0; r < g.moe_rows.size(); ++r) {
+            for (int e = 0; e < g.cols; ++e) {
+                const size_t cell = r * (size_t) g.cols + (size_t) e;
+                const uint64_t n = g_ean_nsel[cell];
+                if (n == 0) {
+                    continue;
+                }
+                sal[std::to_string(g.moe_rows[r]) + ":" + std::to_string(e)] =
+                    g_ean_gxn[cell] / (double) n;
+                ++ean_cells;
+            }
+        }
+        ean_j = {
+            {"enabled",      true},
+            {"source",       "live-EAN"},
+            {"decode_only",  true},
+            {"mtp_excluded", true},
+            {"cells",        ean_cells},
+            {"model",        g.model_hash},
+            {"engine_id",    g.engine_id},
+            {"saliency",     std::move(sal)},
+        };
+    }
+
+    json j = {
         {"seq",               (int) g_seq},
         {"rows",              g.rows},
         {"cols",              g.cols},
         {"map",               map_hex},
         {"hits",              hits_hex},
         {"telemetry_enabled", live},
+        {"geometry", {
+            {"engine_id",      g.engine_id},
+            {"model_hash",     g.model_hash},
+            {"dense_prefix",   g.dense_prefix},
+            {"moe_rows",       g.moe_rows},
+            {"nextn_rows",     g.nextn_rows},
+            {"n_expert_used",  g.n_expert_used},
+        }},
+    };
+    if (ean_live) {
+        j["ean"] = std::move(ean_j);
+    }
+    return j.dump();
+}
+
+// hydra #787 sub-task 1: per-turn capture. Called once per completed
+// completion cycle from send_final_response (server-context.cpp), gated on
+// the same HYDRA_EXPERT_STATS flag as the counters — OFF = no-op.
+void record_turn(int slot, double wall_s, uint64_t prompt_tokens,
+                 uint64_t completion_tokens, uint64_t forwards) {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_stats_on) {
+        return;
+    }
+    if (g_turn_base.size() != g_counts.size()) {
+        g_turn_base.assign(g_counts.size(), 0); // first turn / post-reset
+    }
+    turn_record t;
+    t.turn_seq          = ++g_turn_seq;
+    t.ts                = (int64_t) std::time(nullptr);
+    t.slot              = slot;
+    t.cols              = g_geom ? g_geom->cols : 0;
+    t.wall_s            = wall_s;
+    t.prompt_tokens     = prompt_tokens;
+    t.completion_tokens = completion_tokens;
+    t.forwards          = forwards;
+    for (size_t i = 0; i < g_counts.size(); i++) {
+        const uint64_t base = g_turn_base[i];
+        const uint64_t cur  = g_counts[i];
+        const uint64_t d = cur >= base ? cur - base : cur; // clamp post-reset
+        if (d > 0) {
+            t.routing.push_back({(uint32_t) i, d});
+        }
+    }
+    g_turn_base = g_counts;
+    t.hits = g_turn_hits;
+    g_turn_hits.assign(g_hits_step.size(), 0);
+    g_turns.push_back(std::move(t));
+    while (g_turns.size() > kTurnCap) {
+        g_turns.pop_front();
+    }
+}
+
+std::optional<std::string> profile_json() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_stats_on) {
+        return std::nullopt;
+    }
+    json turns = json::array();
+    for (const auto & t : g_turns) {
+        // Upstream ProfileTurn shape verbatim; phase timings stay 0.0 until
+        // a collision-proposal sign-off instruments them (honest zeros —
+        // the Profiling tab renders the full wall time as "other").
+        turns.push_back({
+            {"turn_seq",         t.turn_seq},
+            {"ts",               t.ts},
+            {"slot",             t.slot},
+            {"wall_s",           t.wall_s},
+            {"prompt_tokens",    t.prompt_tokens},
+            {"completion_tokens", t.completion_tokens},
+            {"expert_disk_s",    0.0},
+            {"expert_wait_s",    0.0},
+            {"expert_matmul_s",  0.0},
+            {"attention_s",      0.0},
+            {"lm_head_s",        0.0},
+            {"forwards",         t.forwards},
+        });
+    }
+    return json({{"seq", g_turn_seq}, {"turns", std::move(turns)}}).dump();
+}
+
+std::optional<std::string> turns_json() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_stats_on) {
+        return std::nullopt;
+    }
+    json turns = json::array();
+    for (const auto & t : g_turns) {
+        turns.push_back({
+            {"turn_seq",         t.turn_seq},
+            {"ts",               t.ts},
+            {"slot",             t.slot},
+            {"wall_s",           t.wall_s},
+            {"prompt_tokens",    t.prompt_tokens},
+            {"completion_tokens", t.completion_tokens},
+            {"forwards",         t.forwards},
+        });
+    }
+    return json({{"seq", g_turn_seq}, {"turns", std::move(turns)}}).dump();
+}
+
+std::optional<std::string> turn_json(uint64_t seq) {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_stats_on) {
+        return std::nullopt;
+    }
+    const turn_record * hit = nullptr;
+    for (const auto & t : g_turns) {
+        if (t.turn_seq == seq) {
+            hit = &t;
+            break;
+        }
+    }
+    if (hit == nullptr) {
+        return std::nullopt; // evicted or never recorded — caller 404s
+    }
+    json routing = json::array();
+    for (const auto & c : hit->routing) {
+        json cell = {{"count", c.count}};
+        if (hit->cols > 0) {
+            cell["row"]    = (uint32_t) (c.cell / (uint32_t) hit->cols);
+            cell["expert"] = (uint32_t) (c.cell % (uint32_t) hit->cols);
+        } else {
+            cell["cell"] = c.cell;
+        }
+        routing.push_back(std::move(cell));
+    }
+    return json({
+        {"turn_seq",         hit->turn_seq},
+        {"ts",               hit->ts},
+        {"slot",             hit->slot},
+        {"wall_s",           hit->wall_s},
+        {"prompt_tokens",    hit->prompt_tokens},
+        {"completion_tokens", hit->completion_tokens},
+        {"forwards",         hit->forwards},
+        {"cols",             hit->cols},
+        {"routing",          std::move(routing)},
+        {"hits",             hex_of(hit->hits.data(), hit->hits.size())},
+    }).dump();
+}
+
+std::optional<std::string> experts_json_at(uint64_t seq) {
+    if (std::getenv("HYDRA_EXPERT_META") == nullptr) {
+        return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_stats_on || !g_geom) {
+        return std::nullopt;
+    }
+    const geometry & g = *g_geom;
+    const size_t cells = (size_t) g.rows * (size_t) g.cols;
+    const turn_record * hit = nullptr;
+    for (const auto & t : g_turns) {
+        if (t.turn_seq == seq) {
+            hit = &t;
+            break;
+        }
+    }
+    if (hit == nullptr) {
+        return std::nullopt; // evicted or never recorded — caller 404s
+    }
+    // Cumulative reconstruction from retained sparse deltas (deque is in
+    // turn_seq order, so stop at seq). Delta computed client-side by the
+    // UI via sparse subtraction vs N-1.
+    std::vector<uint64_t> cum(cells, 0);
+    for (const auto & t : g_turns) {
+        if (t.turn_seq > seq) {
+            break;
+        }
+        for (const auto & c : t.routing) {
+            if (c.cell < cells) {
+                cum[c.cell] += c.count;
+            }
+        }
+    }
+    std::vector<uint8_t> bytes(cells);
+    for (size_t i = 0; i < cells; i++) {
+        const uint64_t c = cum[i];
+        bytes[i] = c == 0 ? 0 : (uint8_t) ((1 << 6) | (c > 63 ? 63 : (int) c));
+    }
+    const std::string map_hex = hex_of(bytes.data(), bytes.size());
+    std::string hits_hex;
+    if (!hit->hits.empty()) {
+        hits_hex = hex_of(hit->hits.data(), hit->hits.size());
+    } else {
+        hits_hex.assign(((cells + 7) / 8) * 2, '0');
+    }
+    const json j = {
+        {"seq",               (int) g_seq},
+        {"turn_seq",          seq},
+        {"rows",              g.rows},
+        {"cols",              g.cols},
+        {"map",               map_hex},
+        {"hits",              hits_hex},
+        {"telemetry_enabled", true},
         {"geometry", {
             {"engine_id",      g.engine_id},
             {"model_hash",     g.model_hash},

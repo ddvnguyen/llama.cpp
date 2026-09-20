@@ -1390,6 +1390,12 @@ void llm_graph_result::reset() {
     t_moe_topk.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_moe_topk.begin(), t_moe_topk.end(), nullptr);
 
+    // hydra #787 S-C3: EAN stash stays empty unless build_moe_ffn fills it (env-gated)
+    t_moe_ean.resize(LLAMA_MAX_LAYERS + 1);
+    std::fill(t_moe_ean.begin(), t_moe_ean.end(), std::vector<ggml_tensor *>());
+    t_moe_weights.resize(LLAMA_MAX_LAYERS + 1);
+    std::fill(t_moe_weights.begin(), t_moe_weights.end(), nullptr);
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1455,8 +1461,28 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     // hydra: expert-atlas Stage A counters (#771) share the same stash/output
     // gate — no new tensor, just one more env name on the existing condition.
     // Decode-only + MTP exclusion enforced at the extraction site, not here.
-    if (getenv("HYDRA_TRACE_ROUTES") || getenv("HYDRA_PIN_FILE") || getenv("HYDRA_EXPERT_STATS")) {
+    // hydra #787 S-C3: HYDRA_EAN_STATS joins the ids gate (EAN needs the
+    // same selected-expert ids as Stage A; norms/weights ride their own gate
+    // below, so Stage A alone never pays for them).
+    if (getenv("HYDRA_TRACE_ROUTES") || getenv("HYDRA_PIN_FILE") || getenv("HYDRA_EXPERT_STATS") || getenv("HYDRA_EAN_STATS")) {
         for (auto * tensor : t_moe_topk) {
+            if (tensor != nullptr) {
+                ggml_set_output(tensor);
+            }
+        }
+    }
+    // hydra #787 S-C3: EAN outputs ride their own env (HYDRA_EAN_STATS), so
+    // Stage A alone never pays for them. Unset = no tensor marked, readout
+    // returns 0, hook skips — byte-identical behavior.
+    if (getenv("HYDRA_EAN_STATS")) {
+        for (const auto & slots : t_moe_ean) {
+            for (auto * tensor : slots) {
+                if (tensor != nullptr) {
+                    ggml_set_output(tensor);
+                }
+            }
+        }
+        for (auto * tensor : t_moe_weights) {
             if (tensor != nullptr) {
                 ggml_set_output(tensor);
             }
@@ -2404,6 +2430,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
+    }
+
+    // hydra #787 S-C3: EAN (expert activation norm) instrumentation for REAP
+    // saliency (design §9: S_j needs ||f_j(x)||_2, the UNWEIGHTED expert
+    // output norm). Taken here, before the router-weight multiply below, so
+    // the norms are the pure expert function outputs. Per-slot L2 reduction
+    // (sqr -> sum_rows -> sqrt) to one [1, n_tokens] tensor per slot; the
+    // server hook multiplies by the stashed gate weights and averages over
+    // selected tokens. Env-gated at build time: unset HYDRA_EAN_STATS adds
+    // no ops, no stashes, no outputs — byte-identical graph.
+    if (res && il >= 0 && (size_t) il < res->t_moe_ean.size() && getenv("HYDRA_EAN_STATS")) {
+        const uint32_t n_ean_il = hparams.n_expert_used(il);
+        std::vector<ggml_tensor *> ean;
+        ean.reserve(n_ean_il);
+        for (uint32_t i = 0; i < n_ean_il; ++i) {
+            ggml_tensor * slot = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+            ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, slot))); // [1, n_tokens]
+            ggml_build_forward_expand(gf, norm);
+            ean.push_back(norm);
+        }
+        res->t_moe_ean[il] = std::move(ean);
+        if ((size_t) il < res->t_moe_weights.size()) {
+            res->t_moe_weights[il] = weights; // final gates ([1, k, n_tokens])
+        }
     }
 
     if (!weight_before_ffn) {

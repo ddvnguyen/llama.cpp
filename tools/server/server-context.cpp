@@ -2375,6 +2375,20 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
+        // hydra #787 sub-task 1: per-turn capture — one turn = one completed
+        // completion cycle (slot-aware). wall_s + forwards first; phase
+        // timings ship only after a collision-proposal sign-off (no graph
+        // hooks here). Env-gated: OFF = enabled() false = no-op, parity.
+        if (hydra_atlas::enabled() && slot.stats.is_set()) {
+            const int64_t t_end = slot.stats.t_gen_last > 0 ? slot.stats.t_gen_last : ggml_time_us();
+            hydra_atlas::record_turn(
+                slot.id,
+                (double) (t_end - slot.stats.t_start) / 1e6,
+                (uint64_t) slot.task->n_tokens(),
+                (uint64_t) slot.stats.n_gen,
+                (uint64_t) slot.stats.n_gen_steps());
+        }
+
         queue_results.send(std::move(res));
     }
 
@@ -4313,6 +4327,65 @@ private:
                     }
                     if (counted) {
                         hydra_atlas::end_step((int) rows.size(), cols);
+                    }
+                }
+            }
+        }
+
+        // hydra #787 S-C3: EAN accumulation for REAP saliency (gate x
+        // expert-output norm, design §9). Own env (HYDRA_EAN_STATS, checked
+        // once); OFF = this block never runs, byte-identical behavior.
+        // Same pure-decode gate as Stage A (single generated tokens only;
+        // prefill tails, embedding batches, and the spec draft path are
+        // skipped), same per-layer liveness discipline (rows lacking EAN
+        // tensors this step are skipped, never veto). MTP/draft rows read
+        // out as 0. A row accumulates only when ids, norms, and gates all
+        // return the same slot count (no partial rows).
+        if (ret == 0 && has_output && hydra_atlas::ean_enabled()) {
+            bool pure_decode = !batch.has_embd;
+            if (pure_decode) {
+                for (int i = off; i < off + batch_view.n_tokens; ++i) {
+                    if (!batch.tokens[i].output || batch.tokens[i].is_prompt) {
+                        pure_decode = false;
+                        break;
+                    }
+                }
+            }
+            if (pure_decode) {
+                const std::vector<int> rows = hydra_atlas::trunk_rows();
+                const int cols = hydra_atlas::grid_cols();
+                const int k = hydra_atlas::expert_used();
+                if (!rows.empty() && cols > 0 && k > 0) {
+                    std::vector<int32_t> ids((size_t) k);
+                    std::vector<float> norms((size_t) k);
+                    std::vector<float> gates((size_t) k);
+                    const int n_out = batch_view.n_tokens; // pure decode: 1 token == 1 output row
+                    std::vector<size_t> live;
+                    live.reserve(rows.size());
+                    for (size_t r = 0; r < rows.size(); ++r) {
+                        if (llama_get_moe_topk_nrows(ctx_tgt, rows[r]) >= n_out &&
+                            llama_get_moe_weight_nrows(ctx_tgt, rows[r]) >= n_out &&
+                            llama_get_moe_ean_nslots(ctx_tgt, rows[r]) >= k) {
+                            live.push_back(r);
+                        }
+                    }
+                    if (live.size() != rows.size()) {
+                        static bool atlas_ean_dead_logged = false;
+                        if (!atlas_ean_dead_logged) {
+                            atlas_ean_dead_logged = true;
+                            SRV_WRN("atlas: %d/%d MoE rows lack EAN tensors - accumulating live rows only\n", (int) (rows.size() - live.size()), (int) rows.size());
+                        }
+                    }
+                    for (int o = 0; o < n_out; ++o) {
+                        for (size_t li = 0; li < live.size(); ++li) {
+                            const size_t r = live[li];
+                            const int n  = llama_get_moe_topk(ctx_tgt, rows[r], o, ids.data(), k);
+                            const int ne = llama_get_moe_ean(ctx_tgt, rows[r], o, norms.data(), k);
+                            const int nw = llama_get_moe_weight(ctx_tgt, rows[r], o, gates.data(), k);
+                            if (n > 0 && ne == n && nw == n) {
+                                hydra_atlas::accumulate_ean((int) r, ids.data(), gates.data(), norms.data(), n, cols);
+                            }
+                        }
                     }
                 }
             }

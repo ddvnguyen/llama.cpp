@@ -12,6 +12,7 @@
 // implementation (server-atlas.cpp) includes llama.h / llama-ext.h.
 struct llama_context;
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -41,12 +42,22 @@ bool enabled();
 void accumulate(int grid_row, const int32_t * ids, int n_ids, int cols);
 void end_step(int rows, int cols);
 // Trunk geometry snapshot for the Stage A decode hook (copies under lock;
-// empty when geometry unavailable). reset() clears counts/seq/hits_step for
-// the per-probe reset protocol (confound control); thread-safe.
+// empty when geometry unavailable). reset() clears counts/seq/hits_step +
+// EAN state for the per-probe reset protocol (confound control);
+// thread-safe.
 std::vector<int> trunk_rows();
 int grid_cols();
 int expert_used();
 void reset();
+// Stage C EAN accumulator (#787 S-C3, HYDRA_EAN_STATS). Called from the
+// decode hook alongside accumulate() with the same expert ids plus the
+// per-slot router gate weights and unweighted expert-output L2 norms of
+// this step. Saliency per (layer, expert): S = sum(g*norm)/n_sel (REAP
+// paper §4 Eq. 9). No-op unless ean_enabled() (env read once at startup).
+// Served inside experts_json() under "ean" (saliency keyed by real layer:
+// "<realLayer>:<expert>"); absent until counted. Thread-safe.
+bool ean_enabled();
+void accumulate_ean(int grid_row, const int32_t * ids, const float * gates, const float * norms, int n, int cols);
 // Allocation snapshot for honest tier/hwinfo reporting on engine /health
 // (#785). Captured once at model-load time (sleep-safe: get_health reads the
 // stored copy, never ctx_server). Tiers are device/host buffer splits from
@@ -69,5 +80,48 @@ bool health_snapshot(alloc_info & out);
 // Stage B payload (Colibri EMAP encoding verbatim: tier=byte>>6, heat=byte&63).
 // nullopt when disabled (env unset or geometry unavailable) — callers no-op.
 std::optional<std::string> experts_json();
+// Per-turn capture (hydra_vortex#787 sub-task 1). One turn = one completed
+// completion cycle, recorded at send_final_response (slot-aware via slot id).
+// Ring of the 256 most recent turns + snapshot-diff routing slices of the
+// Stage-A counters at turn boundaries (no new graph hooks). Phase timings
+// (attention vs expert-matmul vs lm_head) need graph-section events — they
+// ship only after a collision proposal is signed off; until then the profile
+// turns carry wall_s + forwards with phases as honest zeros (the Profiling
+// tab renders the full wall time as "other"). Gated on HYDRA_EXPERT_STATS
+// like the counters: OFF = record_turn no-ops, readers return nullopt.
+constexpr size_t kTurnCap = 256;
+struct turn_cell {
+    uint32_t cell  = 0; // gridRow * cols + expert at record time
+    uint64_t count = 0; // fires during this turn window
+};
+struct turn_record {
+    uint64_t turn_seq         = 0; // monotonic per engine, starts at 1
+    int64_t  ts               = 0; // unix seconds at turn end
+    int      slot             = -1;
+    int      cols             = 0; // grid cols at record time (decodes cell)
+    double   wall_s           = 0.0;
+    uint64_t prompt_tokens    = 0;
+    uint64_t completion_tokens = 0;
+    uint64_t forwards         = 0; // decode forward passes (n_gen_steps)
+    std::vector<turn_cell> routing; // sparse fires during this turn window
+    std::vector<uint8_t>   hits;    // OR of step bitmaps during this window
+};
+void record_turn(int slot, double wall_s, uint64_t prompt_tokens,
+                 uint64_t completion_tokens, uint64_t forwards);
+// Upstream-compatible GET /profile payload: {seq, turns:[ProfileTurn...]}.
+// Extra turn_seq/ts/slot fields ride along; unknown phases read as 0.0.
+// nullopt unless capture is enabled.
+std::optional<std::string> profile_json();
+// GET /turns payload: {seq, turns:[{turn_seq, ts, slot, wall_s,
+// prompt_tokens, completion_tokens, forwards}...]}. nullopt unless enabled.
+std::optional<std::string> turns_json();
+// GET /turns/{seq}: full record incl. sparse routing slice ([{row, expert,
+// count}]) and hits hex. nullopt unless enabled or seq evicted/unknown.
+std::optional<std::string> turn_json(uint64_t seq);
+// GET /experts?turn=N: map+hits as of turn N (cumulative reconstruction
+// from retained sparse deltas; same EMAP encoding + geometry block as
+// experts_json, plus turn_seq). nullopt unless the surface (META) and the
+// capture (STATS) are on, geometry is known, and N is still retained.
+std::optional<std::string> experts_json_at(uint64_t seq);
 
 } // namespace hydra_atlas
