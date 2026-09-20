@@ -2238,9 +2238,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
 #ifdef GGML_USE_CUDA
         if (prof.cuda_backend) dev_ms = ggml_backend_cuda_profiling_elapsed_ms(prof.cuda_backend);
 #endif
-        prof_step(llama_prof_clock_ms(CLOCK_MONOTONIC) - prof_t0_wall,
-                  llama_prof_clock_ms(CLOCK_PROCESS_CPUTIME_ID) - prof_t0_cpu,
-                  dev_ms, prof_sync_ms, (uint32_t) n_outputs_all);
+        const double wall_ms = llama_prof_clock_ms(CLOCK_MONOTONIC) - prof_t0_wall;
+        const double cpu_ms  = llama_prof_clock_ms(CLOCK_PROCESS_CPUTIME_ID) - prof_t0_cpu;
+        // 93: the first large-batch step (prompt eval) gets its own line, never averaged
+        // into the decode-window aggregate.
+        if (!prof.prefill_done && n_tokens_all > 32) {
+            prof.prefill_done = true;
+            const double tps = wall_ms > 0.0 ? (double) n_tokens_all / (wall_ms / 1000.0) : 0.0;
+            fprintf(stderr, "PROF prefill ctx=%p n_tokens=%u tps=%.2f t_wall_ms=%.1f t_cpu_ms=%.1f t_dev_ms=%.1f t_sync_ms=%.1f\n",
+                    (void*) this, (unsigned) n_tokens_all, tps, wall_ms, cpu_ms, dev_ms, prof_sync_ms);
+        } else {
+            prof_step(wall_ms, cpu_ms, dev_ms, prof_sync_ms, (uint32_t) n_outputs_all);
+        }
     }
 
     return 0;
