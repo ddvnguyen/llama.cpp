@@ -107,6 +107,7 @@ struct llama_prof_decode {
     uint64_t steps      = 0; // successful decode() calls accumulated
     uint64_t out_tokens = 0;
     uint32_t win_id     = 0;
+    bool     prefill_done = false; // first large-batch (prompt-eval) step gets its own PROF line
 
     // current window accumulators
     uint32_t win_steps = 0;
