@@ -29,6 +29,8 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 // (record only, NEVER sync). Elapsed is sample semantics (latest completed pair),
 // read back out of band; -1.0 when no complete pair is ready.
 GGML_BACKEND_API void  ggml_backend_cuda_profiling_enable(ggml_backend_t backend, bool enable);
+GGML_BACKEND_API void  ggml_backend_cuda_profiling_span_begin(ggml_backend_t backend);
+GGML_BACKEND_API void  ggml_backend_cuda_profiling_span_end(ggml_backend_t backend);
 GGML_BACKEND_API float ggml_backend_cuda_profiling_elapsed_ms(ggml_backend_t backend);
 GGML_BACKEND_API int   ggml_backend_cuda_profiling_device(ggml_backend_t backend);
 

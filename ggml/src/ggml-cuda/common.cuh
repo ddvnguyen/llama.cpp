@@ -1461,6 +1461,7 @@ struct ggml_backend_cuda_context {
     // the graph-compute segment. Allocated only via profiling_enable(true); never synced.
     bool        prof_enabled = false;
     bool        prof_armed   = false; // a start event was recorded at least once
+    bool        prof_span_open = false; // caller-managed span (one event pair per decode step)
     cudaEvent_t prof_start   = nullptr;
     cudaEvent_t prof_end     = nullptr;
 
