@@ -125,8 +125,9 @@ else:
 PY
 
   # Edge0 S-A2: flush hidden-state sidecar for this probe (when capture enabled)
-  if curl -sf -m 10 -X POST "$SERVER_URL/capture/flush?cat=$cat&idx=$idx" \
-    -o "$OUT/.flush.json" 2>/dev/null; then
+  FLUSH_HTTP=$(curl -sf -m 10 -X POST "$SERVER_URL/capture/flush?cat=$cat&idx=$idx" \
+    -o "$OUT/.flush.json" -w "%{http_code}" 2>/dev/null) || true
+  if [ "$FLUSH_HTTP" = "200" ]; then
     FLUSH_PATH=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('path',''))" "$OUT/.flush.json" 2>/dev/null || true)
     if [ -n "$FLUSH_PATH" ]; then
       FLUSH_REAL=$(realpath "$FLUSH_PATH" 2>/dev/null || echo "$FLUSH_PATH")
@@ -136,10 +137,10 @@ PY
         *) echo "  [$i/$n] $cat/$idx FAIL: engine outdir '$FLUSH_PATH' is not under SIDECAR_DIR '$SIDECAR_DIR' — start engine with HYDRA_CAPTURE_OUTDIR=$SIDECAR_DIR" >&2; exit 1 ;;
       esac
     else
-      echo "  [$i/$n] $cat/$idx done (sidecar flushed, no path in response)"
+      echo "  [$i/$n] $cat/$idx done (flush OK but no path in response — outdir NOT validated)" >&2
     fi
   else
-    echo "  [$i/$n] $cat/$idx done"
+    echo "  [$i/$n] $cat/$idx done (sidecar flush unavailable (HTTP $FLUSH_HTTP) — delta-only mode, NO sidecars written)" >&2
   fi
 done < "$OUT/runlist.tsv"
 
