@@ -134,4 +134,21 @@ std::optional<std::string> turn_json(uint64_t seq);
 // capture (STATS) are on, geometry is known, and N is still retained.
 std::optional<std::string> experts_json_at(uint64_t seq);
 
+// hydra #786 Edge0 S-A2: hidden-state capture for linear-probe prerouter.
+// Env gate: HYDRA_EXPERT_CAPTURE (checked once at startup); OFF = all
+// functions no-op, decode path byte-identical. Decode-only + MTP/draft
+// exclusion (same pure-decode gate as Stage A). Sidecar JSONs written to
+// a configurable output directory; per-probe reset clears accumulated state.
+bool capture_enabled();
+void capture_hidden(int grid_row, const float * hidden, int n_embd,
+                    const int32_t * topk, int k);
+void set_capture_outdir(const std::string & dir);
+// Flush accumulated sidecar data to a per-probe JSON file. probe_cat +
+// probe_idx identify the probe; caller provides category/index for the
+// sidecar. Returns the path written on success, nullopt on failure.
+std::optional<std::string> flush_sidecar(const std::string & probe_cat,
+                                         int probe_idx);
+// Per-probe reset: clears accumulated capture state (no cross-probe leak).
+void capture_reset();
+
 } // namespace hydra_atlas

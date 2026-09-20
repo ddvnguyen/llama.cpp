@@ -389,6 +389,45 @@ int llama_server(common_params & params, int argc, char ** argv) {
         return res;
     }));
 
+    // hydra #786 Edge0 S-A2: capture sidecar flush + per-probe reset.
+    // POST /capture/flush?cat=<category>&idx=<int> — flush accumulated hidden
+    // states to a per-probe sidecar JSON and reset capture state.
+    // POST /capture/reset — clear accumulated capture state without flushing.
+    ctx_http.post("/capture/flush", ex_wrapper([](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        if (!hydra_atlas::capture_enabled()) {
+            res->status = 503;
+            res->data   = safe_json_to_str(json{{"error", "capture disabled (HYDRA_EXPERT_CAPTURE unset)"}});
+            return res;
+        }
+        const std::string cat = req.get_param("cat");
+        int idx = 0;
+        try {
+            idx = std::stoi(req.get_param("idx"));
+        } catch (...) {
+            idx = 0;
+        }
+        auto path = hydra_atlas::flush_sidecar(cat, idx);
+        if (!path) {
+            res->status = 500;
+            res->data   = safe_json_to_str(json{{"error", "flush failed (no capture data or write error)"}});
+            return res;
+        }
+        res->data = safe_json_to_str(json{{"path", *path}});
+        return res;
+    }));
+    ctx_http.post("/capture/reset", ex_wrapper([](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        if (!hydra_atlas::capture_enabled()) {
+            res->status = 503;
+            res->data   = safe_json_to_str(json{{"error", "capture disabled (HYDRA_EXPERT_CAPTURE unset)"}});
+            return res;
+        }
+        hydra_atlas::capture_reset();
+        res->data = safe_json_to_str(json{{"ok", true}});
+        return res;
+    }));
+
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
 

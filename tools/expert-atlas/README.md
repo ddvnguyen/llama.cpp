@@ -54,8 +54,39 @@ production stats path once it lands.
 - `analyze_edge0.py` — Edge0 linear-probe prerouter analyzer (#786): trains
   per-layer one-vs-rest logistic regression on router-input hidden state to
   predict top-k expert selection. Leave-one-prompt-out cross-validation
-  (by prompt, never by token — Rider 1). LTR baseline column present from
+  (by prompt, never by token -- Rider 1). LTR baseline column present from
   day one. See **Edge0 predictor definition** below.
+
+### Edge0 S-A2: hidden-state capture + sidecar dump
+
+When the engine is started with `HYDRA_EXPERT_CAPTURE=1`, the server-side
+decode hook reads the router-input hidden state (post-ffn_norm residual) for
+every MoE layer and every decode token via the `llama_get_moe_hidden` C API.
+Data accumulates in the server-atlas capture buffer and is flushed to
+per-probe sidecar JSONs via `POST /capture/flush?cat=<cat>&idx=<idx>`.
+Per-probe reset: `POST /capture/reset`.
+
+Sidecar JSON format (consumed by `analyze_edge0.py`):
+```json
+{
+  "category": "code_python",
+  "idx": 0,
+  "layers": {
+    "0": {
+      "hidden": [[n_embd floats], ...],
+      "topk": [[expert_ids], ...]
+    }
+  }
+}
+```
+
+Env vars:
+- `HYDRA_EXPERT_CAPTURE` (set=on, unset=off): enables capture hook
+- `HYDRA_CAPTURE_OUTDIR`: sidecar output directory (default: `.`)
+
+sweep.sh calls `/capture/flush` after each probe when capture is enabled.
+When capture is disabled, the flush endpoint returns 503 and sweep.sh
+falls back to the existing delta-only stats path.
 
 ## Edge0 predictor definition (verbatim, schema_version edge0-v1)
 

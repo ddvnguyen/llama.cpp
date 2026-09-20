@@ -1314,6 +1314,12 @@ private:
                                        llama_model_n_layer(model_tgt),
                                        cpu_pats);
         }
+        // hydra #786 Edge0 S-A2: capture sidecar output directory. Default
+        // is HYDRA_CAPTURE_OUTDIR env or "." (current working directory).
+        if (hydra_atlas::capture_enabled()) {
+            const char * outdir = std::getenv("HYDRA_CAPTURE_OUTDIR");
+            hydra_atlas::set_capture_outdir(outdir ? outdir : ".");
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -4413,13 +4419,66 @@ private:
             }
         }
 
+        // hydra #786 Edge0 S-A2: hidden-state capture for linear-probe
+        // prerouter. Env-gated (HYDRA_EXPERT_CAPTURE, checked once); OFF =
+        // this block never runs, byte-identical behavior. Same pure-decode
+        // gate as Stage A + EAN (single generated tokens only; prefill tails,
+        // embedding batches, MTP contexts, and spec draft skipped). Reads
+        // the router-input hidden state (post-ffn_norm residual) via the
+        // llama_get_moe_hidden C API and accumulates per-layer per-token
+        // hidden+topk into the sidecar buffer. MTP/draft rows excluded by
+        // construction (llama_get_moe_hidden returns 0 for MTP context).
+        if (ret == 0 && has_output && hydra_atlas::capture_enabled()) {
+            bool pure_decode = !batch.has_embd;
+            if (pure_decode) {
+                for (int i = off; i < off + batch_view.n_tokens; ++i) {
+                    if (!batch.tokens[i].output || batch.tokens[i].is_prompt) {
+                        pure_decode = false;
+                        break;
+                    }
+                }
+            }
+            if (pure_decode) {
+                const std::vector<int> rows = hydra_atlas::trunk_rows();
+                const int k = hydra_atlas::expert_used();
+                if (!rows.empty() && k > 0) {
+                    const int n_out = batch_view.n_tokens;
+                    for (int o = 0; o < n_out; ++o) {
+                        for (size_t li = 0; li < rows.size(); ++li) {
+                            const size_t r = rows[li];
+                            // Read hidden state (n_embd floats)
+                            const int n_embd = llama_get_moe_hidden_nrows(ctx_tgt, (int) r);
+                            if (n_embd <= 0) {
+                                continue;
+                            }
+                            std::vector<float> hidden((size_t) n_embd);
+                            const int n_written = llama_get_moe_hidden(
+                                ctx_tgt, (int) r, o, hidden.data(), n_embd);
+                            if (n_written <= 0) {
+                                continue;
+                            }
+                            // Read topk expert ids
+                            std::vector<int32_t> topk((size_t) k);
+                            const int n_topk = llama_get_moe_topk(
+                                ctx_tgt, (int) r, o, topk.data(), k);
+                            if (n_topk > 0) {
+                                hydra_atlas::capture_hidden(
+                                    (int) r, hidden.data(), n_written,
+                                    topk.data(), n_topk);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if (ret != 0) {
             {
                 std::string err;
 
                 if (n_batch == 1 && ret == 1) {
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the current batch too
+                    //       need to remove the tokens from the batch too
                     err = "Context size has been exceeded.";
                 }
 
@@ -4428,7 +4487,7 @@ private:
                 }
 
                 if (ret < -1) {
-                    // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
+                    // TODO: handle ret == 2 (abort) when we start aborting
                     err = "Compute error.";
                 }
 
