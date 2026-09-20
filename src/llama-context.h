@@ -239,6 +239,7 @@ struct llama_context {
     // unset at build, MTP/draft context, layer/row out of range, no decode yet).
     int get_moe_hidden(int il, int out_row, float * out_hidden, int n_cap);
     int get_moe_hidden_nrows(int il);
+    int get_moe_hidden_embd(int il);
 
     void attach_threadpool(
             ggml_threadpool_t threadpool,

@@ -4447,7 +4447,7 @@ private:
                         for (size_t li = 0; li < rows.size(); ++li) {
                             const size_t r = rows[li];
                             // Read hidden state (n_embd floats)
-                            const int n_embd = llama_get_moe_hidden_nrows(ctx_tgt, (int) r);
+                            const int n_embd = llama_get_moe_hidden_embd(ctx_tgt, (int) r);
                             if (n_embd <= 0) {
                                 continue;
                             }

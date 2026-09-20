@@ -2414,6 +2414,23 @@ int llama_context::get_moe_hidden_nrows(int il) {
     }
     return (int) t->ne[1];
 }
+int llama_context::get_moe_hidden_embd(int il) {
+    if (il < 0) {
+        return 0;
+    }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return 0;
+    }
+    auto * res = get_gf_res_prev();
+    if (res == nullptr) {
+        return 0;
+    }
+    ggml_tensor * t = res->get_moe_hidden(il);
+    if (t == nullptr || t->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    return (int) t->ne[0];
+}
 // hydra: expert-atlas Stage A (#771) — row count for the hook loop bound.
 int llama_context::get_moe_topk_nrows(int il) {
     if (il < 0) {
@@ -5994,6 +6011,12 @@ int llama_get_moe_hidden_nrows(llama_context * ctx, int il) {
         return 0;
     }
     return ctx->get_moe_hidden_nrows(il);
+}
+int llama_get_moe_hidden_embd(llama_context * ctx, int il) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->get_moe_hidden_embd(il);
 }
 
 void llama_context::prof_note(double t_draft_ms, double t_verify_ms, int32_t n_drafted, int32_t n_accepted) {
