@@ -2799,6 +2799,83 @@ static uint32_t moe_grouped_frequency_halflife() {
     return halflife;
 }
 
+// Per-plan ledger, enabled by GGML_CUDA_MOE_LEDGER=<path>. One record per decode plan launch.
+struct moe_ledger_record {
+    uint64_t t_ns;
+    uint64_t step;
+    uint32_t group;
+    uint32_t n_routes;
+    uint32_t n_unique;
+    uint32_t n_misses;
+    uint32_t n_evict;
+    uint32_t evict_freq_sum;
+    // misses by prior windowed sighting count: 0, 1, 2, 3+
+    uint32_t miss_freq[4];
+};
+
+struct moe_ledger {
+    moe_ledger_record * records = nullptr;
+    unsigned long long * head = nullptr;
+    uint32_t capacity = 0;
+    std::string path;
+};
+
+static moe_ledger * moe_ledger_get() {
+    static moe_ledger * ledger = []() -> moe_ledger * {
+        const char * path = getenv("GGML_CUDA_MOE_LEDGER");
+        if (path == nullptr || path[0] == '\0') {
+            return nullptr;
+        }
+        const uint32_t capacity = 1u << 20;
+        void * host = nullptr;
+        const size_t bytes = 64 + static_cast<size_t>(capacity) * sizeof(moe_ledger_record);
+        if (cudaHostAlloc(&host, bytes, cudaHostAllocMapped) != cudaSuccess) {
+            GGML_LOG_ERROR("moe-ledger: cudaHostAlloc failed\n");
+            return nullptr;
+        }
+        memset(host, 0, bytes);
+        void * device = nullptr;
+        if (cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess) {
+            GGML_LOG_ERROR("moe-ledger: cudaHostGetDevicePointer failed\n");
+            return nullptr;
+        }
+        auto * result = new moe_ledger();
+        result->head = static_cast<unsigned long long *>(device);
+        result->records = reinterpret_cast<moe_ledger_record *>(static_cast<char *>(device) + 64);
+        result->capacity = capacity;
+        result->path = path;
+        return result;
+    }();
+    return ledger;
+}
+
+// Append all records to the ledger file and reset. Call while no plan kernel is running.
+static void moe_ledger_dump_and_reset() {
+    moe_ledger * ledger = moe_ledger_get();
+    if (ledger == nullptr) {
+        return;
+    }
+    cudaDeviceSynchronize();
+    // host and device pointers alias the same mapped allocation
+    volatile unsigned long long * head = ledger->head;
+    const uint64_t total = *head;
+    const uint64_t n = std::min<uint64_t>(total, ledger->capacity);
+    FILE * f = fopen(ledger->path.c_str(), "a");
+    if (f == nullptr) {
+        GGML_LOG_ERROR("moe-ledger: cannot open %s\n", ledger->path.c_str());
+        return;
+    }
+    fprintf(f, "# request records=%llu dropped=%llu\n", (unsigned long long) n, (unsigned long long) (total - n));
+    for (uint64_t i = 0; i < n; ++i) {
+        const moe_ledger_record & r = ledger->records[i];
+        fprintf(f, "%llu,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+            (unsigned long long) r.t_ns, (unsigned long long) r.step, r.group, r.n_routes, r.n_unique,
+            r.n_misses, r.n_evict, r.evict_freq_sum, r.miss_freq[0], r.miss_freq[1], r.miss_freq[2], r.miss_freq[3]);
+    }
+    fclose(f);
+    *head = 0;
+}
+
 static uint32_t moe_grouped_plan_threads(uint32_t n_slots) {
     return n_slots <= WARP_SIZE ? WARP_SIZE : n_slots <= 2 * WARP_SIZE ? 2 * WARP_SIZE : MOE_GROUPED_PLAN_THREADS;
 }
@@ -2978,7 +3055,11 @@ static __global__ void moe_grouped_plan_decode(
         uint64_t host_clock_begin,
         uint64_t host_clock_end,
         uint64_t * device_clock,
-        moe_grouped_decode_plan * plan) {
+        moe_grouped_decode_plan * plan,
+        moe_ledger_record * ledger,
+        unsigned long long * ledger_head,
+        uint32_t ledger_capacity,
+        uint32_t group_index) {
     if (blockIdx.x != 0) {
         return;
     }
@@ -3306,6 +3387,33 @@ static __global__ void moe_grouped_plan_decode(
             moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
         }
         plan->next_clock = clock_begin + plan->n_unique;
+        if (ledger != nullptr) {
+            const unsigned long long index = atomicAdd(ledger_head, 1ULL);
+            if (index < ledger_capacity) {
+                moe_ledger_record record = {};
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(record.t_ns));
+#endif
+                record.step = atomicAdd(reinterpret_cast<unsigned long long *>(device_step), 0ULL) - 1;
+                record.group = group_index;
+                record.n_routes = n_routes;
+                record.n_unique = plan->n_unique;
+                record.n_misses = plan->n_misses;
+                for (uint32_t miss = 0; miss < plan->n_misses; ++miss) {
+                    const int32_t expert = miss_experts[miss];
+                    const uint32_t seen = moe_grouped_effective_frequency(
+                        expert_frequency[expert], expert_frequency_epoch[expert], frequency_epoch);
+                    record.miss_freq[seen < 3 ? seen : 3]++;
+                    const int32_t resident = expert_for_slot[miss_slots[miss]];
+                    if (resident >= 0) {
+                        record.n_evict++;
+                        record.evict_freq_sum += moe_grouped_effective_frequency(
+                            expert_frequency[resident], expert_frequency_epoch[resident], frequency_epoch);
+                    }
+                }
+                ledger[index] = record;
+            }
+        }
     }
     __syncthreads();
     if (thread == 0) {
@@ -6268,6 +6376,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         GGML_UNUSED(prefill_resident_certified);
         return nullptr;
 #else
+        (void) moe_ledger_get();
         uint32_t n_experts = 0;
         if (device < 0 || compute_stream == nullptr || snapshot.n_slots == 0 ||
                 snapshot.n_slot_auxiliaries > snapshot.slot_auxiliaries.size() ||
@@ -9382,12 +9491,15 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             CUDA_CHECK(cudaStreamWaitEvent(compute_stream, early->copy_split ? early->selected : early->done, 0));
         }
         const uint32_t plan_threads = moe_grouped_plan_threads(resource->snapshot.n_slots);
+        moe_ledger * ledger = moe_ledger_get();
         moe_grouped_plan_decode<<<1, plan_threads, 0, compute_stream>>>(
             static_cast<const int32_t *>(ids->data), n_routes, top_k, row_stride,
             device.n_experts, resource->snapshot.n_slots, resource->snapshot.n_slots,
             device.slot_for_expert, device.expert_for_slot, device.last_used,
             device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, impl_->frequency_halflife, clock_begin, clock_end,
-            reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan);
+            reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan,
+            ledger != nullptr ? ledger->records : nullptr, ledger != nullptr ? ledger->head : nullptr,
+            ledger != nullptr ? ledger->capacity : 0, key.candidate.group_index);
         CUDA_CHECK(cudaGetLastError());
 #if CUDART_VERSION >= 12080
         if (ready_only && !ready_late) {
@@ -14825,6 +14937,7 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
 }
 
 ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_reset_legacy_stats() {
+    moe_ledger_dump_and_reset();
     moe_cache_telemetry aggregate;
     auto & owners = moe_cache_owner_telemetry_state();
     {
