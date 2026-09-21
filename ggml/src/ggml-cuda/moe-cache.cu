@@ -2811,6 +2811,9 @@ struct moe_ledger_record {
     uint32_t evict_freq_sum;
     // misses by prior windowed sighting count: 0, 1, 2, 3+
     uint32_t miss_freq[4];
+    // bit i set if unique expert i was a miss; experts[] holds the first 16 unique ids
+    uint32_t miss_mask;
+    uint16_t experts[16];
 };
 
 struct moe_ledger {
@@ -2868,9 +2871,14 @@ static void moe_ledger_dump_and_reset() {
     fprintf(f, "# request records=%llu dropped=%llu\n", (unsigned long long) n, (unsigned long long) (total - n));
     for (uint64_t i = 0; i < n; ++i) {
         const moe_ledger_record & r = ledger->records[i];
-        fprintf(f, "%llu,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+        fprintf(f, "%llu,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
             (unsigned long long) r.t_ns, (unsigned long long) r.step, r.group, r.n_routes, r.n_unique,
-            r.n_misses, r.n_evict, r.evict_freq_sum, r.miss_freq[0], r.miss_freq[1], r.miss_freq[2], r.miss_freq[3]);
+            r.n_misses, r.n_evict, r.evict_freq_sum, r.miss_freq[0], r.miss_freq[1], r.miss_freq[2], r.miss_freq[3],
+            r.miss_mask);
+        for (uint32_t u = 0; u < r.n_unique && u < 16; ++u) {
+            fprintf(f, ",%u", (unsigned) r.experts[u]);
+        }
+        fprintf(f, "\n");
     }
     fclose(f);
     *head = 0;
@@ -3399,8 +3407,14 @@ static __global__ void moe_grouped_plan_decode(
                 record.n_routes = n_routes;
                 record.n_unique = plan->n_unique;
                 record.n_misses = plan->n_misses;
+                for (uint32_t u = 0; u < plan->n_unique && u < 16; ++u) {
+                    record.experts[u] = (uint16_t) unique_experts[u];
+                }
                 for (uint32_t miss = 0; miss < plan->n_misses; ++miss) {
                     const int32_t expert = miss_experts[miss];
+                    if (miss_unique[miss] >= 0 && miss_unique[miss] < 32) {
+                        record.miss_mask |= 1u << miss_unique[miss];
+                    }
                     const uint32_t seen = moe_grouped_effective_frequency(
                         expert_frequency[expert], expert_frequency_epoch[expert], frequency_epoch);
                     record.miss_freq[seen < 3 ? seen : 3]++;
