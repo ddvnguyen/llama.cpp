@@ -19,6 +19,7 @@
 #include "llama.h"
 
 #include <cctype>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -35,6 +36,10 @@
 
 #if !defined(_WIN32)
 #include <unistd.h>
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
 #endif
 
 namespace hydra_atlas {
@@ -105,14 +110,62 @@ bool load_impl(const std::string & path, geometry & g) {
         return false;
     }
 
+    // hydra: gguf-split models put full metadata on shard 1 but scatter the
+    // actual tensors (incl. "exps") across every shard, so the tensor-name
+    // scan below must span all shards, not just the -m path (path).
+    std::vector<gguf_context *> shards = { gguf };
+    std::error_code fs_ec;
+    std::vector<uint64_t> shard_sizes = { (uint64_t) std::filesystem::file_size(path, fs_ec) };
+    if (fs_ec) shard_sizes.back() = 0;
+
+    uint16_t split_count = 0;
+    const int64_t sci = gguf_find_key(gguf, "split.count");
+    if (sci >= 0 && gguf_get_kv_type(gguf, sci) == GGUF_TYPE_UINT16) {
+        split_count = gguf_get_val_u16(gguf, sci);
+    }
+
+    bool split_ok = true;
+    if (split_count > 1) {
+        char prefix_buf[PATH_MAX];
+        // path must be shard 1 (split_no 0); the server is always launched with -m
+        // pointing at the first split, same convention as the main model loader.
+        const int32_t prefix_len = llama_split_prefix(prefix_buf, sizeof(prefix_buf), path.c_str(), 0, split_count);
+        split_ok = prefix_len > 0;
+        const std::string prefix(prefix_buf, split_ok ? prefix_len : 0);
+
+        for (int idx = 1; split_ok && idx < split_count; idx++) {
+            char split_path_buf[PATH_MAX];
+            const int32_t split_len = llama_split_path(split_path_buf, sizeof(split_path_buf), prefix.c_str(), idx, split_count);
+            if (split_len == 0) {
+                split_ok = false;
+                break;
+            }
+            gguf_context * shard_gguf = gguf_init_from_file(split_path_buf, p);
+            if (!shard_gguf) {
+                split_ok = false;
+                break;
+            }
+            shards.push_back(shard_gguf);
+            const auto shard_size = std::filesystem::file_size(split_path_buf, fs_ec);
+            shard_sizes.push_back(fs_ec ? 0 : (uint64_t) shard_size);
+        }
+    }
+
+    if (!split_ok) { // never publish a partial atlas map — missing layers would shift every row
+        for (gguf_context * ctx : shards) gguf_free(ctx);
+        return false;
+    }
+
     // Routed-expert presence per layer, straight from tensor names — arch-agnostic.
     std::vector<bool> moe(block_count + nextn, false);
-    const size_t n_tensors = gguf_get_n_tensors(gguf);
-    for (size_t i = 0; i < n_tensors; i++) {
-        const char * tn = gguf_get_tensor_name(gguf, (int) i);
-        if (std::strstr(tn, "exps") == nullptr) continue;
-        const int il = blk_layer(tn);
-        if (il >= 0 && il < (int) moe.size()) moe[il] = true;
+    for (gguf_context * ctx : shards) {
+        const size_t n_tensors = gguf_get_n_tensors(ctx);
+        for (size_t i = 0; i < n_tensors; i++) {
+            const char * tn = gguf_get_tensor_name(ctx, (int) i);
+            if (std::strstr(tn, "exps") == nullptr) continue;
+            const int il = blk_layer(tn);
+            if (il >= 0 && il < (int) moe.size()) moe[il] = true;
+        }
     }
 
     for (int il = 0; il < (int) block_count; il++) {
@@ -128,12 +181,11 @@ bool load_impl(const std::string & path, geometry & g) {
     g.rows           = (int) (g.moe_rows.size() + g.nextn_rows.size());
     g.model_hash     = path.substr(path.find_last_of("/\\") + 1);
 
-    std::error_code fs_ec;
-    const auto size = std::filesystem::file_size(path, fs_ec);
-    g.engine_id = hex64(fnv1a64(g.arch + ":" + g.model_hash + ":" +
-                                std::to_string(fs_ec ? 0 : (uint64_t) size)));
+    uint64_t total_size = 0;
+    for (const uint64_t s : shard_sizes) total_size += s;
+    g.engine_id = hex64(fnv1a64(g.arch + ":" + g.model_hash + ":" + std::to_string(total_size)));
 
-    gguf_free(gguf);
+    for (gguf_context * ctx : shards) gguf_free(ctx);
     return g.rows > 0;
 }
 
