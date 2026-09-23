@@ -389,6 +389,9 @@ public:
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
+    // hydra #771: read-only; nullptr before first decode / after sched reset
+    llm_graph_result * get_gf_res_prev() const;
+
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(
             ggml_cgraph * gf,
