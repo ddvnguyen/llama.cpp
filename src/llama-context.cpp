@@ -4351,6 +4351,10 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+llm_graph_result * llama_context::get_gf_res_prev() const {
+    return static_cast<llm_graph_result *>(gf_res_prev.get());
+}
+
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
 static void ubatch_prepare_reserve(
               llama_ubatch                            & ubatch,

@@ -8,6 +8,7 @@
 #include "server-schema.h"
 #include "server-speculative-replay.h"
 #include "server-stream.h"
+#include "server-atlas.h" // hydra: expert-atlas read surface (#771)
 
 #include "build-info.h"
 #include "common.h"
