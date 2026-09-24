@@ -3951,7 +3951,13 @@ static void moe_early_router_wait_copy(cudaStream_t stream, uint32_t * done) {
     CUgraph graph = nullptr;
     const CUgraphNode * dependencies = nullptr;
     size_t count = 0;
+#if CUDA_VERSION >= 13000
     CU_CHECK(cuStreamGetCaptureInfo(stream, &status, nullptr, &graph, &dependencies, nullptr, &count));
+#else
+    // CUDA 12.3-12.9: the unversioned name maps to the 6-arg _v2; the 7-arg
+    // (edgeData) form is the explicit _v3 entry point.
+    CU_CHECK(cuStreamGetCaptureInfo_v3(stream, &status, nullptr, &graph, &dependencies, nullptr, &count));
+#endif
     if (status == CU_STREAM_CAPTURE_STATUS_NONE) {
         CU_CHECK(cuStreamWaitValue32(stream, (CUdeviceptr) done, 1, CU_STREAM_WAIT_VALUE_EQ));
         return;
