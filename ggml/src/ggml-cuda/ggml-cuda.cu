@@ -2806,6 +2806,30 @@ static void ggml_cuda_moe_record_legacy_op(
 // either isn't initialized or its slot size doesn't match this op's expert
 // stride. Same approach as iteration 1: stage every unique expert touched by
 // this op into a pool scratch buffer, run the impl, free the scratch.
+// HYDRA Phase-B pilot counters (task-ff7f39af4d): engagement proof for the
+// expert-cache compact-gather MMVQ path. HYDRA_SYNC_STATS=1 enables an atexit
+// summary. HYDRA_GATHER=0 is the A-side kill-switch: the compact-gather is
+// disabled and ops take the legacy routes (same math, different order).
+static std::atomic<int64_t> hydra_compact_calls{0};
+static std::atomic<int64_t> hydra_compact_rows{0};
+static bool hydra_compact_stats_on = false;
+static std::once_flag hydra_compact_once;
+static void hydra_compact_dump(void) {
+    fprintf(stderr, "[HYDRA compact] engaged_calls=%lld gathered_rows=%lld\n",
+        (long long) hydra_compact_calls.load(), (long long) hydra_compact_rows.load());
+}
+static void hydra_compact_init(void) {
+    hydra_compact_stats_on = getenv("HYDRA_SYNC_STATS") != nullptr;
+    if (hydra_compact_stats_on) {
+        atexit(hydra_compact_dump);
+    }
+}
+static inline bool hydra_compact_enabled(void) {
+    std::call_once(hydra_compact_once, hydra_compact_init);
+    static const bool off = []{ const char * e = getenv("HYDRA_GATHER"); return e && e[0] == '0'; }();
+    return !off;
+}
+
 static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                         const std::vector<char> & ids_host_bytes,
                                         size_t ids_host_nb0,
@@ -2849,7 +2873,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 
     const int n_unique = (int)unique_experts.size();
     GGML_ASSERT(n_unique > 0);
-    const bool compact_mmvq = !single_row && ggml_cuda_moe_use_compact_mmvq(dst, n_unique);
+    const bool compact_mmvq = hydra_compact_enabled() && !single_row && ggml_cuda_moe_use_compact_mmvq(dst, n_unique);
     const auto source_capability = ggml_cuda_mmid_source_capability_for(src0->type);
     const bool compact_mmq = !single_row && !compact_mmvq && use_mmq &&
         (source_capability.flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0 &&
@@ -3013,6 +3037,10 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         dst->src[0] = orig_src0;
         dst->src[2] = orig_ids;
         GGML_ASSERT(dispatched);
+        if (compact_mmvq) {
+            hydra_compact_calls++;
+            hydra_compact_rows += n_unique;
+        }
 
         ggml_cuda_moe_record_legacy_op(owner,
             telemetry_is_decode, true, false, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
@@ -3375,7 +3403,7 @@ static void ggml_cuda_mul_mat_id_cached(
         return;
     }
 
-    const bool compact_mmvq = !single_row && ggml_cuda_moe_use_compact_mmvq(dst, slot_capacity);
+    const bool compact_mmvq = hydra_compact_enabled() && !single_row && ggml_cuda_moe_use_compact_mmvq(dst, slot_capacity);
     const bool compact_source = single_row || compact_mmvq;
 
     const int64_t acquire_start_us = ggml_time_us();
@@ -3486,6 +3514,10 @@ static void ggml_cuda_mul_mat_id_cached(
         dst->src[0] = orig_src0;
         dst->src[2] = orig_ids;
         GGML_ASSERT(dispatched);
+        if (compact_mmvq) {
+            hydra_compact_calls++;
+            hydra_compact_rows += (int64_t) unique_eids.size();
+        }
     } else {
         ggml_tensor src0_synth = *src0;
         src0_synth.ne[2] = n_experts_total;
