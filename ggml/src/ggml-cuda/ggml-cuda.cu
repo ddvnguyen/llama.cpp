@@ -2036,11 +2036,17 @@ static hydra_pin_store * hydra_store_for(int device, int il, int site, const ggm
     st.device = device;
     st.il = il;
     st.site = site;
-    // Coupling hard-fail: the store is filled with cudaMemcpyHostToDevice from
-    // src0, so src0 must be CPU-resident. Abort here instead of copying garbage
-    // when experts live on the device (run with --cpu-moe or unset HYDRA_PIN_FILE).
-    if (src0->buffer == nullptr || !ggml_backend_buffer_is_host(src0->buffer)) {
-        GGML_ABORT("hydra: layer %d site %d expert weights are not CPU-resident", il, site);
+    // Coupling check: the store is filled with cudaMemcpyHostToDevice from
+    // src0, so src0 must be CPU-resident. In the mixed production -ot topology
+    // (tail layers' experts on CUDA) a device-resident layer simply DISENGAGES:
+    // its expert rows are already device-local, the direct path is optimal
+    // there, and pin slots have nothing to save. Only a null buffer (broken
+    // graph) aborts loudly.
+    if (src0->buffer == nullptr) {
+        GGML_ABORT("hydra: layer %d site %d expert weights have no buffer", il, site);
+    }
+    if (!ggml_backend_buffer_is_host(src0->buffer)) {
+        return nullptr;
     }
     st.row_bytes = src0->nb[2];
     st.slot_of.assign(n_expert, -1);
@@ -2086,7 +2092,10 @@ static bool hydra_gather_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int64_t ne12 = src1->ne[2];
     const int64_t ne02 = src0->ne[2];
     const int64_t n_expert_used = ids->ne[0];
-    if (ne12 != 1 || !hydra_active() || hydra_pins.empty()) {
+    // HYDRA_GATHER=0 kill-switch: pins stay loaded (CPU consult + stats keep
+    // working) but the gather never engages — the A-side of the gate A/B.
+    static const bool hydra_gather_off = []{ const char * e = getenv("HYDRA_GATHER"); return e && e[0] == '0'; }();
+    if (ne12 != 1 || hydra_gather_off || !hydra_active() || hydra_pins.empty()) {
         return false;
     }
     const char * wname = ggml_get_name(src0);
