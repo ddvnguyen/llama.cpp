@@ -1939,6 +1939,32 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// HYDRA Phase-B pilot counters (task-ff7f39af4d): engagement proof for the
+// expert-cache compact-gather MMVQ path. HYDRA_SYNC_STATS=1 enables an atexit
+// summary. HYDRA_GATHER=0 is the A-side kill-switch: the compact-gather is
+// disabled and ops take the legacy routes (same math, different order).
+static std::atomic<int64_t> hydra_compact_calls{0};
+static std::atomic<int64_t> hydra_compact_rows{0};
+static std::atomic<int64_t> hydra_mmvq_direct{0}; // direct-MMVQ dispatches (kernel-family evidence; counts both arms)
+static bool hydra_compact_stats_on = false;
+static std::once_flag hydra_compact_once;
+static void hydra_compact_dump(void) {
+    fprintf(stderr, "[HYDRA compact] engaged_calls=%lld gathered_rows=%lld mmvq_direct=%lld\n",
+        (long long) hydra_compact_calls.load(), (long long) hydra_compact_rows.load(),
+        (long long) hydra_mmvq_direct.load());
+}
+static void hydra_compact_init(void) {
+    hydra_compact_stats_on = getenv("HYDRA_SYNC_STATS") != nullptr;
+    if (hydra_compact_stats_on) {
+        atexit(hydra_compact_dump);
+    }
+}
+static inline bool hydra_compact_enabled(void) {
+    std::call_once(hydra_compact_once, hydra_compact_init);
+    static const bool off = []{ const char * e = getenv("HYDRA_GATHER"); return e && e[0] == '0'; }();
+    return !off;
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -2017,6 +2043,9 @@ static bool ggml_cuda_mul_mat_id_impl(
                         required_consumer == GGML_CUDA_MMID_CONSUMER_MMVQ)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    if (hydra_compact_stats_on) {
+                        hydra_mmvq_direct++;
+                    }
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return true;
                 }
@@ -2806,30 +2835,6 @@ static void ggml_cuda_moe_record_legacy_op(
 // either isn't initialized or its slot size doesn't match this op's expert
 // stride. Same approach as iteration 1: stage every unique expert touched by
 // this op into a pool scratch buffer, run the impl, free the scratch.
-// HYDRA Phase-B pilot counters (task-ff7f39af4d): engagement proof for the
-// expert-cache compact-gather MMVQ path. HYDRA_SYNC_STATS=1 enables an atexit
-// summary. HYDRA_GATHER=0 is the A-side kill-switch: the compact-gather is
-// disabled and ops take the legacy routes (same math, different order).
-static std::atomic<int64_t> hydra_compact_calls{0};
-static std::atomic<int64_t> hydra_compact_rows{0};
-static bool hydra_compact_stats_on = false;
-static std::once_flag hydra_compact_once;
-static void hydra_compact_dump(void) {
-    fprintf(stderr, "[HYDRA compact] engaged_calls=%lld gathered_rows=%lld\n",
-        (long long) hydra_compact_calls.load(), (long long) hydra_compact_rows.load());
-}
-static void hydra_compact_init(void) {
-    hydra_compact_stats_on = getenv("HYDRA_SYNC_STATS") != nullptr;
-    if (hydra_compact_stats_on) {
-        atexit(hydra_compact_dump);
-    }
-}
-static inline bool hydra_compact_enabled(void) {
-    std::call_once(hydra_compact_once, hydra_compact_init);
-    static const bool off = []{ const char * e = getenv("HYDRA_GATHER"); return e && e[0] == '0'; }();
-    return !off;
-}
-
 // HYDRA Phase-B data-level byte-check (architect d-766e2acef7 leg 5): when
 // HYDRA_GATHER_BYTECHECK=1, every gather H2D row is read back once and memcmp'd
 // against its source expert row. One-shot per process; any mismatch ABORTS the
@@ -2846,12 +2851,13 @@ static void hydra_gather_bytecheck(ggml_backend_cuda_context & ctx, const void *
     if (!hydra_bytecheck_wanted()) {
         return;
     }
-    static std::once_flag once;
-    std::call_once(once, [&]() {
-        GGML_LOG_INFO("[HYDRA bytecheck] enabled: memcmp of gathered rows vs source rows\n");
-    });
     static std::atomic<int64_t> n_checked{0};
-    if (n_checked.fetch_add(1) >= 4096) {
+    if (n_checked.fetch_add(1) == 0) {
+        fprintf(stderr, "[HYDRA bytecheck] enabled: memcmp of gathered rows vs source rows\n");
+        atexit([]{ fprintf(stderr, "[HYDRA bytecheck] rows_checked=%lld mismatches=0\n",
+            (long long) std::min<int64_t>(n_checked.load(), 4096)); });
+    }
+    if (n_checked.load() > 4096) {
         return; // one-shot window: enough rows to prove data-level correctness
     }
     std::vector<char> got(nbytes);
@@ -3076,7 +3082,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         dst->src[0] = orig_src0;
         dst->src[2] = orig_ids;
         GGML_ASSERT(dispatched);
-        if (compact_mmvq) {
+        if (compact_source) { // staged compact dispatch (compact MMVQ or single_row compact)
             hydra_compact_calls++;
             hydra_compact_rows += n_unique;
         }
@@ -3563,7 +3569,7 @@ static void ggml_cuda_mul_mat_id_cached(
         dst->src[0] = orig_src0;
         dst->src[2] = orig_ids;
         GGML_ASSERT(dispatched);
-        if (compact_mmvq) {
+        if (compact_source) {
             hydra_compact_calls++;
             hydra_compact_rows += (int64_t) unique_eids.size();
         }
