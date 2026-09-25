@@ -428,6 +428,33 @@ int llama_server(common_params & params, int argc, char ** argv) {
         return res;
     }));
 
+    // hydra task-16ec332378: engine-hosted Stage-C atlas artifacts (design
+    // §C/D owner ruling: the fork ships the two atlas files; atlas-web proxies
+    // GET {engine}/experts.json and propagates the status verbatim — engine
+    // 404 stays 404 there, per server.ts:250-320). Observability tier:
+    // GET /experts.json + /v1/experts.json. Ranking tier twins: GET
+    // /expert-ranks.json + /v1/expert-ranks.json.
+    //
+    // Engine-id refusal discipline: the artifact is served ONLY when its
+    // provenance.engine_id matches this engine (geometry FNV id, or the
+    // "$arch:$basename[:$size]" short form). Missing artifact → 404 (never a
+    // misleading 200, never another model's atlas). Resolution:
+    // HYDRA_EXPERT_ATLAS (dir override) → the model file's own directory.
+    auto hydra_atlas_artifact_handler = [](const char * kind) {
+        return [kind](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            const int st = hydra_atlas::atlas_json(kind, res->data);
+            if (st != 0) {
+                res->status = st;
+            }
+            return res;
+        };
+    };
+    ctx_http.get("/experts.json",      ex_wrapper(hydra_atlas_artifact_handler("experts")));
+    ctx_http.get("/v1/experts.json",   ex_wrapper(hydra_atlas_artifact_handler("experts")));
+    ctx_http.get("/expert-ranks.json", ex_wrapper(hydra_atlas_artifact_handler("ranks")));
+    ctx_http.get("/v1/expert-ranks.json", ex_wrapper(hydra_atlas_artifact_handler("ranks")));
+
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
 
