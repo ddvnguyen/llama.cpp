@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cfloat>
+#include <cstdint>
 #include <fstream>
 #include <mutex>
 #include <random>
@@ -188,6 +190,19 @@ struct kl_divergence_result {
     size_t count            = 0.0;
 };
 
+// HYDRA KLD tail dump (task-ff7f39af4d leg, architect d-766e2acef7): when
+// HYDRA_KLD_TAIL=<path> is set, write a binary record for every candidate
+// token (kld > 0.05 or top-1 flip) with ON/OFF top-1/top-2 and logit gaps so
+// the worst-KLD tail can be classified as MMVQ/MMQ rounding (near-ties) vs a
+// real defect (large-margin flip). Default OFF.
+static FILE * hydra_kld_tail_file() {
+    static FILE * f = []() -> FILE * {
+        const char * p = getenv("HYDRA_KLD_TAIL");
+        return p ? fopen(p, "wb") : nullptr;
+    }();
+    return f;
+}
+
 static std::pair<double, float> log_softmax(int n_vocab, const float * logits, const uint16_t * base_log_prob, int tok, kl_divergence_result & kld) {
     float max_logit = logits[0];
     int imax = 0;
@@ -237,6 +252,43 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
     ++kld.count;
     if (imax == imax_base) {
         ++kld.n_same_top;
+    }
+
+    if (FILE * tf = hydra_kld_tail_file()) {
+        if (sum > 0.05 || imax != imax_base) {
+            float on_t2 = -FLT_MAX;
+            int i_on2 = -1;
+            for (int i = 0; i < n_vocab; ++i) {
+                if (i != imax && logits[i] > on_t2) { on_t2 = logits[i]; i_on2 = i; }
+            }
+            float off_t2 = 0;
+            int i_off2 = -1;
+            bool have_off2 = false;
+            for (int i = 0; i < n_vocab; ++i) {
+                if (i == imax_base) continue;
+                const float p_log_base = scale*base_log_prob[i] + min_log_prob;
+                if (!have_off2 || p_log_base > off_t2) { off_t2 = p_log_base; i_off2 = i; have_off2 = true; }
+            }
+            static std::mutex tail_mu;
+            std::lock_guard<std::mutex> lock(tail_mu);
+            static uint64_t tail_idx = 0;
+            const uint64_t idx = tail_idx++;
+            const int32_t on_t1 = imax, off_t1 = imax_base;
+            const float on_gap = logits[imax] - on_t2;
+            const float off_gap = p_log_base_max - off_t2;
+            const float fsum = (float) sum;
+            const uint8_t flip = imax != imax_base;
+            fwrite(&idx, sizeof(idx), 1, tf);
+            fwrite(&tok, sizeof(tok), 1, tf);
+            fwrite(&on_t1, sizeof(on_t1), 1, tf);
+            fwrite(&i_on2, sizeof(i_on2), 1, tf);
+            fwrite(&on_gap, sizeof(on_gap), 1, tf);
+            fwrite(&off_t1, sizeof(off_t1), 1, tf);
+            fwrite(&i_off2, sizeof(i_off2), 1, tf);
+            fwrite(&off_gap, sizeof(off_gap), 1, tf);
+            fwrite(&fsum, sizeof(fsum), 1, tf);
+            fwrite(&flip, sizeof(flip), 1, tf);
+        }
     }
 
     const float p_base = expf(-nll_base);

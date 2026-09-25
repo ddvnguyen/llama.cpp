@@ -2830,6 +2830,43 @@ static inline bool hydra_compact_enabled(void) {
     return !off;
 }
 
+// HYDRA Phase-B data-level byte-check (architect d-766e2acef7 leg 5): when
+// HYDRA_GATHER_BYTECHECK=1, every gather H2D row is read back once and memcmp'd
+// against its source expert row. One-shot per process; any mismatch ABORTS the
+// run (exit non-zero). Default OFF. Logit-level gates cannot separate a gather
+// defect from a kernel-numerics change; this check can.
+static inline bool hydra_bytecheck_wanted() {
+    static const bool on = []{ const char * e = getenv("HYDRA_GATHER_BYTECHECK"); return e && e[0] == '1'; }();
+    return on;
+}
+
+static void hydra_gather_bytecheck(ggml_backend_cuda_context & ctx, const void * dev_row,
+                                   const void * src_row, size_t nbytes, int64_t eid,
+                                   const char * tname, cudaStream_t stream) {
+    if (!hydra_bytecheck_wanted()) {
+        return;
+    }
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+        GGML_LOG_INFO("[HYDRA bytecheck] enabled: memcmp of gathered rows vs source rows\n");
+    });
+    static std::atomic<int64_t> n_checked{0};
+    if (n_checked.fetch_add(1) >= 4096) {
+        return; // one-shot window: enough rows to prove data-level correctness
+    }
+    std::vector<char> got(nbytes);
+    CUDA_CHECK(cudaMemcpyAsync(got.data(), dev_row, nbytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (memcmp(got.data(), src_row, nbytes) != 0) {
+        int mismatches = 0;
+        for (size_t b = 0; b < nbytes; ++b) {
+            if (got[b] != ((const char *) src_row)[b]) mismatches++;
+        }
+        GGML_ABORT("[HYDRA bytecheck] GATHER MISMATCH: tensor=%s expert=%lld bytes=%zu mismatched=%d\n",
+                   tname ? tname : "?", (long long) eid, nbytes, mismatches);
+    }
+}
+
 static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                         const std::vector<char> & ids_host_bytes,
                                         size_t ids_host_nb0,
@@ -2945,6 +2982,8 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
                 src_base + (size_t)eid * expert_stride,
                 expert_stride,
                 cudaMemcpyHostToDevice, stream));
+            hydra_gather_bytecheck(ctx, dst_base + (size_t)i * expert_stride,
+                src_base + (size_t)eid * expert_stride, expert_stride, eid, src0->name, stream);
         }
     }
     if (!split_staged && source_padding > 0) {
@@ -3470,6 +3509,16 @@ static void ggml_cuda_mul_mat_id_cached(
     }
 
     void * pool_d = ggml_cuda_moe_cache_slot_ptr(cache, 0);
+    // HYDRA bytecheck (data-level): every acquired row must equal its source
+    // row byte-for-byte (one-shot window, see hydra_gather_bytecheck).
+    if (hydra_bytecheck_wanted()) {
+        for (size_t i = 0; i < unique_eids.size() && i < pinned_slots.size(); ++i) {
+            hydra_gather_bytecheck(ctx,
+                (const char *) pool_d + (size_t) pinned_slots[i] * expert_stride,
+                src_base + (size_t) unique_eids[i] * expert_stride,
+                expert_stride, unique_eids[i], src0->name, stream);
+        }
+    }
     uint64_t remap_time_us = 0;
     if (compact_source) {
         const int64_t remap_start_us = ggml_time_us();
