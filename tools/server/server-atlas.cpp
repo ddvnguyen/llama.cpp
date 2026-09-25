@@ -29,6 +29,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <thread>
@@ -78,9 +79,15 @@ bool load_impl(const std::string & path, geometry & g) {
 
     const int ai = gguf_find_key(gguf, "general.architecture");
     if (ai < 0 || gguf_get_kv_type(gguf, ai) != GGUF_TYPE_STRING) {
-        gguf_free(gguf);
-        return false;
-    }
+    // geometry for the Stage-C artifact lookup (model dir + short id). A
+    // partial init must be invisible: reset the scratch fields and fail.
+    g.model_hash.clear();
+    g.model_path.clear();
+    g.total_size = 0;
+    g.engine_id.clear();
+    gguf_free(gguf);
+    return false;
+}
     g.arch = gguf_get_val_str(gguf, ai);
 
     // hydra #771: expert_count/expert_used_count live under the *model*
@@ -106,9 +113,15 @@ bool load_impl(const std::string & path, geometry & g) {
     kv_find_u32("nextn_predict_layers", nextn);
 
     if (expert_count == 0) { // dense model: no expert atlas surface
-        gguf_free(gguf);
-        return false;
-    }
+    // geometry for the Stage-C artifact lookup (model dir + short id). A
+    // partial init must be invisible: reset the scratch fields and fail.
+    g.model_hash.clear();
+    g.model_path.clear();
+    g.total_size = 0;
+    g.engine_id.clear();
+    gguf_free(gguf);
+    return false;
+}
 
     // hydra: gguf-split models put full metadata on shard 1 but scatter the
     // actual tensors (incl. "exps") across every shard, so the tensor-name
@@ -179,11 +192,19 @@ bool load_impl(const std::string & path, geometry & g) {
     g.n_expert_used  = (int) expert_used;
     g.dense_prefix   = g.moe_rows.empty() ? 0 : g.moe_rows[0];
     g.rows           = (int) (g.moe_rows.size() + g.nextn_rows.size());
-    g.model_hash     = path.substr(path.find_last_of("/\\") + 1);
+    const std::string model_hash = path.substr(path.find_last_of("/\\") + 1);
 
     uint64_t total_size = 0;
     for (const uint64_t s : shard_sizes) total_size += s;
-    g.engine_id = hex64(fnv1a64(g.arch + ":" + g.model_hash + ":" + std::to_string(total_size)));
+    const std::string engine_id =
+        hex64(fnv1a64(g.arch + ":" + model_hash + ":" + std::to_string(total_size)));
+    // hydra task-16ec332378: model_path/total_size land on the geometry for
+    // the Stage-C artifact lookup (experts.json next to the model; the
+    // "$arch:$basename:$size" short id form). Byte-identity verified above.
+    g.model_hash  = model_hash;
+    g.model_path  = path;
+    g.total_size  = total_size;
+    g.engine_id   = engine_id;
 
     for (gguf_context * ctx : shards) gguf_free(ctx);
     return g.rows > 0;
@@ -575,9 +596,9 @@ uint8_t encode_cell(const geometry & g, size_t row, uint64_t count) {
 }
 
 std::optional<std::string> experts_json() {
-    if (std::getenv("HYDRA_EXPERT_META") == nullptr) return std::nullopt;
-    std::lock_guard<std::mutex> lock(g_mtx);
-    if (!g_geom) return std::nullopt;
+    const bool surface_on = std::getenv("HYDRA_EXPERT_META") != nullptr;
+    std::unique_lock<std::mutex> lock(g_mtx);
+    if (!g_geom || !surface_on) return std::nullopt;
     const geometry & g = *g_geom;
 
     const size_t cells = (size_t) g.rows * (size_t) g.cols;
@@ -665,6 +686,123 @@ std::optional<std::string> experts_json() {
         j["ean"] = std::move(ean_j);
     }
     return j.dump();
+}
+
+// hydra task-16ec332378: engine-hosted Stage-C atlas artifacts (design §C/D
+// owner ruling: the fork ships the two atlas files). Resolves the artifact
+// path for `kind` ("experts" → experts.json, "ranks" → expert-ranks.json):
+// HYDRA_EXPERT_ATLAS dir first (explicit override for rigs that keep the
+// artifacts outside the model directory), then the model file's own dir
+// (fork ships the files next to the model). No inference beyond the filename:
+// anything unresolvable returns false and the caller 404s honestly.
+static bool artifact_path(const char * kind, const geometry & g, std::string & out) {
+    const char * fname = nullptr;
+    if (std::strcmp(kind, "experts") == 0) {
+        fname = "experts.json";
+    } else if (std::strcmp(kind, "ranks") == 0) {
+        fname = "expert-ranks.json";
+    }
+    if (fname == nullptr) {
+        return false;
+    }
+    if (const char * dir = std::getenv("HYDRA_EXPERT_ATLAS")) {
+        if (dir[0] != '\0') {
+            out = std::string(dir) + "/" + fname;
+            return true;
+        }
+    }
+    if (!g.model_hash.empty()) { // model_hash = gguf file name (basename)
+        const size_t slash = g.model_path.find_last_of("/\\");
+        if (slash != std::string::npos) {
+            out = g.model_path.substr(0, slash + 1) + fname;
+            return true;
+        }
+    }
+    return false;
+}
+
+// hydra task-16ec332378: engine-id refusal discipline (route_trace.h lineage:
+// histories from another engine are refused). The artifact's provenance
+// block carries the owner-designated engine id (tools/atlas/emit.py sets
+// provenance.engine_id; the shipped qwen38 artifact uses the short id
+// "qwen38"); this engine's geometry id is the 16-hex FNV-1a64(arch:name:
+// summed shard size). An artifact produced for another model must never be
+// served — refusal returns 404 upstream (atlas-web propagates the status
+// verbatim), never a misleading 200. Accepted spellings, so rigs can match
+// ids without recomputing the FNV hash:
+//   - exact geometry id (16-hex FNV), or
+//   - exact short id: "$arch:$basename" or "$arch:$basename:$size".
+// Anything else — including a missing provenance or engine_id field — is
+// refused: provenance is mandatory in both artifacts (#1078 lesson).
+static bool engine_id_matches_relaxed(const std::string & art_id, const geometry & g) {
+    if (art_id.empty()) return false;
+    if (art_id == g.engine_id) return true;
+    if (art_id == g.arch + ":" + g.model_hash) return true;
+    if (art_id == g.arch + ":" + g.model_hash + ":" + std::to_string(g.total_size))
+        return true;
+    return false;
+}
+
+// hydra task-16ec332378: load + validate one atlas artifact.
+// Returns: 0 ok (out_body = artifact bytes), 404 no model / artifact missing
+// / provenance refused (out_body = error JSON), 500 unreadable or corrupt
+// (out_body = error JSON). The engine-id gate runs before any artifact bytes
+// are served: a mismatched artifact is refused with an error JSON only.
+int atlas_file(const char * kind, std::string & out_path, std::string & out_body) {
+    out_path.clear();
+    out_body.clear();
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_geom) {
+        out_body = "{\"error\":\"no model loaded (atlas artifacts are per-model)\"}";
+        return 404;
+    }
+    if (!artifact_path(kind, *g_geom, out_path)) {
+        out_body = "{\"error\":\"no atlas artifact location (model path or HYDRA_EXPERT_ATLAS required)\"}";
+        return 404;
+    }
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(out_path, ec);
+    if (ec || !exists) {
+        out_body = "{\"error\":\"atlas artifact not found: " + out_path + "\"}";
+        return 404;
+    }
+    std::ifstream f(out_path, std::ios::binary);
+    if (!f.is_open()) {
+        out_body = "{\"error\":\"atlas artifact unreadable: " + out_path + "\"}";
+        return 500;
+    }
+    std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+    json doc;
+    try {
+        doc = json::parse(body);
+    } catch (const std::exception &) {
+        out_body = "{\"error\":\"atlas artifact is not valid JSON: " + out_path + "\"}";
+        return 500;
+    }
+    const auto prov_it = doc.find("provenance");
+    const std::string art_id = (prov_it != doc.end() && prov_it->is_object())
+        ? prov_it->value("engine_id", std::string()) : std::string();
+    if (!engine_id_matches_relaxed(art_id, *g_geom)) {
+        out_body = json{ {"error", "atlas artifact refused: provenance.engine_id '" + art_id +
+                                   "' does not match this engine (engine-id refusal discipline)"} }.dump();
+        return 404;
+        // upstream: atlas-web /experts.json propagates this status verbatim
+        // (atlas-web/server/server.ts:250-320), so a refused artifact surfaces
+        // as 404 there too — never a misleading 200.
+    }
+    out_body = std::move(body);
+    return 0;
+}
+
+// hydra task-16ec332378: artifact payload as JSON text (same resolution +
+// refusal rules as atlas_file; in-memory, no file read). Currently there are
+// no in-memory artifacts: the fork ships the two files on disk, so any
+// lookup falls through to the on-disk artifact. Kept as the stable in-memory
+// extension point (RPC 0x33-style consumers) so the HTTP layer stays thin.
+int atlas_json(const char * kind, std::string & out_body) {
+    std::string path;
+    return atlas_file(kind, path, out_body);
 }
 
 // hydra #787 sub-task 1: per-turn capture. Called once per completed
@@ -794,13 +932,9 @@ std::optional<std::string> turn_json(uint64_t seq) {
 }
 
 std::optional<std::string> experts_json_at(uint64_t seq) {
-    if (std::getenv("HYDRA_EXPERT_META") == nullptr) {
-        return std::nullopt;
-    }
-    std::lock_guard<std::mutex> lock(g_mtx);
-    if (!g_stats_on || !g_geom) {
-        return std::nullopt;
-    }
+    const bool surface_on = std::getenv("HYDRA_EXPERT_META") != nullptr;
+    std::unique_lock<std::mutex> lock(g_mtx);
+    if (!g_geom || !surface_on) return std::nullopt;
     const geometry & g = *g_geom;
     const size_t cells = (size_t) g.rows * (size_t) g.cols;
     const turn_record * hit = nullptr;
