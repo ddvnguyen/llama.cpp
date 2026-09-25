@@ -428,3 +428,16 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda AND (NOT WIN32 OR NOT
     add_test(NAME test-moe-cache COMMAND test-moe-cache)
     set_property(TEST test-moe-cache PROPERTY LABELS "main")
 endif()
+
+# hydra (task-16ec332378): CPU-only test for the engine-hosted Stage-C atlas
+# artifact routes (GET /experts.json + /expert-ranks.json): synthetic MoE
+# gguf + artifact files exercising the engine-id refusal discipline. Links
+# server-context like test-chat (hydra_atlas lives there). UNIX-only for
+# setenv/mkdir test-harness conveniences.
+if (UNIX)
+    add_executable(test-hydra-atlas-file test-hydra-atlas-file.cpp)
+    target_include_directories(test-hydra-atlas-file PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-hydra-atlas-file PRIVATE server-context)
+    add_test(NAME test-hydra-atlas-file COMMAND test-hydra-atlas-file)
+    set_property(TEST test-hydra-atlas-file PROPERTY LABELS "main")
+endif()
