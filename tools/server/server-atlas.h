@@ -42,6 +42,13 @@ bool init(const std::string & model_path);
 // No-op unless enabled() (env read once at startup).
 bool enabled();
 void accumulate(int grid_row, const int32_t * ids, int n_ids, int cols);
+// hydra F2 (architect package d-9981fa1092): zero the per-step hits bitmap
+// BEFORE a new decode step accumulates. Without this, g_hits_step stays
+// sticky across steps (bitmaps OR-accumulate forever) and /experts served
+// a lifetime-cumulative hits picture instead of the current step. Call once
+// per decode step before the per-row accumulate() loop; end_step() folds
+// the step bitmap into the turn window and clears it. Thread-safe.
+void begin_step();
 void end_step(int rows, int cols);
 // Trunk geometry snapshot for the Stage A decode hook (copies under lock;
 // empty when geometry unavailable). reset() clears counts/seq/hits_step +

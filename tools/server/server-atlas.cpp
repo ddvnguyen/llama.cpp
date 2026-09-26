@@ -18,6 +18,7 @@
 #include "gguf.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -302,6 +303,22 @@ bool enabled() {
     return g_stats_on;
 }
 
+// hydra F2 (architect package d-9981fa1092): called by the decode hook once
+// per step, BEFORE the per-row accumulate() loop, so g_hits_step describes
+// exactly the current step (not lifetime-OR'd sticky bits).
+void begin_step() {
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_stats_on || !g_geom) {
+        return;
+    }
+    const size_t cells = (size_t) g_geom->rows * (size_t) g_geom->cols;
+    if (g_hits_step.size() != (cells + 7) / 8) {
+        g_hits_step.assign((cells + 7) / 8, 0);
+    } else {
+        std::fill(g_hits_step.begin(), g_hits_step.end(), 0);
+    }
+}
+
 void accumulate(int grid_row, const int32_t * ids, int n_ids, int cols) {
     if (ids == nullptr || n_ids <= 0 || cols <= 0 || grid_row < 0) {
         return;
@@ -338,13 +355,18 @@ void end_step(int rows, int cols) {
     }
     g_seq += 1; // one counted decode step
     // hydra #787: fold this step into the current turn window. Cheap
-    // (bytes = cells/8) and lock-local; cleared at each record_turn.
+    // (bytes = cells/8); cleared at each record_turn.
     if (g_turn_hits.size() != g_hits_step.size()) {
         g_turn_hits.assign(g_hits_step.size(), 0);
     }
     for (size_t i = 0; i < g_hits_step.size(); i++) {
         g_turn_hits[i] |= g_hits_step[i];
     }
+    // hydra F2 (architect package d-9981fa1092): the step bitmap must not
+    // survive its step — begin_step() normally zeroes it, but clear here
+    // too so a skipped begin_step can never resurrect stale bits in
+    // /experts or the next fold.
+    std::fill(g_hits_step.begin(), g_hits_step.end(), 0);
 }
 
 bool ean_enabled() {
@@ -587,9 +609,12 @@ void set_residency(int n_gpu_layers, int n_layer,
 
 // hydra #788: shared EMAP encoder (Colibri byte layout verbatim:
 // tier=byte>>6, heat=byte&63). Tier is a LOAD fact from set_residency();
-// heat is the routing count clamped to 63. Disk unused (tier 0 = unknown,
-// honest omit). Applies to every cell: never-routed experts are still
-// resident, so their tier is real with heat 0. Callers hold g_mtx.
+// heat is the BIT-LENGTH of the routing count (upstream c/telemetry.h
+// emap_emit: `int heat=0; while(u){ heat++; u>>=1; } if(heat>63) heat=63;`
+// — verbatim port, hydra F3, architect package d-9981fa1092). Disk unused
+// (tier 0 = unknown, honest omit). Applies to every cell: never-routed
+// experts are still resident, so their tier is real with heat 0. Callers
+// hold g_mtx.
 uint8_t encode_cell(const geometry & g, size_t row, uint64_t count) {
     uint8_t tier = 0;
     const size_t nrows = g.moe_rows.size() + g.nextn_rows.size();
@@ -601,7 +626,13 @@ uint8_t encode_cell(const geometry & g, size_t row, uint64_t count) {
             tier = g_res_cpu[(size_t) il] ? 1 : 2;
         }
     }
-    return (uint8_t) ((tier << 6) | (count > 63 ? 63 : (int) count));
+    // hydra F3: bit-length heat (upstream parity). count=0 → heat=0;
+    // 1→1, 2→2, 3→2, 4→3, … 2^62→63 (saturates at 63 exactly as upstream).
+    uint64_t u = count;
+    int heat = 0;
+    while (u) { heat++; u >>= 1; }
+    if (heat > 63) heat = 63;
+    return (uint8_t) ((tier << 6) | heat);
 }
 
 std::optional<std::string> experts_json() {
@@ -636,7 +667,14 @@ std::optional<std::string> experts_json() {
             bytes[i] = encode_cell(g, i / (size_t) g.cols, g_counts[i]);
         }
         map_hex = to_hex(bytes.data(), bytes.size());
-        hits_hex = to_hex(g_hits_step.data(), g_hits_step.size());
+        // hydra F2 (architect package d-9981fa1092): /experts serves the
+        // CURRENT TURN window (g_turn_hits, folded per step, cleared at
+        // record_turn) — never the sticky per-step bitmap. Size-guard keeps
+        // the hex payload well-shaped before the first fold.
+        if (g_turn_hits.size() != g_hits_step.size()) {
+            g_turn_hits.assign(g_hits_step.size(), 0);
+        }
+        hits_hex = to_hex(g_turn_hits.data(), g_turn_hits.size());
     } else {
         map_hex.assign(cells * 2, '0');
         hits_hex.assign(((cells + 7) / 8) * 2, '0');

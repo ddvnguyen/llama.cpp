@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -206,6 +207,97 @@ int main() {
         std::string path, out;
         const int st = hydra_atlas::atlas_file("bogus", path, out);
         ATLAS_CHECK(st == 404, "case 8: unknown kind → 404 (no artifact location)");
+    }
+
+    // ---- hydra F2/F3 (architect package d-9981fa1092): hits-window
+    // semantics + bit-length heat, driven through the public accumulator
+    // API on the synthetic MoE model (1 grid row, 8 expert cols).
+    {
+        auto hex_popcount = [](const std::string & hex) -> int {
+            int bits = 0;
+            for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                const int b = std::stoi(hex.substr(i, 2), nullptr, 16);
+                for (int m = 0; m < 8; m++) bits += (b >> m) & 1;
+            }
+            return bits;
+        };
+        auto json_string_field = [](const std::string & j, const char * key) -> std::string {
+            const std::string pat = "\"" + std::string(key) + "\":\"";
+            const size_t p = j.find(pat);
+            if (p == std::string::npos) return "";
+            const size_t s = p + pat.size();
+            const size_t e = j.find('"', s);
+            return e == std::string::npos ? "" : j.substr(s, e - s);
+        };
+
+        setenv("HYDRA_EXPERT_STATS", "1", 1);
+        ATLAS_CHECK(hydra_atlas::init(model_path), "F2/F3: stats init (synthetic MoE gguf)");
+        // The real decode hook gates every call on enabled(); the lazy
+        // one-shot env read lives there, so the test must arm it explicitly.
+        ATLAS_CHECK(hydra_atlas::enabled(), "F2/F3: stats gate armed (lazy env read)");
+
+        // F2: /experts hits = CURRENT TURN window. Step {1,2} → popcount 2.
+        hydra_atlas::begin_step();
+        { const int32_t ids[2] = {1, 2}; hydra_atlas::accumulate(0, ids, 2, 8); }
+        hydra_atlas::end_step(1, 8);
+        std::string body = hydra_atlas::experts_json().value_or("");
+        ATLAS_CHECK(!body.empty(), "F2: experts_json serves with stats on");
+        ATLAS_CHECK(hex_popcount(json_string_field(body, "hits")) == 2,
+                    "F2: window hits = this step's bits (2)");
+
+        // Second step {5} ORs into the same turn window → 3 distinct cells.
+        hydra_atlas::begin_step();
+        { const int32_t ids[1] = {5}; hydra_atlas::accumulate(0, ids, 1, 8); }
+        hydra_atlas::end_step(1, 8);
+        body = hydra_atlas::experts_json().value_or("");
+        ATLAS_CHECK(hex_popcount(json_string_field(body, "hits")) == 3,
+                    "F2: window ORs steps within the turn (3)");
+
+        // Turn closes → served hits return to 0. The pre-F2 sticky bitmap
+        // kept serving 3 here forever (the bug).
+        hydra_atlas::record_turn(0, 0.1, 1, 1, 1);
+        body = hydra_atlas::experts_json().value_or("");
+        ATLAS_CHECK(hex_popcount(json_string_field(body, "hits")) == 0,
+                    "F2: record_turn clears the served window (no sticky hits)");
+
+        // F2 invariant: per-step per-row popcount <= k * n_out. Three top-k
+        // outputs of k=2 over {0..3} → 4 distinct cells, never more than
+        // 3*2=6 and never lifetime-accumulated (begin_step zeroes).
+        hydra_atlas::begin_step();
+        for (int o = 0; o < 3; o++) {
+            const int32_t ids[2] = { (int32_t) o, (int32_t) (o + 1) };
+            hydra_atlas::accumulate(0, ids, 2, 8);
+        }
+        hydra_atlas::end_step(1, 8);
+        body = hydra_atlas::experts_json().value_or("");
+        ATLAS_CHECK(hex_popcount(json_string_field(body, "hits")) == 4,
+                    "F2: step popcount bounded by k*n_out (4 <= 6), not sticky-accumulated");
+        hydra_atlas::record_turn(0, 0.1, 1, 1, 1);
+
+        // F3: heat = bit-length(count), upstream c/telemetry.h emap_emit
+        // parity. Fresh counts via reset(): reps over cells 1..4 → counts
+        // 1,3,4,70 → heat 1,2,3,7 (pre-F3 linear-clamp would say 1,3,4,63).
+        hydra_atlas::reset();
+        const int want[4] = {1, 2, 3, 7};
+        const int reps[4] = {1, 3, 4, 70};
+        for (int c = 0; c < 4; c++) {
+            hydra_atlas::begin_step();
+            for (int r = 0; r < reps[c]; r++) {
+                const int32_t ids[1] = { (int32_t) (c + 1) };
+                hydra_atlas::accumulate(0, ids, 1, 8);
+            }
+            hydra_atlas::end_step(1, 8);
+        }
+        body = hydra_atlas::experts_json().value_or("");
+        const std::string map = json_string_field(body, "map");
+        bool heat_ok = map.size() >= 16; // 8 cells → 16 hex chars
+        for (int c = 0; c < 4 && heat_ok; c++) {
+            const int byte = std::stoi(map.substr(2 * (c + 1), 2), nullptr, 16);
+            heat_ok = (byte & 63) == want[c];
+        }
+        ATLAS_CHECK(heat_ok,
+                    "F3: heat = bit-length(count) at counts 1/3/4/70 (emap_emit parity)");
+        hydra_atlas::record_turn(0, 0.1, 1, 1, 1);
     }
 
     printf(failures ? "\nFAILED %d checks\n" : "\nall ok\n", failures);
