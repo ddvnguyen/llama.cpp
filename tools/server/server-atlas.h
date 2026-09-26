@@ -23,6 +23,8 @@ namespace hydra_atlas {
 struct geometry {
     std::string engine_id;        // FNV-1a64(arch:name:size), 16 hex chars
     std::string model_hash;       // gguf file name — matches tools/atlas provenance
+    std::string model_path;       // full path to the -m gguf (shard 1) — artifact lookup anchor
+    uint64_t    total_size = 0;   // summed gguf shard bytes — engine-id short-form component
     std::string arch;             // gguf general.architecture
     int         rows = 0;         // grid rows = moe_rows.size() + nextn_rows.size()
     int         cols = 0;         // n_routed_experts
@@ -40,6 +42,13 @@ bool init(const std::string & model_path);
 // No-op unless enabled() (env read once at startup).
 bool enabled();
 void accumulate(int grid_row, const int32_t * ids, int n_ids, int cols);
+// hydra F2 (architect package d-9981fa1092): zero the per-step hits bitmap
+// BEFORE a new decode step accumulates. Without this, g_hits_step stays
+// sticky across steps (bitmaps OR-accumulate forever) and /experts served
+// a lifetime-cumulative hits picture instead of the current step. Call once
+// per decode step before the per-row accumulate() loop; end_step() folds
+// the step bitmap into the turn window and clears it. Thread-safe.
+void begin_step();
 void end_step(int rows, int cols);
 // Trunk geometry snapshot for the Stage A decode hook (copies under lock;
 // empty when geometry unavailable). reset() clears counts/seq/hits_step +
@@ -90,6 +99,29 @@ void set_residency(int n_gpu_layers, int n_layer,
 // Stage B payload (Colibri EMAP encoding verbatim: tier=byte>>6, heat=byte&63).
 // nullopt when disabled (env unset or geometry unavailable) — callers no-op.
 std::optional<std::string> experts_json();
+// hydra task-16ec332378 / #771: engine-hosted Stage-C atlas ARTIFACTS
+// (design §C/D owner ruling: the fork ships the two atlas files; atlas-web
+// proxies GET {engine}/experts.json and propagates the status verbatim).
+// kind: "experts" (observability tier) or "ranks" (expert-ranks.json).
+// Engine-id refusal discipline: the artifact is served ONLY when its
+// provenance.engine_id matches this engine's geometry-derived id (FNV-1a64,
+// 16 hex) — mismatch or missing provenance serves nothing (404 by the HTTP
+// layer), never another model's atlas, never a misleading 200.
+//
+// Resolution order: HYDRA_EXPERT_ATLAS (dir containing the files; explicit
+// override for rigs that keep artifacts outside the model dir) → the model
+// file's own directory (fork ships the files next to the model).
+// atlas_file reads from disk each call (always-fresh, no 5 MB residency);
+// out_path returns the resolved artifact path on every lookup, even when the
+// engine-id check fails (operators see what WOULD have been served).
+// Returns: 0 = ok (out_body set), 404 = no model / artifact missing /
+// provenance refused, 500 = artifact exists but cannot be read or parsed.
+int atlas_file(const char * kind, std::string & out_path, std::string & out_body);
+// Artifact body as JSON text (same resolution + refusal rules as
+// atlas_file; in-memory, no file read). out_body carries the full artifact
+// document, or the refusal/error JSON on 404/500 (caller sets the status).
+int atlas_json(const char * kind, std::string & out_body);
+
 // Per-turn capture (hydra_vortex#787 sub-task 1). One turn = one completed
 // completion cycle, recorded at send_final_response (slot-aware via slot id).
 // Ring of the 256 most recent turns + snapshot-diff routing slices of the

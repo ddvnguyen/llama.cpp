@@ -4343,6 +4343,11 @@ private:
                             SRV_WRN("atlas: %d/%d MoE rows lack topk tensors (dead layers: %s) - counting live rows only\n", (int) (rows.size() - live.size()), (int) rows.size(), dead.c_str());
                         }
                     }
+                    // hydra F2 (architect package d-9981fa1092): zero the
+                    // per-step hits bitmap before this step's rows accumulate,
+                    // so /experts hits reflect the current turn window, not
+                    // lifetime-sticky bits.
+                    hydra_atlas::begin_step();
                     bool counted = false;
                     for (int o = 0; o < n_out; ++o) {
                         for (size_t li = 0; li < live.size(); ++li) {
