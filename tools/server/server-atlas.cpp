@@ -115,10 +115,19 @@ bool load_impl(const std::string & path, geometry & g) {
         if (il >= 0 && il < (int) moe.size()) moe[il] = true;
     }
 
-    for (int il = 0; il < (int) block_count; il++) {
+    // hydra fix (layer-40 finding, track t-34d7bdf5d6): with NextN/MTP models,
+    // llama-model semantics count the nextn layer INSIDE block_count
+    // (n_layer_all = block_count; trunk n_layer = block_count - nextn).
+    // The nextn tensors live in blk.<trunk> (e.g. blk.40.nextn.* alongside
+    // blk.40.ffn_*_exps), so the last block is the MTP draft layer — built
+    // only in the MTP context graph, never in ctx_tgt where the topk hook
+    // reads. Classify those rows as nextn_rows (honest: no target-graph
+    // routing) instead of trunk rows that read as permanently unrouted.
+    const int trunk = (int) block_count - (int) nextn;
+    for (int il = 0; il < trunk; il++) {
         if (moe[il]) g.moe_rows.push_back(il);
     }
-    for (int il = (int) block_count; il < (int) (block_count + nextn); il++) {
+    for (int il = trunk; il < (int) (block_count + nextn); il++) {
         if (moe[il]) g.nextn_rows.push_back(il); // MTP rows reported separately (design §A)
     }
 
