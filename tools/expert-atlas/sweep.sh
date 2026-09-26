@@ -86,8 +86,28 @@ while IFS=$'\t' read -r cat idx prompt; do
   dst="$OUT/stats/${cat}_${idx}.json"
   [ -s "$dst" ] && { echo "  [$i/$n] $cat/$idx (cached)"; continue; }
 
-  # per-probe delta: /experts before -> probe -> /experts after
+  # per-probe: snapshot the turn counter BEFORE generation (B3: the turn
+  # counter lives at GET /turns .seq = g_turn_seq; /experts .seq is g_seq,
+  # the decode-step count — comparing the two was always wrong). The
+  # /experts snapshot stays only for the telemetry_enabled gate.
   curl -sf -m 10 "$SERVER_URL/experts" -o "$OUT/.before.json"
+  BEFORE_TURN_SEQ=$(python3 - "$SERVER_URL" <<'PY'
+import json, sys, urllib.request
+try:
+    with urllib.request.urlopen(sys.argv[1].rstrip("/") + "/turns", timeout=10) as r:
+        print(json.load(r).get("seq", ""))
+except Exception:
+    print("")
+PY
+)
+  BEFORE_STATS_ON=$(python3 - "$OUT/.before.json" <<'PY'
+import json, sys
+try:
+    print("1" if json.load(open(sys.argv[1])).get("telemetry_enabled") else "0")
+except Exception:
+    print("0")
+PY
+)
   curl -sf -m 120 "$SERVER_URL/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d "$(python3 -c 'import json,sys;print(json.dumps({"messages":[{"role":"user","content":sys.argv[1]}],"max_tokens":int(sys.argv[2]),"temperature":0,"top_p":1.0,"top_k":0,"min_p":0}))' "$prompt" "$MAX_TOKENS")" \
@@ -101,16 +121,10 @@ while IFS=$'\t' read -r cat idx prompt; do
   # counts, and consumers (tools/atlas/analyze.py sums, validate.py shares)
   # treat "selections" as linear counts, so byte deltas would invert the
   # affinity ranking. Use the engine's exact per-turn routing instead: the
-  # newest /turns/<seq> record carries {row, expert, count} from the same
-  # decode hook, already mapped to real layers via geometry.
-  BEFORE_SEQ=$(python3 - "$OUT/.before.json" <<'PY'
-import json, sys
-try:
-    print(json.load(open(sys.argv[1])).get("seq", ""))
-except Exception:
-    print("")
-PY
-)
+  # probe's turn record at /turns/<seq> carries {row, expert, count} from
+  # the same decode hook. BEFORE_TURN_SEQ was snapshotted before generation
+  # (B3: it comes from GET /turns .seq = g_turn_seq, never /experts .seq =
+  # g_seq, the decode-step counter).
   TURN_SEQ=$(python3 - "$SERVER_URL" <<'PY'
 import json, sys, urllib.request
 base = sys.argv[1].rstrip("/")
@@ -122,10 +136,11 @@ except Exception:
     print("")
 PY
 )
-  # The probe's own turn is the newest seq AFTER the before-snapshot (its
-  # generation creates exactly one new turn). If the ring has not advanced
-  # (probe failed or produced no decode), no selections are recorded.
-  if [ -n "$BEFORE_SEQ" ] && [ -n "$TURN_SEQ" ] && [ "$TURN_SEQ" -gt "$BEFORE_SEQ" ] 2>/dev/null; then
+  # The probe's own turn must be EXACTLY the next one after the snapshot:
+  # a concurrent client's turn would otherwise be silently counted as this
+  # probe's selections (architect round-2 should-fix). Anything but +1 →
+  # telemetry:false with a reason (ring-advanced-by-N / no-new-turn /).
+  if [ "$BEFORE_STATS_ON" = "1" ] && [ -n "$BEFORE_TURN_SEQ" ] && [ -n "$TURN_SEQ" ] && [ "$TURN_SEQ" -eq "$((BEFORE_TURN_SEQ + 1))" ] 2>/dev/null; then
     python3 - "$SERVER_URL" "$TURN_SEQ" "$dst" "$cat" "$idx" <<'PY'
 import json, sys, urllib.request
 
@@ -138,28 +153,36 @@ def fetch(path):
 
 g = fetch("/experts")["geometry"]
 moe = g["moe_rows"]
-nxt = g["nextn_rows"]
-rows = len(moe) + len(nxt)
-def real_layer(row):
-    return nxt[row - len(moe)] if row >= len(moe) else moe[row]
 
 # Exact per-turn selection counts from the probe's turn (same decode hook
-# the EMAP counts come from), MTP draft rows excluded — same rule as the
-# placement analysis (draft rows never route in ctx_tgt).
+# the EMAP counts come from). Trunk rows only: row < len(moe_rows) keeps
+# the NextN/MTP draft rows out — same rule as the placement analysis
+# (draft rows never route in ctx_tgt).
 sel = {}
 for e in fetch(f"/turns/{turn_seq}").get("routing") or []:
-    if 0 <= e["row"] < rows and e["count"] > 0:
-        sel[f"{real_layer(e['row'])}:{e['expert']}"] = e["count"]
+    if 0 <= e["row"] < len(moe) and e["count"] > 0:
+        sel[f"{moe[e['row']]}:{e['expert']}"] = e["count"]
 
-json.dump({"telemetry": True, "category": sys.argv[3], "idx": int(sys.argv[4]),
+# argv (B2, architect round-2): [1]=URL [2]=turn_seq [3]=OUT-FILE [4]=cat [5]=idx
+json.dump({"telemetry": True, "category": sys.argv[4], "idx": int(sys.argv[5]),
            "selections": sel, "source": "turns-routing",
-           "turn_seq": turn_seq}, open(sys.argv[2], "w"), indent=0)
+           "turn_seq": turn_seq}, open(sys.argv[3], "w"), indent=0)
 PY
   else
-    python3 - "$dst" "$cat" "$idx" <<'PY'
+    REASON="turns-unavailable"
+    if [ "$BEFORE_STATS_ON" != "1" ]; then
+      REASON="telemetry-disabled"
+    elif [ -n "$BEFORE_TURN_SEQ" ] && [ -n "$TURN_SEQ" ]; then
+      if [ "$TURN_SEQ" -eq "$BEFORE_TURN_SEQ" ] 2>/dev/null; then
+        REASON="no-new-turn"
+      else
+        REASON="ring-advanced-by-$((TURN_SEQ - BEFORE_TURN_SEQ))"
+      fi
+    fi
+    python3 - "$dst" "$cat" "$idx" "$REASON" <<'PY'
 import json, sys
-json.dump({"telemetry": False, "category": sys.argv[2], "idx": int(sys.argv[3])},
-          open(sys.argv[1], "w"))
+json.dump({"telemetry": False, "category": sys.argv[2], "idx": int(sys.argv[3]),
+           "reason": sys.argv[4]}, open(sys.argv[1], "w"))
 PY
   fi
 
