@@ -191,6 +191,13 @@ bool load_impl(const std::string & path, geometry & g) {
     // reads. Classify those rows as nextn_rows (honest: no target-graph
     // routing) instead of trunk rows that read as permanently unrouted.
     const int trunk = (int) block_count - (int) nextn;
+    if (trunk < 0) {
+        // hydra N1 (architect review d-7045376b02): only reachable with a
+        // malformed GGUF (llama-model asserts n_layer_nextn <= n_layer_all
+        // upstream, but the atlas loads independently) — fail cleanly.
+        gguf_free(gguf);
+        return false;
+    }
     for (int il = 0; il < trunk; il++) {
         if (moe[il]) g.moe_rows.push_back(il);
     }

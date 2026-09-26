@@ -95,34 +95,73 @@ while IFS=$'\t' read -r cat idx prompt; do
     || { echo "  [$i/$n] $cat/$idx GENERATION FAILED"; continue; }
   curl -sf -m 10 "$SERVER_URL/experts" -o "$OUT/.after.json"
 
-  python3 - "$OUT/.before.json" "$OUT/.after.json" "$dst" "$cat" "$idx" <<'PY'
+  # hydra F2/F3 follow-up (architect review d-7045376b02): do NOT decode
+  # EMAP bytes. EMAP heat is a 6-bit encoded value (F3: bit-length, upstream
+  # emap_emit parity) — after-before deltas on map&63 are NOT selection
+  # counts, and consumers (tools/atlas/analyze.py sums, validate.py shares)
+  # treat "selections" as linear counts, so byte deltas would invert the
+  # affinity ranking. Use the engine's exact per-turn routing instead: the
+  # newest /turns/<seq> record carries {row, expert, count} from the same
+  # decode hook, already mapped to real layers via geometry.
+  BEFORE_SEQ=$(python3 - "$OUT/.before.json" <<'PY'
 import json, sys
-def counts(path):
-    d = json.load(open(path))
-    if not d.get("telemetry_enabled"):
-        return None
-    m = bytes.fromhex(d["map"])
-    rows, cols = d["rows"], d["cols"]
-    g = d["geometry"]
-    out = {}
-    for r in range(rows):
-        real = (g["nextn_rows"][r - len(g["moe_rows"])] if r >= len(g["moe_rows"])
-                else g["moe_rows"][r])
-        for c in range(cols):
-            h = m[r * cols + c] & 63
-            if h:
-                out[f"{real}:{c}"] = h   # heat saturates at 63 (EMAP encoding)
-    return out
-b, a = counts(sys.argv[1]), counts(sys.argv[2])
-cat, idx = sys.argv[4], int(sys.argv[5])
-if b is None or a is None:
-    json.dump({"telemetry": False, "category": cat, "idx": idx},
-              open(sys.argv[3], "w"))
-else:
-    delta = {k: a.get(k, 0) - b.get(k, 0) for k in a if a.get(k, 0) > b.get(k, 0)}
-    json.dump({"telemetry": True, "category": cat, "idx": idx,
-               "selections": delta}, open(sys.argv[3], "w"), indent=0)
+try:
+    print(json.load(open(sys.argv[1])).get("seq", ""))
+except Exception:
+    print("")
 PY
+)
+  TURN_SEQ=$(python3 - "$SERVER_URL" <<'PY'
+import json, sys, urllib.request
+base = sys.argv[1].rstrip("/")
+try:
+    with urllib.request.urlopen(base + "/turns", timeout=10) as r:
+        turns = json.load(r).get("turns") or []
+    print(turns[-1]["turn_seq"] if turns else "")
+except Exception:
+    print("")
+PY
+)
+  # The probe's own turn is the newest seq AFTER the before-snapshot (its
+  # generation creates exactly one new turn). If the ring has not advanced
+  # (probe failed or produced no decode), no selections are recorded.
+  if [ -n "$BEFORE_SEQ" ] && [ -n "$TURN_SEQ" ] && [ "$TURN_SEQ" -gt "$BEFORE_SEQ" ] 2>/dev/null; then
+    python3 - "$SERVER_URL" "$TURN_SEQ" "$dst" "$cat" "$idx" <<'PY'
+import json, sys, urllib.request
+
+base = sys.argv[1].rstrip("/")
+turn_seq = int(sys.argv[2])
+
+def fetch(path):
+    with urllib.request.urlopen(base + path, timeout=10) as r:
+        return json.load(r)
+
+g = fetch("/experts")["geometry"]
+moe = g["moe_rows"]
+nxt = g["nextn_rows"]
+rows = len(moe) + len(nxt)
+def real_layer(row):
+    return nxt[row - len(moe)] if row >= len(moe) else moe[row]
+
+# Exact per-turn selection counts from the probe's turn (same decode hook
+# the EMAP counts come from), MTP draft rows excluded — same rule as the
+# placement analysis (draft rows never route in ctx_tgt).
+sel = {}
+for e in fetch(f"/turns/{turn_seq}").get("routing") or []:
+    if 0 <= e["row"] < rows and e["count"] > 0:
+        sel[f"{real_layer(e['row'])}:{e['expert']}"] = e["count"]
+
+json.dump({"telemetry": True, "category": sys.argv[3], "idx": int(sys.argv[4]),
+           "selections": sel, "source": "turns-routing",
+           "turn_seq": turn_seq}, open(sys.argv[2], "w"), indent=0)
+PY
+  else
+    python3 - "$dst" "$cat" "$idx" <<'PY'
+import json, sys
+json.dump({"telemetry": False, "category": sys.argv[2], "idx": int(sys.argv[3])},
+          open(sys.argv[1], "w"))
+PY
+  fi
 
   # Edge0 S-A2: flush hidden-state sidecar for this probe (when capture enabled)
   FLUSH_HTTP=$(curl -sf -m 10 -X POST "$SERVER_URL/capture/flush?cat=$cat&idx=$idx" \
