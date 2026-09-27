@@ -2469,7 +2469,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ean.reserve(n_ean_il);
         for (uint32_t i = 0; i < n_ean_il; ++i) {
             ggml_tensor * slot = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
-            ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, slot))); // [1, n_tokens]
+            // RULING 1 (hydra_vortex#806): `slot` is a strided ggml_view_2d
+            // into [n_embd, n_expert_used, n_tokens], so ggml_sqr(slot) hits
+            // ggml_cuda_op_sqr's contiguity assert and aborts the server at
+            // load warmup whenever HYDRA_EAN_STATS=1. Materialize ONE
+            // contiguous copy (single-copy fallback when the view is not
+            // already contiguous) and assert build-time contiguity of the
+            // sqr input. Entirely inside the env gate: unset HYDRA_EAN_STATS
+            // still adds no ops — byte-identical OFF graph.
+            ggml_tensor * slot_c = ggml_is_contiguous(slot) ? slot : ggml_cont(ctx0, slot);
+            GGML_ASSERT(ggml_is_contiguous(slot_c));
+            ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, slot_c))); // [1, n_tokens]
             ggml_build_forward_expand(gf, norm);
             ean.push_back(norm);
         }

@@ -67,6 +67,15 @@ void reset();
 // "<realLayer>:<expert>"); absent until counted. Thread-safe.
 bool ean_enabled();
 void accumulate_ean(int grid_row, const int32_t * ids, const float * gates, const float * norms, int n, int cols);
+// hydra_vortex#806 (RULING 3): scope-aware reset behind the new
+// POST /atlas/reset?scope=ean|all route — deliberately separate from
+// reset() (per-probe protocol) so the two are never conflated.
+//   "ean" -> zeroes ONLY the EAN accumulators (g_ean_gxn gate*norm sums +
+//            g_ean_nsel per-cell sample counts); expert heat counts, seq,
+//            turn window and capture sidecar survive.
+//   "all" -> full reset including EAN (reset() semantics).
+// Returns false on an unknown scope (caller rejects with 400). Thread-safe.
+bool reset_scope(const std::string & scope);
 // Allocation snapshot for honest tier/hwinfo reporting on engine /health
 // (#785). Captured once at model-load time (sleep-safe: get_health reads the
 // stored copy, never ctx_server). Tiers are device/host buffer splits from

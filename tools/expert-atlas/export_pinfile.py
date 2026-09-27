@@ -6,8 +6,9 @@
 # discipline, colibri route_trace.h: histories/artifacts from another engine
 # are never consumed).
 #
-# Pin-file format (llama-context.cpp hydra_cpu_init; identical parser in
-# ggml-cuda.cu):
+# Pin-file format contract; consumer not present in this tree (see
+# tools/atlas/placement_proposal.py:11-13 in the parent repo — "nothing in
+# prod reads a pin file"; there is no in-tree pinfile parser):
 #   - '#' lines and blank lines are skipped
 #   - each pin line: "L <il> <ids...>"; il must be in [0, 256)
 #   - ORDER IS SIGNIFICANT: ids are hot-first (design §4 contract)
