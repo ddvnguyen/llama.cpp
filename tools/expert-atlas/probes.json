@@ -1,5 +1,5 @@
 {
-  "_comment": "Probe set for the GLM-5.2 Expert Atlas (#175). 10 categories x 3 prompts. Prompts are deliberately varied in phrasing within a category so the affinity vector reflects the TOPIC, not one prompt's surface form. Lengths are kept within a narrow band across categories: prefill routes the prompt tokens too, so a long prompt in one category would inflate its counts.",
+  "_comment": "Probe set for the expert atlas (#175 lineage). OWNER UPDATE 2026-09-27: 8 categories x 3 prompts. Kept code_python / code_sql / json_format / math_proof; ADDED technical_architect / ui_development / reasoning_thinking; FOLDED the former chinese / german / poetry / law / medicine / casual_chat topics into one non_coding contrast bucket (representative medicine / german / poetry prompts). Started from Colibri @a8f2ca62 (10 categories x 3 prompts). Prompts are deliberately varied in phrasing within a category so the affinity vector reflects the TOPIC, not one prompt's surface form. Lengths are kept within a narrow band across categories: prefill routes the prompt tokens too, so a long prompt in one category would inflate its counts.",
 
   "code_python": [
     "Write a Python function that merges two sorted lists into one sorted list.",
@@ -16,39 +16,29 @@
     "Show that the sum of the first n odd numbers equals n squared.",
     "Explain why the derivative of e^x is e^x."
   ],
-  "chinese": [
-    "请用三句话解释什么是机器学习。",
-    "写一首关于秋天的短诗。",
-    "中国的四大发明是什么？请简要说明。"
-  ],
-  "german": [
-    "Erkläre in drei Sätzen, wie ein Verbrennungsmotor funktioniert.",
-    "Schreibe eine kurze formelle E-Mail, in der du einen Termin absagst.",
-    "Was ist der Unterschied zwischen Dativ und Akkusativ im Deutschen?"
-  ],
-  "poetry": [
-    "Write a short poem about the sea at night.",
-    "Compose four lines of verse about an empty train station.",
-    "Write a haiku about the first snow of winter."
-  ],
-  "law": [
-    "Explain in plain terms what consideration means in contract law.",
-    "What is the difference between a misdemeanor and a felony?",
-    "Summarize what the term 'force majeure' covers in a commercial contract."
-  ],
-  "medicine": [
-    "Explain the difference between type 1 and type 2 diabetes.",
-    "What are the common symptoms of iron deficiency anemia?",
-    "Describe how a vaccine produces immunity."
-  ],
   "json_format": [
     "Return a JSON object with keys name, age, and email for a fictional user. Output only JSON.",
     "Convert this to JSON: name Alice, roles admin and editor, active true. Output only JSON.",
     "Write a JSON schema for an object with a required string field 'id' and an optional integer 'count'."
   ],
-  "casual_chat": [
-    "Hey, what's a good way to spend a rainy Sunday afternoon?",
-    "I'm feeling pretty tired today. Any tips to get through the afternoon?",
-    "What's your favourite kind of weather, and why?"
+  "technical_architect": [
+    "Design a high-level architecture for a multi-region read-replica system.",
+    "Compare event-driven and request-response designs for a background job pipeline.",
+    "Describe how you would shard a write-heavy key-value store."
+  ],
+  "ui_development": [
+    "Write the JSX for a modal dialog with a backdrop and a close button.",
+    "Explain how the CSS flexbox gap property differs from margins in a toolbar.",
+    "Describe how to make a data table keyboard-navigable with ARIA roles."
+  ],
+  "reasoning_thinking": [
+    "A farmer has 17 sheep, all but 9 run away. How many are left? Explain step by step.",
+    "If 5 machines make 5 widgets in 5 minutes, how long do 100 machines need for 100 widgets? Reason it out.",
+    "Compare the tradeoffs of sorting one million integers in memory versus on disk. Think it through."
+  ],
+  "non_coding": [
+    "Explain in plain terms how a vaccine helps the body fight a disease.",
+    "Schreibe eine kurze formelle E-Mail, in der du einen Termin absagst.",
+    "Write a short poem about the first snow of winter."
   ]
 }

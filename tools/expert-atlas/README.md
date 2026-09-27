@@ -10,13 +10,13 @@ fork issue #133. Confound traps are enforced by this harness, not by memory:
 | MTP/draft counts describe rejected tokens | run the server WITHOUT MTP/spec args; harness asserts no draft fields in responses |
 | lifetime histogram pollutes per-probe stats | per-probe **delta** of `GET /experts` (reset-free by construction); upgrades to the Stage-A per-probe reset/dump when S-A2 lands |
 | prefill routing is topic-generic | engine counters are decode-only by design (Stage A); deltas exclude prefill |
-| prompt-length bias | probes.json keeps lengths in a narrow band (verbatim from Colibri: 10 categories × 3 prompts) |
+| prompt-length bias | probes.json keeps lengths in a narrow band (owner-set: 8 categories × 3 prompts, started from Colibri's 10 × 3) |
 
 ## Usage
 
 ```bash
 # engine with the Stage B surface enabled (see tools/server/server-atlas.h)
-SERVER_URL=http://127.0.0.1:8086 ./sweep.sh                       # all 30 probes
+SERVER_URL=http://127.0.0.1:8086 ./sweep.sh                       # all 24 probes
 SERVER_URL=http://127.0.0.1:8086 ./sweep.sh probes.json ./out     # explicit
 
 python3 analyze.py --stats ./out/stats --probes probes.json \
@@ -35,7 +35,7 @@ production stats path once it lands.
 
 ## Files
 
-- `probes.json` — verbatim from Colibri @a8f2ca62 (10 categories × 3 prompts)
+- `probes.json` — started verbatim from Colibri @a8f2ca62 (10 × 3); **owner update 2026-09-27**: 8 categories × 3 (adds `technical_architect` / `ui_development` / `reasoning_thinking`; folds chinese/german/poetry/law/medicine/casual_chat into `non_coding`)
 - `sweep.sh` — driver: greedy confound-controlled generation + per-probe delta
 - `analyze.py` — statistics port (mean share, p(c|e), spec = 1 − H/log C,
   replication gate) emitting the observability-tier `experts.json` + provenance
