@@ -40,7 +40,9 @@ production stats path once it lands.
 - `analyze.py` — statistics port (mean share, p(c|e), spec = 1 − H/log C,
   replication gate) emitting the observability-tier `experts.json` + provenance
 - `export_pinfile.py` — `experts.json`/`expert-ranks.json` → pin file
-  (`L <il> <ids...>`, hot-first, wrap-aware). Engine-agnostic: `--expect-engine-id`
+  (`L <il> <ids...>`, hot-first, wrap-aware). Format contract; consumer not
+  present in this tree (see `tools/atlas/placement_proposal.py:11-13` in the
+  parent repo — no in-tree pinfile parser). Engine-agnostic: `--expect-engine-id`
   refusal + optional `--check-url` live geometry match. Round-trip verified
   byte-identical to the parent repo artifact
 - `validate.py` — leave-one-prompt-out validation (LLM pop review #175): the

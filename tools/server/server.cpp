@@ -428,6 +428,25 @@ int llama_server(common_params & params, int argc, char ** argv) {
         return res;
     }));
 
+    // hydra_vortex#806 (RULING 3): per-prompt EAN reset WITHOUT the
+    // /capture/reset surface above (that route 503s unless capture is on and
+    // the gate harness + atlas-web depend on its semantics).
+    // POST /atlas/reset?scope=ean — zero only the EAN accumulators
+    // (g_ean_gxn / g_ean_nsel), leaving expert heat counts/seq untouched.
+    // POST /atlas/reset?scope=all  — full reset including EAN.
+    // 200 + small JSON on success; 400 on unknown scope.
+    ctx_http.post("/atlas/reset", ex_wrapper([](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string scope = req.get_param("scope");
+        if (!hydra_atlas::reset_scope(scope)) {
+            res->status = 400;
+            res->data   = safe_json_to_str(json{{"error", "scope must be 'ean' or 'all'"}});
+            return res;
+        }
+        res->data = safe_json_to_str(json{{"ok", true}, {"scope", scope}});
+        return res;
+    }));
+
     // hydra task-16ec332378: engine-hosted Stage-C atlas artifacts (design
     // §C/D owner ruling: the fork ships the two atlas files; atlas-web proxies
     // GET {engine}/experts.json and propagates the status verbatim — engine

@@ -458,6 +458,33 @@ void reset() {
     g_cap_embd = 0;
 }
 
+// hydra_vortex#806 (RULING 3): scope-aware reset for POST /atlas/reset —
+// kept separate from reset() (the per-probe protocol) so EAN-only resets
+// never wipe expert heat counts/seq/turn/capture state, and scope "all"
+// stays a true full reset incl. EAN. "ean" zeroes the accumulators in place
+// (sizes preserved: /experts keeps serving "ean" with cells=0 until the
+// next decode refills it), so the next prompt's EAN matches that same
+// prompt on a fresh server (per-prompt replay, no cross-prompt leak).
+bool reset_scope(const std::string & scope) {
+    if (scope == "all") {
+        reset();
+        return true;
+    }
+    if (scope != "ean") {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (g_geom) {
+        const size_t cells = (size_t) g_geom->rows * (size_t) g_geom->cols;
+        g_ean_gxn.assign(cells, 0.0);
+        g_ean_nsel.assign(cells, 0);
+    } else {
+        g_ean_gxn.clear();
+        g_ean_nsel.clear();
+    }
+    return true;
+}
+
 // hydra #785: one-shot load-time capture. Breakdown split mirrors
 // common/memory_breakdown_print (fit.cpp:938-965): host buft → ram,
 // device buft → vram. Device totals via ggml_backend_dev_memory; host
