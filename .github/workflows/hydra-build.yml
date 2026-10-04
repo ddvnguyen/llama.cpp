@@ -291,7 +291,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.binary }}-${{ matrix.arch }}-${{ needs.resolve.outputs.sha }}
-          path: staging_${{ matrix.arch }}/${{ matrix.binary }}/
+          path: staging_${{ matrix.arch }}_${{ matrix.binary }}/
           if-no-files-found: error
           retention-days: 14
 

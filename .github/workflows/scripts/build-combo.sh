@@ -92,8 +92,10 @@ if [ "$MODE" = "artifact" ]; then
   echo "=== [$ARCH/$BINARY] artifact mode: stage + exit, NO OCI push ==="
   mkdir -p "${STAGING_DIR}/bin"
   cp "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
-  cp "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
+  # -P keeps the .so -> .so.<ver> symlinks as links (3x smaller artifact)
+  cp -P "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
   ldd "${STAGING_DIR}/bin/$BINARY" > "${STAGING_DIR}/ldd.txt" 2>&1 || true
+  ls -la "${STAGING_DIR}/bin/"
   {
     echo "mode=artifact"
     echo "binary=${BINARY}"
