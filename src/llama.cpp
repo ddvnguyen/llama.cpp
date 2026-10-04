@@ -366,6 +366,28 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             effective_overrides_ptr = effective_overrides.data();
         }
 
+        // Publish --moe-prefill-stream to the CUDA backend (process-wide flag,
+        // same pattern as the expert-cache slot count above). Always published,
+        // including false, so a previous load in this process cannot leak it on.
+        {
+            ggml_backend_moe_cache_set_prefill_stream_t set_prefill_stream_fn = nullptr;
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+                auto candidate = (ggml_backend_moe_cache_set_prefill_stream_t) ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_MOE_CACHE_SET_PREFILL_STREAM_PROC_NAME);
+                if (candidate != nullptr) {
+                    set_prefill_stream_fn = candidate;
+                    break;
+                }
+            }
+            if (set_prefill_stream_fn != nullptr) {
+                set_prefill_stream_fn(params.moe_prefill_stream);
+            } else if (params.moe_prefill_stream) {
+                LLAMA_LOG_WARN("--moe-prefill-stream is set but no backend with prefill-stream support "
+                               "was found; prefill expert streaming stays off.\n");
+            }
+        }
+
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, effective_overrides_ptr);
 
