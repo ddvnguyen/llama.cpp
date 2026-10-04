@@ -193,7 +193,7 @@ jobs:
     needs: resolve
     if: inputs.execution_mode == 'matrix'
     runs-on: ${{ inputs.runner_target == 'cloud' && 'ubuntu-latest' || 'self-hosted' }}
-    timeout-minutes: ${{ inputs.runner_target == 'cloud' && 45 || 60 }}
+    timeout-minutes: ${{ inputs.build_llama_perplexity == true && 120 || (inputs.runner_target == 'cloud' && 45 || 60) }}
     strategy:
       fail-fast: false
       matrix:
