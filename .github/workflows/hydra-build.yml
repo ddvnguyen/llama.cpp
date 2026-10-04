@@ -16,6 +16,10 @@ on:
         description: "Build llama-server"
         type: boolean
         default: false
+      build_llama_perplexity:
+        description: "Build llama-perplexity (artifact upload ONLY, no OCI push) - Stage 0 G-0b KL floor. Needs arch_sm86_sm120 + execution_mode=matrix."
+        type: boolean
+        default: false
       arch_sm86_sm120:
         description: "Target sm86-sm120 (RTX 3060 + 5060 Ti, CUDA 13.2)"
         type: boolean
@@ -141,6 +145,18 @@ jobs:
             fi
           fi
 
+          if [ "${{ inputs.build_llama_perplexity }}" = "true" ]; then
+            if [ "${{ inputs.arch_sm86_sm120 }}" != "true" ]; then
+              echo "::error::build_llama_perplexity needs arch_sm86_sm120 (CUDA 13.2, cuda_arch 86;120)."
+              exit 1
+            fi
+            if [ "${{ inputs.execution_mode }}" != "matrix" ]; then
+              echo "::error::build_llama_perplexity only supports execution_mode=matrix."
+              exit 1
+            fi
+            combos+=('{"arch":"sm86-sm120","binary":"llama-perplexity","cuda_version":"13.2","cuda_arch":"86;120","mode":"artifact"}')
+          fi
+
           if [ ${#combos[@]} -eq 0 ]; then
             echo "::error::No build selected — check at least one architecture and at least one binary."
             exit 1
@@ -253,6 +269,7 @@ jobs:
           echo "CCACHE_SLOPPINESS=pch_defines,time_macros,locale" >> "$GITHUB_ENV"
 
       - name: Login to ghcr.io
+        if: matrix.mode != 'artifact'
         env:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
         run: |
@@ -266,9 +283,20 @@ jobs:
         run: |
           bash .github/workflows/scripts/build-combo.sh \
             "${{ matrix.arch }}" "${{ matrix.binary }}" "${{ matrix.cuda_version }}" "${{ matrix.cuda_arch }}" \
-            "$CUDA_PATH" "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}" "${{ needs.resolve.outputs.pr }}"
+            "$CUDA_PATH" "${{ env.IMAGE_REPO }}" "${{ needs.resolve.outputs.sha }}" "${{ inputs.runner_target }}" "${{ needs.resolve.outputs.pr }}" \
+            "${{ matrix.mode }}"
+
+      - name: Upload binary artifact
+        if: matrix.mode == 'artifact'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.binary }}-${{ matrix.arch }}-${{ needs.resolve.outputs.sha }}
+          path: staging_${{ matrix.arch }}/${{ matrix.binary }}/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Deploy reminder
+        if: matrix.mode != 'artifact'
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
 

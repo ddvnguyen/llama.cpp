@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Configure, build, package, and push one (arch, binary) combination.
 # Assumes: ccache is on PATH with CCACHE_DIR already set, and podman is
-# already logged in to ghcr.io. Called once per combo by hydra-build.yml,
-# either from a matrix job (one combo) or a sequential loop (many combos).
+# already logged in to ghcr.io (image mode only). Called once per combo
+# by hydra-build.yml, either from a matrix job (one combo) or a
+# sequential loop (many combos).
+#
+# $10 = MODE, "image" (default) or "artifact".
+#   image:    build + package + push the OCI image (existing behavior).
+#   artifact: build + stage binary, shared libs, ldd list and build info,
+#             then exit WITHOUT any registry access, podman or push.
+#             The binary is never executed in artifact mode.
 set -euo pipefail
 
 ARCH="$1"
@@ -14,6 +21,12 @@ IMAGE_REPO="$6"
 SHORT_SHA="$7"
 RUNNER_TARGET="$8"  # "local" or "cloud" — native/IPO builds only make sense on the box that runs the binary
 PR_ID="$9"          # optional PR id -> image tag suffix -pr<N> (e.g. 532 -> -pr532)
+MODE="${10:-image}" # "image" (default) or "artifact" (no push, stage + upload)
+
+case "$MODE" in
+  image|artifact) ;;
+  *) echo "::error::Invalid MODE '$MODE' - must be 'image' or 'artifact'"; exit 1 ;;
+esac
 
 BUILD_DIR="build_hydra_${ARCH}_${BINARY}"
 STAGING_DIR="staging_${ARCH}_${BINARY}"
@@ -72,6 +85,39 @@ echo "=== [$ARCH/$BINARY] CMake build ==="
 cmake --build "$BUILD_DIR" --target "$BINARY" -j"$(nproc)"
 
 ccache -s || true
+
+# ── Artifact mode: stage the binary and stop. No podman, no registry ──
+# The binary is never executed here (consumers verify with file/ldd).
+if [ "$MODE" = "artifact" ]; then
+  echo "=== [$ARCH/$BINARY] artifact mode: stage + exit, NO OCI push ==="
+  mkdir -p "${STAGING_DIR}/bin"
+  cp "$BUILD_DIR/bin/$BINARY" "${STAGING_DIR}/bin/"
+  cp "$BUILD_DIR/bin/"*.so* "${STAGING_DIR}/bin/" 2>/dev/null || true
+  ldd "${STAGING_DIR}/bin/$BINARY" > "${STAGING_DIR}/ldd.txt" 2>&1 || true
+  {
+    echo "mode=artifact"
+    echo "binary=${BINARY}"
+    echo "arch=${ARCH}"
+    echo "cuda_arch=${CUDA_ARCH}"
+    echo "cuda_version=${CUDA_VERSION}"
+    echo "runner_target=${RUNNER_TARGET}"
+    echo "source_ref=${GITHUB_REF_NAME:-unknown}"
+    echo "source_commit=${GITHUB_SHA:-unknown}"
+    echo "fork_version=$(tr -d '[:space:]' < VERSION)"
+    echo "cmake_args=${CMAKE_ARGS[*]}"
+    echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "${STAGING_DIR}/build-info.txt"
+  cat "${STAGING_DIR}/build-info.txt"
+  ls -la "${STAGING_DIR}/bin"
+  {
+    echo "### ${ARCH} / ${BINARY} (artifact mode - no OCI push)"
+    echo ""
+    echo "- source commit: \`${GITHUB_SHA:-unknown}\`"
+    echo "- staged files: \`${STAGING_DIR}/\` (binary, shared libs, ldd.txt, build-info.txt)"
+    echo ""
+  } >> "$GITHUB_STEP_SUMMARY"
+  exit 0
+fi
 
 VERSION_OUTPUT=$("$BUILD_DIR/bin/$BINARY" --version 2>&1 || true)
 echo "Binary version: $VERSION_OUTPUT"
