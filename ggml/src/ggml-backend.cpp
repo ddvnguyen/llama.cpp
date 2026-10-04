@@ -1878,6 +1878,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // [TAG_MOE_PREFILL_STAGE] Restart the bank flip here, not only in ggml_backend_sched_split_graph.
+    // A reused graph reaches compute_splits without re-splitting
+    // (ggml_backend_sched_graph_compute_async_ext skips the reset+split+alloc when the graph is
+    // already allocated), so a counter that only advanced would carry its parity across replays.
+    // There are 141 MoE-weight splits - an ODD number - so parity would flip on every ubatch,
+    // each weight's input_cpy->data would alternate between bank 0 and bank 1, and the CUDA-graph
+    // property check would see changed src0 pointers and re-capture on every single prefill
+    // (G-G 'graphs reused >= control' would fail, and the re-capture cost would be hidden inside
+    // the wall being measured). Resetting here makes the bank a deterministic function of the
+    // graph, so the captured pointers are stable across replays.
+    sched->moe_stage_bank_idx = 0;
+
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
