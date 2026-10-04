@@ -819,6 +819,21 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+
+    // [TAG_MOE_PREFILL_STAGE] Stage 1b-R: prefill expert-weight staging overlap.
+    // Two device banks in one allocation, flipped per MoE-weight split, so the H2D for
+    // layer L+1 can land while layer L's GEMM still reads the other bank. moe_stage_free[b][i]
+    // is recorded on the main stream right after the split that last read bank i, and the
+    // copy stream waits on it instead of the host waiting on ggml_backend_synchronize().
+    // moe_stage_bank is a plain I8 tensor in the split backend's compute buffer (never a view,
+    // so bad_padding_clear stays false and the MMQ path is unchanged); the per-weight staging
+    // tensors point into it by having ->data redirected at execution time in compute_splits.
+    // All of this stays zero/NULL unless a backend accepts the staged-copy hook, which the
+    // CUDA backend does only while --moe-prefill-stream is on, so flag-off is byte-identical.
+    struct ggml_tensor * moe_stage_bank[GGML_SCHED_MAX_BACKENDS];
+    size_t               moe_stage_bank_bytes[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_event_t moe_stage_free[GGML_SCHED_MAX_BACKENDS][2];
+    uint32_t             moe_stage_bank_idx;
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1476,7 +1491,57 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
     }
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
+    // [TAG_MOE_PREFILL_STAGE] Size and create the two-bank staging allocation, one per backend
+    // that offers the staged-copy hooks (in practice only CUDA0, and only while
+    // --moe-prefill-stream is on - the hook declines otherwise, so this loop is a no-op for
+    // every other backend and for the whole tree when the flag is off).
+    //
+    // The bank must be sized at ggml_backend_buft_get_alloc_size, NOT ggml_nbytes: quantized
+    // expert weights whose ne[0] is not a multiple of MATRIX_ROW_PADDING get extra row padding
+    // added there (blk.*.ffn_down_exps.weight is iq4_nl with ne[0] = 640), and that padding is
+    // exactly what MMQ reads instead of running off the end - the same slack the scheduler's own
+    // copy_experts adds per run (ggml-backend.cpp:1859-1867).
+    int n_moe_stage_banks = 0;
+    for (int b = 0; b < sched->n_backends; b++) {
+        // Clear first: a graph with no eligible expert weight (decode, or a shape that declined)
+        // must not leave the previous graph's bank pointer and size behind, or
+        // ggml_backend_sched_moe_stage_ready would compare against stale state after a realloc.
+        sched->moe_stage_bank[b]        = NULL;
+        sched->moe_stage_bank_bytes[b] = 0;
+        if (sched->backends[b]->iface.set_tensor_async_staged == NULL ||
+            sched->backends[b]->iface.stage_stream_wait_event == NULL) {
+            continue;
+        }
+        size_t bank_bytes = 0;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            const struct ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_MUL_MAT_ID || node->ne[2] <= 1 || node->src[0] == NULL) {
+                continue; // ne[2] <= 1 is a 1-token decode graph: never staged
+            }
+            const struct ggml_tensor * weight = node->src[0];
+            if (weight->buffer == NULL ||
+                ggml_backend_buffer_get_usage(weight->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                !ggml_backend_buffer_is_host(weight->buffer)) {
+                continue;
+            }
+            bank_bytes = std::max(bank_bytes, ggml_backend_buft_get_alloc_size(sched->bufts[b], weight));
+        }
+        if (bank_bytes == 0) {
+            continue;
+        }
+        // A plain I8 tensor, deliberately NOT a view: a view would set view_src and trip
+        // bad_padding_clear, which would divert the expert GEMM to cuBLAS. The staging tensors
+        // are plain dups (as today) whose ->data is redirected into this bank at execution time.
+        sched->moe_stage_bank[b] = ggml_new_tensor_1d(sched->ctx, GGML_TYPE_I8, 2*bank_bytes);
+        ggml_set_input(sched->moe_stage_bank[b]);
+        ggml_set_output(sched->moe_stage_bank[b]); // prevent ggml-alloc from reclaiming it
+        ggml_format_name(sched->moe_stage_bank[b], "%s#moe_stage_bank#%d", ggml_backend_name(sched->backends[b]), b);
+        sched->moe_stage_bank_bytes[b] = bank_bytes;
+        n_moe_stage_banks++;
+    }
+    sched->moe_stage_bank_idx = 0; // bank flip restarts at every graph split
+
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes + n_moe_stage_banks;
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1493,6 +1558,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->graph.n_leafs = 0;
 
     struct ggml_cgraph * graph_copy = &sched->graph;
+
+    // [TAG_MOE_PREFILL_STAGE] Add each staging bank as the first node of graph_copy so ggml-alloc
+    // reserves it in that backend's compute buffer before anything that is redirected into it.
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->moe_stage_bank[b] == NULL) {
+            continue;
+        }
+        assert(graph_copy->size > graph_copy->n_nodes + 1);
+        sched->node_backend_ids[graph_copy->n_nodes] = b;
+        graph_copy->nodes[graph_copy->n_nodes++] = sched->moe_stage_bank[b];
+    }
 
     int n_dep_nodes_added = 0;
 
@@ -1721,6 +1797,46 @@ static enum ggml_status ggml_backend_sched_dispatch_split(
     return status;
 }
 
+// [TAG_MOE_PREFILL_STAGE] Stage 1b-R. Decide whether this MoE expert-weight staging can be
+// issued on the backend's dedicated copy stream, and make sure the two bank-free events exist.
+//
+// Returns false - and the caller then keeps the exact legacy sequence, per split - if any of:
+//   - the backend does not implement both staged-copy hooks (CUDA only while the flag is on),
+//   - the graph is not prefill-shaped (ne[2] <= 1; decode never reaches this path anyway because
+//     its expert MMIDs are CPU-resident, but this makes that explicit rather than incidental),
+//   - the bank has not been allocated for this graph (different shape, or the hooks declined),
+//   - the weight does not fit one bank,
+//   - the bank-free events could not be created.
+static bool ggml_backend_sched_moe_stage_ready(
+        ggml_backend_sched_t sched, ggml_backend_t backend, int backend_id,
+        const struct ggml_tensor * node, const struct ggml_tensor * weight) {
+    if (backend->iface.set_tensor_async_staged == NULL || backend->iface.stage_stream_wait_event == NULL) {
+        return false;
+    }
+    if (node->ne[2] <= 1) {
+        return false;
+    }
+    if (sched->moe_stage_bank[backend_id] == NULL || sched->moe_stage_bank[backend_id]->data == NULL) {
+        return false;
+    }
+    if (ggml_backend_buft_get_alloc_size(sched->bufts[backend_id], weight) > sched->moe_stage_bank_bytes[backend_id]) {
+        return false;
+    }
+    if (sched->moe_stage_free[backend_id][0] == NULL) {
+        for (int i = 0; i < 2; i++) {
+            sched->moe_stage_free[backend_id][i] = ggml_backend_event_new(backend->device);
+            if (sched->moe_stage_free[backend_id][i] == NULL) {
+                for (int j = 0; j < i; j++) {
+                    ggml_backend_event_free(sched->moe_stage_free[backend_id][j]);
+                    sched->moe_stage_free[backend_id][j] = NULL;
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(
         ggml_backend_sched_t sched,
         uint64_t source_graph_uid,
@@ -1769,6 +1885,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        // [TAG_MOE_PREFILL_STAGE] banks this split staged into, as a bitmask: 0 = nothing staged
+        // (legacy path), 1/2/3 = bank 0/1/both were written and their free events must be
+        // recorded once this split's compute has been submitted.
+        int moe_banks_used = 0;
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -1794,8 +1915,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                // [TAG_MOE_PREFILL_STAGE] Decide staging BEFORE the buffer-reuse barrier: when
+                // staging, that barrier moves off the host and onto the copy stream, which is the
+                // whole point of the change. The conditions mirror the used-expert staging gate
+                // below (:1804-1811) so eligibility is decided identically in both places.
+                const struct ggml_tensor * stage_node = split->graph.n_nodes > 0 ? split->graph.nodes[0] : NULL;
+                const bool stage_weight_input = stage_node != NULL && stage_node->op == GGML_OP_MUL_MAT_ID &&
+                    stage_node->src[0] == input_cpy && input->buffer != NULL &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer);
+                const bool moe_stage = stage_weight_input &&
+                    ggml_backend_sched_moe_stage_ready(sched, split_backend, split_backend_id, stage_node, input);
+                int moe_bank = -1;
+                if (moe_stage) {
+                    moe_bank = (int)(sched->moe_stage_bank_idx++ & 1u);
+                    moe_banks_used |= 1 << moe_bank;
+                }
+
                 // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                if (moe_stage) {
+                    // The copy for this layer targets the bank the previous layer is NOT reading,
+                    // so the only ordering needed is copy-stream-after-the-compute-that-last-read-
+                    // that-bank, which is the event recorded after that split. No host block.
+                    if (!split_backend->iface.stage_stream_wait_event(split_backend,
+                                sched->moe_stage_free[split_backend_id][moe_bank])) {
+                        // decline after all: fall back to the legacy barrier for this split
+                        ggml_backend_synchronize(split_backend);
+                    }
+                } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -1852,6 +1999,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    // [TAG_MOE_PREFILL_STAGE] Point this weight's staging tensor at the bank for
+                    // this layer. Done here, at execution time, rather than at split time, so it
+                    // is re-applied on every replay after ggml-alloc reassigns ->data. input_cpy
+                    // stays a plain dup (view_src == NULL), so bad_padding_clear stays false and
+                    // the expert GEMM keeps taking the exact same MMQ path as with the flag off.
+                    if (moe_stage) {
+                        input_cpy->data = (uint8_t *) sched->moe_stage_bank[split_backend_id]->data +
+                            (size_t) moe_bank * sched->moe_stage_bank_bytes[split_backend_id];
+                    }
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
@@ -1859,12 +2016,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                        // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                        // this is necessary for MMQ in the CUDA backend
+                        const size_t nbytes = expert_size_copy + padding_end;
+                        const uint8_t * src = (const uint8_t *)input->data + expert_offset;
+
+                        if (moe_stage &&
+                            split_backend->iface.set_tensor_async_staged(split_backend, input_cpy, src, expert_offset, nbytes)) {
+                            return; // issued on the copy stream; compute stream ordered after it
+                        }
+                        if (moe_stage) {
+                            // the backend declined mid-split: it may already have consumed part of
+                            // the copy-stream ordering, so restore the legacy barrier before the
+                            // blocking copy. Never silently wrong.
+                            ggml_backend_synchronize(split_backend);
+                        }
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, src, expert_offset, nbytes);
                     };
 
                     int id = 0;
@@ -1964,6 +2131,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
+        // [TAG_MOE_PREFILL_STAGE] The split that just ran read bank moe_bank, so nothing may
+        // overwrite that bank until this compute has retired. The next user of this bank is two
+        // splits away and waits on this event on its copy stream - that is the layer-ahead
+        // overlap, and it is why the host-side barrier above could be removed.
+        if (moe_banks_used != 0 && sched->moe_stage_bank[split_backend_id] != NULL) {
+            for (int i = 0; i < 2; i++) {
+                if (moe_banks_used & (1 << i)) {
+                    ggml_backend_event_record(sched->moe_stage_free[split_backend_id][i], split_backend);
+                }
+            }
+        }
+
         prev_backend_id = split_backend_id;
     }
 
@@ -2032,7 +2211,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
         }
+
+        // [TAG_MOE_PREFILL_STAGE]
+        sched->moe_stage_bank[b]        = NULL;
+        sched->moe_stage_bank_bytes[b] = 0;
+        sched->moe_stage_free[b][0]     = NULL;
+        sched->moe_stage_free[b][1]     = NULL;
     }
+    // [TAG_MOE_PREFILL_STAGE]
+    sched->moe_stage_bank_idx = 0;
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
@@ -2049,6 +2236,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+        }
+        // [TAG_MOE_PREFILL_STAGE]
+        for (int i = 0; i < 2; i++) {
+            if (sched->moe_stage_free[b][i] != NULL) {
+                ggml_backend_event_free(sched->moe_stage_free[b][i]);
+            }
         }
     }
     ggml_gallocr_free(sched->galloc);
