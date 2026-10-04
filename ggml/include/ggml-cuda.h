@@ -64,6 +64,11 @@ GGML_BACKEND_API size_t ggml_backend_cuda_moe_get_l2_pinned_cache_size(void);
 GGML_BACKEND_API void ggml_backend_cuda_moe_set_debug_mm(bool enabled);
 GGML_BACKEND_API bool ggml_backend_cuda_moe_get_debug_mm(void);
 
+// Prefill expert streaming (Stage 1): process-wide enable flag published at
+// model load. Flag off (default) keeps every outcome on the legacy path.
+GGML_BACKEND_API void ggml_backend_cuda_moe_set_prefill_stream(bool enabled);
+GGML_BACKEND_API bool ggml_backend_cuda_moe_get_prefill_stream(void);
+
 // Resource-free compatibility shims for older callers.
 GGML_BACKEND_API void ggml_backend_cuda_moe_observe_expert_tensor(
     const void * tensor_data,
