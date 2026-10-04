@@ -72,6 +72,11 @@ static constexpr size_t MOE_PREFILL_RESIDENT_AUX_BUDGET = 32 * 1024 * 1024;
 static std::atomic<bool> g_moe_cache_mm_debug{false};
 static std::atomic<size_t> g_moe_cache_l2_pinned_size{0};
 
+// Stage 1 prefill expert streaming (--moe-prefill-stream): process-wide
+// enable flag published at model load. Off by default; plan code reads it
+// via ggml_cuda_moe_prefill_stream_enabled() below.
+static std::atomic<bool> g_moe_prefill_stream_enabled{false};
+
 static size_t moe_cache_quantized_source_padding(uint32_t type, int64_t ne0) {
     if (type >= GGML_TYPE_COUNT || ne0 <= 0 || !ggml_is_quantized((ggml_type) type)) {
         return 0;
@@ -9632,6 +9637,157 @@ bool ggml_cuda_moe_grouped_context::finish_decode(
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Stage 1 prefill expert streaming (--moe-prefill-stream, default off).
+// Spec: STAGE1-IMPL-SPEC.md section 3. v1 lands the flag-gated plan outcome,
+// the per-layer union gather, and the phase-scoped pool descriptor below.
+// The grouped dispatch link (pool -> grouped GEMM) is Stage 1b: with the
+// flag on, whitelisted plans are marked PREFILL_STREAMED, and every v1
+// consumer fails closed to the legacy direct path (no copy-engine ungate,
+// no capture change), so numerics are identical flag on vs off.
+// ---------------------------------------------------------------------------
+
+static bool ggml_cuda_moe_prefill_stream_enabled() {
+    return g_moe_prefill_stream_enabled.load(std::memory_order_relaxed);
+}
+
+// One-shot process notices: the streamed outcome is new, so its first plan
+// appearance, and any flag-on fallback, are logged. Never silently wrong.
+static void moe_prefill_stream_note_emitted() {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        GGML_LOG_INFO("moe-cache: prefill expert streaming plan ACTIVE (PREFILL_STREAMED); "
+                      "v1 executes the legacy path, grouped dispatch follows in Stage 1b\n");
+    }
+}
+
+static void moe_prefill_stream_note_fallback() {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        GGML_LOG_WARN("moe-cache: --moe-prefill-stream is on but a prefill plan fell back "
+                      "to legacy (cache-backed experts, group records, or non-prefill graph); "
+                      "decode and numerics unchanged\n");
+    }
+}
+
+bool ggml_cuda_moe_prefill_union_gather(
+        const int32_t * ids_host,
+        int64_t n_rows,
+        int64_t n_ids_per_row,
+        uint32_t n_experts,
+        struct moe_prefill_union * out_union) {
+    if (ids_host == nullptr || out_union == nullptr || n_rows <= 0 || n_ids_per_row <= 0 ||
+            n_experts == 0 || n_experts > GGML_CUDA_MOE_PREFILL_STREAM_MAX_EXPERTS) {
+        return false;
+    }
+    // Distinct-expert bitset, same shape as the sched used_ids pass
+    // (ggml-backend.cpp): one bit per expert, OR over (row, k) routes.
+    uint64_t seen[GGML_CUDA_MOE_PREFILL_STREAM_MAX_EXPERTS / 64] = {};
+    for (int64_t r = 0; r < n_rows; ++r) {
+        for (int64_t k = 0; k < n_ids_per_row; ++k) {
+            const int32_t id = ids_host[r * n_ids_per_row + k];
+            if (id < 0 || (uint32_t) id >= n_experts) {
+                return false;
+            }
+            seen[(uint32_t) id / 64] |= (uint64_t) 1 << ((uint32_t) id % 64);
+        }
+    }
+    out_union->count = 0;
+    for (uint32_t id = 0; id < n_experts; ++id) {
+        if ((seen[id / 64] & ((uint64_t) 1 << (id % 64))) != 0) {
+            out_union->ids[out_union->count++] = id;
+        }
+    }
+    return true;
+}
+
+// Whitelist for emitting PREFILL_STREAMED. True only when every v1 consumer
+// is provably legacy-identical: flag on, no decode-cache machinery active,
+// no group records, and (when asked) a prefill-shaped graph: at least one
+// MUL_MAT_ID node and every MUL_MAT_ID node in PREFILL phase. Decode and
+// mixed graphs stay legacy, so decode tokens are bit-identical flag on vs
+// off (G-K1). Any doubt falls back to legacy with a log line.
+static bool moe_prefill_stream_plan_viable(
+        const ggml_cgraph * cgraph,
+        bool cache_active,
+        bool have_groups,
+        bool check_shape) {
+    if (!ggml_cuda_moe_prefill_stream_enabled() || cache_active || have_groups) {
+        return false;
+    }
+    if (!check_shape) {
+        return true;
+    }
+    if (cgraph == nullptr) {
+        return false;
+    }
+    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
+    uint32_t n_mmid = 0;
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
+        if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        ++n_mmid;
+        if (moe_candidate_execution_phase_for(cgraph, node) != MOE_CANDIDATE_EXECUTION_PHASE_PREFILL) {
+            return false;
+        }
+    }
+    return n_mmid != 0;
+}
+
+// Phase-scoped device pool (Stage 1b entry points): two device slots plus one
+// ready event each, sized by the caller (spec section 3.5: 2 x union x
+// per-expert bytes, capped at the whole bank). The target device must be
+// current on the calling thread. Any failure returns false with nothing left
+// half-initialized; the caller falls back to legacy.
+bool ggml_cuda_moe_prefill_stream_pool_ensure(struct moe_prefill_stream_pool * pool, size_t pool_bytes) {
+    if (pool == nullptr || pool_bytes == 0) {
+        return false;
+    }
+    ggml_cuda_moe_prefill_stream_pool_destroy(pool);
+    for (int slot = 0; slot < 2; ++slot) {
+        void * mem = nullptr;
+        cudaEvent_t ready = nullptr;
+        if (!moe_grouped_cuda_success(cudaMalloc(&mem, pool_bytes)) ||
+                !moe_grouped_cuda_success(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming))) {
+            if (ready != nullptr) {
+                cudaEventDestroy(ready);
+            }
+            if (mem != nullptr) {
+                cudaFree(mem);
+            }
+            ggml_cuda_moe_prefill_stream_pool_destroy(pool);
+            return false;
+        }
+        pool->slot[slot] = mem;
+        pool->ready[slot] = ready;
+        pool->resident_layer[slot] = -1;
+    }
+    pool->pool_bytes = pool_bytes;
+    pool->front = 0;
+    return true;
+}
+
+void ggml_cuda_moe_prefill_stream_pool_destroy(struct moe_prefill_stream_pool * pool) {
+    if (pool == nullptr) {
+        return;
+    }
+    for (int slot = 0; slot < 2; ++slot) {
+        if (pool->ready[slot] != nullptr) {
+            cudaEventDestroy(pool->ready[slot]);
+            pool->ready[slot] = nullptr;
+        }
+        if (pool->slot[slot] != nullptr) {
+            cudaFree(pool->slot[slot]);
+            pool->slot[slot] = nullptr;
+        }
+        pool->resident_layer[slot] = -1;
+    }
+    pool->pool_bytes = 0;
+    pool->front = 0;
+}
+
 void ggml_cuda_moe_grouped_context::compile_graph_plan(
         const ggml_cgraph * cgraph,
         uint64_t graph_uid,
@@ -9767,7 +9923,20 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         plan->mmid_inventory_.size() == diagnostics.cached_mmid && plan->inventory_complete_;
     const bool pure_prefill = cached_prefill && !cached_decode;
     if (pure_prefill) {
-        plan->outcome_ = GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY;
+        // Stage 1: flag-gated streamed outcome. Viable only with host experts
+        // (no cache machinery, no group records); cache users keep legacy and
+        // their graph capture. All three decision points must agree.
+        const bool cache_active = impl_->state.accepted && impl_->state.n_slots != 0;
+        const bool stream_prefill = moe_prefill_stream_plan_viable(
+            cgraph, cache_active, !impl_->table.groups.empty(), false);
+        plan->outcome_ = stream_prefill ?
+            GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STREAMED :
+            GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY;
+        if (stream_prefill) {
+            moe_prefill_stream_note_emitted();
+        } else if (ggml_cuda_moe_prefill_stream_enabled()) {
+            moe_prefill_stream_note_fallback();
+        }
         plan->unknown_reusable_ = certified_inventory;
         if (impl_->state.accepted && impl_->state.n_slots != 0 && !impl_->table.groups.empty()) {
             uint32_t n_prefill_groups = 0;
@@ -9879,8 +10048,27 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     const bool explicitly_disabled = impl_->state.accepted &&
         (impl_->state.n_slots == 0 || empty_manifest);
     if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
-        plan->outcome_ = cached_decode && !explicitly_disabled ?
-            GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR : GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY;
+        // Stage 1 live point for host experts: with --moe-expert-cache-size 0
+        // no node has cached buffers, so cached_* are false and the
+        // pure_prefill branch above never fires. Stream only prefill-shaped
+        // graphs with no cache machinery and no group records; decode and
+        // mixed graphs stay legacy so decode is untouched (G-K1). Any doubt
+        // falls back to legacy with a log line, never silently wrong.
+        const bool cache_active = impl_->state.accepted && impl_->state.n_slots != 0;
+        const bool stream_prefill = !cached_decode && !explicitly_disabled &&
+            moe_prefill_stream_plan_viable(cgraph, cache_active, !plan->groups_.empty(), true);
+        ggml_cuda_moe_graph_outcome outcome = GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY;
+        if (cached_decode && !explicitly_disabled) {
+            outcome = GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
+        } else if (stream_prefill) {
+            outcome = GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STREAMED;
+        }
+        plan->outcome_ = outcome;
+        if (stream_prefill) {
+            moe_prefill_stream_note_emitted();
+        } else if (ggml_cuda_moe_prefill_stream_enabled() && !cached_decode && !explicitly_disabled) {
+            moe_prefill_stream_note_fallback();
+        }
         plan->unknown_reusable_ = explicitly_disabled && certified_inventory;
         execution->plan_ = plan;
         execution->owner_ = const_cast<ggml_cuda_moe_grouped_context *>(this);
@@ -10357,10 +10545,21 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         legacy_groups += materialization_legacy || execution_legacy || consumer_legacy || route_legacy;
     }
     decode_legacy_certificate = decode_legacy_certificate && legacy_groups != 0;
-    plan->outcome_ = call_prefill && !call_decode ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
+    // Stage 1: third decision point, kept in agreement with the two above.
+    // Only reachable with cache machinery present (otherwise the early-out
+    // returns first), so the whitelist below never fires here today and
+    // cache-backed graphs stay legacy. Revisit in Stage 1b if that changes.
+    const bool stream_prefill = call_prefill && !call_decode &&
+        moe_prefill_stream_plan_viable(
+            cgraph, impl_->state.accepted, !plan->groups_.empty(), false);
+    plan->outcome_ = stream_prefill ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STREAMED :
+        call_prefill && !call_decode ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
         mixed_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
         decode_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED :
         decode_legacy_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
+    if (stream_prefill) {
+        moe_prefill_stream_note_emitted();
+    }
     if (decode_legacy_certificate) {
         GGML_LOG_DEBUG("moe-cache: grouped decode selected legacy: groups=%u\n", legacy_groups);
         if (impl_->fallback_notice_generation.exchange(
@@ -14711,6 +14910,16 @@ void ggml_backend_cuda_moe_set_debug_mm(bool enabled) {
 extern "C"
 bool ggml_backend_cuda_moe_get_debug_mm(void) {
     return g_moe_cache_mm_debug.load(std::memory_order_relaxed);
+}
+
+extern "C"
+void ggml_backend_cuda_moe_set_prefill_stream(bool enabled) {
+    g_moe_prefill_stream_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+extern "C"
+bool ggml_backend_cuda_moe_get_prefill_stream(void) {
+    return g_moe_prefill_stream_enabled.load(std::memory_order_relaxed);
 }
 
 extern "C"

@@ -1711,6 +1711,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.n_gpu_layers          = params.n_gpu_layers;
     mparams.moe_expert_cache_slots = params.n_moe_expert_cache_slots;
+    mparams.moe_prefill_stream    = params.moe_prefill_stream;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;

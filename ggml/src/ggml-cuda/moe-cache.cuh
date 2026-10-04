@@ -319,7 +319,44 @@ enum ggml_cuda_moe_graph_outcome : uint32_t {
     GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED,
     GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY,
     GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR,
+    GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STREAMED,  // Stage 1: union in device pool, grouped GPU GEMM
 };
+
+// Stage 1 prefill expert streaming (spec STAGE1-IMPL-SPEC.md section 3.4).
+// Phase-scoped (prefill only): allocated for prefill, freed or parked after.
+// Never touched by decode. Two-slot flip-flop, not a cache: admission is the
+// per-layer routed-expert union, replacement is alternation. No LRU, no
+// eviction. Device-pool fill + grouped dispatch land in Stage 1b; v1 lands
+// the descriptor, the union pass, and the plan-gate fallback below.
+#define GGML_CUDA_MOE_PREFILL_STREAM_MAX_EXPERTS 512
+
+struct moe_prefill_union {
+    uint32_t ids[GGML_CUDA_MOE_PREFILL_STREAM_MAX_EXPERTS];  // ordered distinct experts, count <= 512
+    uint32_t count;
+};
+
+struct moe_prefill_stream_pool {
+    void *       slot[2];           // device buffers, pool_bytes each
+    size_t       pool_bytes;        // sized at first prefill chunk
+    int          resident_layer[2]; // which layer's union is in each slot, -1 = empty
+    cudaEvent_t  ready[2];          // recorded on copy_stream when the slot's union lands
+    uint32_t     front;             // slot the current layer computes from
+};
+
+// Host pass over routing ids, shaped like the sched used_ids bitset loop
+// (ggml-backend.cpp). Gathers the distinct-expert union for one MoE layer.
+// Pure computation, no CUDA calls. Stage 1b entry point: called per MoE layer
+// per prefill chunk once the runtime ids are on host.
+bool ggml_cuda_moe_prefill_union_gather(
+    const int32_t * ids_host,
+    int64_t n_rows,
+    int64_t n_ids_per_row,
+    uint32_t n_experts,
+    struct moe_prefill_union * out_union);
+
+// Phase-scoped device pool (Stage 1b entry points). See moe-cache.cu.
+bool ggml_cuda_moe_prefill_stream_pool_ensure(struct moe_prefill_stream_pool * pool, size_t pool_bytes);
+void ggml_cuda_moe_prefill_stream_pool_destroy(struct moe_prefill_stream_pool * pool);
 
 class ggml_cuda_moe_group_call_lease {
 public:
