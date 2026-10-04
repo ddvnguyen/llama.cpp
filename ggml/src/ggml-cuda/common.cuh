@@ -187,6 +187,10 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 
 #define GGML_CUDA_MAX_STREAMS 8
 
+// [TAG_MOE_PREFILL_STAGE] round-robin pool of copy-completion events for the
+// dedicated prefill staging stream (Stage 1b-R).
+#define GGML_CUDA_STAGE_COPY_EVENTS 8
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
 
@@ -1479,6 +1483,15 @@ struct ggml_backend_cuda_context {
     bool        prof_span_open = false; // caller-managed span (one event pair per decode step)
     cudaEvent_t prof_start   = nullptr;
     cudaEvent_t prof_end     = nullptr;
+
+    // [TAG_MOE_PREFILL_STAGE] Dedicated copy stream for prefill expert-weight staging
+    // (--moe-prefill-stream, Stage 1b-R). Created lazily on the first staged copy and
+    // never touched when the flag is off, so flag-off behaviour is byte-identical.
+    // The event pool is round-robin so that a wait already enqueued on the compute
+    // stream always refers to the capture it was enqueued against.
+    cudaStream_t stage_copy_stream = nullptr;
+    cudaEvent_t  stage_copy_ev[GGML_CUDA_STAGE_COPY_EVENTS] = { nullptr };
+    int          stage_copy_ev_idx = 0;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
