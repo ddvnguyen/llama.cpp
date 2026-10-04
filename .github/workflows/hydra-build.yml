@@ -20,6 +20,10 @@ on:
         description: "Build llama-perplexity (artifact upload ONLY, no OCI push) - Stage 0 G-0b KL floor. Needs arch_sm86_sm120 + execution_mode=matrix."
         type: boolean
         default: false
+      build_llama_server_artifact:
+        description: "Build llama-server (artifact upload ONLY, no OCI push) - Stage 1 prefill-stream rig binary. Needs arch_sm86_sm120 + execution_mode=matrix."
+        type: boolean
+        default: false
       arch_sm86_sm120:
         description: "Target sm86-sm120 (RTX 3060 + 5060 Ti, CUDA 13.2)"
         type: boolean
@@ -157,6 +161,18 @@ jobs:
             combos+=('{"arch":"sm86-sm120","binary":"llama-perplexity","cuda_version":"13.2","cuda_arch":"86;120","mode":"artifact"}')
           fi
 
+          if [ "${{ inputs.build_llama_server_artifact }}" = "true" ]; then
+            if [ "${{ inputs.arch_sm86_sm120 }}" != "true" ]; then
+              echo "::error::build_llama_server_artifact needs arch_sm86_sm120 (CUDA 13.2, cuda_arch 86;120)."
+              exit 1
+            fi
+            if [ "${{ inputs.execution_mode }}" != "matrix" ]; then
+              echo "::error::build_llama_server_artifact only supports execution_mode=matrix."
+              exit 1
+            fi
+            combos+=('{"arch":"sm86-sm120","binary":"llama-server","cuda_version":"13.2","cuda_arch":"86;120","mode":"artifact"}')
+          fi
+
           if [ ${#combos[@]} -eq 0 ]; then
             echo "::error::No build selected — check at least one architecture and at least one binary."
             exit 1
@@ -193,7 +209,7 @@ jobs:
     needs: resolve
     if: inputs.execution_mode == 'matrix'
     runs-on: ${{ inputs.runner_target == 'cloud' && 'ubuntu-latest' || 'self-hosted' }}
-    timeout-minutes: ${{ inputs.build_llama_perplexity == true && 120 || (inputs.runner_target == 'cloud' && 45 || 60) }}
+    timeout-minutes: ${{ (inputs.build_llama_perplexity == true || inputs.build_llama_server_artifact == true) && 120 || (inputs.runner_target == 'cloud' && 45 || 60) }}
     strategy:
       fail-fast: false
       matrix:
