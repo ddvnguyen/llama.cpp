@@ -834,6 +834,11 @@ struct ggml_backend_sched {
     size_t               moe_stage_bank_bytes[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_event_t moe_stage_free[GGML_SCHED_MAX_BACKENDS][2];
     uint32_t             moe_stage_bank_idx;
+    // [TAG_MOE_PREFILL_STAGE] one-shot evidence that the staged path actually ran, and how much
+    // of it was taken up. Reported once per graph; decoded graphs never stage, so they stay 0.
+    uint32_t             moe_stage_staged;
+    uint32_t             moe_stage_declined;
+    size_t               moe_stage_log_bank_bytes;
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1550,6 +1555,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         n_moe_stage_banks++;
     }
     sched->moe_stage_bank_idx = 0; // bank flip restarts at every graph split
+    sched->moe_stage_staged   = 0;
+    sched->moe_stage_declined = 0;
+    sched->moe_stage_log_bank_bytes = 0;
 
     int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes + n_moe_stage_banks;
 
@@ -1952,6 +1960,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                 if (moe_stage) {
                     moe_bank = (int)(sched->moe_stage_bank_idx++ & 1u);
                     moe_banks_used |= 1 << moe_bank;
+                    sched->moe_stage_staged++;
+                    if (sched->moe_stage_log_bank_bytes == 0) {
+                        sched->moe_stage_log_bank_bytes = sched->moe_stage_bank_bytes[split_backend_id];
+                    }
+                } else if (stage_weight_input) {
+                    // a MoE expert weight that WAS eligible by shape but was refused: flag off,
+                    // no bank, or weight too large. Counted so an inert run is visible.
+                    sched->moe_stage_declined++;
                 }
 
                 // wait for the split backend to finish using the input before overwriting it
@@ -2166,6 +2182,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    // [TAG_MOE_PREFILL_STAGE] One-shot evidence per graph that the staged path ran. A graph that
+    // staged nothing (including every decode graph) logs nothing, so this line appearing at all is
+    // the signal; staged == 0 with declined > 0 is the signal that the hooks refused.
+    if (sched->moe_stage_staged > 0 || sched->moe_stage_declined > 0) {
+        GGML_LOG_INFO("%s: moe-stage: bank=%zu staged=%u declined=%u\n",
+            __func__, sched->moe_stage_log_bank_bytes, sched->moe_stage_staged, sched->moe_stage_declined);
     }
 
     return GGML_STATUS_SUCCESS;
