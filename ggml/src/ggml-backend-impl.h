@@ -153,6 +153,28 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // [TAG_MOE_PREFILL_STAGE] (optional) Stage 1b-R prefill expert-weight staging.
+        // NOTE: appended at the end on purpose - every backend in the tree initialises
+        // ggml_backend_i positionally, so new slots must never be inserted in the middle.
+        //
+        // set_tensor_async_staged: issue a host->device staging copy into `tensor` on the
+        // backend's dedicated copy stream, ordering the backend's compute stream after the
+        // copy with an event. Returns false to decline, in which case the caller must fall
+        // back to the ordinary (blocking) set_tensor_async path.
+        bool (*set_tensor_async_staged)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+        // stage_stream_wait_event: make the backend's staging copy stream wait for an event
+        // already recorded on the backend's main stream. Lets the caller move a
+        // buffer-reuse dependency off the host and onto the copy stream. Returns false to
+        // decline, in which case the caller must fall back to a full backend synchronize.
+        bool (*stage_stream_wait_event)(ggml_backend_t backend, ggml_backend_event_t event);
+        // moe_stage_enabled: does this backend currently WANT staged staging? Distinct from the
+        // two slots above existing, which are a compile-time property of the backend. The
+        // scheduler must not allocate a staging bank on the strength of the hooks merely being
+        // present - it has to ask at graph-split time, because with the flag off the whole
+        // mechanism must be inert (flag off has to stay byte-identical). Returns false unless
+        // the backend has enabled it right now.
+        bool (*moe_stage_enabled)(ggml_backend_t backend);
     };
 
     struct ggml_backend {

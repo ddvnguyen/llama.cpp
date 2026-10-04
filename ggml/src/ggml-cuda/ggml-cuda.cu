@@ -2371,6 +2371,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (prof_end != nullptr) {
         CUDA_CHECK(cudaEventDestroy(prof_end));
     }
+    // [TAG_MOE_PREFILL_STAGE]
+    for (int i = 0; i < GGML_CUDA_STAGE_COPY_EVENTS; ++i) {
+        if (stage_copy_ev[i] != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(stage_copy_ev[i]));
+        }
+    }
+    if (stage_copy_stream != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(stage_copy_stream));
+        CUDA_CHECK(cudaStreamDestroy(stage_copy_stream));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4217,6 +4227,79 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+}
+
+// [TAG_MOE_PREFILL_STAGE] Stage 1b-R: issue a host->device weight staging copy on a
+// dedicated copy stream instead of the compute stream, and order the compute stream after
+// it with an event. The caller (ggml_backend_sched) guarantees the destination region is
+// not being read, so this is safe to overlap with compute already in flight.
+//
+// Declines (returns false, caller falls back to the blocking path) unless:
+//   - --moe-prefill-stream is on (flag off => byte-identical legacy behaviour),
+//   - the destination is this device's compute buffer,
+//   - the copy stream could be created.
+static bool ggml_backend_cuda_set_tensor_async_staged(
+        ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (!ggml_backend_cuda_moe_get_prefill_stream()) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (cuda_ctx->stage_copy_stream == nullptr) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        cudaStream_t stream = nullptr;
+        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+            cudaGetLastError(); // clear the sticky-free error and decline
+            return false;
+        }
+        cuda_ctx->stage_copy_stream = stream;
+    }
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buf == nullptr || buf->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) {
+        return false;
+    }
+
+    const int ev_idx = cuda_ctx->stage_copy_ev_idx;
+    cudaEvent_t copy_done = cuda_ctx->stage_copy_ev[ev_idx];
+    if (copy_done == nullptr) {
+        if (cudaEventCreateWithFlags(&copy_done, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        cuda_ctx->stage_copy_ev[ev_idx] = copy_done;
+    }
+    cuda_ctx->stage_copy_ev_idx = (ev_idx + 1) % GGML_CUDA_STAGE_COPY_EVENTS;
+
+    if (cudaMemcpyAsync((char *) tensor->data + offset, data, size,
+                cudaMemcpyHostToDevice, cuda_ctx->stage_copy_stream) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (cudaEventRecord(copy_done, cuda_ctx->stage_copy_stream) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (cudaStreamWaitEvent(cuda_ctx->stream(), copy_done, 0) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+// [TAG_MOE_PREFILL_STAGE] Make the dedicated staging copy stream wait for an event that
+// was already recorded on this backend's main stream. This is what lets the scheduler drop
+// the host-blocking ggml_backend_synchronize() that used to guard the shared staging
+// buffer: the dependency moves from the host onto the copy stream, and the copy for the
+// next layer can then be in flight while the current layer's GEMM runs.
+static bool ggml_backend_cuda_stage_stream_wait_event(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (cuda_ctx->stage_copy_stream == nullptr || event == nullptr) {
+        return false;
+    }
+    if (cudaStreamWaitEvent(cuda_ctx->stage_copy_stream, (cudaEvent_t) event->context, 0) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -7479,6 +7562,9 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    // [TAG_MOE_PREFILL_STAGE] appended last, matching the struct order in ggml-backend-impl.h
+    /* .set_tensor_async_staged = */ ggml_backend_cuda_set_tensor_async_staged,
+    /* .stage_stream_wait_event = */ ggml_backend_cuda_stage_stream_wait_event,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
@@ -8435,6 +8521,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_cache_slots;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_PREFILL_STREAM_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_set_prefill_stream;
     }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_L2_PINNED_SIZE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_l2_pinned_cache_size;
