@@ -168,6 +168,13 @@ extern "C" {
         // buffer-reuse dependency off the host and onto the copy stream. Returns false to
         // decline, in which case the caller must fall back to a full backend synchronize.
         bool (*stage_stream_wait_event)(ggml_backend_t backend, ggml_backend_event_t event);
+        // moe_stage_enabled: does this backend currently WANT staged staging? Distinct from the
+        // two slots above existing, which are a compile-time property of the backend. The
+        // scheduler must not allocate a staging bank on the strength of the hooks merely being
+        // present - it has to ask at graph-split time, because with the flag off the whole
+        // mechanism must be inert (flag off has to stay byte-identical). Returns false unless
+        // the backend has enabled it right now.
+        bool (*moe_stage_enabled)(ggml_backend_t backend);
     };
 
     struct ggml_backend {

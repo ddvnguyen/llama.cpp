@@ -1514,7 +1514,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->moe_stage_bank[b]        = NULL;
         sched->moe_stage_bank_bytes[b] = 0;
         if (sched->backends[b]->iface.set_tensor_async_staged == NULL ||
-            sched->backends[b]->iface.stage_stream_wait_event == NULL) {
+            sched->backends[b]->iface.stage_stream_wait_event == NULL ||
+            sched->backends[b]->iface.moe_stage_enabled == NULL ||
+            !sched->backends[b]->iface.moe_stage_enabled(sched->backends[b])) {
+            // hooks absent, or present but not wanted right now (--moe-prefill-stream off):
+            // allocate nothing, so flag-off VRAM is byte-identical to a build without this code.
             continue;
         }
         // Scan split->inputs, NOT graph->nodes[i]->src[0]: pass 5 has already rewritten every
@@ -1828,7 +1832,8 @@ static enum ggml_status ggml_backend_sched_dispatch_split(
 static bool ggml_backend_sched_moe_stage_ready(
         ggml_backend_sched_t sched, ggml_backend_t backend, int backend_id,
         const struct ggml_tensor * node, const struct ggml_tensor * weight) {
-    if (backend->iface.set_tensor_async_staged == NULL || backend->iface.stage_stream_wait_event == NULL) {
+    if (backend->iface.set_tensor_async_staged == NULL || backend->iface.stage_stream_wait_event == NULL ||
+        backend->iface.moe_stage_enabled == NULL || !backend->iface.moe_stage_enabled(backend)) {
         return false;
     }
     if (node->ne[2] <= 1) {
