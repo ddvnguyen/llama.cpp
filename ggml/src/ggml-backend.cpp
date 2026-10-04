@@ -1512,19 +1512,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             sched->backends[b]->iface.stage_stream_wait_event == NULL) {
             continue;
         }
+        // Scan split->inputs, NOT graph->nodes[i]->src[0]: pass 5 has already rewritten every
+        // node's src pointers to the per-backend staging copies (node->src[j] =
+        // tensor_id_copy(...)), so by now src[0] is the CUDA compute-buffer copy and
+        // ggml_backend_buffer_is_host() on it is FALSE - which is exactly why an earlier
+        // version of this scan silently found nothing and never allocated a bank. split->inputs[]
+        // still holds the ORIGINAL host weight pointers, which is what the used-expert staging
+        // path in compute_splits actually reads from.
         size_t bank_bytes = 0;
-        for (int i = 0; i < graph->n_nodes; i++) {
-            const struct ggml_tensor * node = graph->nodes[i];
-            if (node->op != GGML_OP_MUL_MAT_ID || node->ne[2] <= 1 || node->src[0] == NULL) {
+        for (int i = 0; i < sched->n_splits; i++) {
+            const struct ggml_backend_sched_split * split = &sched->splits[i];
+            const struct ggml_tensor * node = split->graph.n_nodes > 0 ? split->graph.nodes[0] : NULL;
+            if (node == NULL || node->op != GGML_OP_MUL_MAT_ID || node->ne[2] <= 1) {
                 continue; // ne[2] <= 1 is a 1-token decode graph: never staged
             }
-            const struct ggml_tensor * weight = node->src[0];
-            if (weight->buffer == NULL ||
-                ggml_backend_buffer_get_usage(weight->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
-                !ggml_backend_buffer_is_host(weight->buffer)) {
-                continue;
+            for (int j = 0; j < split->n_inputs; j++) {
+                const struct ggml_tensor * weight = split->inputs[j];
+                if (weight->buffer == NULL ||
+                    ggml_backend_buffer_get_usage(weight->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                    !ggml_backend_buffer_is_host(weight->buffer)) {
+                    continue;
+                }
+                bank_bytes = std::max(bank_bytes, ggml_backend_buft_get_alloc_size(sched->bufts[b], weight));
             }
-            bank_bytes = std::max(bank_bytes, ggml_backend_buft_get_alloc_size(sched->bufts[b], weight));
         }
         if (bank_bytes == 0) {
             continue;
